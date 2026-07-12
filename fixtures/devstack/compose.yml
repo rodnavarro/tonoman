@@ -1,0 +1,36 @@
+# Tonoman devcontainerized fixture stack — an OWNED, secret-free multi-service app
+# that exercises everything the brokered runtime must handle, so the devcontainerized
+# scenarios can be asserted without any real project's credentials:
+#   - an IMAGE service with a NAMED VOLUME + a BIND MOUNT (path rewrite, A13)
+#   - a BUILT service (build context → host podman build)
+#   - DNS-by-name between services (app reaches db as "db")
+#   - a published PORT so you can dev against it from the host
+name: tonoman-devstack
+
+services:
+  db:
+    image: docker.io/library/postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: devonly
+      POSTGRES_DB: devstack
+    volumes:
+      - pgdata:/var/lib/postgresql/data          # named volume (podman-managed)
+      - ./init.sql:/docker-entrypoint-initdb.d/00-init.sql:ro   # bind mount — broker rewrites the source path
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d devstack"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+
+  app:
+    build:
+      context: ./app                              # built service — host podman build
+    image: tonoman-devstack/app:local
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8088:80"                                 # dev against it: http://localhost:8088
+
+volumes:
+  pgdata:

@@ -1,0 +1,25 @@
+{
+  "_readme": "Copy to settings.json (git-ignored) and fill in. CRITICAL: telegram.media_dir and workspace.root must be bind-mounts visible at the SAME absolute path on the host (where this gateway runs) and inside agent.container (where claude reads them). See docs/architecture.md 'Live-handoff prerequisites'.",
+  "agent": {
+    "name": "business-cards",
+    "container": "tonoman-business-cards",
+    "system_prompt_file": "/agent/identity.md",
+    "model": "sonnet",
+    "window_size": 30
+  },
+  "telegram": {
+    "token": "REPLACE_WITH_BOT_TOKEN",
+    "allowed_user": "your-telegram-username-or-numeric-id",
+    "media_dir": "/opt/data/cards/incoming",
+    "media_mount": "/opt/data/cards/incoming"
+  },
+  "workspace": {
+    "root": "/opt/data/cards",
+    "remote": "",
+    "token": ""
+  },
+  "stream": {
+    "cursor": " 🤖",
+    "edit_interval_ms": 900
+  }
+}

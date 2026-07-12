@@ -1,0 +1,40 @@
+{
+  "_readme": "roster / A11 roster example: multiple agents from one config, each a GUID-identified instance with its OWN isolated brain. Each agent's private config volume is bind-mounted at the harness config-home (Claude Code: /root/.claude) and is OPAQUE to Tonoman; auth (the credential store) lands there and persists across restarts. Per agent: omit `guid` to have it assigned + persisted to <state_root>/agents.json; omit `config_volume`/`workspace.root` to derive them from <state_root>/<guid>/{config,memory}. Each agent owns its own bot (telegram.token) so they're reachable side by side. Container provisioning (podman run with the config volume mounted at the config-home, ports namespaced by port_base) is a deploy step. Copy to a git-ignored settings.json and fill the secrets.",
+  "state_root": "/srv/tonoman",
+  "stream": {
+    "cursor": " 🤖",
+    "edit_interval_ms": 900
+  },
+  "agents": [
+    {
+      "name": "alpha",
+      "role": "what this agent is for, in one line — injected each turn so it presents itself by role (roster-name-role)",
+      "harness": "claude-code",
+      "container": "tonoman-alpha",
+      "system_prompt_file": "/root/agent/AGENTS.md",
+      "model": "sonnet",
+      "tunnel_bin": "cloudflared",
+      "mounts": [{ "name": "p", "host": "/home/you/p", "read_only": false }],
+      "telegram": {
+        "token": "REPLACE_WITH_ALPHA_BOT_TOKEN",
+        "allowed_user": "your-telegram-id",
+        "media_dir": "/srv/tonoman/alpha/memory/incoming",
+        "media_mount": "/root/.tonoman/incoming"
+      }
+    },
+    {
+      "name": "beta",
+      "role": "what this agent is for, in one line",
+      "harness": "claude-code",
+      "container": "tonoman-beta",
+      "system_prompt_file": "/root/agent/AGENTS.md",
+      "model": "opus",
+      "telegram": {
+        "token": "REPLACE_WITH_BETA_BOT_TOKEN",
+        "allowed_user": "your-telegram-id",
+        "media_dir": "/srv/tonoman/beta/memory/incoming",
+        "media_mount": "/root/.tonoman/incoming"
+      }
+    }
+  ]
+}

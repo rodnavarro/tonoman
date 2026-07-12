@@ -1,0 +1,40 @@
+# Build artifacts
+/tonoman
+/tonoman.exe
+*.exe
+*.test
+*.out
+/dist/
+/bin/
+
+# Go
+/vendor/
+go.work
+go.work.sum
+
+# Node
+/node_modules/
+npm-debug.log*
+*.tsbuildinfo
+
+# Secrets — never commit (cfg-no-secrets). Only *.example.* is tracked (cfg-per-agent).
+.env
+*.env
+secrets/
+*.token
+*.secret
+settings*.json
+.claude/.credentials.json
+*.credentials.json
+!*.example.*
+
+# Session context dumps (compaction handoff notes)
+.context-dump/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~

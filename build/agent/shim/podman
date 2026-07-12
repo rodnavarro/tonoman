@@ -1,0 +1,87 @@
+#!/usr/bin/env node
+// Tonoman in-container `podman` shim (A13). Installed at /usr/local/bin/podman so
+// it shadows the real podman in the sandbox PATH. Instead of running containers
+// nested, it forwards the command — verbatim argv + the caller's cwd (+ piped stdin)
+// — to the host broker over the file-based control channel on the shared memory
+// mount, and relays the result. So `podman …` / `podman compose …` typed inside the
+// sandbox actually runs on the HOST podman (non-privileged siblings, visible in
+// Podman Desktop), gated by the agent's policy. Self-contained: no Tonoman imports,
+// only Node built-ins, because it runs inside the agent container.
+'use strict';
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+
+const dir = process.env.TONOMAN_CONTROL_DIR || '/root/.tonoman/control';
+const reqDir = path.join(dir, 'requests');
+const resDir = path.join(dir, 'responses');
+fs.mkdirSync(reqDir, { recursive: true });
+fs.mkdirSync(resDir, { recursive: true });
+
+const argv = process.argv.slice(2);
+
+// Only consume stdin when the command actually asks for it (`-i`/`--interactive`, a
+// combined short flag containing `i` like `-it`, or a bare `-`). Otherwise skip it
+// entirely, so ordinary commands stay instant and we never block reading an idle
+// stdin. (The broker also closes the host command's stdin when none is forwarded, so
+// an `-i` command with no real input gets EOF and returns rather than hanging.)
+function wantsStdin(a) {
+  return a === '-' || a === '-i' || a === '--interactive' || (/^-[a-zA-Z]+$/.test(a) && a.indexOf('i') >= 0);
+}
+
+function gatherStdin(cb) {
+  if (process.stdin.isTTY || !argv.some(wantsStdin)) return cb(undefined);
+  let data = '';
+  let settled = false;
+  let sawData = false;
+  const finish = function (v) {
+    if (settled) return;
+    settled = true;
+    try { process.stdin.pause(); } catch (e) { /* ignore */ }
+    cb(v);
+  };
+  process.stdin.setEncoding('utf8');
+  // `-i` given but nothing actually piped (idle/open stdin) → don't block.
+  const guard = setTimeout(function () { if (!sawData) finish(undefined); }, 500);
+  process.stdin.on('data', function (c) { sawData = true; clearTimeout(guard); data += c; });
+  process.stdin.on('end', function () { clearTimeout(guard); finish(data); });
+  process.stdin.on('error', function () { clearTimeout(guard); finish(sawData ? data : undefined); });
+}
+
+gatherStdin(function (stdin) {
+  const id = crypto.randomUUID();
+  const req = { id: id, argv: argv, cwd: process.cwd() };
+  if (typeof stdin === 'string' && stdin.length > 0) req.stdin = stdin;
+
+  // write-temp-then-rename so the broker never reads a partial request
+  const reqFile = path.join(reqDir, id + '.json');
+  const tmp = reqFile + '.' + crypto.randomUUID() + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(req));
+  fs.renameSync(tmp, reqFile);
+
+  const resFile = path.join(resDir, id + '.json');
+  const deadline = Date.now() + 30 * 60 * 1000; // 30 min — covers long builds/compose up
+
+  (function poll() {
+    let raw;
+    try {
+      raw = fs.readFileSync(resFile, 'utf8');
+    } catch (e) {
+      if (Date.now() > deadline) {
+        process.stderr.write('tonoman: broker did not respond (is the gateway running?)\n');
+        process.exit(124);
+      }
+      return setTimeout(poll, 150);
+    }
+    let res;
+    try {
+      res = JSON.parse(raw);
+    } catch (e) {
+      return setTimeout(poll, 50); // response mid-write; retry
+    }
+    try { fs.unlinkSync(resFile); } catch (e) { /* ignore */ }
+    if (res.stdout) process.stdout.write(res.stdout);
+    if (res.stderr) process.stderr.write(res.stderr);
+    process.exit(typeof res.code === 'number' ? res.code : 0);
+  })();
+});

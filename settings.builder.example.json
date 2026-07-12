@@ -1,0 +1,30 @@
+{
+  "_readme": "Unified agent (devlandingpage + gateway). Workspace = granted host mounts surfaced at ~/files/<name> (A9); memory is separate at workspace.root (mounted ~/.tonoman, A3). Skills mounted under ~/.claude/skills: register-business-card, list-projects, create-tunnel. allowed_tools adds WebSearch/WebFetch for dev + research. Tunnels are on-demand via the create-tunnel skill → substrate control channel (request/response files under the memory mount, A8); tunnel_bin = path to cloudflared. Copy to a git-ignored settings.json and fill the token. Container provisioning (mounts/ports/env) is currently a deploy step — see build/agent.",
+  "agent": {
+    "name": "tonoman",
+    "container": "tonoman-agent",
+    "system_prompt_file": "/root/agent/AGENTS.md",
+    "model": "sonnet",
+    "window_size": 30,
+    "allowed_tools": ["Bash", "Read", "Write", "Edit", "WebSearch", "WebFetch"],
+    "tunnel_bin": "cloudflared",
+    "mounts": [
+      { "name": "p", "host": "/home/you/p", "read_only": false }
+    ]
+  },
+  "telegram": {
+    "token": "REPLACE_WITH_BOT_TOKEN",
+    "allowed_user": "your-telegram-username-or-numeric-id",
+    "media_dir": "/path/to/host/memory/incoming",
+    "media_mount": "/root/.tonoman/incoming"
+  },
+  "workspace": {
+    "root": "/path/to/host/memory",
+    "remote": "",
+    "token": ""
+  },
+  "stream": {
+    "cursor": " 🤖",
+    "edit_interval_ms": 900
+  }
+}

@@ -1,0 +1,33 @@
+{
+  "name": "tonoman",
+  "version": "0.1.0-dev",
+  "description": "Control plane for AI agents — orchestrates harnesses (Claude Code, codex, hermes) in podman sandboxes over a shared substrate.",
+  "license": "Apache-2.0",
+  "repository": "github:rodnavarro/tonoman",
+  "type": "commonjs",
+  "bin": {
+    "tonoman": "dist/cli.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "dist",
+    "build",
+    "docs"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/cli.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:live": "vitest run --config vitest.live.config.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0",
+    "vitest": "^2.1.0"
+  }
+}

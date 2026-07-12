@@ -1,0 +1,73 @@
+#!/usr/bin/env node
+// Tonoman in-container `tonoman` shim (A13). Installed at /usr/local/bin/tonoman.
+// It exposes the platform verbs an agent can *request* — today `url`, `expose`,
+// `unexpose` (reachable-service URLs, devcontainerized-resolve-url/-expose-url).
+//
+// Like the `podman` shim it forwards over the file control channel on the shared
+// memory mount; the difference is it prepends the `__tonoman__` sentinel so the host
+// broker routes the argv to its builtin handler (host-side URL resolution + a
+// brokered, policy-gated, audited, revocable port-forward) instead of to podman.
+// The agent NEVER opens a port itself — it asks; the broker decides and acts.
+// Self-contained: only Node built-ins (it runs inside the agent container).
+'use strict';
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+
+const SENTINEL = '__tonoman__';
+
+const dir = process.env.TONOMAN_CONTROL_DIR || '/root/.tonoman/control';
+const reqDir = path.join(dir, 'requests');
+const resDir = path.join(dir, 'responses');
+fs.mkdirSync(reqDir, { recursive: true });
+fs.mkdirSync(resDir, { recursive: true });
+
+const args = process.argv.slice(2);
+if (args.length === 0) {
+  process.stderr.write('usage: tonoman url <service> | expose <service> | unexpose <service> | learn ...\n');
+  process.exit(2);
+}
+
+// LOCAL platform verbs run the full CLI IN-PROCESS (no broker roundtrip): `learn` persists a learning
+// to git directly using the agent's OWN credential/env (learn-durable Model B) — it is not a brokered
+// host op. Everything else falls through to the file control channel below.
+const LOCAL_VERBS = { learn: true, sync: true };
+if (LOCAL_VERBS[args[0]]) {
+  const cliPath = process.env.TONOMAN_CLI || '/opt/tonoman/dist/cli.js';
+  const r = require('child_process').spawnSync(process.execPath, [cliPath].concat(args), { stdio: 'inherit' });
+  process.exit(r.status == null ? 1 : r.status);
+}
+
+const id = crypto.randomUUID();
+const req = { id: id, argv: [SENTINEL].concat(args), cwd: process.cwd() };
+
+const reqFile = path.join(reqDir, id + '.json');
+const tmp = reqFile + '.' + crypto.randomUUID() + '.tmp';
+fs.writeFileSync(tmp, JSON.stringify(req));
+fs.renameSync(tmp, reqFile);
+
+const resFile = path.join(resDir, id + '.json');
+const deadline = Date.now() + 60 * 1000; // URL/expose ops are quick
+
+(function poll() {
+  let raw;
+  try {
+    raw = fs.readFileSync(resFile, 'utf8');
+  } catch (e) {
+    if (Date.now() > deadline) {
+      process.stderr.write('tonoman: broker did not respond (is the gateway running?)\n');
+      process.exit(124);
+    }
+    return setTimeout(poll, 100);
+  }
+  let res;
+  try {
+    res = JSON.parse(raw);
+  } catch (e) {
+    return setTimeout(poll, 50); // response mid-write; retry
+  }
+  try { fs.unlinkSync(resFile); } catch (e) { /* ignore */ }
+  if (res.stdout) process.stdout.write(res.stdout);
+  if (res.stderr) process.stderr.write(res.stderr);
+  process.exit(typeof res.code === 'number' ? res.code : 0);
+})();

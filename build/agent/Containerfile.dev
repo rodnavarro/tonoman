@@ -1,0 +1,49 @@
+# Tonoman dev-agent sandbox (devcontainerized track): nested podman + Claude Code.
+#
+# Base = the official podman-in-podman image: native rootless `overlay` storage
+# (build cache works — spike-proven, no vfs/fuse-overlayfs needed) and the
+# rootless plumbing already configured.
+#
+# RUN RECIPE (set at provision time, not here):
+#   podman run -d --privileged <this-image> sleep infinity
+# `--privileged` is required for full compose-style networking (bridge + DNS by
+# service name); the firewall_driver=none drop-in below is also required because
+# netavark's nftables rule application fails in a nested rootless namespace.
+# NOTE: --privileged SOFTENS the "the sandbox IS the security boundary" posture
+# (architecture A2, the reason we run --dangerously-skip-permissions). This is a
+# CONSCIOUS, documented deviation accepted for the dev track — see devcontainerized.md.
+FROM quay.io/podman/stable
+
+# Tools the dev agent needs on top of podman:
+#  - Claude Code CLI (the brain/harness)            - git (workspaces)
+#  - aws CLI (cloud tooling, e.g. registry auth)    - podman-compose (`podman compose` provider)
+RUN dnf -y install --setopt=install_weak_deps=False \
+        nodejs npm git awscli podman-compose \
+ && dnf clean all && rm -rf /var/cache/dnf
+RUN npm install -g @anthropic-ai/claude-code && claude --version
+
+# netavark firewall: nftables rule application fails nested-rootless; "none" keeps
+# the user bridge + aardvark DNS-by-name working for compose stacks (spike-proven).
+RUN mkdir -p /etc/containers/containers.conf.d \
+ && printf '[network]\nfirewall_driver="none"\n' > /etc/containers/containers.conf.d/99-tonoman-fw.conf
+
+# Resolve short image names (e.g. postgres:17, localstack/localstack:3) to docker.io
+# WITHOUT an interactive prompt — the base enforces short-name resolution, which
+# fails headless ("cannot prompt without a TTY"). Dev compose files use short names.
+RUN mkdir -p /etc/containers/registries.conf.d \
+ && printf 'short-name-mode="permissive"\nunqualified-search-registries=["docker.io"]\n' > /etc/containers/registries.conf.d/99-tonoman-shortnames.conf
+
+# container-root git must trust bind-mounted workspaces (avoids "dubious ownership").
+RUN git config --system --add safe.directory '*'
+
+# Tonoman in-sandbox shims (A13): `podman` forwards container commands to the host
+# broker over the file control channel; `tonoman` forwards the platform verbs
+# (url/expose/unexpose — reachable-service URLs). Build context is build/agent/, so
+# these resolve as shim/<name>. Baked in so they survive a container rebuild (they
+# were previously podman-cp'd into the running sandbox by hand).
+COPY shim/podman shim/tonoman /usr/local/bin/
+RUN chmod +x /usr/local/bin/podman /usr/local/bin/tonoman
+
+ENTRYPOINT []
+WORKDIR /work
+CMD ["sleep", "infinity"]
