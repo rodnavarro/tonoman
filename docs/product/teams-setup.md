@@ -18,34 +18,56 @@ Teams  →  Azure Bot  →  https://<your-host>/api/messages  →  tonoman gatew
 
 ---
 
-## Part 1 — What you need from your Microsoft 365 admin
+## Part 1 — Permissions you'll need
 
-**If you're not the tenant admin, this is the section to forward.** Everything else you can do
-yourself. Two approvals, and neither grants access to anything beyond the bot:
+If you administer the tenant yourself, grant these and move on. If you don't, you'll need someone
+who does — and this section is written so you can hand the request over without a meeting.
 
-**1. Let me register an application in Entra ID.**
+Two things must be true before anything else works:
+
+**1. You can register an application in Entra ID.**
 This creates the bot's identity. It needs **no Graph API permissions** — no mail, no files, no
-directory access. The bot can only receive messages that are explicitly sent to it, and reply to
-them. It cannot read channels it hasn't been added to, and it cannot see anything else in the tenant.
+directory access. The bot only receives messages that are explicitly sent to it, and replies to
+them. It cannot read channels it hasn't been added to, and it cannot see anything else in the
+tenant. Many tenants already let any user register apps; if yours doesn't, you need it enabled for
+your account.
 
-**2. Let me upload a custom app to Teams** (called *sideloading*).
-This is how the bot appears in the Teams client. By default, tenants block it.
-
-An admin enables it **per person**, not org-wide:
+**2. You can upload a custom app to Teams** (*sideloading*).
+This is how the bot appears in the Teams client, and most tenants block it by default. It's granted
+**per person**, not org-wide:
 
 > **Teams admin center → Teams apps → Setup policies → Global (or a new policy)**
-> Turn **"Upload custom apps"** to **On**, then assign that policy to the specific users who need it.
+> Set **"Upload custom apps"** to **On**, and assign that policy to the people who need it.
 
-Two things worth knowing before you ask:
+Before you ask, know the two traps:
 
-- **Guest accounts cannot upload custom apps, ever** — no policy changes that. If the person doing
-  the setup is a guest in the tenant, they need a real member account.
-- Policy changes can take **up to 24 hours** to reach the Teams client. If "Upload a custom app"
-  is still greyed out, that's usually why — wait, don't re-do the steps.
+- **Guest accounts can never sideload**, no matter the policy. If your account is a guest in the
+  tenant, no permission fixes it — you need a real member account.
+- Policy changes take **up to 24 hours** to reach the Teams client. If "Upload a custom app" is
+  still missing after it's been granted, that's usually why. Wait; don't redo the setup.
 
-Once the agent is proven, you can skip sideloading entirely by publishing it to the **org app
-catalog**, so people install it like any other Teams app. That's the productized path; sideloading
-is the fast path for getting one person talking to it today.
+Once the agent is proven you can skip sideloading entirely by publishing it to the **org app
+catalog**, so people install it like any other Teams app. Sideloading is the fast path to getting
+one person talking to it today; the catalog is how you roll it out.
+
+### Asking your admin
+
+Copy this. It says what you need and — the part that usually unsticks the conversation — what you
+don't.
+
+> I'm setting up a chat assistant that lives in Teams. I need two things:
+>
+> 1. **Permission to register an application in Entra ID.** This is the bot's identity. It requires
+>    **no Graph API permissions** — no access to mail, files, or the directory. The bot can only see
+>    messages people explicitly send to it, and reply to them. It can't read channels it hasn't been
+>    added to, and it can't see anything else in the tenant.
+>
+> 2. **Permission to upload a custom app to Teams**, so the bot appears in my Teams client. In the
+>    Teams admin center that's **Teams apps → Setup policies**, setting **"Upload custom apps"** to
+>    **On** for my account. It doesn't need to be enabled for anyone else.
+>
+> Both are scoped to me and to this one bot. Nothing else in the tenant is affected, and either can
+> be revoked at any time.
 
 ---
 
