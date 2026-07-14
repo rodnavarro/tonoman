@@ -183,10 +183,19 @@ not a feature per knob.
   alone would read a PRE-EXISTING credential and report a false ✓ on a login that never happened.
 - **One login at a time:** a second `/auth/login` supersedes any pending one (the stale PKCE
   verifier is useless); `/auth/code` with no login in flight is a clean `409`, not a hang.
+- **The transport is resolved by `spec.remote` BEFORE any check on `loginArgs`/`statusArgs`**, and
+  the order is load-bearing: a remote harness declares *no* login argv on purpose (the agent owns
+  it, pod-side — see above), so checking for those args first classifies every remote agent as a
+  service harness and refuses the login outright.
 - _Why this exists: the headless flow was written for `podman exec` and silently did not exist
   across the split — the same gap class that already bit media (bytes on the wire), the broker,
   and account-usage (`/usage`). Closing it means an agent in k8s is authenticated with the
   product, not with hand-run `kubectl exec` incantations._
+- _Regression, 2026-07-14: the resolver shipped with exactly that ordering bug, so the remote
+  branch was **unreachable** and `auth login --headless` failed for every k8s agent with "runs the
+  service harness … no login flow". It went unnoticed because the tests drove the runtime's
+  `/auth/*` endpoints and a **fake** AuthOps — nothing resolved a transport from the **real**
+  harness registry. `cli.test.ts` now does, per harness kind (remote / local / service)._
 - _Tested: `extractAuthUrl`/`looksLoggedIn` stay pure + unit-tested; the HTTP auth ops are
   unit-tested against a fake agent server (URL out, code in, 401 unauthorized, 409 no-login,
   false-✓ rejected when the cred didn't change). Arch: A2, A11, A15 (the k8s split)._
