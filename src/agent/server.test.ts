@@ -4,7 +4,7 @@ import { promises as fs } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { Server } from "node:http";
-import { serveRuntime, encodeEvent, materializeMedia } from "./server";
+import { serveRuntime, encodeEvent, materializeMedia, sweepStaleMedia } from "./server";
 import type { TurnEvent, TurnRequest, TurnRunner } from "../core/contracts";
 
 // A canned runner: yields the given events, no process spawned (net-runtime-server).
@@ -219,7 +219,9 @@ describe("agent runtime server — inbound media (split-media-carried)", () => {
     }
   });
 
-  it("/turn hands the runner req.mediaPaths for the shipped media, then cleans the files up", async () => {
+  it("/turn hands the runner req.mediaPaths, and the media SURVIVES the turn (used by a later turn)", async () => {
+    // Regression: media used to be unlinked when its turn ended, so a receipt sent in one Teams
+    // message was already gone by the follow-up turn that told the agent to file it. It must persist.
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "tnagentmedia-"));
     const prev = process.env.AGENT_MEDIA_DIR;
     process.env.AGENT_MEDIA_DIR = dir;
@@ -234,6 +236,7 @@ describe("agent runtime server — inbound media (split-media-carried)", () => {
     };
     try {
       const port = await boot({ port: 0, newRunner: () => capture });
+      // Turn 1: the image arrives (as its own message, no instruction yet).
       await fetch(`http://127.0.0.1:${port}/turn`, {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -241,12 +244,54 @@ describe("agent runtime server — inbound media (split-media-carried)", () => {
       }).then((r) => r.text());
       expect(seen?.mediaPaths).toHaveLength(1);
       expect(path.basename(seen!.mediaPaths![0])).toBe("r.pdf");
-      // cleaned up after the turn (per-turn media is transient)
-      await expect(fs.readFile(seen!.mediaPaths![0])).rejects.toThrow();
+      // AFTER the turn the file is STILL THERE — a follow-up turn (the "file it under X" message,
+      // which carries no media of its own) can still `rn finance receipt` the same path.
+      expect(await fs.readFile(seen!.mediaPaths![0])).toEqual(Buffer.from([7, 7]));
     } finally {
       if (prev === undefined) delete process.env.AGENT_MEDIA_DIR;
       else process.env.AGENT_MEDIA_DIR = prev;
       await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("sweepStaleMedia reclaims only files older than the TTL, never the fresh one", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "tnagentmedia-"));
+    const prev = process.env.AGENT_MEDIA_DIR;
+    const prevTtl = process.env.AGENT_MEDIA_TTL_MS;
+    process.env.AGENT_MEDIA_DIR = dir;
+    process.env.AGENT_MEDIA_TTL_MS = String(60 * 60 * 1000); // 1h window
+    try {
+      await materializeMedia([
+        { name: "old.jpg", b64: Buffer.from([1]).toString("base64") },
+        { name: "fresh.jpg", b64: Buffer.from([2]).toString("base64") },
+      ]);
+      // age "old.jpg" past the TTL by back-dating its mtime; "fresh.jpg" stays new.
+      const old = path.join(dir, "old.jpg");
+      const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000);
+      await fs.utimes(old, twoHoursAgo, twoHoursAgo);
+
+      const swept = await sweepStaleMedia();
+
+      expect(swept.map((p) => path.basename(p))).toEqual(["old.jpg"]);
+      await expect(fs.readFile(old)).rejects.toThrow(); // reclaimed
+      expect(await fs.readFile(path.join(dir, "fresh.jpg"))).toEqual(Buffer.from([2])); // kept
+    } finally {
+      if (prev === undefined) delete process.env.AGENT_MEDIA_DIR;
+      else process.env.AGENT_MEDIA_DIR = prev;
+      if (prevTtl === undefined) delete process.env.AGENT_MEDIA_TTL_MS;
+      else process.env.AGENT_MEDIA_TTL_MS = prevTtl;
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("sweepStaleMedia on a missing dir is a clean no-op (never throws)", async () => {
+    const prev = process.env.AGENT_MEDIA_DIR;
+    process.env.AGENT_MEDIA_DIR = path.join(os.tmpdir(), "tnagentmedia-does-not-exist-" + process.pid);
+    try {
+      await expect(sweepStaleMedia()).resolves.toEqual([]);
+    } finally {
+      if (prev === undefined) delete process.env.AGENT_MEDIA_DIR;
+      else process.env.AGENT_MEDIA_DIR = prev;
     }
   });
 });

@@ -105,8 +105,8 @@ function agentMediaDir(): string {
 }
 
 /** Write each wire media item under AGENT_MEDIA_DIR using ONLY its basename (path.basename strips
- * any dir components → no traversal / arbitrary write). Returns the written paths for the turn +
- * cleanup. Skips items with no bytes/name. (split-media-carried.) */
+ * any dir components → no traversal / arbitrary write). Returns the written paths for the turn.
+ * Skips items with no bytes/name. (split-media-carried.) */
 export async function materializeMedia(media: { name?: string; b64?: string }[] | undefined): Promise<string[]> {
   const paths: string[] = [];
   if (!media?.length) return paths;
@@ -119,6 +119,45 @@ export async function materializeMedia(media: { name?: string; b64?: string }[] 
     paths.push(dest);
   }
   return paths;
+}
+
+/** How long a materialized media file lives before it's swept (split-media-carried lifetime).
+ * Default 6h; override with AGENT_MEDIA_TTL_MS. */
+function mediaTtlMs(): number {
+  const v = Number(process.env.AGENT_MEDIA_TTL_MS);
+  return Number.isFinite(v) && v > 0 ? v : 6 * 60 * 60 * 1000;
+}
+
+/** Reclaim media files older than the TTL. Runs at the START of each turn, NOT the end — because a
+ * receipt and the instruction to file it routinely arrive as SEPARATE messages (separate turns), so
+ * media MUST outlive the single turn that carried it. Per-turn deletion was the bug: the image was
+ * unlinked the instant its turn ended, so the follow-up turn that acted on it found nothing. A
+ * start-of-turn TTL sweep keeps disk bounded while letting a file survive the follow-up turns of one
+ * task; the file just materialized for the CURRENT turn has age ~0 and is never swept. Best-effort:
+ * a missing dir, or a race with a concurrent unlink, is not an error. (split-media-carried.) */
+export async function sweepStaleMedia(now: number = Date.now()): Promise<string[]> {
+  const dir = agentMediaDir();
+  const swept: string[] = [];
+  let names: string[];
+  try {
+    names = await fs.readdir(dir);
+  } catch {
+    return swept; // no media dir yet → nothing to reclaim
+  }
+  const ttl = mediaTtlMs();
+  for (const name of names) {
+    const p = path.join(dir, name);
+    try {
+      const st = await fs.stat(p);
+      if (st.isFile() && now - st.mtimeMs > ttl) {
+        await fs.unlink(p);
+        swept.push(p);
+      }
+    } catch {
+      /* raced with another sweep or a concurrent write — fine */
+    }
+  }
+  return swept;
 }
 
 let sysCounter = 0;
@@ -392,8 +431,11 @@ async function handleTurn(req: http.IncomingMessage, res: http.ServerResponse, o
     sysFile = opts.identityFile;
   }
 
-  // Materialize any inbound media into this pod's FS so `claude` can Read it by the same path
-  // the prompt references (split-media-carried). Cleaned up in the finally below.
+  // Reclaim media from earlier turns that has aged out (start-of-turn TTL sweep), THEN materialize
+  // this turn's media. The order matters: sweeping first bounds the dir, and the file we're about to
+  // write has age ~0 so it can never be caught by its own turn's sweep. Media is NOT deleted at turn
+  // end — a receipt sent in one message is routinely acted on in a LATER turn (split-media-carried).
+  await sweepStaleMedia().catch((e) => console.error(`runtime: media sweep failed: ${(e as Error).message}`));
   let mediaPaths: string[] = [];
   try {
     mediaPaths = await materializeMedia(body.media);
@@ -430,7 +472,8 @@ async function handleTurn(req: http.IncomingMessage, res: http.ServerResponse, o
   } finally {
     clearInterval(hb);
     if (sysFile && sysTmp) fs.unlink(sysFile).catch(() => {}); // never delete a mounted identity file
-    for (const p of mediaPaths) fs.unlink(p).catch(() => {}); // per-turn media is transient
+    // NB: media is deliberately NOT unlinked here. It must survive into follow-up turns (the image
+    // arrives, the instruction to act on it comes next) — the start-of-turn TTL sweep reclaims it.
     if (!res.writableEnded) res.end();
   }
 }
