@@ -1,8 +1,10 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import * as os from "node:os";
 import * as path from "node:path";
-import { resolveCommand, parseGlobalFlags, defaultConfig, parseMountsArgs, envRoot, applyEnv, currentEnv } from "./cli";
-import type { Config } from "./config";
+import { resolveCommand, parseGlobalFlags, defaultConfig, parseMountsArgs, envRoot, applyEnv, currentEnv, resolveAuthOps } from "./cli";
+import type { Config, AgentConfig } from "./config";
+import * as http from "node:http";
+import type { AddressInfo } from "node:net";
 
 // cli-grammar — kubectl-style VERB RESOURCE [name] grammar routes to one command.
 describe("resolveCommand — grammar & dispatch (cli-grammar)", () => {
@@ -192,5 +194,50 @@ describe("resolveCommand — backend switch (backend-switch-live)", () => {
   });
   it("missing agent → usage error", () => {
     expect(resolveCommand(["backend"])).toMatchObject({ kind: "usage", exitCode: 2 });
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// roster-auth-remote — the OPERATOR'S command is the same across the k8s split; only the
+// transport differs. These drive `resolveAuthOps` against the REAL harness registry, which is the
+// whole point: the original tests for this feature exercised the runtime's /auth/* endpoints and a
+// FAKE AuthOps, so nothing ever checked that the resolver could actually REACH the remote branch.
+// It couldn't — `claude-code-http` declares no loginArgs/statusArgs (the agent owns its own argv),
+// and the service-harness guard tripped on that first. Login was broken for every k8s agent.
+describe("resolveAuthOps — transport by harness (roster-auth-remote)", () => {
+  const agent = (over: Partial<AgentConfig>): Config =>
+    ({ agents: [{ name: "atlas", container: "atlas", ...over }] }) as Config;
+
+  it("a REMOTE agent (claude-code-http) logs in over its own runtime's /auth/login — not podman", async () => {
+    const hits: string[] = [];
+    const srv = http.createServer((req, res) => {
+      hits.push(`${req.method} ${req.url}`);
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ url: "https://claude.ai/oauth/authorize?code=true" }));
+    });
+    await new Promise<void>((r) => srv.listen(0, "127.0.0.1", () => r()));
+    const { port } = srv.address() as AddressInfo;
+    try {
+      const cfg = agent({ harness: "claude-code-http", url: `http://127.0.0.1:${port}` });
+      const url = await resolveAuthOps(cfg, "atlas").startHeadless();
+      expect(url).toContain("oauth/authorize");
+      expect(hits).toEqual(["POST /auth/login"]); // it went over HTTP, to the agent
+    } finally {
+      srv.close();
+    }
+  });
+
+  it("a remote agent with no url in the roster fails loudly (never silently podman-execs)", () => {
+    expect(() => resolveAuthOps(agent({ harness: "claude-code-http" }), "atlas")).toThrow(/no "url"/);
+  });
+
+  it("a LOCAL agent (claude-code) still resolves to the podman transport", () => {
+    // Proven by behaviour: podmanAuthOps shells `podman`, which is absent/irrelevant here — what
+    // matters is that it does NOT throw the service-harness error, i.e. it took the local branch.
+    expect(() => resolveAuthOps(agent({ harness: "claude-code" }), "atlas")).not.toThrow();
+  });
+
+  it("a SERVICE harness (hermes) still has no login flow — auth is injected env", () => {
+    expect(() => resolveAuthOps(agent({ harness: "hermes" }), "atlas")).toThrow(/no login flow/);
   });
 });

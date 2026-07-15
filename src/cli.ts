@@ -255,18 +255,31 @@ async function runBackend(cfgPath: string, env: string | undefined, agent: strin
  * A LOCAL agent is driven through `podman exec`; a REMOTE one (claude-code-http, the k8s split) has
  * no podman and no shared filesystem, so it's driven over its own runtime's /auth/* endpoints. The
  * operator's command is the same either way — resolving the transport is our job, not theirs. */
-function resolveAuthOps(cfg: Config, agentName: string): AuthOps {
+export function resolveAuthOps(cfg: Config, agentName: string): AuthOps {
   const ac = findAgent(cfg, agentName);
   const spec = gateway.defaultHarnesses().lookup(ac.harness ?? "");
   if (!spec) throw new Error(`agent "${ac.name}" has unknown harness "${ac.harness}"`);
-  // A service harness (svc-self-channeled) authenticates via injected env (svc-config-env),
-  // not an interactive login — it has no login/status commands.
-  if (spec.service || !spec.loginArgs || !spec.statusArgs) {
+
+  // A service harness (svc-self-channeled) authenticates via injected env (svc-config-env), not an
+  // interactive login — it has no login flow at all.
+  if (spec.service) {
     throw new Error(`agent "${ac.name}" runs the service harness "${ac.harness}" — auth is injected env (svc-config-env), no login flow`);
   }
+
+  // REMOTE (the k8s split) is decided BEFORE the login-args check, and that order is load-bearing.
+  // A remote harness deliberately declares NO loginArgs/statusArgs: the argv comes from the AGENT's
+  // own harness spec, pod-side, never from this process and never off the wire (that's what keeps
+  // /auth/login from being a remote-exec hole). Checking for those args first therefore rejected
+  // every remote agent as if it were a service harness, which made `tonoman auth login --headless`
+  // impossible across the split — the exact flow roster-auth-remote exists to provide.
   if (spec.remote) {
     if (!ac.url) throw new Error(`agent "${ac.name}" is remote (${ac.harness}) but has no "url" in the roster`);
     return httpAuthOps(ac.url, process.env.AGENT_RUNTIME_TOKEN);
+  }
+
+  // Local (podman): we drive `claude` in the agent's container, so we DO need its argv.
+  if (!spec.loginArgs || !spec.statusArgs) {
+    throw new Error(`agent "${ac.name}" runs harness "${ac.harness}", which declares no login/status commands — no login flow`);
   }
   return podmanAuthOps(ac.container, spec.loginArgs, spec.statusArgs, spec.credFile);
 }
