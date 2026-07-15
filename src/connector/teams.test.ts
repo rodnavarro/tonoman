@@ -185,17 +185,96 @@ describe("TeamsConnector — streaminfo streaming (teams-stream-progressive, -st
     expect(informative.length).toBe(1); // only the pre-text informative cue
   });
 
-  it("stops streaming past the age cap; finalize still delivers", async () => {
+  it("age cap CLOSES the open stream cleanly (streaminfo final, streamed prefix) — no orphaned stop (teams-stream-cap-close)", async () => {
     let t = 0;
     const { f, calls } = makeFetch([TOKEN, ACTIVITIES]);
     const c = conn({ now: () => t, maxStreamAgeMs: 100 }, f);
     await c.normalize(personalActivity());
     const reply = c.reply("a:1conv");
-    await reply.send("a"); // streamStart = 0
+    await reply.send("a"); // opens the stream (typing+streaming seq1), streamStart = 0, captures streamId=act-123
     t = 500; // well past the 100ms cap
-    await reply.update("act-123", "ab"); // should NO-OP
-    const streamingPosts = calls.filter((x) => x.url.includes("/activities") && JSON.parse(x.init!.body as string).type === "typing");
-    expect(streamingPosts.length).toBe(1); // only the initial send streamed; the past-cap update was skipped
+    await reply.update("act-123", "ab"); // crossing the cap must CLOSE the stream, not go silently open
+
+    const posts = calls.filter((x) => x.url.endsWith("/activities") && x.init?.method !== "PUT").map((x) => JSON.parse(x.init!.body as string));
+    const streaming = posts.filter((b) => b.type === "typing" && b.entities?.[0]?.streamType === "streaming");
+    const closes = posts.filter((b) => b.type === "message" && b.entities?.[0]?.streamType === "final");
+    expect(streaming.length).toBe(1); // only the initial chunk streamed live
+    expect(closes.length).toBe(1); // the cap CLOSED the stream (previously a silent no-op → orphaned stop)
+    expect(closes[0].text).toBe("ab"); // closed carrying the streamed prefix so far (strict prefix → Teams accepts)
+    expect(closes[0].entities[0].streamId).toBe("act-123");
+  });
+
+  it("finalize GROWS the capped stream in place (plain edit, no new streaminfo, no duplicate) (teams-stream-cap-close)", async () => {
+    let t = 0;
+    const { f, calls } = makeFetch([TOKEN, ACTIVITIES]);
+    const c = conn({ now: () => t, maxStreamAgeMs: 100 }, f);
+    await c.normalize(personalActivity());
+    const reply = c.reply("a:1conv");
+    await reply.send("a");
+    t = 500;
+    await reply.update("act-123", "ab"); // cap-close → cappedMsgId = act-123
+    await reply.finalize("act-123", "ab, the full answer");
+
+    const edits = calls.filter((x) => x.init?.method === "PUT" && x.url.includes("/activities/act-123"));
+    expect(edits.length).toBe(1); // grew IN PLACE via an edit — not a new post
+    const editBody = JSON.parse(edits[0].init!.body as string);
+    expect(editBody.type).toBe("message");
+    expect(editBody.text).toBe("ab, the full answer");
+    expect(editBody.entities).toBeUndefined(); // a PLAIN edit — no streaminfo, so it can't 403 on the stream limit
+
+    // finalize must NOT post a second streaminfo-final (that would duplicate + risk the 403). Only the
+    // cap-close final exists.
+    const finalPosts = calls
+      .filter((x) => x.url.endsWith("/activities") && x.init?.method !== "PUT")
+      .map((x) => JSON.parse(x.init!.body as string))
+      .filter((b) => b.type === "message" && b.entities?.[0]?.streamType === "final");
+    expect(finalPosts.length).toBe(1);
+  });
+
+  it("capped-stream finalize falls back to a plain message if the in-place edit is rejected (teams-stream-cap-close)", async () => {
+    let t = 0;
+    const { f, calls } = makeFetch([
+      TOKEN,
+      {
+        match: "/activities",
+        respond: (init) =>
+          init?.method === "PUT"
+            ? new Response(JSON.stringify({ error: { code: "NotFound" } }), { status: 404 }) // the message can't be edited
+            : new Response(JSON.stringify({ id: "act-123" })),
+      },
+    ]);
+    const c = conn({ now: () => t, maxStreamAgeMs: 100 }, f);
+    await c.normalize(personalActivity());
+    const reply = c.reply("a:1conv");
+    await reply.send("a");
+    t = 500;
+    await reply.update("act-123", "ab"); // cap-close
+    await reply.finalize("act-123", "the full answer"); // edit 404s → must NOT throw, delivers a plain message
+
+    const plain = calls
+      .filter((x) => x.url.endsWith("/activities") && x.init?.method === "POST")
+      .map((x) => JSON.parse(x.init!.body as string))
+      .filter((b) => b.type === "message" && b.text === "the full answer" && !b.entities);
+    expect(plain.length).toBe(1); // the answer still lands, as a plain message
+  });
+
+  it("further update()s after the cap no-op streaming but keep the latest prefix for finalize (teams-stream-cap-close)", async () => {
+    let t = 0;
+    const { f, calls } = makeFetch([TOKEN, ACTIVITIES]);
+    const c = conn({ now: () => t, maxStreamAgeMs: 100 }, f);
+    await c.normalize(personalActivity());
+    const reply = c.reply("a:1conv");
+    await reply.send("a");
+    t = 500;
+    await reply.update("act-123", "ab"); // cap-close
+    await reply.update("act-123", "abc"); // AFTER the cap — must NOT stream again (no new typing/final post)
+    await reply.update("act-123", "abcd");
+
+    const streamActivities = calls
+      .filter((x) => x.url.endsWith("/activities") && x.init?.method !== "PUT")
+      .map((x) => JSON.parse(x.init!.body as string))
+      .filter((b) => b.entities?.[0]?.streamType === "streaming" || b.entities?.[0]?.streamType === "final");
+    expect(streamActivities.length).toBe(2); // exactly: the one live chunk + the one cap-close. No re-streaming.
   });
 });
 

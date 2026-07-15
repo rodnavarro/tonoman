@@ -445,7 +445,9 @@ class TeamsReply implements Reply {
   private streamStarted = false; // any streaminfo activity (informative OR streaming) sent → stream exists, finalize must close it
   private textStarted = false; // a real text/streaming chunk sent → working() stops (chunks carry liveness)
   private finalized = false;
-  private lastText = ""; // last text streamed via send()/update() — used to close cleanly on reset()
+  private streamCapped = false; // the age cap closed the stream in-flight (teams-stream-cap-close); further updates no-op
+  private cappedMsgId = ""; // the message that closed the stream at the cap — finalize GROWS it in place to the full answer
+  private lastText = ""; // last text streamed via send()/update() — used to close cleanly on reset()/cap
   private seq = 0; // monotonic across informative + streaming activities (Teams requires increasing streamSequence)
   private streamStart = 0; // set at the first TEXT chunk — the age cap measures streaming, not the working cue
   private workingStart = -1; // -1 = unset (0 is a valid clock value, so don't use it as the sentinel)
@@ -497,14 +499,44 @@ class TeamsReply implements Reply {
 
   async update(_msgID: string, text: string): Promise<void> {
     if (!this.ref || !this.textStarted || this.finalized) return;
-    if (this.opts.now() - this.streamStart > this.opts.maxStreamAgeMs) return; // age cap → finalize delivers
-    this.lastText = text;
+    this.lastText = text; // always keep the freshest prefix — finalize grows the answer from it, even past the cap
+    if (this.streamCapped) return; // stream already closed at the cap; liveness now rides the status trace
+    if (this.opts.now() - this.streamStart > this.opts.maxStreamAgeMs) {
+      // Age cap crossed: don't abandon the OPEN stream (that orphans Teams' "stop" control and the
+      // eventual finalize 403s past the streaming-time limit). Close it cleanly NOW, well under the
+      // limit, and grow it in place at finalize (teams-stream-cap-close).
+      await this.capClose(text);
+      return;
+    }
     this.seq += 1;
     await this.c.postActivity(this.ref, {
       type: "typing",
       text,
       entities: [streamInfo("streaming", this.streamId || undefined, this.seq)],
     });
+  }
+
+  /** The age cap crossed: close the still-open stream with a `streamType: "final"` message carrying
+   * the streamed prefix so far (a strict prefix of the eventual answer, so Teams accepts it; sent well
+   * under the ~2-min streaming limit, so it does NOT 403). Records the closed message's id so
+   * finalize() GROWS it in place to the full answer — one clean message, no orphaned stop, no duplicate,
+   * no finalize-time 403 (teams-stream-cap-close). Best-effort: if the close POST fails we still mark the
+   * stream capped (streaming stops); finalize's plain-message path still delivers. */
+  private async capClose(text: string): Promise<void> {
+    if (!this.ref) return;
+    this.streamCapped = true;
+    try {
+      this.cappedMsgId =
+        (await this.c.postActivity(this.ref, {
+          type: "message",
+          text,
+          textFormat: "markdown",
+          entities: [streamInfo("final", this.streamId || undefined)],
+        })) || "";
+      console.log(`teams: stream capped at ${this.opts.maxStreamAgeMs}ms — closed cleanly, growing in place (streamId ${this.streamId || "none"})`);
+    } catch {
+      /* close POST failed → still capped so streaming stops; finalize falls back to a plain message */
+    }
   }
 
   /** The universal closer: always delivers a final `message` (so the answer ALWAYS lands).
@@ -515,6 +547,24 @@ class TeamsReply implements Reply {
     if (!this.ref) return;
     this.finalized = true;
     try {
+      if (this.streamCapped) {
+        // The stream was already closed at the age cap. Grow the closed message IN PLACE to the full
+        // answer — a plain edit (no streaminfo), so it can't 403 on the streaming-time limit, and there's
+        // exactly one message (no partial+full duplicate). If the edit is rejected (message gone / not
+        // editable), post a plain message so the answer still lands.
+        if (this.cappedMsgId) {
+          try {
+            await this.c.updateActivity(this.ref, this.cappedMsgId, { type: "message", text, textFormat: "markdown" });
+            console.log(`teams: grew capped stream in place — ${text.length} chars (msg ${this.cappedMsgId})`);
+            return;
+          } catch {
+            /* edit failed → fall through to a plain message so the answer still lands */
+          }
+        }
+        await this.c.postActivity(this.ref, { type: "message", text, textFormat: "markdown" });
+        console.log(`teams: delivered ${text.length} chars as a plain message (capped, no editable message)`);
+        return;
+      }
       if (this.streamStarted) {
         try {
           await this.c.postActivity(this.ref, {
@@ -560,6 +610,8 @@ class TeamsReply implements Reply {
     this.streamStarted = false;
     this.textStarted = false;
     this.finalized = false;
+    this.streamCapped = false;
+    this.cappedMsgId = "";
     this.seq = 0;
     this.streamStart = 0;
     this.lastText = "";
