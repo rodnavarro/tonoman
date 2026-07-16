@@ -26,6 +26,11 @@ const BF_OPENID_CONFIG = "https://login.botframework.com/v1/.well-known/openidco
 /** Past this many ms of streaming, stop emitting chunks; finalize delivers the whole
  * answer (teams-stream-fallback — openclaw's 45s guardrail). */
 const DEFAULT_MAX_STREAM_AGE_MS = 45_000;
+/** During a post-text idle gap (a long tool runs between streamed chunks), re-emit a streaming
+ * keepalive on the heartbeat if the last stream activity is older than this — so Teams' typing
+ * indicator + "stop" control stay live instead of freezing (teams-stream-keepalive). Kept just under
+ * the 4s heartbeat so a quiet tick always refreshes, but a tick right after a real chunk doesn't double-post. */
+const STREAM_KEEPALIVE_MS = 2_500;
 /** A "message"-cue status trace only appears once a turn has run this long — so a quick reply
  * never flashes a status message (teams-working-status). */
 const STATUS_DELAY_MS = 4_000;
@@ -450,6 +455,7 @@ class TeamsReply implements Reply {
   private lastText = ""; // last text streamed via send()/update() — used to close cleanly on reset()/cap
   private seq = 0; // monotonic across informative + streaming activities (Teams requires increasing streamSequence)
   private streamStart = 0; // set at the first TEXT chunk — the age cap measures streaming, not the working cue
+  private lastStreamAt = 0; // clock of the last streaming/keepalive post — the heartbeat keepalive throttles on it
   private workingStart = -1; // -1 = unset (0 is a valid clock value, so don't use it as the sentinel)
   private lastWorkingLabel = "";
   private lastTool = ""; // the most recent tool line (🔧 …), persisted so it coexists with the ticking cue
@@ -486,6 +492,7 @@ class TeamsReply implements Reply {
     this.textStarted = true;
     this.streamStarted = true;
     this.streamStart = this.opts.now();
+    this.lastStreamAt = this.streamStart;
     this.lastText = text;
     this.seq += 1; // continues the working() informative stream if one was opened (else starts at 1)
     const id = await this.c.postActivity(this.ref, {
@@ -509,6 +516,7 @@ class TeamsReply implements Reply {
       return;
     }
     this.seq += 1;
+    this.lastStreamAt = this.opts.now();
     await this.c.postActivity(this.ref, {
       type: "typing",
       text,
@@ -700,6 +708,37 @@ class TeamsReply implements Reply {
       }
     }
     if (!this.canEdit()) return; // group: just the bubble (no streaming stream / status to manage)
+
+    // (1b) POST-TEXT liveness (teams-stream-keepalive). A streamed chunk was assumed to "carry
+    // liveness", but a long tool gap between chunks leaves the stream idle — Teams expires the typing
+    // indicator and freezes the "stop" control (the mid-turn freeze). The 4s heartbeat fires even when
+    // NO new text arrives, so keep the OPEN stream alive here: re-emit a streaming keepalive (the last
+    // prefix, seq++) while under the age cap; on crossing the cap close it cleanly (cap-close) so no
+    // stop lingers; after that keep a plain typing bubble alive until finalize grows the reply in place.
+    if (this.textStarted && this.streamStarted) {
+      if (this.streamCapped) {
+        try {
+          await this.c.postActivity(this.ref, { type: "typing" }); // "…" stays alive; stream already closed
+        } catch {
+          /* bubble best-effort */
+        }
+      } else if (now - this.streamStart > this.opts.maxStreamAgeMs) {
+        await this.capClose(this.lastText); // heartbeat-driven cap-close — fires without any new text
+      } else if (now - this.lastStreamAt >= STREAM_KEEPALIVE_MS) {
+        this.seq += 1;
+        this.lastStreamAt = now;
+        try {
+          await this.c.postActivity(this.ref, {
+            type: "typing",
+            text: this.lastText,
+            entities: [streamInfo("streaming", this.streamId || undefined, this.seq)],
+          });
+        } catch {
+          /* keepalive best-effort */
+        }
+      }
+      // fall through: the "message" cue also refreshes its gray status trace (verb/elapsed + last tool)
+    }
 
     if (this.opts.cue === "card") {
       // informative streaminfo card — pre-text only (establishes the stream).

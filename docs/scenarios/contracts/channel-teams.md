@@ -186,6 +186,24 @@ outbound call. These scenarios state that surface.
   not a block send — the stream is closed cleanly and grown in place._
 - _Arch: A4 (the `canEdit()=false` degrade is already in the contract + consumer)._
 
+### `teams-stream-keepalive` — a long tool gap keeps the stream live (no mid-turn freeze)
+- Given a streamed chunk was assumed to "carry liveness", but a turn commonly streams a little text and
+  then runs a **long tool** (tens of seconds) before the next chunk — during that gap `update()` is not
+  called, so nothing refreshes the stream. Teams then **expires the typing indicator** and **freezes the
+  "stop" control**, which reads as a hung bot. _(Learned live — the mid-turn freeze, distinct from the
+  end-of-turn 403.)_
+- Given the router already drives a **~4s wall-clock heartbeat** (`keepWorking` → `reply.working()`) that
+  fires **even when no new text arrives**,
+- Then on each heartbeat, while the stream is **open and under the age cap**, the connector **re-emits a
+  streaming keepalive** — a `streamType: "streaming"` typing activity carrying the **last streamed prefix**
+  with an incremented `streamSequence` — so Teams' indicator + "stop" stay **live** through the gap (throttled
+  so a tick right after a real chunk doesn't double-post). The visible text doesn't change during a
+  tool gap (there's no new text), but the indicator no longer dies.
+- On **crossing the age cap**, the heartbeat itself triggers `teams-stream-cap-close` (so the cap fires
+  **without** needing a new chunk — the case a purely `update()`-driven cap misses). After the cap, the
+  heartbeat keeps a **plain typing bubble** alive until `finalize` grows the reply in place.
+- _Arch: A4. The `message`-cue status trace still ticks in parallel; this restores the STREAM's own liveness._
+
 ### `teams-stream-cap-close` — a long turn closes its stream cleanly at the age cap, then grows in place
 - Given Teams live-streams for only a **bounded lifetime** (~2 min server-side), and a turn can run
   **far longer** (many back-to-back tools), the connector caps streaming at **~45s** (`maxStreamAgeMs`,

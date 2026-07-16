@@ -276,6 +276,63 @@ describe("TeamsConnector — streaminfo streaming (teams-stream-progressive, -st
       .filter((b) => b.entities?.[0]?.streamType === "streaming" || b.entities?.[0]?.streamType === "final");
     expect(streamActivities.length).toBe(2); // exactly: the one live chunk + the one cap-close. No re-streaming.
   });
+
+  it("heartbeat re-emits a streaming keepalive during a post-text idle gap (teams-stream-keepalive)", async () => {
+    let t = 0;
+    const { f, calls } = makeFetch([TOKEN, ACTIVITIES]);
+    const c = conn({ now: () => t, maxStreamAgeMs: 100_000 }, f); // big cap: exercise keepalive, not cap-close
+    await c.normalize(personalActivity());
+    const reply = c.reply("a:1conv");
+    await reply.send("hello"); // opens stream at t=0, lastStreamAt=0
+    t = 5_000; // a 5s idle gap while a tool runs — NO update() in this window
+    await reply.working("🔧 Bash: pup logs search"); // the 4s heartbeat tick
+
+    const streams = calls
+      .filter((x) => x.url.endsWith("/activities") && x.init?.method !== "PUT")
+      .map((x) => JSON.parse(x.init!.body as string))
+      .filter((b) => b.type === "typing" && b.entities?.[0]?.streamType === "streaming");
+    expect(streams.length).toBe(2); // the send + a heartbeat keepalive (previously: nothing → indicator died)
+    expect(streams[1].text).toBe("hello"); // keepalive re-emits the last streamed prefix
+    expect(streams[1].entities[0].streamSequence).toBeGreaterThan(streams[0].entities[0].streamSequence ?? 0);
+  });
+
+  it("heartbeat drives cap-close during a SILENT gap — no update() needed (teams-stream-keepalive → cap-close)", async () => {
+    let t = 0;
+    const { f, calls } = makeFetch([TOKEN, ACTIVITIES]);
+    const c = conn({ now: () => t, maxStreamAgeMs: 100 }, f);
+    await c.normalize(personalActivity());
+    const reply = c.reply("a:1conv");
+    await reply.send("partial"); // opens stream at t=0
+    t = 5_000; // way past the 100ms cap, but update() is NEVER called (agent is deep in a tool)
+    await reply.working("🔧 Bash: slow query"); // heartbeat must close the stream itself
+
+    const closes = calls
+      .filter((x) => x.url.endsWith("/activities") && x.init?.method !== "PUT")
+      .map((x) => JSON.parse(x.init!.body as string))
+      .filter((b) => b.type === "message" && b.entities?.[0]?.streamType === "final");
+    expect(closes.length).toBe(1); // the stream was CLOSED from the heartbeat, with no new text
+    expect(closes[0].text).toBe("partial"); // closed carrying the last streamed prefix
+  });
+
+  it("after cap-close the heartbeat keeps a plain typing bubble alive (no more streaming) (teams-stream-keepalive)", async () => {
+    let t = 0;
+    const { f, calls } = makeFetch([TOKEN, ACTIVITIES]);
+    const c = conn({ now: () => t, maxStreamAgeMs: 100 }, f);
+    await c.normalize(personalActivity());
+    const reply = c.reply("a:1conv");
+    await reply.send("partial");
+    t = 5_000;
+    await reply.working(); // heartbeat → cap-close
+    const mark = calls.length;
+    t = 9_000;
+    await reply.working(); // next heartbeat, now capped → plain "…" bubble, NOT a streaming activity
+
+    const after = calls.slice(mark)
+      .filter((x) => x.url.endsWith("/activities") && x.init?.method === "POST")
+      .map((x) => JSON.parse(x.init!.body as string));
+    expect(after.some((b) => b.type === "typing" && !b.entities)).toBe(true); // plain bubble keeps liveness
+    expect(after.some((b) => b.entities?.[0]?.streamType === "streaming")).toBe(false); // no streaming post-cap
+  });
 });
 
 describe("TeamsConnector — typing + media (teams-typing, teams-media-inbound)", () => {
