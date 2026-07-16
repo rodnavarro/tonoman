@@ -127,9 +127,11 @@ outbound call. These scenarios state that surface.
     of the prefix-locked stream — it can update **for the whole turn, including after text has
     started**, closing the mid-turn-quiet gap. Fail-soft: if the delete is rejected it's blanked to
     `✓` so a stale "🤖 working…" never lingers.
-- The label is **elapsed-aware** — it **steps every 10s in the first minute** (`🤖 working…` →
-  `(10s)` → … → `(50s)`) then **per minute** (`(1m)`, `(2m)`, …) — and **deduped by the label**, so
-  it re-posts only when the step changes (well within Teams' ~1 req/s).
+- The label is **elapsed-aware** — it counts **exact seconds in the first minute** (`🤖 working…` →
+  `(1s)` → `(2s)` → …) so the cue is visibly moving, then **10s steps** after a minute (`(1m)`,
+  `(1m10s)`, `(2m30s)`, …) so a long wait doesn't churn — and **deduped by the label**, so it re-posts
+  only when the label changes, bounded by the ~4s heartbeat (these are Teams REST posts, **zero model
+  tokens**, well within Teams' ~1 req/s).
 - The streamed reply is a **separate** streaminfo stream (`teams-stream-progressive`), unaffected
   by the status message.
 
@@ -182,16 +184,15 @@ outbound call. These scenarios state that surface.
   preserved) — the consumer's existing whole-answer path. In-turn liveness still comes from
   the typing indicator (`teams-typing`). (The ~4000-char cap rides the consumer's existing
   `maxLen` guard; the group check lives in the connector.)
-- _An **already-open** stream that crosses the **time** cap is handled by `teams-stream-cap-close`,
-  not a block send — the stream is closed cleanly and grown in place._
+- _An **already-open** stream that crosses the **time** cap is handled by `teams-stream-keepalive` /
+  `teams-stream-cap`, not a block send._
 - _Arch: A4 (the `canEdit()=false` degrade is already in the contract + consumer)._
 
 ### `teams-stream-keepalive` — a long tool gap keeps the stream live (no mid-turn freeze)
 - Given a streamed chunk was assumed to "carry liveness", but a turn commonly streams a little text and
   then runs a **long tool** (tens of seconds) before the next chunk — during that gap `update()` is not
   called, so nothing refreshes the stream. Teams then **expires the typing indicator** and **freezes the
-  "stop" control**, which reads as a hung bot. _(Learned live — the mid-turn freeze, distinct from the
-  end-of-turn 403.)_
+  "stop" control**, which reads as a hung bot. _(Learned live — the mid-turn freeze.)_
 - Given the router already drives a **~4s wall-clock heartbeat** (`keepWorking` → `reply.working()`) that
   fires **even when no new text arrives**,
 - Then on each heartbeat, while the stream is **open and under the age cap**, the connector **re-emits a
@@ -199,34 +200,30 @@ outbound call. These scenarios state that surface.
   with an incremented `streamSequence` — so Teams' indicator + "stop" stay **live** through the gap (throttled
   so a tick right after a real chunk doesn't double-post). The visible text doesn't change during a
   tool gap (there's no new text), but the indicator no longer dies.
-- On **crossing the age cap**, the heartbeat itself triggers `teams-stream-cap-close` (so the cap fires
-  **without** needing a new chunk — the case a purely `update()`-driven cap misses). After the cap, the
-  heartbeat keeps a **plain typing bubble** alive until `finalize` grows the reply in place.
+- On **crossing the age cap** (see `teams-stream-cap`), the heartbeat itself stops the streaming keepalive and
+  switches to a **plain typing bubble** for the rest of the turn (fires **without** needing a new chunk — the
+  case a purely `update()`-driven cap misses).
 - _Arch: A4. The `message`-cue status trace still ticks in parallel; this restores the STREAM's own liveness._
 
-### `teams-stream-cap-close` — a long turn closes its stream cleanly at the age cap, then grows in place
-- Given Teams live-streams for only a **bounded lifetime** (~2 min server-side), and a turn can run
-  **far longer** (many back-to-back tools), the connector caps streaming at **~45s** (`maxStreamAgeMs`,
-  safely under Teams' limit). **Crossing the cap must not abandon the open stream** — an open-but-silent
-  stream leaves Teams' **"stop ✕" control orphaned** and the typing bubble expires, so the user stares at
-  a frozen "still generating" UI for minutes, and the eventual `finalize` then `403 ContentStreamNotAllowed`
-  (its total lifetime long past the limit) and only survives via the plain-message fallback. _(Learned live —
-  the "null Ordway id" turn.)_
-- When an **open** stream (`send()` already ran) crosses the age cap on the next `update()`,
-- Then the connector **closes the stream cleanly right then** — a `streamType: "final"` message carrying the
-  **streamed prefix so far** (a strict prefix of the eventual answer, so Teams accepts it; sent well under the
-  ~2-min limit, so it does **not** 403) — and **records that message's id**. Streaming stops; further `update()`s
-  no-op (they only keep the latest prefix for finalize). The **stop control disappears** and no orphaned bubble
-  lingers.
-- **Liveness continues** through the separate status trace (`teams-working-status`) — the `🤖 working… (Nm)`
-  cue + last `🔧 tool` line keep ticking for the rest of the turn — so the turn never looks frozen.
-- On `finalize`, because the stream is already closed, the connector **grows the recorded message IN PLACE**
-  to the full answer — a **plain edit** (`updateActivity`, no `streaminfo`) that **cannot 403** on the streaming
-  limit and leaves **exactly one** message (no partial+full duplicate). The `🤖 …ed for N min` trace settles
-  just above it (Claude-style "thought for…"). If the in-place edit fails (message gone / not editable), it falls
-  back to a **plain message** so the answer still lands.
-- _Arch: A4. Supersedes the old "past ~45s → block send" clause of `teams-stream-fallback` for a stream that
-  already started. Pattern: close-then-edit rather than close-then-repost, so the live bubble simply completes._
+### `teams-stream-cap` — past the age cap, stop streaming; deliver ONE message at finalize
+- Given Teams live-streams for only a **bounded lifetime** (~2 min server-side), the connector caps streaming
+  at **~90s** (`maxStreamAgeMs`, safely under that limit). Past the cap it must **stop re-emitting streaming
+  updates** so the stream never exceeds Teams' limit.
+- **It must NOT post a partial** at the cap. An earlier attempt closed the stream with a `streamType: "final"`
+  message carrying the prefix-so-far and then tried to **grow it in place** at finalize — but a streamed-final
+  message has **no editable activity id**, so the edit was rejected and the full answer landed as a *separate*
+  message: a long reply split into a **frozen partial + a duplicate full**. _(Learned live — a 19-row list that
+  chopped at "…ABL Transport LLC —".)_
+- When the stream crosses the cap (via `update()` **or** the heartbeat), the connector simply **flips to
+  capped**: streaming stops, further `update()`s no-op (keeping only the latest prefix), and liveness rides the
+  plain typing bubble (`teams-stream-keepalive`) + the status trace. The transient streaming preview stops
+  growing; **nothing persistent is posted**.
+- On `finalize`, the reply lands **exactly once** via the normal path — a `streamType: "final"` message with the
+  **full answer** (which Teams accepts while the stream is within its lifetime; if it 403s past the limit, the
+  connector falls back to a **plain message**). Either way: **one message, no partial, no duplicate.** The 45s→90s
+  cap bump also means most turns finish **before** the cap and stream cleanly end-to-end.
+- _Arch: A4. Supersedes the earlier close-then-grow approach (`teams-stream-cap-close`), which the editable-id
+  gap made unworkable._
 
 ### `teams-consumer-telegram-safe` — the streaming accommodations never touch Telegram
 - Given the prefix-stream behavior (`teams-stream-progressive`) needs consumer changes
