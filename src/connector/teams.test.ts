@@ -185,17 +185,147 @@ describe("TeamsConnector — streaminfo streaming (teams-stream-progressive, -st
     expect(informative.length).toBe(1); // only the pre-text informative cue
   });
 
-  it("stops streaming past the age cap; finalize still delivers", async () => {
+  it("past the age cap, streaming STOPS with NO partial posted — finalize delivers ONE message (teams-stream-keepalive)", async () => {
     let t = 0;
     const { f, calls } = makeFetch([TOKEN, ACTIVITIES]);
     const c = conn({ now: () => t, maxStreamAgeMs: 100 }, f);
     await c.normalize(personalActivity());
     const reply = c.reply("a:1conv");
-    await reply.send("a"); // streamStart = 0
-    t = 500; // well past the 100ms cap
-    await reply.update("act-123", "ab"); // should NO-OP
-    const streamingPosts = calls.filter((x) => x.url.includes("/activities") && JSON.parse(x.init!.body as string).type === "typing");
-    expect(streamingPosts.length).toBe(1); // only the initial send streamed; the past-cap update was skipped
+    await reply.send("a"); // opens the stream (typing+streaming seq1)
+    t = 500; // past the 100ms cap
+    await reply.update("act-123", "ab"); // crossing the cap: stop streaming — must NOT post a partial
+    await reply.finalize("act-123", "ab, the full answer");
+
+    const posts = calls.filter((x) => x.url.endsWith("/activities")).map((x) => ({ m: x.init?.method, b: JSON.parse(x.init!.body as string) }));
+    // Crucially: no streaminfo-`final` PARTIAL was ever posted (that split answers into partial + full).
+    const partialFinals = posts.filter((p) => p.m !== "PUT" && p.b.type === "message" && p.b.entities?.[0]?.streamType === "final" && p.b.text === "ab");
+    expect(partialFinals.length).toBe(0);
+    // The answer lands EXACTLY once — the finalize streaminfo-final carrying the full text.
+    const finals = posts.filter((p) => p.b.type === "message" && p.b.entities?.[0]?.streamType === "final");
+    expect(finals.length).toBe(1);
+    expect(finals[0].b.text).toBe("ab, the full answer");
+    // and no PUT edit (grow-in-place is gone — it never worked)
+    expect(posts.some((p) => p.m === "PUT")).toBe(false);
+  });
+
+  it("finalize past the cap falls back to a plain message if the streaminfo-final is rejected — still ONE message (teams-stream-keepalive)", async () => {
+    let t = 0;
+    const { f, calls } = makeFetch([
+      TOKEN,
+      {
+        match: "/activities",
+        respond: (init) => {
+          const body = init?.body ? JSON.parse(init.body as string) : {};
+          // Teams rejects a stream-close past its limit (ContentStreamNotAllowed) → the connector must
+          // fall back to a plain message. Reject any streaminfo-final; accept everything else.
+          if (body?.entities?.[0]?.streamType === "final") return new Response(JSON.stringify({ error: { code: "ContentStreamNotAllowed" } }), { status: 403 });
+          return new Response(JSON.stringify({ id: "act-123" }));
+        },
+      },
+    ]);
+    const c = conn({ now: () => t, maxStreamAgeMs: 100 }, f);
+    await c.normalize(personalActivity());
+    const reply = c.reply("a:1conv");
+    await reply.send("a");
+    t = 500;
+    await reply.update("act-123", "ab"); // cap → stop streaming
+    await reply.finalize("act-123", "the full answer"); // streaminfo-final 403s → must NOT throw, plain fallback
+
+    const plain = calls
+      .filter((x) => x.url.endsWith("/activities") && x.init?.method === "POST")
+      .map((x) => JSON.parse(x.init!.body as string))
+      .filter((b) => b.type === "message" && b.text === "the full answer" && !b.entities);
+    expect(plain.length).toBe(1); // the answer still lands, exactly once, as a plain message
+  });
+
+  it("further update()s after the cap no-op streaming but keep the latest prefix for finalize (teams-stream-keepalive)", async () => {
+    let t = 0;
+    const { f, calls } = makeFetch([TOKEN, ACTIVITIES]);
+    const c = conn({ now: () => t, maxStreamAgeMs: 100 }, f);
+    await c.normalize(personalActivity());
+    const reply = c.reply("a:1conv");
+    await reply.send("a");
+    t = 500;
+    await reply.update("act-123", "ab"); // cap → stop streaming (no post)
+    await reply.update("act-123", "abc"); // AFTER the cap — must NOT stream again
+    await reply.update("act-123", "abcd");
+    await reply.finalize("act-123", "abcd done");
+
+    const streamingPosts = calls
+      .filter((x) => x.url.endsWith("/activities") && x.init?.method !== "PUT")
+      .map((x) => JSON.parse(x.init!.body as string))
+      .filter((b) => b.type === "typing" && b.entities?.[0]?.streamType === "streaming");
+    expect(streamingPosts.length).toBe(1); // exactly the one live chunk (send); nothing streamed past the cap
+    const finals = calls
+      .filter((x) => x.url.endsWith("/activities"))
+      .map((x) => JSON.parse(x.init!.body as string))
+      .filter((b) => b.entities?.[0]?.streamType === "final");
+    expect(finals.length).toBe(1); // one finalize, carrying the freshest prefix's full answer
+    expect(finals[0].text).toBe("abcd done");
+  });
+
+  it("heartbeat re-emits a streaming keepalive during a post-text idle gap (teams-stream-keepalive)", async () => {
+    let t = 0;
+    const { f, calls } = makeFetch([TOKEN, ACTIVITIES]);
+    const c = conn({ now: () => t, maxStreamAgeMs: 100_000 }, f); // big cap: exercise keepalive, not the cap
+    await c.normalize(personalActivity());
+    const reply = c.reply("a:1conv");
+    await reply.send("hello"); // opens stream at t=0, lastStreamAt=0
+    t = 5_000; // a 5s idle gap while a tool runs — NO update() in this window
+    await reply.working("🔧 Bash: pup logs search"); // the 4s heartbeat tick
+
+    const streams = calls
+      .filter((x) => x.url.endsWith("/activities") && x.init?.method !== "PUT")
+      .map((x) => JSON.parse(x.init!.body as string))
+      .filter((b) => b.type === "typing" && b.entities?.[0]?.streamType === "streaming");
+    expect(streams.length).toBe(2); // the send + a heartbeat keepalive (previously: nothing → indicator died)
+    expect(streams[1].text).toBe("hello"); // keepalive re-emits the last streamed prefix
+    expect(streams[1].entities[0].streamSequence).toBeGreaterThan(streams[0].entities[0].streamSequence ?? 0);
+  });
+
+  it("past the cap, the heartbeat stops streaming and keeps a plain typing bubble alive — no partial (teams-stream-keepalive)", async () => {
+    let t = 0;
+    const { f, calls } = makeFetch([TOKEN, ACTIVITIES]);
+    const c = conn({ now: () => t, maxStreamAgeMs: 100 }, f);
+    await c.normalize(personalActivity());
+    const reply = c.reply("a:1conv");
+    await reply.send("partial"); // opens stream at t=0
+    t = 5_000; // past the cap, update() NEVER called (deep in a tool)
+    await reply.working("🔧 Bash: slow query"); // heartbeat crosses the cap → stop streaming (no post)
+    const mark = calls.length;
+    t = 9_000;
+    await reply.working(); // next heartbeat, now capped → plain "…" bubble, NOT a streaming activity
+
+    // No streaminfo-`final` PARTIAL was ever posted by the heartbeat (the split-message bug).
+    const allPosts = calls.filter((x) => x.url.endsWith("/activities") && x.init?.method !== "PUT").map((x) => JSON.parse(x.init!.body as string));
+    expect(allPosts.some((b) => b.type === "message" && b.entities?.[0]?.streamType === "final")).toBe(false);
+    // After the cap, liveness rides a plain typing bubble; no more streaming activities.
+    const after = calls.slice(mark).filter((x) => x.url.endsWith("/activities")).map((x) => JSON.parse(x.init!.body as string));
+    expect(after.some((b) => b.type === "typing" && !b.entities)).toBe(true); // plain bubble keeps liveness
+    expect(after.some((b) => b.entities?.[0]?.streamType === "streaming")).toBe(false); // no streaming post-cap
+  });
+
+  it("status elapsed counts exact seconds in the first minute, 10s steps after (teams-working-status)", async () => {
+    // pure formatter checks via the status trace text
+    let t = 0;
+    const { f, calls } = makeFetch([TOKEN, { match: "/activities", respond: () => new Response(JSON.stringify({ id: "status-x" })) }]);
+    const c = conn({ now: () => t, pickVerb: COGITATE }, f);
+    await c.normalize(personalActivity());
+    const reply = c.reply("a:1conv");
+    await reply.working(); // t=0 sets workingStart; status delayed
+    const texts: string[] = [];
+    for (const at of [5_000, 12_000, 47_000, 70_000, 130_000]) {
+      t = at;
+      await reply.working();
+    }
+    for (const x of calls.filter((x) => x.url.includes("/activities"))) {
+      const s = statusCardText(x.init!.body as string);
+      if (s) texts.push(s);
+    }
+    expect(texts).toContain("🤖 Cogitating… 5s"); // exact seconds early — clearly moving
+    expect(texts).toContain("🤖 Cogitating… 47s");
+    expect(texts).toContain("🤖 Cogitating… 1m10s"); // 10s steps after a minute
+    expect(texts).toContain("🤖 Cogitating… 2m10s");
   });
 });
 
@@ -208,19 +338,19 @@ describe("TeamsConnector — typing + media (teams-typing, teams-media-inbound)"
     const reply = c.reply("a:1conv");
     await reply.working(); // t=0 → typing bubble only (status delayed)
     t = 4_000;
-    await reply.working(); // past delay → CREATE status trace "Cogitating…"
+    await reply.working(); // past delay → CREATE status trace "Cogitating… 4s"
     t = 12_000;
-    await reply.working(); // 10s step → UPDATE (PUT) trace to "Cogitating… 10s"
+    await reply.working(); // exact-seconds step → UPDATE (PUT) trace to "Cogitating… 12s"
     await reply.finalize("", "Done — 3 drafts ready");
 
     const acts = calls.filter((x) => x.url.includes("/activities"));
     // (1) typing bubble present (plain typing, no streaminfo, no text).
     expect(acts.some((x) => x.init!.method === "POST" && (() => { const b = JSON.parse(x.init!.body as string); return b.type === "typing" && !b.entities && !b.text; })())).toBe(true);
     // (2) status trace: created (POST card), updated (PUT card), then SETTLED in place (final PUT) — never deleted.
-    const statusPost = acts.find((x) => x.init!.method === "POST" && statusCardText(x.init!.body as string) === "🤖 Cogitating…");
+    const statusPost = acts.find((x) => x.init!.method === "POST" && statusCardText(x.init!.body as string) === "🤖 Cogitating… 4s");
     expect(statusPost).toBeDefined();
     const putTexts = acts.filter((x) => x.init!.method === "PUT").map((x) => statusCardText(x.init!.body as string));
-    expect(putTexts).toContain("🤖 Cogitating… 10s"); // mid-turn step update (🤖 marker while in progress)
+    expect(putTexts).toContain("🤖 Cogitating… 12s"); // exact-seconds step update (🤖 marker while in progress)
     expect(putTexts).toContain("Cogitated for 12 seconds"); // settled to a final past-tense footer
     expect(acts.some((x) => x.init!.method === "DELETE")).toBe(false); // never deleted (no "deleted" quirk)
     // and the actual reply landed.
@@ -342,20 +472,20 @@ describe("TeamsConnector — typing + media (teams-typing, teams-media-inbound)"
     const reply = c.reply("a:1conv");
     await reply.working(); // t=0 → bubble + informative "🤖 working…" (seq1), captures streamId
     t = 5_000;
-    await reply.working(); // <10s → deduped
+    await reply.working(); // "🤖 working… (5s)" — exact seconds now, no longer deduped (seq2)
     t = 12_000;
-    await reply.working(); // "🤖 working… (10s)" (seq2)
+    await reply.working(); // "🤖 working… (12s)" (seq3)
     t = 65_000;
-    await reply.working(); // "🤖 working… (1m)" (seq3)
-    const id = await reply.send("Here's the answer"); // first text → CONTINUES stream (seq4)
+    await reply.working(); // "🤖 working… (1m)" (seq4)
+    const id = await reply.send("Here's the answer"); // first text → CONTINUES stream (seq5)
 
     const posts = calls.filter((x) => x.url.includes("/activities")).map((x) => JSON.parse(x.init!.body as string));
     expect(posts.some((p) => p.type === "typing" && !p.entities && !p.text)).toBe(true); // bubble
     const infos = posts.filter((p) => (p.entities ?? []).some((e: { streamType?: string }) => e.streamType === "informative"));
-    expect(infos.map((p) => p.text)).toEqual(["🤖 working…", "🤖 working… (10s)", "🤖 working… (1m)"]);
+    expect(infos.map((p) => p.text)).toEqual(["🤖 working…", "🤖 working… (5s)", "🤖 working… (12s)", "🤖 working… (1m)"]);
     expect(id).toBe("stream-7");
     const chunk = posts.find((p) => (p.entities ?? []).some((e: { streamType?: string }) => e.streamType === "streaming"))!;
-    expect(chunk.entities[0]).toMatchObject({ streamType: "streaming", streamId: "stream-7", streamSequence: 4 });
+    expect(chunk.entities[0]).toMatchObject({ streamType: "streaming", streamId: "stream-7", streamSequence: 5 });
 
     // a throwing transport must not propagate out of working()
     const boom = (() => {

@@ -25,7 +25,12 @@ const DEFAULT_SERVICE_HOSTS = ["smba.trafficmanager.net", "smba.infra.gov.teams.
 const BF_OPENID_CONFIG = "https://login.botframework.com/v1/.well-known/openidconfiguration";
 /** Past this many ms of streaming, stop emitting chunks; finalize delivers the whole
  * answer (teams-stream-fallback — openclaw's 45s guardrail). */
-const DEFAULT_MAX_STREAM_AGE_MS = 45_000;
+const DEFAULT_MAX_STREAM_AGE_MS = 90_000;
+/** During a post-text idle gap (a long tool runs between streamed chunks), re-emit a streaming
+ * keepalive on the heartbeat if the last stream activity is older than this — so Teams' typing
+ * indicator + "stop" control stay live instead of freezing (teams-stream-keepalive). Kept just under
+ * the 4s heartbeat so a quiet tick always refreshes, but a tick right after a real chunk doesn't double-post. */
+const STREAM_KEEPALIVE_MS = 2_500;
 /** A "message"-cue status trace only appears once a turn has run this long — so a quick reply
  * never flashes a status message (teams-working-status). */
 const STATUS_DELAY_MS = 4_000;
@@ -73,7 +78,7 @@ export interface ConnectorOptions {
   port?: number; // webhook listen port; default 3978
   serviceHosts?: string[]; // serviceUrl host allow-list; default DEFAULT_SERVICE_HOSTS
   loginBase?: string; // token authority; default https://login.microsoftonline.com
-  maxStreamAgeMs?: number; // stream age cap; default 45s
+  maxStreamAgeMs?: number; // stop re-emitting streaming updates past this age (stay under Teams' ~2min limit); default 90s
   workingCue?: "message" | "card"; // liveness-cue style (teams-working-informative); default "message"
   fetchImpl?: typeof fetch; // injectable for tests
   now?: () => number; // injectable clock (ms)
@@ -445,9 +450,11 @@ class TeamsReply implements Reply {
   private streamStarted = false; // any streaminfo activity (informative OR streaming) sent → stream exists, finalize must close it
   private textStarted = false; // a real text/streaming chunk sent → working() stops (chunks carry liveness)
   private finalized = false;
-  private lastText = ""; // last text streamed via send()/update() — used to close cleanly on reset()
+  private streamCapped = false; // past the age cap: STOP re-emitting streaming updates (stay under Teams' limit), switch to a plain typing bubble. No partial is posted — finalize delivers ONE message (teams-stream-keepalive).
+  private lastText = ""; // last text streamed via send()/update() — used to close cleanly on reset()/cap
   private seq = 0; // monotonic across informative + streaming activities (Teams requires increasing streamSequence)
   private streamStart = 0; // set at the first TEXT chunk — the age cap measures streaming, not the working cue
+  private lastStreamAt = 0; // clock of the last streaming/keepalive post — the heartbeat keepalive throttles on it
   private workingStart = -1; // -1 = unset (0 is a valid clock value, so don't use it as the sentinel)
   private lastWorkingLabel = "";
   private lastTool = ""; // the most recent tool line (🔧 …), persisted so it coexists with the ticking cue
@@ -484,6 +491,7 @@ class TeamsReply implements Reply {
     this.textStarted = true;
     this.streamStarted = true;
     this.streamStart = this.opts.now();
+    this.lastStreamAt = this.streamStart;
     this.lastText = text;
     this.seq += 1; // continues the working() informative stream if one was opened (else starts at 1)
     const id = await this.c.postActivity(this.ref, {
@@ -497,9 +505,18 @@ class TeamsReply implements Reply {
 
   async update(_msgID: string, text: string): Promise<void> {
     if (!this.ref || !this.textStarted || this.finalized) return;
-    if (this.opts.now() - this.streamStart > this.opts.maxStreamAgeMs) return; // age cap → finalize delivers
-    this.lastText = text;
+    this.lastText = text; // always keep the freshest prefix — finalize delivers the full answer from it
+    if (this.streamCapped) return; // past the cap: stop streaming; liveness rides the typing bubble + status trace
+    if (this.opts.now() - this.streamStart > this.opts.maxStreamAgeMs) {
+      // Past the age cap: STOP re-emitting streaming updates so we stay under Teams' ~2min limit. We do NOT
+      // post a partial (a streamed-final message has no editable id, so it can't be grown — that split a
+      // long answer into a frozen partial + a duplicate full). The transient preview simply stops growing;
+      // finalize delivers ONE message. Liveness continues via the typing bubble (teams-stream-keepalive).
+      this.streamCapped = true;
+      return;
+    }
     this.seq += 1;
+    this.lastStreamAt = this.opts.now();
     await this.c.postActivity(this.ref, {
       type: "typing",
       text,
@@ -560,6 +577,7 @@ class TeamsReply implements Reply {
     this.streamStarted = false;
     this.textStarted = false;
     this.finalized = false;
+    this.streamCapped = false;
     this.seq = 0;
     this.streamStart = 0;
     this.lastText = "";
@@ -649,6 +667,37 @@ class TeamsReply implements Reply {
     }
     if (!this.canEdit()) return; // group: just the bubble (no streaming stream / status to manage)
 
+    // (1b) POST-TEXT liveness (teams-stream-keepalive). A streamed chunk was assumed to "carry
+    // liveness", but a long tool gap between chunks leaves the stream idle — Teams expires the typing
+    // indicator and freezes the "stop" control (the mid-turn freeze). The 4s heartbeat fires even when
+    // NO new text arrives, so keep the stream alive here: re-emit a streaming keepalive (the last prefix,
+    // seq++) while under the age cap; on crossing the cap STOP streaming (stay under Teams' limit — no
+    // partial posted, finalize delivers one message) and keep a plain typing bubble alive instead.
+    if (this.textStarted && this.streamStarted) {
+      if (this.streamCapped) {
+        try {
+          await this.c.postActivity(this.ref, { type: "typing" }); // "…" stays alive; streaming has stopped
+        } catch {
+          /* bubble best-effort */
+        }
+      } else if (now - this.streamStart > this.opts.maxStreamAgeMs) {
+        this.streamCapped = true; // stop streaming from here; next tick shows the plain typing bubble
+      } else if (now - this.lastStreamAt >= STREAM_KEEPALIVE_MS) {
+        this.seq += 1;
+        this.lastStreamAt = now;
+        try {
+          await this.c.postActivity(this.ref, {
+            type: "typing",
+            text: this.lastText,
+            entities: [streamInfo("streaming", this.streamId || undefined, this.seq)],
+          });
+        } catch {
+          /* keepalive best-effort */
+        }
+      }
+      // fall through: the "message" cue also refreshes its gray status trace (verb/elapsed + last tool)
+    }
+
     if (this.opts.cue === "card") {
       // informative streaminfo card — pre-text only (establishes the stream).
       if (this.textStarted) return;
@@ -698,30 +747,30 @@ class TeamsReply implements Reply {
   }
 }
 
-/** The labeled liveness cue text. It **steps every 10s** in the first minute
- * (`🤖 working…` → `(10s)` → … → `(50s)`) so a watcher gets quick "still alive" reassurance early,
- * then **per minute** after (`(1m)`, `(2m)`, …) so a long wait doesn't churn. Because the cue is
- * deduped by this label, it re-posts exactly when the step changes. */
+/** The labeled liveness cue text. It counts **exact seconds in the first minute** (`🤖 working…` →
+ * `(1s)` → `(2s)` → …) so a watcher sees it clearly ticking, then **steps every 10s** after a minute
+ * (`(1m)`, `(1m10s)`, …) so a long wait doesn't churn. Deduped by this label, so it re-posts exactly
+ * when the label changes (bounded by the ~4s heartbeat — these are Teams REST posts, zero model cost). */
 function workingLabel(elapsedMs: number): string {
-  if (elapsedMs < 60_000) {
-    const s = Math.floor(elapsedMs / 10_000) * 10; // 0,10,20,30,40,50
-    return s === 0 ? "🤖 working…" : `🤖 working… (${s}s)`;
-  }
-  const m = Math.floor(elapsedMs / 60_000);
-  return `🤖 working… (${m}m)`;
+  const e = compactElapsed(elapsedMs);
+  return e ? `🤖 working… (${e})` : "🤖 working…";
 }
 
 /** Active status-trace text (working_cue: "message") — the 🤖 bot marker + the mystic verb in
- * gerund + a compact elapsed that steps every 10s under a minute then per minute (so it re-posts
- * exactly on each step, deduped). Under 10s the count is omitted ("🤖 Cogitating…"). */
+ * gerund + a compact elapsed that counts exact seconds under a minute (clearly moving) then steps
+ * every 10s after (so it re-posts on each step, deduped). Under 1s the count is omitted. */
 function statusActiveText(verb: MysticVerb, elapsedMs: number): string {
   const e = compactElapsed(elapsedMs);
   return e ? `🤖 ${verb.ing}… ${e}` : `🤖 ${verb.ing}…`;
 }
+/** Exact seconds in the first minute ("5s", "47s") so the cue is visibly moving; after a minute,
+ * 10s steps ("1m", "1m10s", "2m30s") so a long wait doesn't churn. */
 function compactElapsed(ms: number): string {
-  if (ms < 10_000) return "";
-  if (ms < 60_000) return `${Math.floor(ms / 10_000) * 10}s`;
-  return `${Math.floor(ms / 60_000)}m`;
+  if (ms < 1_000) return "";
+  if (ms < 60_000) return `${Math.floor(ms / 1000)}s`;
+  const m = Math.floor(ms / 60_000);
+  const s10 = Math.floor((ms % 60_000) / 10_000) * 10;
+  return s10 ? `${m}m${s10}s` : `${m}m`;
 }
 /** Settled status-trace text — the verb in past tense + total elapsed ("Cogitated for 34 seconds"
  * / "… for 2 minutes"), à la Claude's "Thought for…". */

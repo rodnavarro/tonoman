@@ -127,9 +127,11 @@ outbound call. These scenarios state that surface.
     of the prefix-locked stream — it can update **for the whole turn, including after text has
     started**, closing the mid-turn-quiet gap. Fail-soft: if the delete is rejected it's blanked to
     `✓` so a stale "🤖 working…" never lingers.
-- The label is **elapsed-aware** — it **steps every 10s in the first minute** (`🤖 working…` →
-  `(10s)` → … → `(50s)`) then **per minute** (`(1m)`, `(2m)`, …) — and **deduped by the label**, so
-  it re-posts only when the step changes (well within Teams' ~1 req/s).
+- The label is **elapsed-aware** — it counts **exact seconds in the first minute** (`🤖 working…` →
+  `(1s)` → `(2s)` → …) so the cue is visibly moving, then **10s steps** after a minute (`(1m)`,
+  `(1m10s)`, `(2m30s)`, …) so a long wait doesn't churn — and **deduped by the label**, so it re-posts
+  only when the label changes, bounded by the ~4s heartbeat (these are Teams REST posts, **zero model
+  tokens**, well within Teams' ~1 req/s).
 - The streamed reply is a **separate** streaminfo stream (`teams-stream-progressive`), unaffected
   by the status message.
 
@@ -174,15 +176,54 @@ outbound call. These scenarios state that surface.
   typing indicator instead). Edits are throttled to **≥~1.5s** (Teams' ~1 req/s limit).
 - _Arch: A4. Pattern: openclaw `streaming-message.ts` (`TeamsHttpStream`) + `draft-stream-loop.ts`._
 
-### `teams-stream-fallback` — block-send when streaming can't apply (group, or past the caps)
+### `teams-stream-fallback` — block-send when streaming can't apply (group, or over the char cap)
 - Given streaming is **1:1-only** and bounded, the connector reports **`canEdit()=false`** for
-  a **group/channel** conversation, and a live stream **falls back to a single block send**
-  past **~4000 chars** or **~45s** of streaming,
+  a **group/channel** conversation, and a reply that never opened a live stream **falls back to a
+  single block send** past **~4000 chars**,
 - Then the reply is delivered as **one message, chunked** on line boundaries (code fences
   preserved) — the consumer's existing whole-answer path. In-turn liveness still comes from
   the typing indicator (`teams-typing`). (The ~4000-char cap rides the consumer's existing
-  `maxLen` guard; the age cap + the group check live in the connector.)
+  `maxLen` guard; the group check lives in the connector.)
+- _An **already-open** stream that crosses the **time** cap is handled by `teams-stream-keepalive` /
+  `teams-stream-cap`, not a block send._
 - _Arch: A4 (the `canEdit()=false` degrade is already in the contract + consumer)._
+
+### `teams-stream-keepalive` — a long tool gap keeps the stream live (no mid-turn freeze)
+- Given a streamed chunk was assumed to "carry liveness", but a turn commonly streams a little text and
+  then runs a **long tool** (tens of seconds) before the next chunk — during that gap `update()` is not
+  called, so nothing refreshes the stream. Teams then **expires the typing indicator** and **freezes the
+  "stop" control**, which reads as a hung bot. _(Learned live — the mid-turn freeze.)_
+- Given the router already drives a **~4s wall-clock heartbeat** (`keepWorking` → `reply.working()`) that
+  fires **even when no new text arrives**,
+- Then on each heartbeat, while the stream is **open and under the age cap**, the connector **re-emits a
+  streaming keepalive** — a `streamType: "streaming"` typing activity carrying the **last streamed prefix**
+  with an incremented `streamSequence` — so Teams' indicator + "stop" stay **live** through the gap (throttled
+  so a tick right after a real chunk doesn't double-post). The visible text doesn't change during a
+  tool gap (there's no new text), but the indicator no longer dies.
+- On **crossing the age cap** (see `teams-stream-cap`), the heartbeat itself stops the streaming keepalive and
+  switches to a **plain typing bubble** for the rest of the turn (fires **without** needing a new chunk — the
+  case a purely `update()`-driven cap misses).
+- _Arch: A4. The `message`-cue status trace still ticks in parallel; this restores the STREAM's own liveness._
+
+### `teams-stream-cap` — past the age cap, stop streaming; deliver ONE message at finalize
+- Given Teams live-streams for only a **bounded lifetime** (~2 min server-side), the connector caps streaming
+  at **~90s** (`maxStreamAgeMs`, safely under that limit). Past the cap it must **stop re-emitting streaming
+  updates** so the stream never exceeds Teams' limit.
+- **It must NOT post a partial** at the cap. An earlier attempt closed the stream with a `streamType: "final"`
+  message carrying the prefix-so-far and then tried to **grow it in place** at finalize — but a streamed-final
+  message has **no editable activity id**, so the edit was rejected and the full answer landed as a *separate*
+  message: a long reply split into a **frozen partial + a duplicate full**. _(Learned live — a 19-row list that
+  chopped at "…ABL Transport LLC —".)_
+- When the stream crosses the cap (via `update()` **or** the heartbeat), the connector simply **flips to
+  capped**: streaming stops, further `update()`s no-op (keeping only the latest prefix), and liveness rides the
+  plain typing bubble (`teams-stream-keepalive`) + the status trace. The transient streaming preview stops
+  growing; **nothing persistent is posted**.
+- On `finalize`, the reply lands **exactly once** via the normal path — a `streamType: "final"` message with the
+  **full answer** (which Teams accepts while the stream is within its lifetime; if it 403s past the limit, the
+  connector falls back to a **plain message**). Either way: **one message, no partial, no duplicate.** The 45s→90s
+  cap bump also means most turns finish **before** the cap and stream cleanly end-to-end.
+- _Arch: A4. Supersedes the earlier close-then-grow approach (`teams-stream-cap-close`), which the editable-id
+  gap made unworkable._
 
 ### `teams-consumer-telegram-safe` — the streaming accommodations never touch Telegram
 - Given the prefix-stream behavior (`teams-stream-progressive`) needs consumer changes
