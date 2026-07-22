@@ -26,7 +26,7 @@ set -euo pipefail
 AZ="${AZ:-az}"; GH="${GH:-gh}"; CLOUDFLARED="${CLOUDFLARED:-cloudflared}"
 NODE="${NODE:-node}"; PODMAN="${PODMAN:-podman}"; CLI="${TONOMAN_CLI:-dist/cli.js}"
 
-NAME=""; TENANT=""; RG=""; PORT=3979; ICON=""; ALLOWED_USER=""; PERSONA=""; TUNNEL_URL=""
+NAME=""; TENANT=""; RG=""; PORT=3979; ICON=""; ALLOWED_USER=""; PERSONA=""; TUNNEL_URL=""; GH_ENABLE=""
 EXTRA=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -39,6 +39,7 @@ while [ $# -gt 0 ]; do
     --persona) PERSONA="$2"; shift 2;;
     --tunnel-url) TUNNEL_URL="$2"; shift 2;;  # reuse an already-running public endpoint (https://…); skips cloudflared
     --bot-handle) BOT_HANDLE="$2"; shift 2;;  # globally-unique Azure bot handle (default: <name>-<appid8>)
+    --gh) GH_ENABLE=1; shift;;                # install gh in the sandbox + forward the host's GH_TOKEN
     --) shift; EXTRA=("$@"); break;;
     *) echo "unknown arg: $1" >&2; exit 2;;
   esac
@@ -124,6 +125,20 @@ CREATE=("$NODE" "$CLI" create agent "$NAME" --channel teams
         --teams-app-id "$APP_ID" --teams-tenant "$TENANT_ID" --teams-port "$PORT")
 [ -n "$ALLOWED_USER" ] && CREATE+=(--teams-allowed-user "$ALLOWED_USER")
 [ -n "$PERSONA" ] && CREATE+=(--role "$(head -1 "$PERSONA" | sed 's/^#* *//')")
+# gh CLI (--gh): the host token lives in the OS keyring (nothing to mount), so inject it as
+# GH_TOKEN — tonoman's secret pattern. gh is installed once in the sandbox via --setup; the
+# token is written to $ENVFILE (git-ignored) and forwarded as a bare `-e GH_TOKEN` at boot.
+if [ -n "$GH_ENABLE" ]; then
+  GH_TOKEN_VAL="$("$GH" auth token -h github.com 2>/dev/null | tr -d '\r\n')"
+  if [ -n "$GH_TOKEN_VAL" ]; then
+    printf 'export GH_TOKEN=%s\n' "$GH_TOKEN_VAL" >> "$ENVFILE"   # secret → file, never printed
+    export GH_TOKEN="$GH_TOKEN_VAL"                                # so the initial container gets it too
+    CREATE+=(--secret GH_TOKEN --setup 'command -v gh >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq wget >/dev/null && wget -qO- https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg 2>/dev/null && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" >/etc/apt/sources.list.d/github-cli.list && apt-get update -qq && apt-get install -y -qq gh; }')
+    echo "gh: enabled — installed in sandbox, GH_TOKEN forwarded via $ENVFILE"
+  else
+    echo "WARNING: --gh set but '$GH auth token' returned nothing (is the host gh logged in?). Skipping gh wiring."
+  fi
+fi
 CREATE+=("${EXTRA[@]}")
 # On Windows/Git-Bash, MSYS rewrites container-internal paths (e.g. an --env value like
 # `/root/files/aws/credentials`) into `C:/Program Files/Git/root/…` when handing argv to the
