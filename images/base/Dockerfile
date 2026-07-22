@@ -27,7 +27,11 @@ RUN git config --system --add safe.directory '*'
 # (url/expose/unexpose). Baked in so they survive a container rebuild. They are
 # self-contained Node scripts (only Node built-ins), so node:22-slim runs them as-is.
 COPY build/agent/shim/podman build/agent/shim/tonoman /usr/local/bin/
-RUN chmod +x /usr/local/bin/podman /usr/local/bin/tonoman
+# Normalize line endings before making them executable. A Windows (CRLF) checkout otherwise
+# bakes the shebang as `#!/usr/bin/env node\r`, so `env` looks for `node\r`, the shim fails to
+# exec, and the agent→host broker round-trip reports UNREACHABLE. Strip CR to be checkout-safe.
+RUN sed -i 's/\r$//' /usr/local/bin/podman /usr/local/bin/tonoman \
+ && chmod +x /usr/local/bin/podman /usr/local/bin/tonoman
 
 # Long-lived container; the gateway drives turns via `podman exec` (A2).
 WORKDIR /work

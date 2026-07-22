@@ -1,0 +1,8 @@
+# These run in a Linux sandbox and are baked into the agent image. They MUST stay LF even on a
+# Windows checkout — a CRLF shebang (`#!/usr/bin/env node\r`) makes the shim fail to exec, which
+# breaks the agent→host broker (A13) and surfaces as "tonoman broker (from agent): UNREACHABLE".
+build/agent/shim/podman   text eol=lf
+build/agent/shim/tonoman  text eol=lf
+
+# Shell scripts + shipped skill scripts likewise must be LF to run under sh/bash in the sandbox.
+*.sh text eol=lf

@@ -38,3 +38,8 @@ Thumbs.db
 .vscode/
 *.swp
 *~
+
+# Per-agent bot secrets written by scripts/teams-quickstart.sh (e.g. .env.cody) — never commit.
+.env.*
+# Generated Teams app packages (manifest + icons + zip) — build output, not source.
+/build/teams-app/
