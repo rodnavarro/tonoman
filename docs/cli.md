@@ -103,7 +103,7 @@ recreated with the rendered `-v` (`get mounts -a <name> --podman`).
 ## `tonoman auth`
 
 ```
-tonoman auth <login|status|logout> <agent> [--config settings.json]
+tonoman auth <login [--headless] | code <agent> <code> | status | logout> <agent> [--config settings.json]
 ```
 Runs an agent's **harness auth flow** through the substrate (scenarios
 `roster-auth-volume`). Tonoman resolves `<agent>` (by name in the roster) to its sandbox
@@ -114,6 +114,12 @@ volume**, so it persists across container restarts.
 - `login` — interactive subscription login (needs a TTY for the code paste). For Claude
   Code: `claude auth login --claudeai`, writing the auto-refreshing
   `~/.claude/.credentials.json` into the volume.
+- `login --headless` — **for a remote/headless host or a phone-only operator** (scenarios
+  `roster-auth-headless` / `roster-auth-remote`): instead of opening a browser where the agent
+  runs, it prints an OAuth **URL you can open on any device**. Sign in with the account the
+  agent should own, authorize, then finish with `auth code` (below). No local TTY/browser needed.
+- `code <agent> <code>` — **completes** a `--headless` login by handing back the authorization
+  code you got from the URL. Writes the same `~/.claude/.credentials.json` into the volume.
 - `status` — print auth status (e.g. `loggedIn`, account email, subscription type).
 - `logout` — clear the credential store from the volume.
 
@@ -121,8 +127,10 @@ Different agents can authenticate to **different accounts** — credentials are 
 per config volume.
 
 ```sh
-tonoman auth login  registrar
-tonoman auth status registrar     # → "loggedIn": true, "email": ...
+tonoman auth login  registrar                     # local: opens a browser here
+tonoman auth login  registrar --headless          # remote/phone: prints a URL to open anywhere
+tonoman auth code   registrar ABC123...           #   …then paste the code back to finish
+tonoman auth status registrar                     # → "loggedIn": true, "email": ...
 tonoman auth logout registrar
 ```
 
