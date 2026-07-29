@@ -93,3 +93,28 @@ describe("validate — auth backend (backend-config-default)", () => {
     expect(() => validate(cfg({ telegram: { token: "t" }, auth: "openai" as never }))).toThrow(/invalid auth/);
   });
 });
+
+describe("validate — status-line default (gw-command-statusline)", () => {
+  it("accepts the known modes", () => {
+    for (const m of ["none", "small", "full"] as const)
+      expect(() => validate(cfg({ telegram: { token: "t" }, statusline: m }))).not.toThrow();
+  });
+  it("rejects an unknown statusline value", () => {
+    expect(() => validate(cfg({ telegram: { token: "t" }, statusline: "tiny" as never }))).toThrow(/invalid statusline/);
+  });
+  it("defaults to \"none\" when unset, and keeps an explicit mode (applyDefaults)", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "tncfg-sl-"));
+    const p = path.join(dir, "roster.json");
+    await fs.writeFile(p, JSON.stringify({
+      health_addr: "127.0.0.1:1", state_root: "/state",
+      agents: [
+        { name: "off", container: "tn-off", telegram: { token: "t" } },
+        { name: "on", container: "tn-on", telegram: { token: "t" }, statusline: "small" },
+      ],
+    }));
+    const c = await load(p);
+    expect(c.agents.find((a) => a.name === "off")?.statusline).toBe("none");
+    expect(c.agents.find((a) => a.name === "on")?.statusline).toBe("small");
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+});

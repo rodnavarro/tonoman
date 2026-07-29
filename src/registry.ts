@@ -17,6 +17,8 @@ export interface Agent {
   /** auth backend default (backend-*): "subscription" | "bedrock"; the gateway's knob flips it live. */
   backend?: "subscription" | "bedrock";
   max_turns?: number; // per-turn agentic-loop cap (claude-code --max-turns)
+  /** status-line footer default (gw-command-statusline): "none" | "small" | "full"; /statusline flips it live. */
+  statusline?: "none" | "small" | "full";
   container: string;
   config_volume: string;
   config_home: string;

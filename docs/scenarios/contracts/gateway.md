@@ -299,6 +299,11 @@ the turn visibly alive.
   — **display-only: it is NOT written to the committed transcript** (so it can't pollute context),
   and it rides the same message (a "sticky bottom"), not a separate bubble. **`/statusline none`**
   (the default) shows no footer.
+- **Configured default (`statusline` in the roster/helm):** an agent boots with the footer mode from
+  its roster entry — `none` (default), `small`, or `full` — so a deployment can turn the status line
+  **on for a given agent from new sessions** without anyone typing `/statusline`. The command still
+  overrides it for the live session; a restart reverts to the configured value (same lifecycle as the
+  `auth`/backend default). An unknown value is rejected at config-validation time.
 - **Tappable picker (no typing):** **`/statusline`** with no argument shows a **tappable choice of
   `none | small | full | print`** (Telegram inline buttons) — picking a mode sets it; no need to type
   the arg. (Generic command-choice UI: an inline-button list whose taps come back as the chosen

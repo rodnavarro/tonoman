@@ -158,6 +158,7 @@ export function resolveAgents(
         model: ac.model,
         backend: ac.auth, // brain auth backend default (backend-config-default)
         max_turns: ac.max_turns,
+        statusline: ac.statusline, // status-line footer default (gw-command-statusline)
         container: ac.container,
         config_volume: configVol,
         config_home: spec.configHome,
@@ -463,9 +464,10 @@ async function runAgent(
       ? remoteAccountUsageCached(usageKey, ra.cfg.url ?? "", process.env.AGENT_RUNTIME_TOKEN)
       : accountUsageCached(rec.container, ra.spec.credFile!);
 
-  // /statusline mode (gw-command-statusline): per-conversation, default none, survives /new,
-  // resets on restart (like /model). v0.1 single-agent ⇒ one holder per agent.
-  let statusMode: StatusMode = "none";
+  // /statusline mode (gw-command-statusline): starts at the roster/helm default (`statusline`,
+  // default "none"), survives /new, and resets to that configured default on restart — same
+  // lifecycle as the backend knob. v0.1 single-agent ⇒ one holder per agent.
+  let statusMode: StatusMode = rec.statusline ?? "none";
   const statusControl: StatusControl = {
     get: () => statusMode,
     set: (m) => void (statusMode = m),
