@@ -1,0 +1,130 @@
+name: publish-images
+
+# Build the OSS runtime images (tonoman-base, tonoman-claudecode) and publish them to GHCR — the
+# free, public GitHub Container Registry. Auth is the built-in GITHUB_TOKEN (permissions.packages:
+# write), so there is NO stored registry credential anywhere in this public repo.
+#
+# Customer / employer names must NEVER ride into a published tonoman artifact. The denylist that
+# knows those names does not live in this repo — it arrives as the `LEAK_GUARD_BUNDLE` secret (built
+# by the private config repo's ci/bundle-to-github.sh) and the scan runs in --ci mode, which prints
+# only file:line, never a term. The publish job re-runs the guard as a HARD gate and only pushes if clean.
+#
+# The private AGENT images (sapien, marshall, …) are built elsewhere — the ADO pipelines that already
+# reach Harbor from MS-hosted infra. This workflow is the PUBLIC half only.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  # Pre-merge scan. Runs on PRs too. A same-repo PR / push has the secret and is scanned; a fork PR
+  # has no secret (GitHub withholds them from forks) so it SKIPS with a neutral note rather than
+  # failing an outside contributor — an outsider cannot know the private names anyway, and nothing is
+  # published from a PR. The real gate is in `publish`, which requires the secret.
+  leak-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: "Scan the tree for customer / secret strings (--ci: file:line only)"
+        env:
+          LEAK_GUARD_BUNDLE: ${{ secrets.LEAK_GUARD_BUNDLE }}
+        run: |
+          set -euo pipefail
+          if [ -z "${LEAK_GUARD_BUNDLE:-}" ]; then
+            echo "::notice::leak-guard skipped — no denylist secret (fork PR). The push-to-main gate will scan."
+            exit 0
+          fi
+          mkdir -p "$RUNNER_TEMP/lg"
+          printf '%s' "$LEAK_GUARD_BUNDLE" | base64 -d | tar -xz -C "$RUNNER_TEMP/lg"
+          node "$RUNNER_TEMP/lg/ci/scan.mjs" --tree --profile public --ci
+
+  publish:
+    # Only real refs publish: main and version tags. PRs never push an image.
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    needs: leak-guard
+    steps:
+      - uses: actions/checkout@v4
+
+      # HARD gate: the secret MUST be present here (it always is on push to main/tags). Fail closed —
+      # a missing denylist means "cannot prove clean", which must block a publish, not wave it through.
+      - name: Leak guard (required before publish)
+        env:
+          LEAK_GUARD_BUNDLE: ${{ secrets.LEAK_GUARD_BUNDLE }}
+        run: |
+          set -euo pipefail
+          if [ -z "${LEAK_GUARD_BUNDLE:-}" ]; then
+            echo "::error::LEAK_GUARD_BUNDLE secret missing — refusing to publish an unscanned image."
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/lg"
+          printf '%s' "$LEAK_GUARD_BUNDLE" | base64 -d | tar -xz -C "$RUNNER_TEMP/lg"
+          node "$RUNNER_TEMP/lg/ci/scan.mjs" --tree --profile public --ci
+
+      - name: Compute image refs + tag
+        id: meta
+        run: |
+          set -euo pipefail
+          owner="${GITHUB_REPOSITORY_OWNER,,}"   # GHCR requires a lowercase owner
+          echo "base=${REGISTRY}/${owner}/tonoman-base"             >> "$GITHUB_OUTPUT"
+          echo "claudecode=${REGISTRY}/${owner}/tonoman-claudecode" >> "$GITHUB_OUTPUT"
+          # Version tag = the git tag on a tag push, else the short SHA. `latest` moves on main only.
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT";
+          else echo "tag=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"; fi
+          if [ "${GITHUB_REF}" = "refs/heads/main" ] || [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "latest=1" >> "$GITHUB_OUTPUT"; else echo "latest=0" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Build base (context = repo root: it COPYs build/agent/shim/*), tagged locally so claudecode's
+      # `FROM localhost/tonoman/base:latest` resolves to what we just built — no dependence on a
+      # previously-published base.
+      - name: Build base
+        run: |
+          set -euo pipefail
+          docker build -f images/base/Dockerfile \
+            -t localhost/tonoman/base:latest \
+            -t "${{ steps.meta.outputs.base }}:${{ steps.meta.outputs.tag }}" .
+
+      - name: Build claudecode (FROM the just-built base)
+        run: |
+          set -euo pipefail
+          docker build -f images/claudecode/Dockerfile \
+            -t "${{ steps.meta.outputs.claudecode }}:${{ steps.meta.outputs.tag }}" .
+
+      - name: Push (version tag, + latest on main/tags)
+        run: |
+          set -euo pipefail
+          docker push "${{ steps.meta.outputs.base }}:${{ steps.meta.outputs.tag }}"
+          docker push "${{ steps.meta.outputs.claudecode }}:${{ steps.meta.outputs.tag }}"
+          if [ "${{ steps.meta.outputs.latest }}" = "1" ]; then
+            docker tag "${{ steps.meta.outputs.base }}:${{ steps.meta.outputs.tag }}"       "${{ steps.meta.outputs.base }}:latest"
+            docker tag "${{ steps.meta.outputs.claudecode }}:${{ steps.meta.outputs.tag }}" "${{ steps.meta.outputs.claudecode }}:latest"
+            docker push "${{ steps.meta.outputs.base }}:latest"
+            docker push "${{ steps.meta.outputs.claudecode }}:latest"
+          fi
+
+      - name: Summary
+        run: |
+          {
+            echo "### Published to GHCR"
+            echo "- \`${{ steps.meta.outputs.base }}:${{ steps.meta.outputs.tag }}\`"
+            echo "- \`${{ steps.meta.outputs.claudecode }}:${{ steps.meta.outputs.tag }}\`"
+            echo ""
+            echo "First publish only: flip each package's visibility to **Public** under the repo's Packages settings (they default to private)."
+          } >> "$GITHUB_STEP_SUMMARY"
