@@ -93,6 +93,11 @@ export interface AgentConfig {
   bedrock_model?: string;
   window_size?: number;
   max_turns?: number; // cap the agentic tool-loop per turn (claude-code --max-turns); 0 = uncapped
+  /** Status-line display default (gw-command-statusline): "none" (no footer — the default),
+   * "small" (a one-line usage footer after each turn), or "full" (a breakdown). This is the DURABLE
+   * default the agent boots with; `/statusline` overrides it for the live session, and a restart
+   * reverts to this value (same lifecycle as `auth`/backend). Default "none". */
+  statusline?: "none" | "small" | "full";
   /** resume the harness's own session across turns (claude-code --resume) instead of re-sending the
    * window each turn — cheaper via prompt caching; `/new` rotates it. Default off (substrate window). */
   session_persist?: boolean;
@@ -232,6 +237,8 @@ function applyDefaults(c: Config): void {
     // Cap the per-turn agentic tool-loop by default so an open-ended turn can't loop unbounded
     // and drain the account's usage window. Set max_turns: 0 to opt a heavy dev agent out.
     if (a.max_turns == null) a.max_turns = 10;
+    // Status-line footer default (gw-command-statusline): off unless a roster/helm value opts in.
+    if (!a.statusline) a.statusline = "none";
     if (!a.name) a.name = "agent";
     // Infer the channel from which connector block is present (channel-teams); a service
     // agent owns its own channel, so leave it unset.
@@ -274,6 +281,9 @@ export function validate(c: Config): void {
     if (a.auth && a.auth !== "subscription" && a.auth !== "bedrock")
       throw new Error(`config: agent "${who}" invalid auth "${a.auth}" (expected "subscription" or "bedrock")`);
     if (a.auth === "bedrock" && !a.region) missing.push("region (required for auth: bedrock)");
+    // Status-line default (gw-command-statusline): known modes only.
+    if (a.statusline && !["none", "small", "full"].includes(a.statusline))
+      throw new Error(`config: agent "${who}" invalid statusline "${a.statusline}" (expected "none", "small", or "full")`);
     if (!a.workspace?.root && !c.state_root) missing.push("workspace.root or state_root");
     if (missing.length) throw new Error(`config: agent "${who}" missing required fields: ${missing.join(", ")}`);
   });
