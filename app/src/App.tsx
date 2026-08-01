@@ -1,6 +1,18 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { CloudApi, GatewayApi, type ChatEvent, type FleetAgent, type FleetGateway } from "./api";
-import { completeLogin, current, loadConfig, login, logout, type OidcConfig, type Session } from "./auth";
+import {
+  clearUrl,
+  completeLogin,
+  current,
+  isVerifyRoute,
+  loadConfig,
+  login,
+  logout,
+  requestMagicLink,
+  verifyMagicLink,
+  type OidcConfig,
+  type Session,
+} from "./auth";
 import { Scanner } from "./Scanner";
 import { buildPdf, type Page } from "./scan";
 
@@ -22,6 +34,15 @@ export function App() {
   useEffect(() => {
     (async () => {
       try {
+        // Landing from an emailed link takes priority over everything else.
+        const linkToken = isVerifyRoute();
+        if (linkToken) {
+          const s = await verifyMagicLink(linkToken);
+          clearUrl();
+          setSession(s);
+          setCfg(await loadConfig().catch(() => ({ issuer: "", clientId: "", redirectUri: "", scope: "" })));
+          return;
+        }
         const c = await loadConfig();
         setCfg(c);
         setSession((await completeLogin(c)) ?? current());
@@ -33,18 +54,7 @@ export function App() {
 
   if (error) return <Shell><p className="error">{error}</p></Shell>;
   if (!cfg) return <Shell><p className="muted">Loading…</p></Shell>;
-  if (!session)
-    return (
-      <Shell>
-        <div className="signin">
-          <h1>Tonoman</h1>
-          <p className="muted">Your agents, wherever they run.</p>
-          <button className="primary big" onClick={() => login(cfg)}>
-            Sign in
-          </button>
-        </div>
-      </Shell>
-    );
+  if (!session) return <SignIn cfg={cfg} />;
 
   return view.kind === "fleet" ? (
     <Fleet session={session} onOpen={(gw, agent) => setView({ kind: "chat", gw, agent })} />
@@ -55,6 +65,71 @@ export function App() {
 
 function Shell({ children }: { children: React.ReactNode }) {
   return <div className="shell">{children}</div>;
+}
+
+function SignIn({ cfg }: { cfg: OidcConfig }) {
+  const [email, setEmail] = useState("");
+  const [sent, setSent] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const submit = async () => {
+    if (!email.trim()) return;
+    setBusy(true);
+    setErr(null);
+    try {
+      await requestMagicLink(email.trim());
+      setSent(true);
+    } catch (e) {
+      setErr((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (sent)
+    return (
+      <Shell>
+        <div className="signin">
+          <h1>Check your email</h1>
+          <p className="muted">
+            If <strong>{email}</strong> has an account, a sign-in link is on its way. It works once and
+            expires in 15 minutes.
+          </p>
+          <button onClick={() => setSent(false)}>Use a different address</button>
+        </div>
+      </Shell>
+    );
+
+  return (
+    <Shell>
+      <div className="signin">
+        <h1>Tonoman</h1>
+        <p className="muted">Your agents, wherever they run.</p>
+        <input
+          type="email"
+          inputMode="email"
+          autoComplete="email"
+          placeholder="you@example.com"
+          value={email}
+          onChange={(e) => setEmail(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && submit()}
+          disabled={busy}
+        />
+        <button className="primary big" onClick={submit} disabled={busy || !email.trim()}>
+          {busy ? "Sending…" : "Email me a sign-in link"}
+        </button>
+        {err && <p className="error">{err}</p>}
+        {/* Shown only once a social IdP is actually configured — otherwise the button is a
+            dead end that reports a confusing OIDC error. */}
+        {cfg.clientId && (
+          <button className="link" onClick={() => login(cfg)}>
+            Sign in with your organization account
+          </button>
+        )}
+      </div>
+    </Shell>
+  );
 }
 
 function Fleet({ session, onOpen }: { session: Session; onOpen: (gw: FleetGateway, a: FleetAgent) => void }) {

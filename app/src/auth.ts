@@ -102,6 +102,48 @@ export async function completeLogin(cfg: OidcConfig): Promise<Session | null> {
   return session;
 }
 
+// --- magic link ------------------------------------------------------------
+// The primary sign-in path. OIDC above stays for when a social IdP is configured.
+
+/** Asks for a sign-in link. Always resolves — the server reports success whether or not the
+ * address is known, so that this cannot be used to probe for accounts. */
+export async function requestMagicLink(email: string): Promise<void> {
+  const r = await fetch("/api/auth/magic-link", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ email }),
+  });
+  if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error ?? `sign-in failed (${r.status})`);
+}
+
+/** Redeems a token from the emailed link.
+ *
+ * POST, not a plain GET on the link itself: mail scanners fetch every URL in a message, and
+ * a GET that consumed the token would let the scanner burn it before the recipient clicks.
+ * The link opens this page; this call redeems it. */
+export async function verifyMagicLink(token: string): Promise<Session> {
+  const r = await fetch("/api/auth/verify", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ token }),
+  });
+  if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error ?? "that link is invalid or has expired");
+  const t = (await r.json()) as { token: string; expiresIn: number };
+  const session: Session = { accessToken: t.token, expiresAt: Date.now() + t.expiresIn * 1000 };
+  save(session);
+  return session;
+}
+
+/** True when the browser is on the link-verification route. */
+export function isVerifyRoute(): string | null {
+  if (window.location.pathname !== "/auth/verify") return null;
+  return new URLSearchParams(window.location.search).get("token");
+}
+
+export function clearUrl(): void {
+  window.history.replaceState({}, "", "/");
+}
+
 export function save(s: Session): void {
   // sessionStorage, not localStorage: the token dies with the tab. On a shared or borrowed
   // phone that is the difference between a session and a standing grant.
