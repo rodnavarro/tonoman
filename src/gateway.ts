@@ -14,6 +14,9 @@ import type { Config, AgentConfig } from "./config";
 import { validate } from "./config";
 import { TelegramConnector } from "./connector/telegram";
 import { TeamsConnector } from "./connector/teams";
+import { AppConnector } from "./connector/app";
+import { MultiConnector } from "./connector/multi";
+import { JwksVerifier, type TokenVerifier } from "./cloudauth";
 import type { Connector, Envelope, MemoryStore } from "./core/contracts";
 import { Registry as HarnessRegistry, type Spec } from "./harness";
 import * as claudecode from "./harness/claudecode";
@@ -374,8 +377,12 @@ async function runAgent(
   // the chosen channel's credentials are present. The harness/router/queue downstream are
   // channel-neutral — only this instantiation differs.
   const isTeams = (ra.cfg.channel ?? (ra.cfg.teams ? "teams" : "telegram")) === "teams";
+  const chatOnly = Boolean(ra.cfg.app && !ra.cfg.teams && !ra.cfg.telegram); // app-only agent
   let conn: Connector;
-  if (isTeams) {
+  if (chatOnly) {
+    // No chat platform configured — the app is this agent's only channel. Built below.
+    conn = undefined as unknown as Connector;
+  } else if (isTeams) {
     const tm = ra.cfg.teams!;
     // app_password is a SECRET (cfg-no-secrets): prefer it injected via env at run time,
     // fall back to the roster field for dev. Error clearly if neither is present.
@@ -412,6 +419,37 @@ async function runAgent(
       mediaDir: tg.media_dir,
       mediaMount: tg.media_mount,
     });
+  }
+
+  // The Tonoman app channel (channel-app) is ADDITIVE: an agent keeps the chat platform it
+  // already had and gains the app surface alongside it, fanned in by MultiConnector. The
+  // chat platform stays FIRST in the list so it remains the fallback for a reply on a
+  // conversation we have not seen inbound (see multi.ts).
+  if (ra.cfg.app) {
+    const ac = ra.cfg.app;
+    // A gateway with no jwks_url serves an OPEN api. AppConnector warns at startup; we
+    // refuse it outright when the listener is not loopback-only, because an unauthenticated
+    // agent API on a routable address is a remote-code-execution surface, not a dev nicety.
+    let verifier: TokenVerifier | undefined;
+    if (ac.jwks_url) {
+      verifier = new JwksVerifier({ jwksUrl: ac.jwks_url, issuer: ac.issuer, audience: ac.gateway_id });
+    } else if (process.env.TONOMAN_APP_INSECURE === "1") {
+      verifier = undefined; // explicit, local-only opt-out
+    } else {
+      throw new Error(
+        `app: agent "${rec.name}" has no app.jwks_url — the app API would be unauthenticated. ` +
+          `Set app.jwks_url, or set TONOMAN_APP_INSECURE=1 to accept an open API for local development.`,
+      );
+    }
+    const appConn = new AppConnector({
+      port: ac.port ?? 3980,
+      mediaDir: ac.media_dir || path.join(rec.memory_root, "media"),
+      mediaMount: ac.media_mount,
+      agent: { name: rec.name, role: ra.cfg.role },
+      verifier,
+      allowedOrigins: ac.allowed_origins,
+    });
+    conn = chatOnly ? appConn : new MultiConnector([conn, appConn]);
   }
 
   // Wrap the harness runner with a live-turn tap (gw-command-btw): the snapshot it keeps

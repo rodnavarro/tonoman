@@ -53,6 +53,30 @@ export interface Teams {
   working_cue?: "message" | "card";
 }
 
+/** One agent's Tonoman app connector wiring (channel-app). This is ADDITIVE: an agent with
+ * an `app` block keeps its telegram/teams channel and gains the app surface alongside it
+ * (MultiConnector), because the app is a control panel beside the chat platform, not a
+ * replacement for it. */
+export interface AppChannel {
+  /** listen port for the app API; default 3980. */
+  port?: number;
+  media_dir?: string;
+  media_mount?: string;
+  /** Tonoman Cloud's key set, e.g. https://app.axiplex.com/api/.well-known/jwks.json.
+   * OMITTING this leaves the app API UNAUTHENTICATED — development only; the gateway logs
+   * a warning at startup and it must never be omitted in a deployment. */
+  jwks_url?: string;
+  /** required `iss` on client tokens (the cloud's issuer URL). */
+  issuer?: string;
+  /** required `aud` on client tokens — THIS gateway's id in the cloud registry. A token
+   * minted for another gateway must not be accepted here. */
+  gateway_id?: string;
+  /** browser origins allowed to call this API (the cloud app's origin). The client talks
+   * to the gateway directly — the cloud is a directory, not a relay — so this is a real
+   * cross-origin call. */
+  allowed_origins?: string[];
+}
+
 /** One agent's git-backed memory substrate (A3). The push `token` is a SECRET — it is
  * NOT written by the CLI and should be supplied via env at gateway-run time, never
  * committed (cfg-no-secrets); `set memory git` only manages the non-secret fields. */
@@ -110,6 +134,9 @@ export interface AgentConfig {
   /** MS Teams connector wiring for a turn-driven agent (channel-teams). Mutually
    * exclusive with `telegram` per agent. */
   teams?: Teams;
+  /** Tonoman app connector (channel-app). ADDITIVE — it does not replace `telegram`/`teams`;
+   * an agent with both is served over both (MultiConnector). */
+  app?: AppChannel;
   workspace?: Workspace;
   // --- Service-mode (svc-self-channeled / svc-config-env) ----------------------
   /** Service agent: Tonoman boots + lifecycle-manages a long-lived self-channeled server
@@ -234,8 +261,10 @@ function applyDefaults(c: Config): void {
     if (a.max_turns == null) a.max_turns = 10;
     if (!a.name) a.name = "agent";
     // Infer the channel from which connector block is present (channel-teams); a service
-    // agent owns its own channel, so leave it unset.
+    // agent owns its own channel, so leave it unset. `app` is deliberately NOT considered
+    // here — it is additive (channel-app), so it never becomes the inferred primary channel.
     if (!a.service && !a.channel) a.channel = a.teams ? "teams" : "telegram";
+    if (a.app && a.app.port == null) a.app.port = 3980;
   }
 }
 
@@ -253,7 +282,9 @@ export function validate(c: Config): void {
     // A turn-driven agent needs its channel's credentials: telegram.token, or — for a
     // Teams agent (channel-teams) — teams.app_id + teams.tenant_id (app_password is a
     // secret injected at run time, so it is not required in the roster file).
-    if (!a.service) {
+    // An `app`-only agent is legitimate (reachable solely from the Tonoman client), so a
+    // missing telegram/teams block is only an error when `app` is absent too.
+    if (!a.service && !(a.app && !a.teams && !a.telegram)) {
       const ch = a.channel ?? (a.teams ? "teams" : "telegram");
       if (ch === "teams") {
         if (!a.teams?.app_id) missing.push("teams.app_id");
