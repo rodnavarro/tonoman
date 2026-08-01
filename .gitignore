@@ -17,6 +17,10 @@ go.work.sum
 npm-debug.log*
 *.tsbuildinfo
 
+# The client app (app/) builds and installs independently of the engine.
+/app/node_modules/
+/app/dist/
+
 # Secrets — never commit (cfg-no-secrets). Only *.example.* is tracked (cfg-per-agent).
 .env
 *.env
