@@ -62,7 +62,7 @@ export interface AppChannel {
   port?: number;
   media_dir?: string;
   media_mount?: string;
-  /** Tonoman Cloud's key set, e.g. https://app.axiplex.com/api/.well-known/jwks.json.
+  /** Tonoman Cloud's key set, e.g. https://cloud.tonoman.com/api/.well-known/jwks.json.
    * OMITTING this leaves the app API UNAUTHENTICATED — development only; the gateway logs
    * a warning at startup and it must never be omitted in a deployment. */
   jwks_url?: string;

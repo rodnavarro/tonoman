@@ -22,7 +22,7 @@ async function start(opts?: { mediaMount?: string }) {
     mediaDir: dir,
     mediaMount: opts?.mediaMount,
     agent: { name: "sapien", role: "the axiplex agent" },
-    allowedOrigins: ["https://app.axiplex.com"],
+    allowedOrigins: ["https://cloud.tonoman.com"],
     // no verifier => open API (the dev path); auth itself is covered in cloudauth.test.ts
   });
   const ac = new AbortController();
@@ -143,8 +143,8 @@ describe("AppConnector — the client surface (channel-app)", () => {
 
   it("only sends CORS headers to an allow-listed origin", async () => {
     const { base } = await start();
-    const ok = await fetch(`${base}/api/agents`, { headers: { origin: "https://app.axiplex.com" } });
-    expect(ok.headers.get("access-control-allow-origin")).toBe("https://app.axiplex.com");
+    const ok = await fetch(`${base}/api/agents`, { headers: { origin: "https://cloud.tonoman.com" } });
+    expect(ok.headers.get("access-control-allow-origin")).toBe("https://cloud.tonoman.com");
     const bad = await fetch(`${base}/api/agents`, { headers: { origin: "https://evil.test" } });
     expect(bad.headers.get("access-control-allow-origin")).toBeNull();
   });

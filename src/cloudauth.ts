@@ -39,7 +39,7 @@ const MIN_REFETCH_MS = 60_000;
 const MAX_KEY_AGE_MS = 10 * 60_000;
 
 export interface JwksVerifierOptions {
-  /** the cloud's key set, e.g. https://app.axiplex.com/api/.well-known/jwks.json */
+  /** the cloud's key set, e.g. https://cloud.tonoman.com/api/.well-known/jwks.json */
   jwksUrl: string;
   /** required `iss`. Omit only in tests. */
   issuer?: string;
