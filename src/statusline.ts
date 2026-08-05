@@ -130,6 +130,9 @@ function modelLabel(u: TurnUsage, model?: string): string | undefined {
 export function renderSmall(u: TurnUsage, model: string | undefined, windows: UsageWindow[], now: number = Date.now()): string {
   const ml = modelLabel(u, model);
   const parts = [`📊${ml ? " " + ml : ""}`, `${compactTokens(totalTokens(u))} tok`, `ctx ${contextPercent(u)}%`];
+  // Agentic iterations the turn took (⟳ N), when the harness reports it — shows how hard the turn
+  // worked and how close it ran to its step cap (gw-command-statusline / 40-turn cap).
+  if (u.iterationsUsed != null) parts.push(`⟳ ${u.iterationsUsed}`);
   if (windows.length) parts.push(windowsLine(windows, now));
   return parts.join(" · ");
 }
@@ -145,6 +148,7 @@ export function renderFull(u: TurnUsage, model: string | undefined, windows: Usa
     `• output: ${grouped(u.outputTokens || 0)}`,
     `• context: ${contextPercent(u)}% of ${compactTokens(contextWindow(u))}`,
   ];
+  if (u.iterationsUsed != null) lines.push(`• iterations: ${u.iterationsUsed}`);
   lines.push(renderWindows(windows, now));
   return lines.join("\n");
 }

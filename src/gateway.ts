@@ -17,6 +17,7 @@ import { TeamsConnector } from "./connector/teams";
 import type { Connector, Envelope, MemoryStore } from "./core/contracts";
 import { Registry as HarnessRegistry, type Spec } from "./harness";
 import * as claudecode from "./harness/claudecode";
+import * as codex from "./harness/codex";
 import * as httpRunner from "./harness/httpRunner";
 import * as hermes from "./harness/hermes";
 import * as health from "./health";
@@ -100,7 +101,7 @@ export function handleBackendControl(
  * so `tonoman create agent` resolves a harness's spec (image, config-home, identity) from
  * the same registry the gateway runs on. */
 export function defaultHarnesses(): HarnessRegistry {
-  return new HarnessRegistry().add(claudecode.spec()).add(httpRunner.spec()).add(hermes.spec());
+  return new HarnessRegistry().add(claudecode.spec()).add(codex.spec()).add(httpRunner.spec()).add(hermes.spec());
 }
 
 interface ResolvedAgent {
@@ -463,9 +464,11 @@ async function runAgent(
       ? remoteAccountUsageCached(usageKey, ra.cfg.url ?? "", process.env.AGENT_RUNTIME_TOKEN)
       : accountUsageCached(rec.container, ra.spec.credFile!);
 
-  // /statusline mode (gw-command-statusline): per-conversation, default none, survives /new,
-  // resets on restart (like /model). v0.1 single-agent ⇒ one holder per agent.
-  let statusMode: StatusMode = "none";
+  // /statusline mode (gw-command-statusline): per-conversation, survives /new, resets on restart
+  // (like /model). Default is "small" (a compact per-turn footer is shown by default); override the
+  // startup default with TONOMAN_STATUSLINE=none|small|full. `/statusline <mode>` still switches live.
+  const envMode = process.env.TONOMAN_STATUSLINE;
+  let statusMode: StatusMode = envMode === "none" || envMode === "full" || envMode === "small" ? envMode : "small";
   const statusControl: StatusControl = {
     get: () => statusMode,
     set: (m) => void (statusMode = m),

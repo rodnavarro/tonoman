@@ -43,6 +43,10 @@ export interface TurnUsage {
   /** that model's real context window in tokens (e.g. 1_000_000 for an opus 1M variant),
    * so context % isn't a hardcoded 200k guess. */
   contextWindow?: number;
+  /** how many agentic steps (tool/model iterations) the turn actually took, when the harness
+   * reports it (claude-code num_turns; codex counts its tool/command items). Shown in the
+   * statusline so the operator sees how hard a turn worked / how close it ran to the cap. */
+  iterationsUsed?: number;
 }
 
 /** One normalized event emitted by a harness turn (A2). */

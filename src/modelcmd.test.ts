@@ -16,8 +16,14 @@ describe("validateModelName — /model is validated at command time (gw-command-
     expect(validateModelName("Claude-Haiku-4-5-20251001")).toEqual({ ok: true, model: "claude-haiku-4-5-20251001" });
   });
 
+  it("accepts the codex tiers (dual-harness): sol/terra/luna aliases + gpt-* slugs", () => {
+    for (const a of ["sol", "terra", "luna"]) expect(validateModelName(a)).toEqual({ ok: true, model: a });
+    expect(validateModelName("gpt-5.6-sol")).toEqual({ ok: true, model: "gpt-5.6-sol" });
+    expect(validateModelName("GPT-5.6-Terra")).toEqual({ ok: true, model: "gpt-5.6-terra" });
+  });
+
   it("rejects junk immediately, listing the valid options (no cryptic failed turn later)", () => {
-    const r = validateModelName("gpt-4");
+    const r = validateModelName("banana-4");
     expect(r.ok).toBe(false);
     if (!r.ok) {
       expect(r.error).toContain("Unknown model");
@@ -26,6 +32,7 @@ describe("validateModelName — /model is validated at command time (gw-command-
     }
     expect(validateModelName("opusy").ok).toBe(false); // near-miss is still a miss
     expect(validateModelName("claude-").ok).toBe(false); // bare prefix is not an id
+    expect(validateModelName("gpt-").ok).toBe(false); // bare prefix is not an id
   });
 
   it("treats empty as a usage hint, not a model", () => {
