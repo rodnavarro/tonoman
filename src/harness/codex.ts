@@ -345,68 +345,103 @@ export function mapUsage(u: CodexUsage | undefined, model: string | undefined): 
 }
 
 // --- account usage window (5h/7d) — the codex equivalent of claude's OAuth-usage API ------------
-// codex exec --json does NOT surface rate limits, but the ChatGPT backend exposes them at
-// /backend-api/codex/usage (the same data the codex TUI shows). Reading usage (not inference) with
-// the account's own OAuth token mirrors exactly what the claude statusline does against Anthropic's
-// oauth/usage endpoint. Requires the chatgpt-account-id header + a codex-style UA (a bare bearer 403s).
+// codex exec --json doesn't surface rate limits, and the ChatGPT /codex/usage HTTP endpoint is
+// Cloudflare-bot-blocked for headless clients (403 challenge page). But codex WRITES the rate limits
+// it receives on every turn into its session rollout log (CODEX_HOME/sessions/.../rollout-*.jsonl).
+// Reading that file is network-free, always current, and ToS-clean (it's codex's own state, no API
+// call) — the analog of the claude statusline's 5h/7d window. (Our Runner never uses --ephemeral, so
+// the rollout is always persisted.)
 
-const CODEX_UA = `codex_cli_rs/${process.env.CODEX_CLI_VERSION || "0.146.0"}`;
-
-/** Map one ChatGPT rate-limit window to a neutral UsageWindow. 18000s→"5h", 604800s→"7d". */
-function windowKey(secs: number): string {
-  if (secs === 18000) return "5h";
-  if (secs === 604800) return "7d";
-  if (secs >= 86400) return `${Math.round(secs / 86400)}d`;
-  return `${Math.round(secs / 3600)}h`;
+interface CodexRateWindow {
+  used_percent?: number;
+  window_minutes?: number;
+  resets_at?: number;
 }
 
-/** Parse the /codex/usage payload into 5h/7d UsageWindows (gw-command-statusline). Pure + testable. */
-export function parseCodexUsage(payload: unknown): UsageWindow[] {
-  const rl = ((payload ?? {}) as Record<string, unknown>).rate_limit as
-    | { primary_window?: CodexWindow; secondary_window?: CodexWindow }
-    | undefined;
+/** Map codex's `rate_limits` (primary/secondary) to neutral UsageWindows. 300min→"5h", 10080→"7d".
+ * Shorter window first (the one that bites soonest). Pure + testable. */
+export function parseCodexRateLimits(rl: { primary?: CodexRateWindow; secondary?: CodexRateWindow } | undefined): UsageWindow[] {
   if (!rl) return [];
+  const key = (m: number): string =>
+    m === 300 ? "5h" : m === 10080 ? "7d" : m >= 1440 ? `${Math.round(m / 1440)}d` : `${Math.round(m / 60)}h`;
   const out: UsageWindow[] = [];
-  for (const w of [rl.primary_window, rl.secondary_window]) {
-    if (!w || w.limit_window_seconds == null) continue;
+  for (const w of [rl.primary, rl.secondary]) {
+    if (!w || w.window_minutes == null) continue;
     out.push({
-      key: windowKey(w.limit_window_seconds),
+      key: key(w.window_minutes),
       usedPct: Math.round(w.used_percent ?? 0),
-      resetAt: w.reset_at ? new Date(w.reset_at * 1000).toISOString() : undefined,
+      resetAt: w.resets_at ? new Date(w.resets_at * 1000).toISOString() : undefined,
     });
   }
-  // Show the shorter window first (5h before 7d) — the one that bites soonest.
   return out.sort((a, b) => (a.key.endsWith("h") ? 0 : 1) - (b.key.endsWith("h") ? 0 : 1));
 }
 
-interface CodexWindow {
-  used_percent?: number;
-  limit_window_seconds?: number;
-  reset_after_seconds?: number;
-  reset_at?: number;
+/** Recursively find a `rate_limits` object anywhere in a parsed rollout line. */
+function findRateLimits(o: unknown): { primary?: CodexRateWindow; secondary?: CodexRateWindow } | null {
+  if (!o || typeof o !== "object") return null;
+  const rec = o as Record<string, unknown>;
+  if (rec.rate_limits && typeof rec.rate_limits === "object") return rec.rate_limits as never;
+  for (const k of Object.keys(rec)) {
+    const r = findRateLimits(rec[k]);
+    if (r) return r;
+  }
+  return null;
 }
 
-/** Fetch the codex account's usage windows from CODEX_HOME/auth.json. Returns [] on any failure
- * (missing cred / non-OAuth / network) — never throws, never logs the token. */
+/** Newest rollout-*.jsonl under CODEX_HOME/sessions (recursive), by mtime. */
+function latestRolloutFile(sessionsDir: string): string | undefined {
+  let best: string | undefined;
+  let bestM = -1;
+  const walk = (d: string): void => {
+    let ents;
+    try {
+      ents = fs.readdirSync(d, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of ents) {
+      const p = `${d}/${e.name}`;
+      if (e.isDirectory()) walk(p);
+      else if (e.name.startsWith("rollout-") && e.name.endsWith(".jsonl")) {
+        try {
+          const m = fs.statSync(p).mtimeMs;
+          if (m > bestM) {
+            bestM = m;
+            best = p;
+          }
+        } catch {
+          /* raced unlink */
+        }
+      }
+    }
+  };
+  walk(sessionsDir);
+  return best;
+}
+
+/** The codex account's 5h/7d usage windows, read from the latest session rollout log. Returns []
+ * when no turn has run yet (no rollout) or on any failure — never throws. Named `fetchCodexUsage`
+ * (async) to match the /usage caller, though it's a local file read (no network). */
 export async function fetchCodexUsage(codexHomeDir: string = CONFIG_HOME): Promise<UsageWindow[]> {
   try {
-    const a = JSON.parse(fs.readFileSync(`${codexHomeDir}/auth.json`, "utf8")) as {
-      tokens?: { access_token?: string; account_id?: string; chatgpt_account_id?: string };
-    };
-    const tok = a?.tokens?.access_token;
-    const acct = a?.tokens?.account_id || a?.tokens?.chatgpt_account_id || "";
-    if (!tok) return [];
-    const res = await fetch("https://chatgpt.com/backend-api/codex/usage", {
-      headers: {
-        Authorization: `Bearer ${tok}`,
-        "chatgpt-account-id": acct,
-        "User-Agent": CODEX_UA,
-        originator: "codex_cli_rs",
-        Accept: "application/json",
-      },
-    });
-    if (!res.ok) return [];
-    return parseCodexUsage(await res.json());
+    const f = latestRolloutFile(`${codexHomeDir}/sessions`);
+    if (!f) return [];
+    const lines = fs.readFileSync(f, "utf8").split("\n");
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (!lines[i].includes('"rate_limits"')) continue;
+      let o: unknown;
+      try {
+        o = JSON.parse(lines[i]);
+      } catch {
+        continue;
+      }
+      const rl = findRateLimits(o);
+      if (rl) {
+        const w = parseCodexRateLimits(rl);
+        if (w.length) return w;
+      }
+    }
+    return [];
   } catch {
     return [];
   }

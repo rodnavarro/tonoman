@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseLine, mapUsage, normalizeModel, shortModel, localEnv, identityPreamble, parseCodexUsage, CODEX_CONTEXT_WINDOW } from "./codex";
+import { parseLine, mapUsage, normalizeModel, shortModel, localEnv, identityPreamble, parseCodexRateLimits, CODEX_CONTEXT_WINDOW } from "./codex";
 
 describe("codex harness — model normalization (gw-command-model)", () => {
   it("maps the friendly tier aliases to gpt-5.6 slugs, passes slugs/unknowns through", () => {
@@ -46,21 +46,19 @@ describe("codex harness — event parsing (the --json stream → neutral TurnEve
 });
 
 describe("codex harness — account usage window (5h/7d, like claude's statusline)", () => {
-  it("maps ChatGPT rate_limit windows to neutral UsageWindows, 5h before 7d", () => {
-    const w = parseCodexUsage({
-      rate_limit: {
-        primary_window: { used_percent: 3, limit_window_seconds: 604800, reset_at: 1786507094 },
-        secondary_window: { used_percent: 41, limit_window_seconds: 18000, reset_at: 1786500000 },
-      },
+  it("maps codex rate_limits (rollout format) to neutral UsageWindows, 5h before 7d", () => {
+    const w = parseCodexRateLimits({
+      primary: { used_percent: 3, window_minutes: 10080, resets_at: 1786507094 },
+      secondary: { used_percent: 41, window_minutes: 300, resets_at: 1786500000 },
     });
     expect(w.map((x) => x.key)).toEqual(["5h", "7d"]); // shorter window first
     const five = w.find((x) => x.key === "5h")!;
     expect(five.usedPct).toBe(41);
     expect(five.resetAt).toBe(new Date(1786500000 * 1000).toISOString());
   });
-  it("returns [] when there is no rate_limit (never throws)", () => {
-    expect(parseCodexUsage({})).toEqual([]);
-    expect(parseCodexUsage(null)).toEqual([]);
+  it("returns [] when there is no rate_limits (never throws)", () => {
+    expect(parseCodexRateLimits(undefined)).toEqual([]);
+    expect(parseCodexRateLimits({})).toEqual([]);
   });
 });
 
