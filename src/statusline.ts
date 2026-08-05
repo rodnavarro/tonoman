@@ -113,7 +113,7 @@ const windowsLine = (windows: UsageWindow[], now: number): string =>
  * Reused by `renderFull` and the on-demand `/statusline print` (gw-command-statusline). */
 export function renderWindows(windows: UsageWindow[], now: number): string {
   if (!windows.length) return "📈 account usage: n/a";
-  const lines = ["📈 Claude account"];
+  const lines = ["📈 Account usage"];
   for (const w of windows) {
     const reset = fmtReset(w.resetAt, now);
     lines.push(`• ${w.key}: ${w.usedPct}% used${reset ? ` · resets ${reset}` : ""}`);

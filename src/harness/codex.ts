@@ -22,6 +22,7 @@ import * as fs from "node:fs";
 import * as readline from "node:readline";
 import type { TurnEvent, TurnRequest, TurnRunner, TurnUsage } from "../core/contracts";
 import type { Spec, RunnerParams, EphemeralParams } from "../harness";
+import type { UsageWindow } from "../statusline";
 
 /** The harness key used in agent config. */
 export const KIND = "codex";
@@ -211,8 +212,10 @@ export class Runner implements TurnRunner {
             break;
           }
         } else if (ev.kind === "done") {
-          // turn.completed: carries usage only; the final text is what we accumulated.
+          // turn.completed: carries usage only; the final text is what we accumulated. codex's
+          // turn.completed omits the model name, so stamp it from our own model knob (statusline).
           usage = ev.usage;
+          if (usage && !usage.model) usage.model = shortModel(this.model);
         } else if (ev.kind === "error") {
           yield ev;
           signal?.removeEventListener("abort", onAbort);
@@ -339,6 +342,74 @@ export function mapUsage(u: CodexUsage | undefined, model: string | undefined): 
     model: shortModel(model),
     contextWindow: CODEX_CONTEXT_WINDOW,
   };
+}
+
+// --- account usage window (5h/7d) — the codex equivalent of claude's OAuth-usage API ------------
+// codex exec --json does NOT surface rate limits, but the ChatGPT backend exposes them at
+// /backend-api/codex/usage (the same data the codex TUI shows). Reading usage (not inference) with
+// the account's own OAuth token mirrors exactly what the claude statusline does against Anthropic's
+// oauth/usage endpoint. Requires the chatgpt-account-id header + a codex-style UA (a bare bearer 403s).
+
+const CODEX_UA = `codex_cli_rs/${process.env.CODEX_CLI_VERSION || "0.146.0"}`;
+
+/** Map one ChatGPT rate-limit window to a neutral UsageWindow. 18000s→"5h", 604800s→"7d". */
+function windowKey(secs: number): string {
+  if (secs === 18000) return "5h";
+  if (secs === 604800) return "7d";
+  if (secs >= 86400) return `${Math.round(secs / 86400)}d`;
+  return `${Math.round(secs / 3600)}h`;
+}
+
+/** Parse the /codex/usage payload into 5h/7d UsageWindows (gw-command-statusline). Pure + testable. */
+export function parseCodexUsage(payload: unknown): UsageWindow[] {
+  const rl = ((payload ?? {}) as Record<string, unknown>).rate_limit as
+    | { primary_window?: CodexWindow; secondary_window?: CodexWindow }
+    | undefined;
+  if (!rl) return [];
+  const out: UsageWindow[] = [];
+  for (const w of [rl.primary_window, rl.secondary_window]) {
+    if (!w || w.limit_window_seconds == null) continue;
+    out.push({
+      key: windowKey(w.limit_window_seconds),
+      usedPct: Math.round(w.used_percent ?? 0),
+      resetAt: w.reset_at ? new Date(w.reset_at * 1000).toISOString() : undefined,
+    });
+  }
+  // Show the shorter window first (5h before 7d) — the one that bites soonest.
+  return out.sort((a, b) => (a.key.endsWith("h") ? 0 : 1) - (b.key.endsWith("h") ? 0 : 1));
+}
+
+interface CodexWindow {
+  used_percent?: number;
+  limit_window_seconds?: number;
+  reset_after_seconds?: number;
+  reset_at?: number;
+}
+
+/** Fetch the codex account's usage windows from CODEX_HOME/auth.json. Returns [] on any failure
+ * (missing cred / non-OAuth / network) — never throws, never logs the token. */
+export async function fetchCodexUsage(codexHomeDir: string = CONFIG_HOME): Promise<UsageWindow[]> {
+  try {
+    const a = JSON.parse(fs.readFileSync(`${codexHomeDir}/auth.json`, "utf8")) as {
+      tokens?: { access_token?: string; account_id?: string; chatgpt_account_id?: string };
+    };
+    const tok = a?.tokens?.access_token;
+    const acct = a?.tokens?.account_id || a?.tokens?.chatgpt_account_id || "";
+    if (!tok) return [];
+    const res = await fetch("https://chatgpt.com/backend-api/codex/usage", {
+      headers: {
+        Authorization: `Bearer ${tok}`,
+        "chatgpt-account-id": acct,
+        "User-Agent": CODEX_UA,
+        originator: "codex_cli_rs",
+        Accept: "application/json",
+      },
+    });
+    if (!res.ok) return [];
+    return parseCodexUsage(await res.json());
+  } catch {
+    return [];
+  }
 }
 
 /** The Codex harness plug for the roster registry (A11). */

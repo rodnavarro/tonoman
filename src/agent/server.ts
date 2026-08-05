@@ -265,18 +265,21 @@ async function handleUsage(req: http.IncomingMessage, res: http.ServerResponse, 
     res.end('{"error":"unauthorized"}\n');
     return;
   }
-  // The account-headroom window is a Claude-subscription concept (Anthropic OAuth usage API);
-  // codex/ChatGPT exposes no equivalent, so a codex agent reports { windows: [] } and its
-  // statusline shows per-turn tokens + iterations instead. Read the CLAUDE credential regardless
-  // of the pod's default harness, so a dual agent still surfaces its Claude headroom.
-  const credFile = opts.credFile ?? `${claudecode.CONFIG_HOME}/.credentials.json`;
+  // Account-headroom windows (5h/7d): read from the ACTIVE harness's own usage source — codex from
+  // the ChatGPT /codex/usage endpoint, claude from Anthropic's OAuth-usage API. Both read usage (not
+  // inference) with the account's own token. So a codex agent shows the same 5h/7d window as claude.
   let windows: import("../statusline").UsageWindow[] = [];
-  try {
-    const raw = await fs.readFile(credFile, "utf8");
-    const token = (JSON.parse(raw).claudeAiOauth?.accessToken as string) || null;
-    if (token) windows = await fetchAccountUsage(token);
-  } catch {
-    /* missing cred / bad json / not OAuth → [] */
+  if (activeHarness() === "codex") {
+    windows = await codex.fetchCodexUsage(process.env.CODEX_HOME || codex.CONFIG_HOME);
+  } else {
+    const credFile = opts.credFile ?? `${claudecode.CONFIG_HOME}/.credentials.json`;
+    try {
+      const raw = await fs.readFile(credFile, "utf8");
+      const token = (JSON.parse(raw).claudeAiOauth?.accessToken as string) || null;
+      if (token) windows = await fetchAccountUsage(token);
+    } catch {
+      /* missing cred / bad json / not OAuth → [] */
+    }
   }
   res.writeHead(200, { "content-type": "application/json" });
   res.end(JSON.stringify({ windows }) + "\n");
