@@ -7,9 +7,14 @@
 /** Friendly model aliases the Claude Code CLI accepts directly. */
 export const KNOWN_ALIASES = ["sonnet", "opus", "haiku"] as const;
 
+/** Codex tier aliases (gw-command-model): a dual-harness agent (codex + claude in one image)
+ * switches harness by model, so `/model` accepts these too and the agent server routes sol/terra/
+ * luna to the codex Runner. Full `gpt-*` slugs (e.g. gpt-5.6-sol) are also accepted. */
+export const CODEX_ALIASES = ["sol", "terra", "luna"] as const;
+
 /** Human-facing list of what `/model` accepts (shown on a rejected name). */
 export function modelHint(): string {
-  return `${KNOWN_ALIASES.join(", ")}, or a full claude-* id (e.g. claude-opus-4-8)`;
+  return `${KNOWN_ALIASES.join(", ")}, ${CODEX_ALIASES.join(", ")}, or a full claude-*/gpt-* id (e.g. claude-opus-4-8, gpt-5.6-sol)`;
 }
 
 export type ModelValidation = { ok: true; model: string } | { ok: false; error: string };
@@ -21,8 +26,10 @@ export function validateModelName(raw: string): ModelValidation {
   const name = (raw ?? "").trim().toLowerCase();
   if (!name) return { ok: false, error: `Usage: /model <name> — ${modelHint()}` };
   if ((KNOWN_ALIASES as readonly string[]).includes(name)) return { ok: true, model: name };
-  // Full model ids: claude-<family>-<version> (letters, digits, dots, dashes).
+  if ((CODEX_ALIASES as readonly string[]).includes(name)) return { ok: true, model: name };
+  // Full model ids: claude-<family>-<version> or gpt-<version>-<tier> (letters, digits, dots, dashes).
   if (/^claude-[a-z0-9][a-z0-9.\-]*$/.test(name)) return { ok: true, model: name };
+  if (/^gpt-[a-z0-9][a-z0-9.\-]*$/.test(name)) return { ok: true, model: name };
   return { ok: false, error: `Unknown model "${raw.trim()}". Valid: ${modelHint()}` };
 }
 

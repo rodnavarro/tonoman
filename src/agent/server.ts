@@ -30,11 +30,38 @@ import { promises as fs } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { execFile, spawn } from "node:child_process";
-import { Runner, CONFIG_HOME, spec } from "../harness/claudecode";
+import * as claudecode from "../harness/claudecode";
+import * as codex from "../harness/codex";
 import type { BackendMode } from "../harness/claudecode";
+import type { Spec } from "../harness";
 import type { TurnEvent, TurnRequest, TurnRunner } from "../core/contracts";
 import { fetchAccountUsage } from "../statusline";
 import { extractAuthUrl, looksLoggedIn } from "../authflow";
+
+// This ONE agent binary can drive EITHER harness — the dual-harness image bakes both `claude`
+// and `codex`, and both subscription credentials are mounted. The pod's DEFAULT harness is set
+// by TONOMAN_HARNESS (default "claude-code"); it decides /health, /auth and /usage (which hold
+// a harness's credential + login), and the runner used when a turn carries no model override.
+function activeHarness(): "codex" | "claude-code" {
+  return process.env.TONOMAN_HARNESS === "codex" ? "codex" : "claude-code";
+}
+/** The active harness's Spec (loginArgs/statusArgs/credFile/bin), for /auth + /health + /usage. */
+function activeSpec(): Spec {
+  return activeHarness() === "codex" ? codex.spec() : claudecode.spec();
+}
+/** Default CLI binary for the active harness (version probe). */
+function activeBin(): string {
+  return activeHarness() === "codex" ? "codex" : "claude";
+}
+
+/** Which harness a model name belongs to — lets `/model` switch harness per turn (default codex
+ * `sol`, `/model opus` hops to claude), since the pod holds both CLIs + both credentials. */
+function isClaudeModel(m: string | undefined): boolean {
+  return !!m && (["sonnet", "opus", "haiku"].includes(m) || /^claude-/.test(m));
+}
+function isCodexModel(m: string | undefined): boolean {
+  return !!m && (["sol", "terra", "luna"].includes(m) || /^gpt-/.test(m));
+}
 
 export interface RuntimeOptions {
   /** listen port; 0 lets the OS pick (tests read server.address().port). */
@@ -175,9 +202,20 @@ export function encodeEvent(ev: TurnEvent): string {
   return JSON.stringify(wire);
 }
 
-/** Default runner factory: a local-exec claudecode Runner (spawns `claude` in THIS container). */
-const localRunner = (o: { model?: string; maxTurns?: number; backend?: BackendMode; disallowedTools?: string[] }): TurnRunner =>
-  new Runner({ local: true, model: o.model, maxTurns: o.maxTurns, backend: o.backend, disallowedTools: o.disallowedTools });
+/** Local-exec runner factory, routed by MODEL so `/model` can switch harness within one agent:
+ *  - a codex model (sol/terra/luna, gpt-*) → codex Runner (spawns `codex`)
+ *  - a claude model (sonnet/opus/haiku, claude-*) → claudecode Runner (spawns `claude`)
+ *  - no/unknown model → the pod's DEFAULT harness (TONOMAN_HARNESS), so a bare turn runs on the
+ *    configured default (e.g. codex `sol`) with no model flag.
+ * Both credentials are mounted and each Runner points at its own CONFIG_HOME, so the two never
+ * cross-contaminate. */
+const localRunner = (o: { model?: string; maxTurns?: number; backend?: BackendMode; disallowedTools?: string[] }): TurnRunner => {
+  const useCodex = isCodexModel(o.model) || (!o.model && activeHarness() === "codex");
+  if (useCodex && !isClaudeModel(o.model)) {
+    return new codex.Runner({ local: true, model: o.model, maxTurns: o.maxTurns });
+  }
+  return new claudecode.Runner({ local: true, model: o.model, maxTurns: o.maxTurns, backend: o.backend, disallowedTools: o.disallowedTools });
+};
 
 function readBody(req: http.IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -193,7 +231,7 @@ function readBody(req: http.IncomingMessage): Promise<string> {
   });
 }
 
-function claudeVersion(bin: string): Promise<string | null> {
+function binVersion(bin: string): Promise<string | null> {
   return new Promise((resolve) =>
     execFile(bin, ["--version"], { windowsHide: true, timeout: 5000 }, (err, so) =>
       resolve(err ? null : (so?.toString() ?? "").trim()),
@@ -202,7 +240,7 @@ function claudeVersion(bin: string): Promise<string | null> {
 }
 
 async function handleHealth(res: http.ServerResponse, opts: RuntimeOptions): Promise<void> {
-  const credFile = opts.credFile ?? `${CONFIG_HOME}/.credentials.json`;
+  const credFile = opts.credFile ?? activeSpec().credFile ?? `${claudecode.CONFIG_HOME}/.credentials.json`;
   let cred = false;
   let mtime: string | undefined;
   try {
@@ -212,10 +250,10 @@ async function handleHealth(res: http.ServerResponse, opts: RuntimeOptions): Pro
   } catch {
     /* missing → not healthy */
   }
-  const claude = await claudeVersion(opts.bin ?? "claude");
-  const ok = cred && !!claude;
+  const version = await binVersion(opts.bin ?? activeBin());
+  const ok = cred && !!version;
   res.writeHead(ok ? 200 : 503, { "content-type": "application/json" });
-  res.end(JSON.stringify({ ok, cred, mtime, claude }) + "\n");
+  res.end(JSON.stringify({ ok, cred, mtime, harness: activeHarness(), claude: version }) + "\n");
 }
 
 /** GET /usage — the agent reads its OWN OAuth token and reports account headroom (5h/7d) as
@@ -227,14 +265,21 @@ async function handleUsage(req: http.IncomingMessage, res: http.ServerResponse, 
     res.end('{"error":"unauthorized"}\n');
     return;
   }
-  const credFile = opts.credFile ?? `${CONFIG_HOME}/.credentials.json`;
+  // Account-headroom windows (5h/7d): read from the ACTIVE harness's own usage source — codex from
+  // the ChatGPT /codex/usage endpoint, claude from Anthropic's OAuth-usage API. Both read usage (not
+  // inference) with the account's own token. So a codex agent shows the same 5h/7d window as claude.
   let windows: import("../statusline").UsageWindow[] = [];
-  try {
-    const raw = await fs.readFile(credFile, "utf8");
-    const token = (JSON.parse(raw).claudeAiOauth?.accessToken as string) || null;
-    if (token) windows = await fetchAccountUsage(token);
-  } catch {
-    /* missing cred / bad json / not OAuth → [] */
+  if (activeHarness() === "codex") {
+    windows = await codex.fetchCodexUsage(process.env.CODEX_HOME || codex.CONFIG_HOME);
+  } else {
+    const credFile = opts.credFile ?? `${claudecode.CONFIG_HOME}/.credentials.json`;
+    try {
+      const raw = await fs.readFile(credFile, "utf8");
+      const token = (JSON.parse(raw).claudeAiOauth?.accessToken as string) || null;
+      if (token) windows = await fetchAccountUsage(token);
+    } catch {
+      /* missing cred / bad json / not OAuth → [] */
+    }
   }
   res.writeHead(200, { "content-type": "application/json" });
   res.end(JSON.stringify({ windows }) + "\n");
@@ -272,7 +317,7 @@ async function handleAuthLogin(req: http.IncomingMessage, res: http.ServerRespon
     res.end('{"error":"unauthorized"}\n');
     return;
   }
-  const loginArgs = opts.loginArgs ?? spec().loginArgs ?? [];
+  const loginArgs = opts.loginArgs ?? activeSpec().loginArgs ?? [];
   if (!loginArgs.length) {
     res.writeHead(501, { "content-type": "application/json" });
     res.end('{"error":"this harness defines no login command"}\n');
@@ -343,14 +388,14 @@ async function handleAuthCode(req: http.IncomingMessage, res: http.ServerRespons
     res.end('{"error":"no login in progress — start one with auth login --headless"}\n');
     return;
   }
-  const credFile = opts.credFile ?? `${CONFIG_HOME}/.credentials.json`;
+  const credFile = opts.credFile ?? activeSpec().credFile ?? `${claudecode.CONFIG_HOME}/.credentials.json`;
   const before = await credStamp(credFile);
 
   pendingLogin.child.stdin?.write(`${code}\n`);
   await new Promise((r) => setTimeout(r, opts.authSettleMs ?? 4500)); // exchange the code + write creds
 
   const after = await credStamp(credFile);
-  const statusArgs = opts.statusArgs ?? spec().statusArgs ?? [];
+  const statusArgs = opts.statusArgs ?? activeSpec().statusArgs ?? [];
   const status = statusArgs.length ? (await run(statusArgs[0], statusArgs.slice(1))).trim() : "";
   const authLog = opts.authLog ?? DEFAULT_AUTH_LOG;
   const loginTail = (await fs.readFile(authLog, "utf8").catch(() => "")).slice(-400);
@@ -371,7 +416,7 @@ async function handleAuthStatus(req: http.IncomingMessage, res: http.ServerRespo
     res.end('{"error":"unauthorized"}\n');
     return;
   }
-  const statusArgs = opts.statusArgs ?? spec().statusArgs ?? [];
+  const statusArgs = opts.statusArgs ?? activeSpec().statusArgs ?? [];
   const status = statusArgs.length ? (await run(statusArgs[0], statusArgs.slice(1))).trim() : "";
   res.writeHead(200, { "content-type": "application/json" });
   res.end(JSON.stringify({ loggedIn: looksLoggedIn(status), status }) + "\n");

@@ -314,7 +314,7 @@ describe("dispatchCommand /model — switch model, effect next turn (gw-command-
 
   it("rejects an invalid model at command time and does NOT change it", async () => {
     const s = setup("sonnet");
-    await run(s, "gpt-4");
+    await run(s, "banana-4");
     expect(s.current()).toBe("sonnet");
     expect(s.sent[0]).toContain("Unknown model");
     expect(s.sent[0]).toContain("sonnet"); // lists valid options
