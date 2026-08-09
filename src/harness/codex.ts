@@ -19,6 +19,7 @@
 
 import { spawn } from "node:child_process";
 import * as fs from "node:fs";
+import * as path from "node:path";
 import * as readline from "node:readline";
 import type { TurnEvent, TurnRequest, TurnRunner, TurnUsage } from "../core/contracts";
 import type { Spec, RunnerParams, EphemeralParams } from "../harness";
@@ -41,10 +42,71 @@ export const CONFIG_HOME = "/root/.codex";
  * the stdin prompt as a system preamble (see identityPreamble). */
 export const IDENTITY_HOME = "/root/agent";
 
-/** Best-effort context window for the gpt-5.6 codex tiers, for the statusline context %.
- * Not reported per-turn by codex; overridable via CODEX_CONTEXT_WINDOW. An estimate, not a
- * hard fact — correct it without a rebuild by setting the env. */
-export const CODEX_CONTEXT_WINDOW = Number(process.env.CODEX_CONTEXT_WINDOW || "400000");
+/** Explicit override, when set. Kept as the escape hatch it always was — but it is no longer the
+ * primary source, because codex publishes the real number (see modelContextWindow). */
+const CONTEXT_WINDOW_ENV = process.env.CODEX_CONTEXT_WINDOW ? Number(process.env.CODEX_CONTEXT_WINDOW) : undefined;
+
+/** Last-resort context window, used only when codex's own metadata is unreadable.
+ *
+ * Was 400_000 — a guess, and wrong. The gpt-5.6 tiers advertise a 272_000 raw window, but a turn
+ * only gets `effective_context_window_percent` of it (95), and 272_000 × 0.95 = 258_400 — exactly
+ * the `model_context_window` codex reports per turn in its own token_count event. So 258_400 is the
+ * number to divide by; the raw 272_000 still reads ~5% optimistic.
+ *
+ * Guessing HIGH is the dangerous direction either way: context % reads lower than reality and the
+ * window fills without warning. */
+export const CODEX_CONTEXT_WINDOW = CONTEXT_WINDOW_ENV ?? 258_400;
+
+/** Per-model EFFECTIVE context window, derived from codex's OWN metadata cache.
+ *
+ * codex writes `models_cache.json` into CODEX_HOME and keeps it current, each entry carrying
+ * `context_window` and `effective_context_window_percent`. Reading it is network-free and stays
+ * right when OpenAI changes a tier, instead of drifting until someone notices the statusline lying.
+ *
+ * Two traps, both confirmed against a live CODEX_HOME and the running agent:
+ *  - Use `context_window`, NOT `max_context_window`: gpt-5.4 advertises a 1M ceiling but a turn gets
+ *    272_000, and dividing by the ceiling puts context % ~3.7x under reality.
+ *  - Apply `effective_context_window_percent`: codex reserves the remainder, and its own per-turn
+ *    `model_context_window` is the post-percentage number (272_000 → 258_400). Skipping it leaves
+ *    the bar ~5% optimistic.
+ *
+ * Precedence: explicit env override → codex's metadata → CODEX_CONTEXT_WINDOW. Memoized on the
+ * file's mtime, so a refresh is picked up without a restart and without re-reading a 300KB file
+ * every turn. Any failure falls through to the constant — a statusline must never break a turn. */
+let windowCache: { mtimeMs: number; bySlug: Map<string, number> } | undefined;
+
+export function modelContextWindow(model: string | undefined, home: string = process.env.CODEX_HOME || CONFIG_HOME): number {
+  if (CONTEXT_WINDOW_ENV) return CONTEXT_WINDOW_ENV;
+  const slug = normalizeModel(model);
+  if (!slug) return CODEX_CONTEXT_WINDOW;
+  try {
+    const file = path.join(home, "models_cache.json");
+    const { mtimeMs } = fs.statSync(file);
+    if (windowCache?.mtimeMs !== mtimeMs) {
+      const doc = JSON.parse(fs.readFileSync(file, "utf8")) as {
+        models?: { slug?: string; context_window?: number; effective_context_window_percent?: number }[];
+      };
+      const bySlug = new Map<string, number>();
+      for (const m of doc.models ?? []) {
+        if (!m.slug || typeof m.context_window !== "number" || m.context_window <= 0) continue;
+        // Absent/implausible percentage → take the raw window rather than scale by a garbage factor.
+        const pct = typeof m.effective_context_window_percent === "number" && m.effective_context_window_percent > 0 && m.effective_context_window_percent <= 100
+          ? m.effective_context_window_percent
+          : 100;
+        bySlug.set(m.slug, Math.round((m.context_window * pct) / 100));
+      }
+      windowCache = { mtimeMs, bySlug };
+    }
+    return windowCache.bySlug.get(slug) ?? CODEX_CONTEXT_WINDOW;
+  } catch {
+    return CODEX_CONTEXT_WINDOW;
+  }
+}
+
+/** Test seam: drop the memo so a test can point at a different CODEX_HOME. */
+export function resetContextWindowCache(): void {
+  windowCache = undefined;
+}
 
 /** Short aliases → real codex model slugs (gw-command-model): the user picks `sol`/`terra`/
  * `luna`, codex is invoked with the full `gpt-5.6-*` slug. A value that is already a full slug
@@ -340,7 +402,8 @@ export function mapUsage(u: CodexUsage | undefined, model: string | undefined): 
     // codex re-sends the window each call, so total input ≈ peak single-call context occupancy.
     contextTokens: totalInput,
     model: shortModel(model),
-    contextWindow: CODEX_CONTEXT_WINDOW,
+    // Per-model, from codex's own metadata — not one constant for every tier.
+    contextWindow: modelContextWindow(model),
   };
 }
 

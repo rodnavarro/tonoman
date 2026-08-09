@@ -1,5 +1,8 @@
 import { describe, it, expect } from "vitest";
-import { parseLine, mapUsage, normalizeModel, shortModel, localEnv, identityPreamble, parseCodexRateLimits, CODEX_CONTEXT_WINDOW } from "./codex";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { parseLine, mapUsage, normalizeModel, shortModel, localEnv, identityPreamble, parseCodexRateLimits, CODEX_CONTEXT_WINDOW, modelContextWindow, resetContextWindowCache } from "./codex";
 
 describe("codex harness — model normalization (gw-command-model)", () => {
   it("maps the friendly tier aliases to gpt-5.6 slugs, passes slugs/unknowns through", () => {
@@ -72,5 +75,66 @@ describe("codex harness — env + identity (ToS-safe subscription, no API key)",
   it("identityPreamble is empty when no file is given (a missing persona never fails a turn)", () => {
     expect(identityPreamble(undefined)).toBe("");
     expect(identityPreamble("/no/such/file/xyz")).toBe("");
+  });
+});
+
+describe("codex harness — context window (statusline ctx %)", () => {
+  const mkHome = (models: unknown): string => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-models-"));
+    fs.writeFileSync(path.join(dir, "models_cache.json"), JSON.stringify({ models }));
+    resetContextWindowCache();
+    return dir;
+  };
+
+  // The shape codex actually writes — verified against a live CODEX_HOME and the running agent.
+  const SOL = { slug: "gpt-5.6-sol", context_window: 272000, max_context_window: 272000, effective_context_window_percent: 95 };
+
+  it("returns the EFFECTIVE window codex itself reports per turn", () => {
+    // codex's own token_count event carries model_context_window: 258400 = 272000 x 95%.
+    // Matching it exactly is the whole point — anything else makes ctx % disagree with codex.
+    const home = mkHome([SOL]);
+    expect(modelContextWindow("gpt-5.6-sol", home)).toBe(258400);
+    expect(modelContextWindow("sol", home)).toBe(258400); // alias resolves first
+  });
+
+  it("takes the model's default window, not max_context_window", () => {
+    // gpt-5.4 advertises a 1M ceiling but a turn gets 272k. Reporting the ceiling would make ctx %
+    // read ~3.7x lower than reality — the window would fill with no warning.
+    const home = mkHome([{ slug: "gpt-5.4", context_window: 272000, max_context_window: 1000000, effective_context_window_percent: 95 }]);
+    expect(modelContextWindow("gpt-5.4", home)).toBe(258400);
+  });
+
+  it("falls back to the raw window when no effective percentage is published", () => {
+    const home = mkHome([{ slug: "gpt-5.6-sol", context_window: 272000 }]);
+    expect(modelContextWindow("gpt-5.6-sol", home)).toBe(272000);
+  });
+
+  it("ignores an implausible effective percentage rather than scaling by garbage", () => {
+    const home = mkHome([{ slug: "gpt-5.6-sol", context_window: 272000, effective_context_window_percent: 0 }]);
+    expect(modelContextWindow("gpt-5.6-sol", home)).toBe(272000);
+  });
+
+  it("falls back to the constant for an unknown model or unreadable cache", () => {
+    const home = mkHome([SOL]);
+    expect(modelContextWindow("gpt-9-nonexistent", home)).toBe(CODEX_CONTEXT_WINDOW);
+    resetContextWindowCache();
+    expect(modelContextWindow("gpt-5.6-sol", path.join(os.tmpdir(), "no-such-codex-home"))).toBe(CODEX_CONTEXT_WINDOW);
+  });
+
+  it("the fallback is the effective 258.4k, not the old 400k guess nor the raw 272k", () => {
+    // Guessing HIGH is the dangerous direction: ctx % reads lower than reality.
+    expect(CODEX_CONTEXT_WINDOW).toBe(258400);
+  });
+
+  it("picks up a refreshed cache without a restart (memo keyed on mtime)", () => {
+    const home = mkHome([SOL]);
+    expect(modelContextWindow("gpt-5.6-sol", home)).toBe(258400);
+    // codex rewrites the file when OpenAI changes a tier; the memo must not pin the old number.
+    fs.writeFileSync(
+      path.join(home, "models_cache.json"),
+      JSON.stringify({ models: [{ slug: "gpt-5.6-sol", context_window: 400000, effective_context_window_percent: 100 }] }),
+    );
+    fs.utimesSync(path.join(home, "models_cache.json"), new Date(), new Date(Date.now() + 1000));
+    expect(modelContextWindow("gpt-5.6-sol", home)).toBe(400000);
   });
 });
