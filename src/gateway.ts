@@ -13,7 +13,9 @@ import * as path from "node:path";
 import type { Config, AgentConfig } from "./config";
 import { validate } from "./config";
 import { TelegramConnector } from "./connector/telegram";
-import { TeamsConnector } from "./connector/teams";
+import { TeamsConnector, type ConvRef } from "./connector/teams";
+import { ConvStore } from "./connector/convstore";
+import { withWake } from "./connector/wake";
 import type { Connector, Envelope, MemoryStore } from "./core/contracts";
 import { Registry as HarnessRegistry, type Spec } from "./harness";
 import * as claudecode from "./harness/claudecode";
@@ -376,6 +378,7 @@ async function runAgent(
   // channel-neutral — only this instantiation differs.
   const isTeams = (ra.cfg.channel ?? (ra.cfg.teams ? "teams" : "telegram")) === "teams";
   let conn: Connector;
+  let convStore: ConvStore<ConvRef> | undefined;
   if (isTeams) {
     const tm = ra.cfg.teams!;
     // app_password is a SECRET (cfg-no-secrets): prefer it injected via env at run time,
@@ -393,7 +396,9 @@ async function runAgent(
         console.error(`teams: could not read people_file ${tm.people_file}: ${(e as Error).message}`);
       }
     }
+    convStore = new ConvStore<ConvRef>({ file: ra.cfg.wake?.store_file });
     conn = new TeamsConnector({
+      convStore,
       appId: tm.app_id,
       appPassword,
       tenantId: tm.tenant_id,
@@ -407,12 +412,32 @@ async function runAgent(
     });
   } else {
     const tg = ra.cfg.telegram!;
+    convStore = new ConvStore<ConvRef>({ file: ra.cfg.wake?.store_file });
     conn = new TelegramConnector({
       token: tg.token,
       allowedUser: tg.allowed_user,
       mediaDir: tg.media_dir,
       mediaMount: tg.media_mount,
+      convStore,
     });
+  }
+
+  // A wake turns an authenticated POST into an ordinary envelope, so the loop
+  // below cannot tell a woken turn from a typed one — which is the point: it
+  // inherits session resume, queueing, /steer and streamed replies untouched.
+  const wakeToken = ra.cfg.wake?.token_env ? process.env[ra.cfg.wake.token_env] : undefined;
+  if (wakeToken && convStore) {
+    conn = withWake(conn, {
+      token: wakeToken,
+      port: ra.cfg.wake?.port,
+      store: convStore,
+      user: "system",
+    });
+  } else if (ra.cfg.wake?.token_env) {
+    console.error(
+      `wake: ${ra.cfg.wake.token_env} is not set — the wake endpoint is NOT served. ` +
+        "Nothing can ask this agent to speak first.",
+    );
   }
 
   // Wrap the harness runner with a live-turn tap (gw-command-btw): the snapshot it keeps

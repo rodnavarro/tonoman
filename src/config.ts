@@ -111,6 +111,11 @@ export interface AgentConfig {
    * exclusive with `telegram` per agent. */
   teams?: Teams;
   workspace?: Workspace;
+  /** Lets a SYSTEM start a conversation (gw-wake). An authenticated POST becomes
+   * an ordinary envelope, so a wake inherits session resume, turn queueing and
+   * streamed replies with no special handling anywhere downstream. Absent, or
+   * with no token, the endpoint is not served at all. */
+  wake?: Wake;
   // --- Service-mode (svc-self-channeled / svc-config-env) ----------------------
   /** Service agent: Tonoman boots + lifecycle-manages a long-lived self-channeled server
    * (e.g. the Hermes harness) but does NOT drive its turns. The harness `spec` is the
@@ -137,6 +142,18 @@ export interface AgentConfig {
   /** Install commands run ONCE at provision to pre-warm tools (cfg-agent-tools), e.g.
    * the AWS CLI. The agent may also install tools on demand at turn time. */
   setup?: string[];
+}
+
+/** Wake endpoint config (gw-wake). */
+export interface Wake {
+  /** NAME of the env var holding the shared secret, e.g. TONOMAN_WAKE_TOKEN.
+   *  Never the value: secrets do not live in settings.json (cfg-no-secrets). */
+  token_env?: string;
+  /** Listen port; default 3980. */
+  port?: number;
+  /** File the conversation store persists to — put it on the PVC, or the agent
+   *  loses the ability to speak first on every restart. */
+  store_file?: string;
 }
 
 export interface StreamConfig {

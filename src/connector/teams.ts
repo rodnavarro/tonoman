@@ -18,6 +18,7 @@ import * as crypto from "node:crypto";
 import * as path from "node:path";
 import type { Connector, Envelope, Reply } from "../core/contracts";
 import { Roster, resolveIdentity, refusalNotice } from "../identity";
+import { ConvStore } from "./convstore";
 
 /** Bot Framework hosts we will send a bearer token to (SSRF guard, teams-outbound-token). */
 const DEFAULT_SERVICE_HOSTS = ["smba.trafficmanager.net", "smba.infra.gov.teams.microsoft.us"];
@@ -86,6 +87,10 @@ export interface ConnectorOptions {
   // Injectable inbound-token validator (teams-inbound-auth). Defaults to a real
   // Bot Framework JWKS/RS256 validator; tests pass a fake.
   validateToken?: (authHeader: string | undefined) => Promise<boolean>;
+  // Where conversationReferences are kept. Supply a file-backed store and the
+  // agent can still message first after a restart; omit it and refs live only
+  // in memory, which is fine for tests and silently fatal in production.
+  convStore?: ConvStore<ConvRef>;
 }
 
 /** What we capture from an inbound activity to address a reply later
@@ -103,12 +108,13 @@ export interface ConvRef {
 
 export class TeamsConnector implements Connector {
   private tokenCache?: { value: string; exp: number };
-  private readonly refs = new Map<string, ConvRef>();
+  private readonly refs: ConvStore<ConvRef>;
   private readonly emailCache = new Map<string, { value: string; exp: number }>(); // fromId → resolved email
   private readonly validate: (authHeader: string | undefined) => Promise<boolean>;
 
   constructor(private readonly o: ConnectorOptions) {
     if (!o.appId || !o.appPassword || !o.tenantId) throw new Error("teams: appId/appPassword/tenantId required");
+    this.refs = o.convStore ?? new ConvStore<ConvRef>();
     this.validate =
       o.validateToken ?? createBotFrameworkJwtValidator({ appId: o.appId, fetchImpl: o.fetchImpl, now: o.now });
   }
@@ -215,6 +221,10 @@ export class TeamsConnector implements Connector {
     // so recognition is keyed on a verified address, not a spoofable display name.
     const email = await this.resolveEmail(ref); // undefined if unresolvable (non-fatal)
     const identity = resolveIdentity(this.o.roster, email, displayName);
+    // A verified email is the most durable way to name this person, so it joins
+    // the store's aliases — that is what lets a caller wake "rod@example.com"
+    // or just "rod" without knowing anything about Teams.
+    if (email) this.refs.put(ref.conversationId, ref, [email, email.split("@")[0]]);
     if (this.o.restrictToRoster && !identity.verified) {
       // Deterministic refusal (identity-roster-restrict): no turn, no LLM, but never silent.
       try {
@@ -261,7 +271,14 @@ export class TeamsConnector implements Connector {
       channelId: activity.channelId || "msteams",
       tenantId: conv.tenantId || activity.channelData?.tenant?.id || this.o.tenantId,
     };
-    this.refs.set(ref.conversationId, ref);
+    // Store every name this person answers to, so a caller can address them as
+    // a person rather than carrying an opaque Teams conversation id.
+    this.refs.put(ref.conversationId, ref, [
+      ref.fromAad,
+      ref.fromId,
+      activity.from?.name ?? "",
+      (activity.from?.name ?? "").split(" ")[0],
+    ]);
     return ref;
   }
 

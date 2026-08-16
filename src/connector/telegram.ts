@@ -7,6 +7,7 @@
 import { promises as fs } from "node:fs";
 import * as path from "node:path";
 import type { Connector, Envelope, Reply } from "../core/contracts";
+import type { ConvStore } from "./convstore";
 
 export interface ConnectorOptions {
   token: string; // bot token the gateway owns exclusively (one token = one poller)
@@ -17,6 +18,10 @@ export interface ConnectorOptions {
   fileBase?: string; // default https://api.telegram.org/file
   pollTimeout?: number; // long-poll seconds; default 30
   fetchImpl?: typeof fetch; // injectable for tests; defaults to global fetch
+  // Records who each chat belongs to so a wake can address a PERSON rather than
+  // a chat id. Telegram has no restart problem (chat ids are stable), but the
+  // person index is the same need on every channel.
+  convStore?: ConvStore<unknown>;
 }
 
 export class TelegramConnector implements Connector {
@@ -88,9 +93,15 @@ export class TelegramConnector implements Connector {
     if (this.o.allowedUser && this.o.allowedUser !== user && this.o.allowedUser !== uid) {
       return null; // not on the allow-list
     }
+    const chat = String(m.chat.id);
+    this.o.convStore?.put(chat, { chatId: chat }, [
+      user,
+      uid,
+      m.from?.first_name ?? "",
+    ]);
     const env: Envelope = {
       channel: this.name(),
-      conversation: String(m.chat.id),
+      conversation: chat,
       user,
       text: m.text || m.caption || "",
       mediaPaths: [],
