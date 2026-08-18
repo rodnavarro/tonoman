@@ -1,0 +1,37 @@
+# Repository code checks that gate merges into main. Runs on every pull request. The `leak` step
+# scans the tree for content that must never ship in this OSS repo (secrets, and — from a denylist
+# kept OUT of this public repo — customer/employer identifiers). The denylist + scanner arrive as a
+# single Actions secret (LEAK_GUARD_BUNDLE), are decoded to a temp dir OUTSIDE the checkout, and run
+# with --ci so the log only ever prints file:line, never a matched term. Fails closed: if the bundle
+# is absent (e.g. a fork PR, which GitHub does not give secrets), the step errors and the check fails.
+name: code-check
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: leak
+        env:
+          BUNDLE: ${{ secrets.LEAK_GUARD_BUNDLE }}
+        run: |
+          set -euo pipefail
+          if [ -z "${BUNDLE:-}" ]; then
+            echo "code-check: verification bundle unavailable (fork PR or missing secret) — failing closed."
+            exit 2
+          fi
+          DIR="$RUNNER_TEMP/cc"
+          mkdir -p "$DIR"
+          printf '%s' "$BUNDLE" | base64 -d | tar -xzf - -C "$DIR"
+          node "$DIR/ci/scan.mjs" --tree --profile public --ci

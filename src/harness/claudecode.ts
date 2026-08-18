@@ -280,6 +280,7 @@ interface RawLine {
   is_error?: boolean;
   usage?: RawUsage; // present on the result line (gw-command-statusline)
   total_cost_usd?: number;
+  num_turns?: number; // agentic iterations the turn took (result line) — statusline iteration count
   /** per-model usage, keyed by model name (e.g. "claude-opus-4-8[1m]"); each carries the
    * real contextWindow — so context % uses the actual window, not a hardcoded 200k. */
   modelUsage?: Record<string, { inputTokens?: number; cacheReadInputTokens?: number; cacheCreationInputTokens?: number; contextWindow?: number }>;
@@ -464,6 +465,7 @@ function parseUsage(rl: RawLine): import("../core/contracts").TurnUsage | undefi
     contextTokens,
     model,
     contextWindow,
+    iterationsUsed: rl.num_turns,
   };
 }
 
