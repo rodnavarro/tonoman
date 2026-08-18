@@ -37,6 +37,7 @@ import { TurnQueue } from "./turnqueue";
 import type { Grant, Policy } from "./runtime/policy";
 import { validateModelName, modelHint, modelChoices, fetchModelIds } from "./modelcmd";
 import { AsideLane, LiveTurn } from "./aside";
+import { startAgentTunnel, stopAgentTunnel, tunnelConfigFor } from "./tunnelcmd";
 import { compactConversation } from "./compact";
 import { parseStatusMode, renderStatus, renderWindows, accountUsageCached, remoteAccountUsageCached, cachedAccountUsage, readOauthToken, STATUS_MODES, type StatusMode, type UsageWindow } from "./statusline";
 
@@ -601,6 +602,21 @@ async function runAgent(
   console.log(
     `gateway: agent "${rec.name}" (${rec.guid}) up: harness=${rec.harness} container=${rec.container} memory=${rec.memory_root} port_base=${rec.port_base}`,
   );
+
+  // Local-dev webhook tunnel (channel-teams), opt-in via `teams.tunnel.enabled`. Started HERE so
+  // it shares the GATEWAY's lifecycle: up with `up`, torn down on `down`/Ctrl-C — rather than a
+  // stray background process whose silent death breaks Teams with no visible error. Unset config
+  // (the k8s path, where a real ingress fronts the webhook) makes this a no-op.
+  if (tunnelConfigFor(ra.cfg)) {
+    try {
+      await startAgentTunnel(cfg, ra.cfg, (m) => console.log(m));
+      signal.addEventListener("abort", () => void stopAgentTunnel(cfg, ra.cfg, (m) => console.log(m)).catch(() => {}), { once: true });
+    } catch (e) {
+      // Never fail the whole gateway over a tunnel — but be LOUD: the symptom of a missing tunnel
+      // (Teams simply never replies) is otherwise indistinguishable from a hung agent.
+      console.error(`gateway: tunnel for "${rec.name}" FAILED to start — Teams will not reach this agent: ${(e as Error).message}`);
+    }
+  }
 
   // Register the channel's command menu (best-effort), so the commands are discoverable.
   void conn

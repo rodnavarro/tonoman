@@ -22,6 +22,7 @@ import { findAgent, upsertMount, removeMount, listMounts, podmanVolumeArgs, agen
 import { sinkFromEnv, decodeClaudeTranscript, postTrace, fullContextEnabled, parsePrefix, fullContextSections, type ContextPrefix, type ContextSection } from "./telemetry";
 import { CONFIG_HOME, spec as claudecodeSpec } from "./harness/claudecode";
 import { runCreateAgent } from "./agentcmd";
+import { runTunnel } from "./tunnelcmd";
 import { runLearn } from "./learncmd";
 import { parseRepo } from "./learn-git";
 import { assembleSkills, parseAssignments } from "./skills";
@@ -122,6 +123,7 @@ export type Resolved =
   | { kind: "get" | "create" | "delete" | "set" | "open" | "close"; resource: Resource }
   | { kind: "backend"; agent: string; mode?: string }
   | { kind: "learn"; args: string[] }
+  | { kind: "tunnel"; args: string[] }
   | { kind: "usage"; exitCode: number; error?: string };
 
 /** Pure dispatch resolver — maps the args (GLOBAL flags already stripped) to a command
@@ -156,6 +158,9 @@ export function resolveCommand(argv: string[]): Resolved {
     case "sync":
       // `tonoman sync` — refresh the local registry checkout to canonical upstream (pull merged skills).
       return { kind: "sync" };
+    case "tunnel":
+      // `tonoman tunnel <up|down|status> <agent>` — local-dev webhook tunnel (channel-teams).
+      return { kind: "tunnel", args: argv.slice(1) };
     case "backend": {
       // `tonoman backend <agent> [subscription|bedrock]` — live auth-backend switch (backend-switch-live).
       const agent = argv[1];
@@ -890,6 +895,7 @@ Commands:
   auth code <agent> <code>             Finish a --headless login with the code from the browser
   auth <status|logout> <agent>         Show / clear an agent's harness auth
   logs [-a NAME] [-n N] [-f]           View the gateway log (turns, broker ops, errors); -f to follow
+  tunnel <up|down|status> <agent>      Local-dev webhook tunnel: opens it AND repoints the Azure bot endpoint
   runtime [--port N]                   Run the agent runtime HTTP server in-container (k8s split;
                                        gateway drives turns over HTTP via the claude-code-http harness)
   version                              Print version
@@ -985,6 +991,10 @@ async function main(): Promise<void> {
     case "backend":
       echoEnv(env);
       await runBackend(cfgPath, env, res.agent, res.mode);
+      return;
+    case "tunnel":
+      echoEnv(env);
+      await runTunnel(cfgPath, env, res.args);
       return;
     case "get":
       echoEnv(env);

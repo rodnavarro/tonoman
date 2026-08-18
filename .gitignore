@@ -43,3 +43,4 @@ Thumbs.db
 .env.*
 # Generated Teams app packages (manifest + icons + zip) — build output, not source.
 /build/teams-app/
+people.cody.json

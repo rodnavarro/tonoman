@@ -44,6 +44,18 @@ export interface Teams {
   media_mount?: string;
   /** webhook listen port the gateway serves (dev tunnel / ingress points here); default 3978. */
   port?: number;
+  /** LOCAL-DEV dev tunnel (see runtime/tunnel). Opt-in: absent or `enabled:false` = no tunnel and
+   * behavior is unchanged — in Kubernetes the webhook has a real ingress, so this stays unset.
+   * When enabled, `tonoman up` opens a tunnel to `port` and repoints the Azure bot's messaging
+   * endpoint at it (an anonymous quick tunnel gets a new hostname each start, and a stale endpoint
+   * makes Teams fail SILENTLY). `azure` holds the ARM coordinates for that repoint; without it the
+   * tunnel still opens but the endpoint must be set by hand. */
+  tunnel?: {
+    enabled?: boolean;
+    /** cloudflared binary; falls back to the agent's `tunnel_bin`, then "cloudflared". */
+    bin?: string;
+    azure?: { resource_group: string; bot_name: string; az_bin?: string };
+  };
   /** How the "🤖 working…" liveness cue is shown while a turn runs (channel-teams):
    *  - "message" (default): a SEPARATE status message, updated with elapsed for the WHOLE turn
    *    (incl. a mid-turn quiet gap) and deleted when the reply finalizes — so the operator is
