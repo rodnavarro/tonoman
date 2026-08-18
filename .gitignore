@@ -31,6 +31,10 @@ settings*.json
 # Session context dumps (compaction handoff notes)
 .context-dump/
 
+# Detached process logs (gateway / POC ttyd wrapper / LAN proxy)
+.cody-gateway*.log
+.poc-*.log
+
 # OS / editor
 .DS_Store
 Thumbs.db
