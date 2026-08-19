@@ -10,6 +10,7 @@ import * as path from "node:path";
 import type { Config, AgentConfig } from "./config";
 import type { Spec } from "./harness";
 import { podmanVolumeArgs } from "./mounts";
+import { tuiPort } from "./tui";
 
 /** Where the git-backed memory substrate (A3) + the A13 control channel mount inside the
  * sandbox. The shim reads <MEMORY_HOME>/control, so mounting memory here wires the broker
@@ -118,6 +119,16 @@ export function podmanRunArgs(a: AgentConfig, cfg: Config, spec: Spec): string[]
   // run — never persisted to settings.json.
   for (const [k, v] of Object.entries(a.env ?? {})) args.push("-e", `${k}=${v}`);
   for (const name of a.secrets ?? []) args.push("-e", name);
+
+  // Web-TUI (tui-over-web): publish the wrapper port to HOST LOOPBACK only, so the
+  // brokered `tonoman expose` can LAN-forward it on demand. Loopback bind keeps it off
+  // the LAN until expose runs (default-deny). Opt-in and works for turn-driven agents
+  // too (unlike the service ports below), so a dev agent gets a phone-reachable TUI
+  // without becoming a service. A non-tui agent publishes nothing (k8s path unaffected).
+  if (a.tui?.enabled) {
+    const p = tuiPort(a.tui);
+    args.push("-p", `127.0.0.1:${p}:${p}`);
+  }
 
   if (service) {
     // Publish the dashboard/health port to the host for the token-free health probe (health-no-tokens).

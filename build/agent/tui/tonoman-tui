@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# Tonoman web-TUI launcher (baked into the sandbox image). Brings up an interactive
+# Claude Code (or any harness) TUI reachable from a phone browser, reusing the agent's
+# own creds/tools inside the sandbox — no host scripts, no admin.
+#
+#   ttyd (base-path /term, tuned for mobile) ── serves the terminal, loopback-only
+#     └─ tmux session `tui` in the workspace ── persistent; survives disconnects
+#   wrapper.cjs on :$TUI_PORT ───────────────── keyboard-aware + scroll-button page,
+#                                                same-origin reverse-proxy to ttyd
+#   tonoman expose $TUI_PORT ────────────────── brokered, gateway tcpProxies it to LAN
+#
+# Usage: tonoman-tui [up|down|url|status]
+set -u
+
+TTYD_PORT="${TTYD_PORT:-7681}"
+TUI_PORT="${TUI_PORT:-7682}"
+TUI_FONT="${TUI_FONT:-15}"
+TUI_SESSION="${TUI_SESSION:-tui}"
+WRAPPER="${TUI_WRAPPER:-/usr/local/lib/tonoman-tui/wrapper.cjs}"
+# Workspace to open the TUI in: first existing of the agent's mount, else /work.
+TUI_CWD="${TUI_CWD:-}"
+if [ -z "$TUI_CWD" ]; then
+  for d in /root/files/p /root/files/* /work; do [ -d "$d" ] && TUI_CWD="$d" && break; done
+fi
+
+TTYD_PIDF=/tmp/tonoman-tui-ttyd.pid
+WRAP_PIDF=/tmp/tonoman-tui-wrapper.pid
+
+alive() { [ -f "$1" ] && kill -0 "$(cat "$1" 2>/dev/null)" 2>/dev/null; }
+
+start() {
+  # tmux: mouse on + generous scrollback (idempotent).
+  [ -f /root/.tmux.conf ] || printf 'set -g mouse on\nset -g history-limit 50000\n' > /root/.tmux.conf
+
+  if alive "$TTYD_PIDF"; then
+    echo "ttyd already running (pid $(cat "$TTYD_PIDF"))"
+  else
+    ( cd "$TUI_CWD" 2>/dev/null || cd /work
+      nohup ttyd -b /term -W -p "$TTYD_PORT" \
+        -t fontSize="$TUI_FONT" \
+        -t "fontFamily=Menlo, DejaVu Sans Mono, Consolas, monospace" \
+        -t rendererType=webgl -t disableLeaveAlert=true -t cursorBlink=true \
+        tmux new -A -s "$TUI_SESSION" >/tmp/tonoman-tui-ttyd.log 2>&1 &
+      echo $! > "$TTYD_PIDF" )
+    echo "ttyd started (:$TTYD_PORT/term, font $TUI_FONT, cwd ${TUI_CWD:-/work})"
+  fi
+
+  if alive "$WRAP_PIDF"; then
+    echo "wrapper already running (pid $(cat "$WRAP_PIDF"))"
+  else
+    TUI_PORT="$TUI_PORT" TTYD_PORT="$TTYD_PORT" nohup node "$WRAPPER" >/tmp/tonoman-tui-wrapper.log 2>&1 &
+    echo $! > "$WRAP_PIDF"
+    echo "wrapper started (:$TUI_PORT)"
+  fi
+
+  # LAN reach is handled by the GATEWAY, not the agent: the wrapper port lives on THIS
+  # sandbox's own container, and `tonoman expose` targets only sibling containers. The
+  # gateway forwards the tui port (config `tui.enabled`) and logs the http://<lan-ip>:<port>
+  # URL at boot. Here we just confirm the local service is up.
+  echo "tui up — ttyd :$TTYD_PORT/term behind wrapper :$TUI_PORT (host loopback)."
+  echo "LAN URL is managed + logged by the gateway (config tui.enabled). On this host: http://127.0.0.1:$TUI_PORT"
+}
+
+stop() {
+  [ -f "$WRAP_PIDF" ] && kill "$(cat "$WRAP_PIDF" 2>/dev/null)" 2>/dev/null; rm -f "$WRAP_PIDF"
+  [ -f "$TTYD_PIDF" ] && kill "$(cat "$TTYD_PIDF" 2>/dev/null)" 2>/dev/null; rm -f "$TTYD_PIDF"
+  tonoman unexpose "$TUI_PORT" 2>/dev/null || true
+  echo "tui stopped"
+}
+
+case "${1:-up}" in
+  up|start|"") start ;;
+  down|stop)   stop ;;
+  url)         tonoman url "$TUI_PORT" ;;
+  status)      alive "$TTYD_PIDF" && echo "ttyd: up" || echo "ttyd: down"; alive "$WRAP_PIDF" && echo "wrapper: up" || echo "wrapper: down" ;;
+  *) echo "usage: tonoman-tui [up|down|url|status]"; exit 2 ;;
+esac

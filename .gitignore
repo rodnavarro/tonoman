@@ -34,6 +34,8 @@ settings*.json
 # Detached process logs (gateway / POC ttyd wrapper / LAN proxy)
 .cody-gateway*.log
 .poc-*.log
+# One-off local recreate/scratch helpers (not part of the product)
+scratch-*.cjs
 
 # OS / editor
 .DS_Store

@@ -1,0 +1,14 @@
+# Keep the image build context tiny + stable. The image Dockerfiles only need a few
+# files under build/agent/ (shims + tui launcher/wrapper); everything else is noise and,
+# for large churny trees like node_modules, trips podman's context tar ("write too long").
+node_modules
+dist
+.git
+*.log
+.env
+.env.*
+*.tsbuildinfo
+build/teams-app
+scratchpad
+.context-dump
+people.cody.json

@@ -33,6 +33,7 @@ import { HostBrowserManager } from "./runtime/hostbrowser";
 import { teeConsole, gatewayLogPath } from "./logfile";
 import { tcpProxy, type ProxyHandle } from "./runtime/proxy";
 import { agentMountPath } from "./mounts";
+import { tuiPort } from "./tui";
 import { ensureStarted, stopContainer } from "./lifecycle";
 import { TurnQueue } from "./turnqueue";
 import type { Grant, Policy } from "./runtime/policy";
@@ -368,9 +369,32 @@ async function runAgent(
     }).catch((e) => {
       if (!signal.aborted) console.error(`gateway: control channel error: ${(e as Error).message}`);
     });
+
+    // Web-TUI (tui-over-web): LAN-forward the agent's OWN published wrapper port so a phone can
+    // reach it. The agent-driven `tonoman expose` deliberately targets only SIBLING containers
+    // (an agent never exposes its own sandbox), but the TUI wrapper runs in the agent's own
+    // container — so the gateway forwards that known, config-declared port directly here. The
+    // port is published loopback-only by provisioning, so it stays host-local until this runs.
+    if (ra.cfg.tui?.enabled) {
+      const port = tuiPort(ra.cfg.tui);
+      forward("add", port)
+        .then(() => console.log(`gateway: tui '${rec.name}' reachable at http://${advertiseHost}:${port} — start it with 'tonoman tui ${rec.name} up'`))
+        .catch((e) => console.error(`gateway: tui '${rec.name}' LAN forward failed: ${(e as Error).message}`));
+      signal.addEventListener("abort", () => void forward("remove", port).catch(() => {}), { once: true });
+    }
   }
 
   registerAgentHealth(hreg, ra);
+
+  // Connector-less agent (channel: "none"): its container is booted and the broker + expose
+  // are wired above (persistent, bound to `signal`), so brokered podman / `tonoman expose` /
+  // the web-TUI all work — but there is NO Tonoman connector or turn-loop. The operator
+  // interacts through `tonoman tui <agent>` (tui-over-web), not a chat channel. Return before
+  // building any connector so the agent simply stays up as a broker-backed dev sandbox.
+  if (ra.cfg.channel === "none") {
+    console.log(`gateway: agent "${rec.name}" is connector-less (channel: none) — broker + expose up, no turn loop; reach it via 'tonoman tui ${rec.name}'.`);
+    return;
+  }
 
   // Non-service path: select the channel connector (channel-teams). validate() guarantees
   // the chosen channel's credentials are present. The harness/router/queue downstream are

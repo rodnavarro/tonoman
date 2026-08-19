@@ -23,6 +23,7 @@ import { sinkFromEnv, decodeClaudeTranscript, postTrace, fullContextEnabled, par
 import { CONFIG_HOME, spec as claudecodeSpec } from "./harness/claudecode";
 import { runCreateAgent } from "./agentcmd";
 import { runTunnel } from "./tunnelcmd";
+import { runTui } from "./tuicmd";
 import { runLearn } from "./learncmd";
 import { parseRepo } from "./learn-git";
 import { assembleSkills, parseAssignments } from "./skills";
@@ -124,6 +125,7 @@ export type Resolved =
   | { kind: "backend"; agent: string; mode?: string }
   | { kind: "learn"; args: string[] }
   | { kind: "tunnel"; args: string[] }
+  | { kind: "tui"; args: string[] }
   | { kind: "usage"; exitCode: number; error?: string };
 
 /** Pure dispatch resolver — maps the args (GLOBAL flags already stripped) to a command
@@ -161,6 +163,10 @@ export function resolveCommand(argv: string[]): Resolved {
     case "tunnel":
       // `tonoman tunnel <up|down|status> <agent>` — local-dev webhook tunnel (channel-teams).
       return { kind: "tunnel", args: argv.slice(1) };
+    case "tui":
+      // `tonoman tui <agent> [up|down|url|status]` — web-TUI (tui-over-web): ttyd + mobile wrapper,
+      // LAN-reachable via brokered `tonoman expose`.
+      return { kind: "tui", args: argv.slice(1) };
     case "backend": {
       // `tonoman backend <agent> [subscription|bedrock]` — live auth-backend switch (backend-switch-live).
       const agent = argv[1];
@@ -995,6 +1001,10 @@ async function main(): Promise<void> {
     case "tunnel":
       echoEnv(env);
       await runTunnel(cfgPath, env, res.args);
+      return;
+    case "tui":
+      echoEnv(env);
+      await runTui(cfgPath, env, res.args);
       return;
     case "get":
       echoEnv(env);

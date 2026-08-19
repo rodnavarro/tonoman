@@ -80,6 +80,20 @@ export interface Workspace {
 }
 
 /** One agent in the roster (A11). */
+/** Web-TUI wiring (tui-over-web). The launcher (baked in the image) starts ttyd (base-path
+ * /term) + the keyboard-aware/scroll wrapper, then `tonoman expose`s the wrapper port. */
+export interface Tui {
+  /** Opt in. When true, provisioning publishes `port` to host loopback so the brokered
+   * `tonoman expose` can LAN-forward it; when false/absent nothing is published. */
+  enabled?: boolean;
+  /** LAN-facing wrapper port (published to host loopback + exposed). Default 7682. */
+  port?: number;
+  /** loopback-only ttyd port inside the sandbox (behind the wrapper). Default 7681. */
+  ttyd_port?: number;
+  /** xterm font size (mobile default 15). */
+  font?: number;
+}
+
 export interface AgentConfig {
   guid?: string;
   name: string;
@@ -109,13 +123,22 @@ export interface AgentConfig {
    * window each turn — cheaper via prompt caching; `/new` rotates it. Default off (substrate window). */
   session_persist?: boolean;
   mounts?: Mount[];
+  /** Opt-in web-TUI (tui-over-web): expose an interactive harness TUI (ttyd + tmux,
+   * made phone-usable by the baked keyboard-aware/scroll wrapper) over the browser,
+   * LAN-reachable through the brokered `tonoman expose`. Absent / `enabled:false` = no
+   * TUI and nothing published, so the k8s deploy path is unaffected. `tonoman tui <agent>`
+   * brings it up on demand. */
+  tui?: Tui;
   tunnel_bin?: string;
   config_volume?: string;
   port_base?: number;
   /** Channel for a turn-driven agent (channel-teams). Usually inferred from which
    * connector block is present (`telegram` → telegram, `teams` → teams); set explicitly
-   * to disambiguate. A service agent owns its own channel (derived "self"). */
-  channel?: "telegram" | "teams";
+   * to disambiguate. A service agent owns its own channel (derived "self").
+   * `"none"` = a CONNECTOR-LESS agent (tui-only): the gateway still boots its container and
+   * wires the broker + expose (so brokered podman / `tonoman expose` / the web-TUI work), but
+   * attaches NO connector or turn-loop — you reach it only through `tonoman tui`. */
+  channel?: "telegram" | "teams" | "none";
   /** Connector wiring for a turn-driven agent (A1). OPTIONAL: a service agent
    * (svc-self-channeled) owns its own channel and needs no Tonoman connector. */
   telegram?: Telegram;
@@ -265,7 +288,7 @@ export function validate(c: Config): void {
     // A turn-driven agent needs its channel's credentials: telegram.token, or — for a
     // Teams agent (channel-teams) — teams.app_id + teams.tenant_id (app_password is a
     // secret injected at run time, so it is not required in the roster file).
-    if (!a.service) {
+    if (!a.service && a.channel !== "none") {
       const ch = a.channel ?? (a.teams ? "teams" : "telegram");
       if (ch === "teams") {
         if (!a.teams?.app_id) missing.push("teams.app_id");
