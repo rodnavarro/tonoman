@@ -66,7 +66,7 @@ sequenceDiagram
     GW->>Entra: Mint a bot token at boot (fail-loud check)
     Entra-->>GW: access_token → "bot token OK"
 
-    You->>Azure: Point the messaging endpoint at https://<host>/api/messages
+    You->>Azure: Point the messaging endpoint at the gateway<br/>https://HOST/api/messages
     You->>TAC: Sideload the app package (manifest + 2 icons, zipped)
     Note over You,TAC: Later: publish to the org catalog instead,<br/>so people install it like any other app.
 ```
@@ -85,7 +85,7 @@ sequenceDiagram
     participant Agent as Agent sandbox<br/>(claude-code / codex)
 
     User->>BF: Message the bot (DM, or @mention in a channel)
-    BF->>GW: POST /api/messages<br/>Authorization: Bearer <BF JWT>
+    BF->>GW: POST /api/messages<br/>Authorization Bearer, a Bot Framework JWT
 
     rect rgb(245, 240, 230)
         Note over GW: Transport authentication
@@ -97,7 +97,7 @@ sequenceDiagram
     end
 
     GW-->>BF: 200 ACK (immediately)
-    Note over GW,BF: The HTTP request is NOT held open.<br/>A turn can run for minutes; the reply is<br/>delivered asynchronously to serviceUrl.
+    Note over GW,BF: The HTTP request is NOT held open.<br/>A turn can run for minutes, so the reply is<br/>delivered asynchronously to serviceUrl.
 
     GW->>GW: Capture conversationReference<br/>(serviceUrl, conversation.id, from.aadObjectId,<br/>recipient.id, tenant.id)
 
