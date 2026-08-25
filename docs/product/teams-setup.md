@@ -3,9 +3,10 @@
 A tonoman agent can live in Teams: your team chats with it like a colleague, in DMs or a channel.
 This walks through the whole setup, start to finish.
 
-**Time:** about an hour. **You need:** an Azure subscription, and a Microsoft 365 tenant where
-someone can approve two things (see Part 1). Nothing here is tonoman-specific magic — you're
-registering a normal Teams bot, then pointing it at your gateway.
+**Time:** about an hour, plus however long your tenant admin takes. **You need:** an Azure
+subscription, and a Microsoft 365 tenant where someone can approve four scoped grants (Part 1 names
+each console and role, so you can hand it over as one ticket). Nothing here is tonoman-specific
+magic — you're registering a normal Teams bot, then pointing it at your gateway.
 
 **How the pieces fit:** Teams sends every message to one HTTPS endpoint you control. Your tonoman
 gateway answers on `/api/messages`, hands the message to the agent, and streams the reply back.
@@ -18,56 +19,254 @@ Teams  →  Azure Bot  →  https://<your-host>/api/messages  →  tonoman gatew
 
 ---
 
+## How it works
+
+Read this before Part 1 if you're the one who has to justify the setup to an IT team. It's also
+the answer to "what exactly is this thing allowed to do in our tenant?"
+
+### The moving parts
+
+There are four, and only one of them is yours to run:
+
+| part | who owns it | what it is |
+|---|---|---|
+| **Teams client + Teams service** | Microsoft | Where people type. Delivers messages to registered bots. |
+| **Azure Bot** (`Microsoft.BotService`) | your Azure subscription | A routing record. Says "the bot with app ID *X* is reachable at URL *Y*." It stores no messages. |
+| **Entra app registration** | your M365 tenant | The bot's identity — an app ID and a secret. **Zero Graph API permissions.** |
+| **tonoman gateway** | you | The only thing that runs code. Receives activities, drives the agent, posts replies. |
+
+The Azure Bot resource is a *pointer*, not a proxy of yours — the message path runs through
+Microsoft's Bot Framework connector service, which looks up your endpoint and calls it.
+
+### Setup — what gets created, and by whom
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor You as You (installer)
+    participant Admin as Tenant admin
+    participant Entra as Entra ID
+    participant Azure as Azure subscription
+    participant TAC as Teams admin center
+    participant GW as tonoman gateway
+
+    Admin->>Entra: Grant "Application Developer" (or register the app for you)
+    Admin->>TAC: App setup policy — "Upload custom apps" = On (for you)
+    Note over Admin,TAC: Both are scoped to one person + one bot.<br/>Neither grants data access.
+
+    You->>Entra: Register application → app ID
+    You->>Entra: Add client secret → app password
+    You->>Entra: Create service principal in the tenant
+    Note right of Entra: az ad sp create --id $APP_ID<br/>Skipping this = AADSTS7000229 later
+
+    You->>Azure: Create Azure Bot (app ID, messaging endpoint)
+    You->>Azure: Enable the Microsoft Teams channel
+
+    You->>GW: Configure agent (app ID, tenant ID, roster)<br/>secret via TEAMS_APP_PASSWORD
+    GW->>Entra: Mint a bot token at boot (fail-loud check)
+    Entra-->>GW: access_token → "bot token OK"
+
+    You->>Azure: Point the messaging endpoint at https://<host>/api/messages
+    You->>TAC: Sideload the app package (manifest + 2 icons, zipped)
+    Note over You,TAC: Later: publish to the org catalog instead,<br/>so people install it like any other app.
+```
+
+### Runtime — one message, end to end
+
+This is the whole mechanism. Everything above exists so that this loop can run.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User as Person in Teams
+    participant BF as Bot Framework<br/>(Microsoft)
+    participant GW as tonoman gateway<br/>(your host)
+    participant Entra as Entra ID
+    participant Agent as Agent sandbox<br/>(claude-code / codex)
+
+    User->>BF: Message the bot (DM, or @mention in a channel)
+    BF->>GW: POST /api/messages<br/>Authorization: Bearer <BF JWT>
+
+    rect rgb(245, 240, 230)
+        Note over GW: Transport authentication
+        GW->>BF: Fetch JWKS (login.botframework.com)
+        GW->>GW: Verify RS256 signature, issuer,<br/>audience == our app ID
+        alt token invalid
+            GW-->>BF: 401 — no envelope, no turn
+        end
+    end
+
+    GW-->>BF: 200 ACK (immediately)
+    Note over GW,BF: The HTTP request is NOT held open.<br/>A turn can run for minutes; the reply is<br/>delivered asynchronously to serviceUrl.
+
+    GW->>GW: Capture conversationReference<br/>(serviceUrl, conversation.id, from.aadObjectId,<br/>recipient.id, tenant.id)
+
+    rect rgb(235, 242, 248)
+        Note over GW,Entra: Outbound credential (cached until expiry − 60s)
+        GW->>Entra: POST /{tenant}/oauth2/v2.0/token<br/>client_credentials, scope api.botframework.com/.default
+        Entra-->>GW: bot token
+    end
+
+    rect rgb(240, 245, 238)
+        Note over GW,BF: Who is this? — verified email, not display name
+        GW->>BF: GET /v3/conversations/{id}/members/{fromId}
+        BF-->>GW: email / userPrincipalName
+        GW->>GW: Match against people.json roster
+        alt not on the roster and restrict_to_roster
+            GW->>BF: Post a plain refusal message
+            Note right of GW: No turn. No model call. Never silent.
+        end
+    end
+
+    GW->>GW: Download attachments to the shared media mount
+    GW->>Agent: Envelope {channel, conversation, user,<br/>identity, text, mediaPaths} — one turn
+
+    loop while the agent works
+        Agent-->>GW: stream events (text deltas, tool progress)
+        GW->>BF: typing + streaminfo(streaming, seq++)<br/>with the grown reply
+        BF->>User: Reply grows in place, live
+    end
+
+    Agent-->>GW: done
+    GW->>BF: message + streaminfo(final) — the complete answer
+    BF->>User: Final reply
+```
+
+Three details in that diagram carry most of the security story:
+
+- **The gateway authenticates every inbound POST** before it does anything else. The listener is
+  internet-exposed by necessity — anyone can send it bytes — so an unsigned, expired, or
+  wrong-audience token is rejected with a `401` and produces no turn. This is why `curl`-ing the
+  endpoint with an empty body should return `401`, not `200` (Part 6).
+- **The gateway authenticates itself outbound**, with its own client-credentials token — never the
+  inbound one. Before that bearer is sent anywhere, the target `serviceUrl` host is checked against
+  an allow-list (`smba.trafficmanager.net`), so a forged activity can't redirect the bot's
+  credential to an attacker's server.
+- **Identity comes from the verified email**, resolved from the Teams members API — never from the
+  display name, which anyone in a tenant can change to anyone else's.
+
+### What the bot can and cannot see
+
+This is usually the question that decides whether IT says yes.
+
+| | |
+|---|---|
+| **Can see** | Messages sent directly to it in a 1:1 chat. Messages that **@mention** it in a channel it has been added to. Attachments on those messages. The sender's name and email. |
+| **Cannot see** | Anything in a channel it hasn't been added to. Anything in a channel it *has* been added to that doesn't @mention it. Mail. Files. SharePoint. The directory. Other people's chats. Anything at all when nobody is talking to it. |
+
+The reason is structural, not a promise: the app registration holds **no Microsoft Graph
+permissions**. There is no token in the system that could read a mailbox or a drive, because none
+was ever requested or consented to. The bot's only credential is scoped to
+`https://api.botframework.com/.default` — the message-routing API, and nothing else.
+
+---
+
 ## Part 1 — Permissions you'll need
 
 If you administer the tenant yourself, grant these and move on. If you don't, you'll need someone
 who does — and this section is written so you can hand the request over without a meeting.
 
-Two things must be true before anything else works:
+### The exact ask, by system
 
-**1. You can register an application in Entra ID.**
-This creates the bot's identity. It needs **no Graph API permissions** — no mail, no files, no
-directory access. The bot only receives messages that are explicitly sent to it, and replies to
-them. It cannot read channels it hasn't been added to, and it cannot see anything else in the
-tenant. Many tenants already let any user register apps; if yours doesn't, you need it enabled for
-your account.
+Four grants, in three different admin consoles. Naming the console and the role is what turns a
+week of back-and-forth into one ticket.
 
-**2. You can upload a custom app to Teams** (*sideloading*).
-This is how the bot appears in the Teams client, and most tenants block it by default. It's granted
-**per person**, not org-wide:
+| # | What you need | Where the admin grants it | Role the admin must hold |
+|---|---|---|---|
+| 1 | **Register an application** in Entra ID | Entra admin center → **Roles and administrators** → assign **Application Developer** to you.<br/>(Or: Entra → **User settings** → *Users can register applications* = **Yes**, tenant-wide.) | Privileged Role Administrator, or Global Administrator |
+| 2 | **A service principal for that app** in the tenant | Usually implicit with #1. If `az ad sp create` is refused, the admin runs it, or holds **Cloud Application Administrator**. | Cloud Application Administrator, or Global Administrator |
+| 3 | **Create the Azure Bot resource** | Azure portal → the target subscription → **Contributor** on one resource group | Owner / User Access Administrator on the subscription |
+| 4 | **Upload a custom app to Teams** (*sideloading*) | Teams admin center → **Teams apps** → **Manage apps** → *Org-wide app settings* → **Custom apps** = On<br/>**and** → **Setup policies** → your policy → **Upload custom apps** = On, assigned to you | **Teams Administrator**, or Global Administrator |
 
-> **Teams admin center → Teams apps → Setup policies → Global (or a new policy)**
-> Set **"Upload custom apps"** to **On**, and assign that policy to the people who need it.
+Grant #4 is two switches, not one, and this is the single most common place the setup stalls: the
+per-user setup policy does nothing if the **org-wide** custom-apps toggle is off. Ask for both by
+name.
 
-Before you ask, know the two traps:
+If a **custom app permission policy** is in force (Teams apps → **Permission policies**), custom
+apps must also be *allowed* there. Most tenants leave it permissive; a locked-down one will not,
+and the symptom is identical to a missing setup policy.
+
+### What is *not* being asked for
+
+Worth stating explicitly, because it's what the admin is actually worried about:
+
+- **No Microsoft Graph API permissions.** Not delegated, not application, not one. No mail, no
+  files, no SharePoint, no directory read. Nothing to consent to on the Graph side at all.
+- **No Global Administrator for you.** Every grant above is a scoped role or a policy toggle.
+- **No tenant-wide change**, except optionally #1 — and that has a per-user alternative
+  (Application Developer) if the admin prefers not to flip the tenant setting.
+- **No standing access.** The bot has one credential, scoped to
+  `https://api.botframework.com/.default` — message routing, nothing else. Deleting the app
+  registration revokes everything, instantly.
+
+### Two traps to know before you ask
 
 - **Guest accounts can never sideload**, no matter the policy. If your account is a guest in the
-  tenant, no permission fixes it — you need a real member account.
+  tenant, no permission fixes it — you need a real **member** account. Check first; this determines
+  whether you're asking for a policy or an account.
 - Policy changes take **up to 24 hours** to reach the Teams client. If "Upload a custom app" is
   still missing after it's been granted, that's usually why. Wait; don't redo the setup.
 
+### Networking, if the gateway runs inside the corporate network
+
+Two directions, both narrow:
+
+- **Inbound:** Microsoft's Bot Framework connector must reach `https://<your-host>/api/messages`
+  from the public internet, on 443, with a **publicly trusted certificate**. A self-signed cert
+  fails silently. This is one path on one host — not a general ingress.
+- **Outbound:** the gateway needs egress to `login.microsoftonline.com` (mint the bot token),
+  `login.botframework.com` (fetch the JWKS to validate inbound tokens), and
+  `*.smba.trafficmanager.net` (post replies). Plus whatever the agent's model provider needs.
+
+### Getting to production: skip sideloading
+
 Once the agent is proven you can skip sideloading entirely by publishing it to the **org app
-catalog**, so people install it like any other Teams app. Sideloading is the fast path to getting
-one person talking to it today; the catalog is how you roll it out.
+catalog** (Teams admin center → Manage apps → **Upload new app**), then using an app setup policy
+to install or pin it for a group. People then get it like any other Teams app, and nobody needs
+the sideload permission. Sideloading is the fast path to getting one person talking to it today;
+the catalog is how you roll it out.
 
 ### Asking your admin
 
 Copy this. It says what you need and — the part that usually unsticks the conversation — what you
 don't.
 
-> I'm setting up a chat assistant that lives in Teams. I need two things:
+> I'm setting up a chat assistant that runs as a bot in Teams. It's a normal Teams bot registration
+> pointed at a service we run. I need four things, and I've named the console and role for each so
+> you can check them off:
 >
-> 1. **Permission to register an application in Entra ID.** This is the bot's identity. It requires
->    **no Graph API permissions** — no access to mail, files, or the directory. The bot can only see
->    messages people explicitly send to it, and reply to them. It can't read channels it hasn't been
->    added to, and it can't see anything else in the tenant.
+> 1. **Register an application in Entra ID** — the bot's identity. Either assign me the
+>    **Application Developer** role, or register the app for me and send me the app ID and a client
+>    secret. **It requires no Microsoft Graph API permissions** — no mail, no files, no SharePoint,
+>    no directory. There is nothing to grant admin consent for.
 >
-> 2. **Permission to upload a custom app to Teams**, so the bot appears in my Teams client. In the
->    Teams admin center that's **Teams apps → Setup policies**, setting **"Upload custom apps"** to
->    **On** for my account. It doesn't need to be enabled for anyone else.
+> 2. **A service principal for that app in our tenant** (`az ad sp create --id <appId>`). This is
+>    usually automatic; if it isn't, it needs **Cloud Application Administrator**. Without it the
+>    bot fails with `AADSTS7000229`, which doesn't mention service principals at all.
 >
-> Both are scoped to me and to this one bot. Nothing else in the tenant is affected, and either can
-> be revoked at any time.
+> 3. **Contributor on one Azure resource group**, so I can create the Azure Bot resource. That
+>    resource is just a routing record — it says "the bot with this app ID is reachable at this
+>    URL." It stores no message content.
+>
+> 4. **Permission to upload a custom app to Teams**, so the bot appears in my client for testing.
+>    In the Teams admin center this is **two** settings:
+>    - **Teams apps → Manage apps → Org-wide app settings → Custom apps** = On
+>    - **Teams apps → Setup policies →** (my policy) **→ Upload custom apps** = On, assigned to me
+>
+>    It doesn't need to be enabled for anyone else. Once the agent is approved we'd publish it to
+>    the org app catalog instead, and this permission can be revoked.
+>
+> **What the bot can see:** only messages sent directly to it in a 1:1 chat, and messages that
+> @mention it in a channel someone has explicitly added it to. It cannot read any other channel, or
+> anything else in the tenant — not because we've configured it not to, but because it holds no
+> Graph permissions that would let it.
+>
+> **Network:** it needs one inbound HTTPS path (`/api/messages` on one host, publicly reachable with
+> a valid certificate) and outbound access to `login.microsoftonline.com`,
+> `login.botframework.com`, and `*.smba.trafficmanager.net`.
+>
+> Everything above is scoped to me and to this one bot, and any of it can be revoked at any time —
+> deleting the app registration kills the bot immediately.
 
 ---
 
@@ -305,9 +504,11 @@ This is the single most common setup failure, and the error message never says t
 "service principal".
 
 **"Upload a custom app" is missing or greyed out in Teams.**
-In order of likelihood: the app setup policy isn't assigned to that user; the policy was assigned
-but hasn't propagated (**allow up to 24 hours**); or the account is a **guest**, which can never
-sideload regardless of policy.
+In order of likelihood: the **org-wide** custom-apps toggle is off (Teams admin center → Manage apps
+→ Org-wide app settings → **Custom apps**) — the per-user setup policy does nothing without it; the
+app **setup policy** isn't assigned to that user; the policy was assigned but hasn't propagated
+(**allow up to 24 hours**); a **permission policy** blocks custom apps; or the account is a
+**guest**, which can never sideload regardless of policy.
 
 **The bot replies in a DM but is silent in a channel.**
 In a channel it only sees messages that **@mention** it — that's Teams' behaviour, not a bug.
