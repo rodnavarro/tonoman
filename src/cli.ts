@@ -16,6 +16,7 @@ import * as http from "node:http";
 import * as os from "node:os";
 import * as path from "node:path";
 import { load, type Config, type AgentConfig } from "./config";
+import { controlPlaneFrom } from "./core/controlplane";
 import * as gateway from "./gateway";
 import * as health from "./health";
 import { findAgent, upsertMount, removeMount, listMounts, podmanVolumeArgs, agentMountPath } from "./mounts";
@@ -200,8 +201,21 @@ async function readRaw(cfgPath: string): Promise<Config> {
   return JSON.parse(raw) as Config;
 }
 
+/** The roster, from whichever control plane this deployment runs under (§1 seam).
+ *
+ *  Self-hosted Tonoman reads settings.json and behaves exactly as before. Tonoman Cloud sets
+ *  TONOMANCLOUD_API_URL and the roster comes from the registry instead, which is what makes an
+ *  agent a row rather than a pull request against infrastructure. Nothing downstream — router,
+ *  queue, harness, connectors — can tell the difference. */
+async function loadRoster(cfgPath: string): Promise<Config> {
+  const plane = controlPlaneFrom(process.env, cfgPath);
+  const cfg = await plane.roster();
+  console.log(`tonoman: roster from ${plane.name()} — ${cfg.agents?.length ?? 0} agent(s)`);
+  return cfg;
+}
+
 async function runUp(cfgPath: string, env: string | undefined): Promise<void> {
-  const cfg = await load(cfgPath);
+  const cfg = await loadRoster(cfgPath);
   applyEnv(cfg, env); // co-locate state + suffix containers for a named env (cli-env)
   const ac = new AbortController();
   const onSig = () => ac.abort();
@@ -298,7 +312,8 @@ async function runAuth(cfgPath: string, env: string | undefined, args: string[])
       process.exit(2);
       return;
     }
-    const cfg = await load(cfgPath);
+    // The roster, not the file: under Cloud the agent being authenticated exists only as a row.
+    const cfg = await loadRoster(cfgPath);
     applyEnv(cfg, env);
     const r = await resolveAuthOps(cfg, agent).submitCode(code);
     process.stdout.write(r.ok ? `Authenticated "${agent}" ✓\n` : `Submitted code for "${agent}", but auth status isn't logged-in yet — check the detail below.\n`);
@@ -313,7 +328,7 @@ async function runAuth(cfgPath: string, env: string | undefined, args: string[])
     return;
   }
   const agent = positional[1];
-  const cfg = await load(cfgPath);
+  const cfg = await loadRoster(cfgPath);
   applyEnv(cfg, env); // auth execs into the env's (suffixed) container
 
   // `tonoman auth login <agent> --headless` — print the OAuth URL; no local browser/TTY needed.
