@@ -109,10 +109,14 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
     console.error("worker: NO agents have a usable channel binding — nothing will be answered.");
   }
 
-  // Check out every granted second-brain source before serving. An agent that answers before its
-  // memory is on disk answers "I don't know" to things it does know, which is worse than a slow
-  // start — so this is awaited rather than kicked off in the background.
-  for (const [name, a] of wired) {
+  /** Pull every granted source and refresh the agent's context note.
+   *
+   *  Run once before serving, then on a timer. The timer is not a nicety: the whole point of the
+   *  voice flow is that a meeting recorded minutes ago is something the agent can talk about, and a
+   *  checkout taken only at boot would mean the answer is "I don't know" until somebody restarts a
+   *  pod. */
+  const syncAll = async (): Promise<void> => {
+    for (const [name, a] of wired) {
     const sources = (a.cfg.secondbrain ?? []).map((s) => ({
       id: s.id,
       label: s.label,
@@ -123,21 +127,30 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
       secretRef: s.secret_ref,
       readOnly: s.read_only,
     }));
-    if (sources.length === 0) {
-      console.log(`worker: ${name} has no second-brain sources granted`);
-      continue;
+      if (sources.length === 0) continue;
+      const ready = await secondbrain
+        .sync(sources, {
+          root: path.join(process.env.TONOMAN_STATE_ROOT ?? "/root/.tonoman", "secondbrain", name),
+          resolveRef,
+          // Quiet on the timer: one line per source per minute is noise, and a failure still logs.
+          log: (s) => {
+            if (!a.context || /failed/.test(s)) console.log(s);
+          },
+        })
+        .catch((e) => {
+          console.error(`worker: ${name} second-brain sync failed: ${(e as Error).message}`);
+          return [] as { dir: string; label: string }[];
+        });
+      a.context = secondbrain.contextNote(ready);
     }
-    const ready = await secondbrain
-      .sync(sources, {
-        root: path.join(process.env.TONOMAN_STATE_ROOT ?? "/root/.tonoman", "secondbrain", name),
-        resolveRef,
-      })
-      .catch((e) => {
-        console.error(`worker: ${name} second-brain sync failed: ${(e as Error).message}`);
-        return [] as { dir: string; label: string }[];
-      });
-    a.context = secondbrain.contextNote(ready);
-  }
+  };
+
+  await syncAll();
+  const syncEvery = Number(process.env.SECONDBRAIN_SYNC_SECONDS ?? 60) * 1000;
+  const syncTimer = setInterval(() => {
+    void syncAll().catch(() => {});
+  }, syncEvery);
+  signal.addEventListener("abort", () => clearInterval(syncTimer), { once: true });
 
   const deps = { agent: (name: string) => wired.get(name) };
   const activities = makeActivities(deps);
