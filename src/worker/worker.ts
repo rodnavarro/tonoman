@@ -273,15 +273,19 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
         say: async (name, conversation, text) => {
           await wired.get(name)?.conn.reply(conversation).send(text);
         },
-        ask: async (name, conversation, text) => {
+        ask: async (name, conversation, text, user) => {
           // Through the same workflow as a typed message, so a woken turn has the same history,
           // the same ordering and the same interruption behaviour as any other.
+          //
+          // `user` is the RECIPIENT. A placeholder here made the agent believe it was addressing a
+          // stranger, and it refused to discuss the meeting it had just been asked to summarise —
+          // which was the right call on its part and the wrong input from ours.
           await client.workflow.signalWithStart(conversationWorkflow, {
             workflowId: `${name}:slack:${conversation}`,
             taskQueue: o.taskQueue,
             args: [{ agent: name, conversation, channel: "slack" }],
             signal: messageSignal,
-            signalArgs: [{ text, user: "system", ts: String(Date.now()) }],
+            signalArgs: [{ text, user: user ?? "", ts: String(Date.now()) }],
           });
         },
       },

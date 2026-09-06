@@ -85,7 +85,13 @@ export function makeActivities(deps: TurnDeps) {
       );
       const parts = [
         found.context ?? "",
-        known ? `You are speaking with ${known.label}.` : `You are speaking with someone you don't recognise (${input.user}); ask who they are before sharing anything specific.`,
+        known
+          ? `You are speaking with ${known.label}.`
+          : input.user
+            ? `You are speaking with someone you don't recognise (${input.user}); ask who they are before sharing anything specific.`
+            // No sender at all means a system notification, not an unknown person. Treating it as
+            // a stranger made the agent refuse to discuss the meeting it had just been handed.
+            : "This turn was started by the system, not by a person. Write it as a message to the person in this conversation.",
         input.afterInterruption
           ? "(your previous answer was interrupted by a new message; continue from what the user now says)"
           : "",

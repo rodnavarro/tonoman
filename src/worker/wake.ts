@@ -35,8 +35,14 @@ export interface WakeDeps {
   dmFor(agent: string, userId: string): Promise<string | undefined>;
   /** Say something verbatim in a conversation. */
   say(agent: string, conversation: string, text: string): Promise<void>;
-  /** Run `text` as though the person had sent it. */
-  ask(agent: string, conversation: string, text: string): Promise<void>;
+  /** Run `text` as though the person had sent it.
+   *
+   *  `user` is who the agent is SPEAKING TO, and it matters: a woken turn has no human sender, so
+   *  passing a placeholder makes the agent believe it is talking to a stranger and — correctly —
+   *  refuse to discuss anything specific. Observed: the highlights DM came back as "I don't think
+   *  we've met, who are you?". The recipient's own id is the right answer, because the message is
+   *  addressed to them. */
+  ask(agent: string, conversation: string, text: string, user?: string): Promise<void>;
   /** Whether this agent exists in the roster. */
   has(agent: string): boolean;
 }
@@ -109,7 +115,7 @@ export function serveWake(o: WakeServerOptions, signal: AbortSignal): boolean {
             return;
           }
           if (verbatim) await o.deps.say(agent, conv, text);
-          else await o.deps.ask(agent, conv, text);
+          else await o.deps.ask(agent, conv, text, user);
         } catch (e) {
           console.error(`wake: ${agent} failed: ${(e as Error).message}`);
         }
