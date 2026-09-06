@@ -55,8 +55,9 @@ export function makeActivities(deps: TurnDeps) {
       const { conn, run } = found;
 
       const reply: Reply = conn.reply(input.conversation);
-      // Post the placeholder before any output, so the person sees the agent take the message
-      // within a second. Slack has no typing indicator for apps; this message is the cue.
+      // In an assistant thread this renders Slack's own "is thinking…" line under the composer.
+      // Everywhere else it is a no-op, and the placeholder below is the cue instead.
+      await reply.working?.("is thinking").catch(() => {});
       const msgId = await reply.send("…");
 
       let answer = "";
@@ -71,6 +72,7 @@ export function makeActivities(deps: TurnDeps) {
       // what happened — a reply that silently stops looks like a broken bot.
       ctx.cancelled.catch(() => {
         if (done) return;
+        void reply.settle?.().catch(() => {});
         void reply
           .finalize(msgId, `${answer.trim() || "_(nothing yet)_"}\n\n_— interrupted; working on your new message_`)
           .catch(() => {});
@@ -113,6 +115,9 @@ export function makeActivities(deps: TurnDeps) {
           const now = Date.now();
           if (now - lastEdit >= EDIT_INTERVAL_MS) {
             lastEdit = now;
+            // In an assistant thread the tool goes in the status line, where Slack renders it as
+            // the agent's activity rather than as a message that will be overwritten.
+            await reply.working?.(`is ${(ev.tool ?? "working").toLowerCase()}…`).catch(() => {});
             await reply.update(msgId, `_${activity.slice(0, 200)}_`).catch(() => {});
           }
         } else if (ev.kind === "done" && ev.final) {
@@ -129,6 +134,9 @@ export function makeActivities(deps: TurnDeps) {
       }
 
       done = true;
+      // Slack leaves "is thinking…" on screen until it is cleared, so an answered turn that
+      // forgets this looks permanently busy.
+      await reply.settle?.().catch(() => {});
       if (ctx.cancellationSignal.aborted) return;
       await reply.finalize(msgId, answer.trim() || "_(no answer)_");
     },

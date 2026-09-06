@@ -418,10 +418,42 @@ class SlackReply implements Reply {
     }
   }
 
-  /** Slack has no typing indicator for apps. The streamed message itself is the cue: the first
-   *  `send` posts within a second of the mention, so the person sees an answer forming. */
-  async working(): Promise<void> {
-    /* no-op by design — see above */
+  /** The status cue.
+   *
+   *  Slack gives apps no typing indicator in an ordinary channel — that was only ever available to
+   *  real user sessions over RTM. But in an **assistant thread** (the Agents & AI Apps surface)
+   *  `assistant.threads.setStatus` renders a proper "Nelly is thinking…" line under the composer,
+   *  and it takes arbitrary text, so tool narration goes there instead of into the answer.
+   *
+   *  Only meaningful inside an assistant thread, which is a DM with a thread. Elsewhere Slack
+   *  answers with an error and the streamed message remains the only cue — so a failure here is
+   *  swallowed rather than costing a turn. */
+  async working(status?: string): Promise<void> {
+    if (!this.target.threadTs) return; // not an assistant thread; nothing to set
+    try {
+      await this.c.call("assistant.threads.setStatus", {
+        channel_id: this.target.channel,
+        thread_ts: this.target.threadTs,
+        status: (status ?? "is thinking").slice(0, 100),
+      });
+    } catch {
+      /* not an assistant thread, or the scope is missing — the message itself is still the cue */
+    }
+  }
+
+  /** Clear the status. Slack leaves "is thinking…" on screen until it is set to empty, so an
+   *  answered turn that forgets this looks permanently busy. */
+  async settle(): Promise<void> {
+    if (!this.target.threadTs) return;
+    try {
+      await this.c.call("assistant.threads.setStatus", {
+        channel_id: this.target.channel,
+        thread_ts: this.target.threadTs,
+        status: "",
+      });
+    } catch {
+      /* best effort */
+    }
   }
 
   /** Standalone notice (telegram/teams parity): post / edit-by-id / delete a plain message,
