@@ -24,6 +24,17 @@ export interface Telegram {
   media_mount?: string;
 }
 
+/** One agent's Slack connector wiring (A1, channel-slack). Socket Mode, so the agent DIALS OUT
+ * and needs no ingress, no public URL, no TLS certificate and no signing-secret verification —
+ * the same shape as Telegram's long-poll. Both tokens are SECRETS: keep them out of the roster
+ * file (forward via `secrets[]` / env) and set them on the wired connector at gateway-run time. */
+export interface Slack {
+  app_token?: string; // `xapp-…`, scope connections:write — opens the Socket Mode socket
+  bot_token?: string; // `xoxb-…` — every Web API call
+  /** allow-list of Slack user ids (`U…`); empty = accept anyone in the workspace. */
+  allowed_users?: string[];
+}
+
 /** One agent's MS Teams connector wiring (A1, channel-teams). A turn-driven agent
  * reached on Teams instead of Telegram — Tonoman owns the webhook + outbound, the
  * harness is unchanged. `app_password` is a SECRET: keep it out of the roster file
@@ -103,13 +114,16 @@ export interface AgentConfig {
   /** Channel for a turn-driven agent (channel-teams). Usually inferred from which
    * connector block is present (`telegram` → telegram, `teams` → teams); set explicitly
    * to disambiguate. A service agent owns its own channel (derived "self"). */
-  channel?: "telegram" | "teams";
+  channel?: "telegram" | "teams" | "slack";
   /** Connector wiring for a turn-driven agent (A1). OPTIONAL: a service agent
    * (svc-self-channeled) owns its own channel and needs no Tonoman connector. */
   telegram?: Telegram;
   /** MS Teams connector wiring for a turn-driven agent (channel-teams). Mutually
    * exclusive with `telegram` per agent. */
   teams?: Teams;
+  /** Slack connector wiring for a turn-driven agent (channel-slack). Mutually exclusive
+   * with `telegram` / `teams` per agent. */
+  slack?: Slack;
   workspace?: Workspace;
   // --- Service-mode (svc-self-channeled / svc-config-env) ----------------------
   /** Service agent: Tonoman boots + lifecycle-manages a long-lived self-channeled server
@@ -235,7 +249,7 @@ function applyDefaults(c: Config): void {
     if (!a.name) a.name = "agent";
     // Infer the channel from which connector block is present (channel-teams); a service
     // agent owns its own channel, so leave it unset.
-    if (!a.service && !a.channel) a.channel = a.teams ? "teams" : "telegram";
+    if (!a.service && !a.channel) a.channel = a.slack ? "slack" : a.teams ? "teams" : "telegram";
   }
 }
 
@@ -254,10 +268,13 @@ export function validate(c: Config): void {
     // Teams agent (channel-teams) — teams.app_id + teams.tenant_id (app_password is a
     // secret injected at run time, so it is not required in the roster file).
     if (!a.service) {
-      const ch = a.channel ?? (a.teams ? "teams" : "telegram");
+      const ch = a.channel ?? (a.slack ? "slack" : a.teams ? "teams" : "telegram");
       if (ch === "teams") {
         if (!a.teams?.app_id) missing.push("teams.app_id");
         if (!a.teams?.tenant_id) missing.push("teams.tenant_id");
+      } else if (ch === "slack") {
+        // Both Slack tokens are secrets injected at run time, so the roster carries neither.
+        // Presence is checked where the connector is wired, not here.
       } else if (!a.telegram?.token) {
         missing.push("telegram.token");
       }
