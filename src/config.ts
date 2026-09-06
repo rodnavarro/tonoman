@@ -29,6 +29,9 @@ export interface Telegram {
  * the same shape as Telegram's long-poll. Both tokens are SECRETS: keep them out of the roster
  * file (forward via `secrets[]` / env) and set them on the wired connector at gateway-run time. */
 export interface Slack {
+  /** Slack team id (`T…`). Not secret, and needed to build a conversation key for a DM the agent
+   * opens itself (gw-wake) — the agent has no inbound envelope to take one from. */
+  team_id?: string;
   app_token?: string; // `xapp-…`, scope connections:write — opens the Socket Mode socket
   bot_token?: string; // `xoxb-…` — every Web API call
   /** allow-list of Slack user ids (`U…`); empty = accept anyone in the workspace. */

@@ -22,6 +22,7 @@ import { SlackConnector } from "../connector/slack";
 import { httpAuthOps } from "../authflow";
 import * as gate from "./authgate";
 import * as secondbrain from "./secondbrain";
+import { serveWake } from "./wake";
 import { promises as fsp } from "node:fs";
 import { defaultHarnesses } from "../gateway";
 import { makeActivities, type TurnRunReq } from "./activities";
@@ -247,6 +248,48 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
         }
       })(),
     );
+  }
+
+  // gw-wake: a system can start the conversation. This is what lets the voice flow say "I've got
+  // your meeting" without anybody asking — the beat the whole pipeline exists to produce.
+  const wakeToken = process.env.TONOMAN_WAKE_TOKEN ?? "";
+  const wakeServing = serveWake(
+    {
+      port: Number(process.env.TONOMAN_WAKE_PORT ?? 3980),
+      token: wakeToken,
+      deps: {
+        has: (name) => wired.has(name),
+        dmFor: async (name, userId) => {
+          const a = wired.get(name);
+          if (!a) return undefined;
+          const j = await (a.conn as SlackConnector).call<{ channel?: { id?: string } }>(
+            "conversations.open",
+            { users: userId },
+          );
+          const channel = j.channel?.id;
+          // The connector's conversation key shape: `<team>/<channel>`. A DM has no thread.
+          return channel ? `${a.cfg.slack?.team_id ?? ""}/${channel}` : undefined;
+        },
+        say: async (name, conversation, text) => {
+          await wired.get(name)?.conn.reply(conversation).send(text);
+        },
+        ask: async (name, conversation, text) => {
+          // Through the same workflow as a typed message, so a woken turn has the same history,
+          // the same ordering and the same interruption behaviour as any other.
+          await client.workflow.signalWithStart(conversationWorkflow, {
+            workflowId: `${name}:slack:${conversation}`,
+            taskQueue: o.taskQueue,
+            args: [{ agent: name, conversation, channel: "slack" }],
+            signal: messageSignal,
+            signalArgs: [{ text, user: "system", ts: String(Date.now()) }],
+          });
+        },
+      },
+    },
+    signal,
+  );
+  if (!wakeServing) {
+    console.log("worker: TONOMAN_WAKE_TOKEN is unset — /api/wake is NOT served (no agent can speak first)");
   }
 
   signal.addEventListener("abort", () => worker.shutdown(), { once: true });

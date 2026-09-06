@@ -170,6 +170,9 @@ export class RegistryControlPlane implements ControlPlane {
       agents.push({
         guid: a.guid,
         name: localName,
+        // Empty on purpose: no per-agent container, because the pod is the sandbox. The harness
+        // reads this to choose local-exec over `podman exec`.
+        container: "",
         role: a.role ?? undefined,
         harness: (a.harness as AgentConfig["harness"]) ?? "claude-code",
         model: a.model ?? undefined,
@@ -192,6 +195,7 @@ export class RegistryControlPlane implements ControlPlane {
         })),
         channel: "slack",
         slack: {
+          team_id: a.teamId,
           app_token: appToken,
           bot_token: botToken,
           allowed_users: a.allowedUsers ?? [],
