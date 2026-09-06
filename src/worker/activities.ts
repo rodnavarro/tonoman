@@ -62,6 +62,10 @@ export function makeActivities(deps: TurnDeps) {
       let answer = "";
       let lastEdit = 0;
       let done = false;
+      // Tool narration (Teams parity). Shown ONLY until the first words of the answer arrive, then
+      // replaced by the answer itself. A turn that greps the second brain for ten seconds otherwise
+      // shows nothing but a placeholder, and silence reads as broken rather than as working.
+      let activity = "";
 
       // Temporal cancels the scope when a new message arrives. Leave the partial visible and say
       // what happened — a reply that silently stops looks like a broken bot.
@@ -96,6 +100,14 @@ export function makeActivities(deps: TurnDeps) {
           if (now - lastEdit >= EDIT_INTERVAL_MS && answer.trim()) {
             lastEdit = now;
             await reply.update(msgId, answer).catch(() => {});
+          }
+        } else if (ev.kind === "tool" && !answer) {
+          // "🔧 Grep: Meetings/" — the tool and a short detail, the same shape Teams shows.
+          activity = `🔧 ${ev.tool ?? "working"}${ev.text ? `: ${ev.text}` : ""}`;
+          const now = Date.now();
+          if (now - lastEdit >= EDIT_INTERVAL_MS) {
+            lastEdit = now;
+            await reply.update(msgId, `_${activity.slice(0, 200)}_`).catch(() => {});
           }
         } else if (ev.kind === "done" && ev.final) {
           // The authoritative text. A harness that streams deltas AND sends a final would otherwise
