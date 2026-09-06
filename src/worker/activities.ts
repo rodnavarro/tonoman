@@ -17,7 +17,7 @@ import type { AgentConfig } from "../config";
 /** How the worker finds an agent's connector and runner. Injected at worker construction so this
  *  module holds no globals and can be unit-tested without Temporal. */
 export interface TurnDeps {
-  agent(name: string): { cfg: AgentConfig; conn: Connector; run: (req: TurnRunReq) => AsyncIterable<TurnEvent> } | undefined;
+  agent(name: string): { cfg: AgentConfig; conn: Connector; context?: string; run: (req: TurnRunReq) => AsyncIterable<TurnEvent> } | undefined;
 }
 
 export interface TurnRunReq {
@@ -72,9 +72,21 @@ export function makeActivities(deps: TurnDeps) {
           .catch(() => {});
       });
 
-      const preamble = input.afterInterruption
-        ? "(your previous answer was interrupted by a new message; continue from what the user now says)\n\n"
-        : "";
+      // What the agent can read, and who is asking. Without the first the second brain is present
+      // on disk but the model has no reason to look at it; without the second "Hi Celine" is a
+      // guess rather than a fact from the registry.
+      // Who is asking, from the registry — never guessed from a display name, which is spoofable.
+      const known = (found.cfg.principals ?? []).find(
+        (p) => p.kind === "slack_user_id" && p.value === input.user,
+      );
+      const parts = [
+        found.context ?? "",
+        known ? `You are speaking with ${known.label}.` : `You are speaking with someone you don't recognise (${input.user}); ask who they are before sharing anything specific.`,
+        input.afterInterruption
+          ? "(your previous answer was interrupted by a new message; continue from what the user now says)"
+          : "",
+      ].filter(Boolean);
+      const preamble = parts.length ? `${parts.join("\n\n")}\n\n` : "";
 
       for await (const ev of run({ prompt: `${preamble}${input.text}`, systemPromptFile: found.cfg.system_prompt_file })) {
         if (ctx.cancellationSignal.aborted) return;

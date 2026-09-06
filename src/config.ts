@@ -134,6 +134,23 @@ export interface AgentConfig {
    * Undefined means "not tracked", which is the file-roster case: a self-hosted deployment keeps
    * today's behaviour and is never gated. */
   auth_state?: "unconfigured" | "ok" | "expired" | "error";
+  /** Who this agent recognises, and as whom. A Slack user id resolves to a name the agent can use,
+   * which is how "Hi Celine" happens — from the registry, never from a spoofable display name.
+   * Deliberately unrelated to console access (§7): talking to an agent is not signing in. */
+  principals?: { kind: string; value: string; label: string }[];
+  /** Second-brain sources this agent has been GRANTED (§8). A list, not one repo: the end state
+   * binds an Azure DevOps repo over SSH alongside a GitHub one. Empty when the tool is not granted,
+   * which is what makes revoking it in the console remove the checkout rather than hide a button. */
+  secondbrain?: {
+    id: string;
+    label: string;
+    repo_url: string;
+    branch?: string;
+    subpath?: string;
+    auth_kind?: string;
+    secret_ref?: string | null;
+    read_only?: boolean;
+  }[];
   workspace?: Workspace;
   // --- Service-mode (svc-self-channeled / svc-config-env) ----------------------
   /** Service agent: Tonoman boots + lifecycle-manages a long-lived self-channeled server

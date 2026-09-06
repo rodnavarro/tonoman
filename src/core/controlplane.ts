@@ -62,6 +62,17 @@ export interface RegistryAgent {
   appTokenRef?: string | null;
   allowedUsers?: string[] | null;
   principals?: { kind: string; value: string; label: string }[];
+  tools?: string[];
+  secondbrain?: {
+    id: string;
+    label: string;
+    repoUrl: string;
+    branch?: string;
+    subpath?: string;
+    authKind?: string;
+    secretRef?: string | null;
+    readOnly?: boolean;
+  }[];
 }
 
 export interface RegistryOptions {
@@ -167,6 +178,18 @@ export class RegistryControlPlane implements ControlPlane {
         // Carried through so the runtime can refuse a turn and ask for a login, rather than
         // spending one to discover there is no credential.
         auth_state: (a.authState as AgentConfig["auth_state"]) ?? "unconfigured",
+        principals: a.principals ?? [],
+        // Present only when the tool is granted — the registry decides, not the runtime.
+        secondbrain: (a.secondbrain ?? []).map((s) => ({
+          id: s.id,
+          label: s.label,
+          repo_url: s.repoUrl,
+          branch: s.branch,
+          subpath: s.subpath,
+          auth_kind: s.authKind,
+          secret_ref: s.secretRef,
+          read_only: s.readOnly,
+        })),
         channel: "slack",
         slack: {
           app_token: appToken,

@@ -21,6 +21,8 @@ import type { Connector, TurnEvent } from "../core/contracts";
 import { SlackConnector } from "../connector/slack";
 import { httpAuthOps } from "../authflow";
 import * as gate from "./authgate";
+import * as secondbrain from "./secondbrain";
+import { promises as fsp } from "node:fs";
 import { defaultHarnesses } from "../gateway";
 import { makeActivities, type TurnRunReq } from "./activities";
 import { conversationWorkflow, messageSignal, type Inbound } from "./workflows";
@@ -45,11 +47,30 @@ export function workerOptionsFrom(env: NodeJS.ProcessEnv): WorkerOptions {
   };
 }
 
+/** Resolve `<secret>:<key>` from the mounted secret tree — the same contract the control plane
+ *  uses. Returns "" when absent; the caller decides whether that is fatal. A ref comes from a
+ *  database edited through a web form, so anything that could climb out of the mount is refused
+ *  rather than read. */
+async function resolveRef(ref: string | null | undefined): Promise<string> {
+  if (!ref) return "";
+  const i = ref.indexOf(":");
+  if (i < 0) return "";
+  const secret = ref.slice(0, i);
+  const key = ref.slice(i + 1);
+  if (!/^[A-Za-z0-9._-]+$/.test(secret) || !/^[A-Za-z0-9._-]+$/.test(key)) return "";
+  const dir = process.env.TONOMAN_SECRETS_DIR ?? "/etc/tonoman/secrets";
+  try {
+    return (await fsp.readFile(path.join(dir, secret, key), "utf8")).trim();
+  } catch {
+    return "";
+  }
+}
+
 /** Builds one connector + runner per agent in the roster. An agent whose channel has no connector
  *  is skipped with a reason rather than failing the worker — one bad row must not silence the rest. */
-function wire(cfg: Config): Map<string, { cfg: AgentConfig; conn: Connector; run: (r: TurnRunReq) => AsyncIterable<TurnEvent> }> {
+function wire(cfg: Config): Map<string, { cfg: AgentConfig; conn: Connector; context?: string; run: (r: TurnRunReq) => AsyncIterable<TurnEvent> }> {
   const harnesses = defaultHarnesses();
-  const out = new Map<string, { cfg: AgentConfig; conn: Connector; run: (r: TurnRunReq) => AsyncIterable<TurnEvent> }>();
+  const out = new Map<string, { cfg: AgentConfig; conn: Connector; context?: string; run: (r: TurnRunReq) => AsyncIterable<TurnEvent> }>();
   for (const a of cfg.agents ?? []) {
     const channel = a.channel ?? (a.slack ? "slack" : a.teams ? "teams" : "telegram");
     if (channel !== "slack") {
@@ -86,6 +107,36 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
   if (wired.size === 0) {
     // Loudly: a worker with no connectors looks perfectly healthy while answering nobody.
     console.error("worker: NO agents have a usable channel binding — nothing will be answered.");
+  }
+
+  // Check out every granted second-brain source before serving. An agent that answers before its
+  // memory is on disk answers "I don't know" to things it does know, which is worse than a slow
+  // start — so this is awaited rather than kicked off in the background.
+  for (const [name, a] of wired) {
+    const sources = (a.cfg.secondbrain ?? []).map((s) => ({
+      id: s.id,
+      label: s.label,
+      repoUrl: s.repo_url,
+      branch: s.branch,
+      subpath: s.subpath,
+      authKind: s.auth_kind,
+      secretRef: s.secret_ref,
+      readOnly: s.read_only,
+    }));
+    if (sources.length === 0) {
+      console.log(`worker: ${name} has no second-brain sources granted`);
+      continue;
+    }
+    const ready = await secondbrain
+      .sync(sources, {
+        root: path.join(process.env.TONOMAN_STATE_ROOT ?? "/root/.tonoman", "secondbrain", name),
+        resolveRef,
+      })
+      .catch((e) => {
+        console.error(`worker: ${name} second-brain sync failed: ${(e as Error).message}`);
+        return [] as { dir: string; label: string }[];
+      });
+    a.context = secondbrain.contextNote(ready);
   }
 
   const deps = { agent: (name: string) => wired.get(name) };
