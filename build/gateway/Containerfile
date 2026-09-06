@@ -42,9 +42,14 @@ RUN npm install -g @anthropic-ai/claude-code \
 # Container-root git must trust bind-mounted workspaces, or "dubious ownership" blocks commits.
 RUN git config --system --add safe.directory '*'
 
-# Tonoman has no runtime dependencies, so the compiled output is the whole application.
+# Runtime dependencies. Tonoman had none until the Temporal worker landed — `@temporalio/worker`
+# also carries a native core, so it is installed here on the same base rather than copied from the
+# build stage, which would carry devDependencies (tsc, vitest) into a running pod.
+WORKDIR /opt/tonoman
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev && npm cache clean --force
+
 COPY --from=build /src/dist /opt/tonoman/dist
-COPY package.json /opt/tonoman/package.json
 
 WORKDIR /opt/tonoman
 CMD ["node", "/opt/tonoman/dist/cli.js", "runtime"]
