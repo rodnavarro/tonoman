@@ -19,6 +19,8 @@ import * as path from "node:path";
 import type { Config, AgentConfig } from "../config";
 import type { Connector, TurnEvent } from "../core/contracts";
 import { SlackConnector } from "../connector/slack";
+import { httpAuthOps } from "../authflow";
+import * as gate from "./authgate";
 import { defaultHarnesses } from "../gateway";
 import { makeActivities, type TurnRunReq } from "./activities";
 import { conversationWorkflow, messageSignal, type Inbound } from "./workflows";
@@ -89,6 +91,43 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
   const deps = { agent: (name: string) => wired.get(name) };
   const activities = makeActivities(deps);
 
+  // The agent asks for its OWN credential, through its own runtime. The login endpoints live in
+  // the sidecar sharing this pod's credential volume, so the code goes from a Slack modal to the
+  // process that owns the credential and nowhere else — it never transits the control plane.
+  const authBase = process.env.AGENT_RUNTIME_URL ?? "http://127.0.0.1:8080";
+  const authDeps: gate.AuthGateDeps = {
+    ops: (name) => (wired.has(name) ? httpAuthOps(authBase, process.env.AGENT_RUNTIME_TOKEN) : undefined),
+    conn: (name) => wired.get(name)?.conn as SlackConnector | undefined,
+    setAuthState: async (name, state) => {
+      const a = wired.get(name);
+      const api = process.env.TONOMANCLOUD_API_URL;
+      if (!a?.cfg.guid || !api) return; // a file roster has no registry to tell
+      const r = await fetch(`${api}/v1/system/agents/${a.cfg.guid}/auth-state`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${process.env.TONOMANCLOUD_API_TOKEN ?? ""}`,
+        },
+        body: JSON.stringify({ authState: state }),
+      });
+      if (!r.ok) throw new Error(`auth-state ${r.status}`);
+      // Reflect it locally too, so the very next message is not gated again while the roster
+      // cache is still warm.
+      a.cfg.auth_state = state === "ok" ? "ok" : "error";
+      console.log(`worker: ${name} auth_state -> ${state}`);
+    },
+  };
+
+  // Interactions are wired per connector below, at construction.
+  for (const [name, a] of wired) {
+    (a.conn as SlackConnector).setInteractionHandler?.((it) => {
+      void gate
+        .handleInteraction(authDeps, name, it)
+        .then((msg) => console.log(`worker: ${name} interaction — ${msg}`))
+        .catch((e) => console.error(`worker: ${name} interaction failed: ${(e as Error).message}`));
+    });
+  }
+
   const nativeConn = await NativeConnection.connect({ address: o.address });
   const worker = await Worker.create({
     connection: nativeConn,
@@ -111,6 +150,17 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
     pumps.push(
       (async () => {
         for await (const env of a.conn.receive(signal)) {
+          // The registry says this agent has no working inference, so there is nothing to run.
+          // Ask in the channel instead of spending a turn to discover the same thing — and ask
+          // because of a FACT about the agent, not because a file was missing.
+          if (a.cfg.auth_state && a.cfg.auth_state !== "ok") {
+            const asked = await gate.ask(authDeps, name, a.cfg.name ?? name, env.conversation).catch((e) => {
+              console.error(`worker: auth prompt failed for ${name}: ${(e as Error).message}`);
+              return false;
+            });
+            if (asked) console.log(`worker: ${name} asked for an inference login (auth_state=${a.cfg.auth_state})`);
+            continue;
+          }
           const first: Inbound = { text: env.text, user: env.user, ts: String(Date.now()) };
           try {
             // One call whether or not the conversation is already running. Temporal serializes

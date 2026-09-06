@@ -164,6 +164,9 @@ export class RegistryControlPlane implements ControlPlane {
         model: a.model ?? undefined,
         max_turns: a.maxTurns ?? undefined,
         system_prompt_file: identityFile,
+        // Carried through so the runtime can refuse a turn and ask for a login, rather than
+        // spending one to discover there is no credential.
+        auth_state: (a.authState as AgentConfig["auth_state"]) ?? "unconfigured",
         channel: "slack",
         slack: {
           app_token: appToken,

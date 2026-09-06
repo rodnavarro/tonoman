@@ -124,6 +124,16 @@ export interface AgentConfig {
   /** Slack connector wiring for a turn-driven agent (channel-slack). Mutually exclusive
    * with `telegram` / `teams` per agent. */
   slack?: Slack;
+  /** What the control plane believes about this agent's inference credential:
+   * `unconfigured` | `ok` | `expired` | `error`.
+   *
+   * A FACT about the agent, not a probe of the filesystem — that distinction is the point. A file
+   * check answers "is there a credential file", which is how an agent can report healthy for weeks
+   * over a credential that expired and carried no refresh token.
+   *
+   * Undefined means "not tracked", which is the file-roster case: a self-hosted deployment keeps
+   * today's behaviour and is never gated. */
+  auth_state?: "unconfigured" | "ok" | "expired" | "error";
   workspace?: Workspace;
   // --- Service-mode (svc-self-channeled / svc-config-env) ----------------------
   /** Service agent: Tonoman boots + lifecycle-manages a long-lived self-channeled server

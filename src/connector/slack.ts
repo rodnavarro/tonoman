@@ -27,6 +27,27 @@ export interface SlackOptions {
   fetchImpl?: typeof fetch; // injectable for tests; defaults to global fetch
   /** injectable WebSocket ctor for tests; defaults to the global (Node >= 22). */
   socketImpl?: typeof WebSocket;
+  /** Block Kit interactions: button clicks and modal submissions.
+   *
+   *  Kept OFF the envelope stream on purpose. An envelope is a message a person sent to the agent,
+   *  and a button press is not that — routing it as one would put "connect_claude" through the
+   *  harness as if somebody had typed it. */
+  onInteraction?: (p: SlackInteraction) => void;
+}
+
+/** A Block Kit interaction, normalized to the two cases we act on. */
+export interface SlackInteraction {
+  kind: "block_actions" | "view_submission";
+  userId: string;
+  /** Short-lived (~3s) token that authorizes opening a modal. Only on block_actions. */
+  triggerId?: string;
+  /** The action id of the button that was pressed. */
+  actionId?: string;
+  /** Opaque state carried on the button, so a modal knows which conversation it belongs to. */
+  value?: string;
+  /** For view_submission: the modal's private_metadata, and the values the person typed. */
+  privateMetadata?: string;
+  values?: Record<string, Record<string, { value?: string }>>;
 }
 
 /** Socket Mode envelope, the outer frame Slack pushes down the WebSocket. */
@@ -169,6 +190,15 @@ export class SlackConnector implements Connector {
           return;
         }
 
+        // Block Kit interactions ride the same socket but are not messages. A modal submission
+        // must be acked with an EMPTY payload body, or Slack leaves the dialog open showing a
+        // spinner even though the submission was accepted.
+        if (frame.type === "interactive" && frame.payload) {
+          const it = normalizeInteraction(frame.payload as Record<string, unknown>);
+          if (it) this.o.onInteraction?.(it);
+          return;
+        }
+
         if (frame.type !== "events_api" || !frame.payload?.event) return;
         const env = this.normalize(frame.payload.event, frame.payload.team_id ?? "");
         if (env) push(env);
@@ -200,6 +230,28 @@ export class SlackConnector implements Connector {
 
   reply(conversation: string): Reply {
     return new SlackReply(this, conversation);
+  }
+
+  /** Register the interaction handler after construction. The worker builds connectors first and
+   *  only then has the dependencies (auth ops, registry client) the handler needs. */
+  setInteractionHandler(fn: (p: SlackInteraction) => void): void {
+    this.o.onInteraction = fn;
+  }
+
+  /** Post a message carrying Block Kit blocks — a button, in practice. Outside the `Reply`
+   *  contract on purpose: `Reply` is the streaming-answer surface, and this is an interaction the
+   *  agent needs from a person before it can answer at all. `text` is still supplied because it is
+   *  what notifications and screen readers use. */
+  async postBlocks(conversation: string, text: string, blocks: unknown[]): Promise<string> {
+    const t = parseConversation(conversation);
+    const res = await this.call<{ ts?: string }>("chat.postMessage", {
+      channel: t.channel,
+      text,
+      blocks,
+      ...(t.threadTs ? { thread_ts: t.threadTs } : {}),
+      unfurl_links: false,
+    });
+    return res.ts ?? "";
   }
 
   /** Turns a Slack event into a neutral envelope, or null to ignore it.
@@ -246,6 +298,46 @@ export function conversationKey(team: string, channel: string, threadTs?: string
 export function parseConversation(conversation: string): { team: string; channel: string; threadTs?: string } {
   const [team = "", channel = "", threadTs] = conversation.split("/");
   return { team, channel, threadTs };
+}
+
+/** PURE: normalize a Block Kit interaction payload to the two cases we act on, or null. Unit-tested
+ *  because the payload shape is deeply nested and a silent miss here looks like a dead button. */
+export function normalizeInteraction(p: Record<string, unknown>): SlackInteraction | undefined {
+  const user = (p.user as { id?: string } | undefined)?.id ?? "";
+  if (p.type === "block_actions") {
+    const action = (p.actions as { action_id?: string; value?: string }[] | undefined)?.[0];
+    if (!action?.action_id) return undefined;
+    return {
+      kind: "block_actions",
+      userId: user,
+      triggerId: String(p.trigger_id ?? ""),
+      actionId: action.action_id,
+      value: action.value,
+    };
+  }
+  if (p.type === "view_submission") {
+    const view = p.view as
+      | { private_metadata?: string; state?: { values?: Record<string, Record<string, { value?: string }>> } }
+      | undefined;
+    return {
+      kind: "view_submission",
+      userId: user,
+      privateMetadata: view?.private_metadata,
+      values: view?.state?.values,
+    };
+  }
+  return undefined;
+}
+
+/** PURE: pull the first non-empty input value out of a modal's state, whatever block it sits in.
+ *  Addressing it by block id would break the moment the modal is restyled. */
+export function firstInputValue(values?: Record<string, Record<string, { value?: string }>>): string {
+  for (const block of Object.values(values ?? {})) {
+    for (const input of Object.values(block)) {
+      if (input?.value && input.value.trim()) return input.value.trim();
+    }
+  }
+  return "";
 }
 
 /** PURE: drop the leading `<@U123>` the platform prepends to an app_mention, so the harness sees
