@@ -32,30 +32,30 @@ function plane(agents: RegistryAgent[]): RegistryControlPlane {
 
 const base: RegistryAgent = {
   guid: "g1",
-  name: "nelly",
-  tenant: "murphy",
+  name: "nova",
+  tenant: "acme",
   tenantId: "t1",
   channel: "slack",
   teamId: "T1",
-  botTokenRef: "nelly-slack:SLACK_BOT_TOKEN",
-  appTokenRef: "nelly-slack:SLACK_APP_TOKEN",
+  botTokenRef: "acme-slack:SLACK_BOT_TOKEN",
+  appTokenRef: "acme-slack:SLACK_APP_TOKEN",
 };
 
 describe("RegistryControlPlane", () => {
   it("resolves token refs from mounted secrets — the token is never in the roster payload", async () => {
-    await putSecret("nelly-slack", "SLACK_BOT_TOKEN", "xoxb-real\n");
-    await putSecret("nelly-slack", "SLACK_APP_TOKEN", "xapp-real\n");
+    await putSecret("acme-slack", "SLACK_BOT_TOKEN", "xoxb-real\n");
+    await putSecret("acme-slack", "SLACK_APP_TOKEN", "xapp-real\n");
     const cfg = await plane([base]).roster();
     expect(cfg.agents).toHaveLength(1);
     // Trailing newline trimmed — kubernetes secret files routinely carry one, and Slack rejects it.
     expect(cfg.agents[0]!.slack).toMatchObject({ bot_token: "xoxb-real", app_token: "xapp-real" });
   });
 
-  it("namespaces the agent by tenant, so two tenants may both have a 'nelly'", async () => {
-    await putSecret("nelly-slack", "SLACK_BOT_TOKEN", "b");
-    await putSecret("nelly-slack", "SLACK_APP_TOKEN", "a");
+  it("namespaces the agent by tenant, so two tenants may both name an agent the same", async () => {
+    await putSecret("acme-slack", "SLACK_BOT_TOKEN", "b");
+    await putSecret("acme-slack", "SLACK_APP_TOKEN", "a");
     const cfg = await plane([base]).roster();
-    expect(cfg.agents[0]!.name).toBe("murphy-nelly");
+    expect(cfg.agents[0]!.name).toBe("acme-nova");
     expect(cfg.agents[0]!.guid).toBe("g1");
   });
 
@@ -65,34 +65,34 @@ describe("RegistryControlPlane", () => {
     const good: RegistryAgent = {
       ...base,
       guid: "g2",
-      name: "sapien",
-      tenant: "axiplex",
+      name: "scout",
+      tenant: "globex",
       botTokenRef: "ok-slack:SLACK_BOT_TOKEN",
       appTokenRef: "ok-slack:SLACK_APP_TOKEN",
     };
     // `base` points at a secret that was never written.
     const cfg = await plane([base, good]).roster();
-    expect(cfg.agents.map((a) => a.name)).toEqual(["axiplex-sapien"]);
+    expect(cfg.agents.map((a) => a.name)).toEqual(["globex-scout"]);
   });
 
   it("refuses a ref that tries to climb out of the secrets mount", async () => {
-    await putSecret("nelly-slack", "SLACK_APP_TOKEN", "a");
+    await putSecret("acme-slack", "SLACK_APP_TOKEN", "a");
     const evil: RegistryAgent = { ...base, botTokenRef: "../../etc:passwd" };
     const cfg = await plane([evil]).roster();
     expect(cfg.agents).toHaveLength(0); // unresolvable → skipped, never read
   });
 
   it("writes identity to a file, because the harness takes a file and the registry holds text", async () => {
-    await putSecret("nelly-slack", "SLACK_BOT_TOKEN", "b");
-    await putSecret("nelly-slack", "SLACK_APP_TOKEN", "a");
-    const cfg = await plane([{ ...base, identity: "# Nelly\nYou are Nelly." }]).roster();
+    await putSecret("acme-slack", "SLACK_BOT_TOKEN", "b");
+    await putSecret("acme-slack", "SLACK_APP_TOKEN", "a");
+    const cfg = await plane([{ ...base, identity: "# Nova\nYou are Nova." }]).roster();
     const file = cfg.agents[0]!.system_prompt_file!;
-    expect(await fs.readFile(file, "utf8")).toContain("You are Nelly.");
+    expect(await fs.readFile(file, "utf8")).toContain("You are Nova.");
   });
 
   it("omits the identity file when the registry has no identity, rather than writing an empty one", async () => {
-    await putSecret("nelly-slack", "SLACK_BOT_TOKEN", "b");
-    await putSecret("nelly-slack", "SLACK_APP_TOKEN", "a");
+    await putSecret("acme-slack", "SLACK_BOT_TOKEN", "b");
+    await putSecret("acme-slack", "SLACK_APP_TOKEN", "a");
     const cfg = await plane([{ ...base, identity: "   " }]).roster();
     expect(cfg.agents[0]!.system_prompt_file).toBeUndefined();
   });

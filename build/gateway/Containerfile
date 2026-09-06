@@ -9,7 +9,7 @@
 #   agent    node /opt/tonoman/dist/cli.js runtime
 #
 # Build (context = repo root):
-#   podman build -t harbor.rodnavarro.com/docker-images/tonoman:<tag> -f build/gateway/Containerfile .
+#   podman build -t <your-registry>/tonoman:<tag> -f build/gateway/Containerfile .
 
 # --- build -------------------------------------------------------------------
 # tsc runs here so the runtime image carries no TypeScript and no devDependencies.

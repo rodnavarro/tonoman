@@ -17,6 +17,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { load, type Config, type AgentConfig } from "./config";
 import { controlPlaneFrom } from "./core/controlplane";
+import * as tworker from "./worker/worker";
 import * as gateway from "./gateway";
 import * as health from "./health";
 import { findAgent, upsertMount, removeMount, listMounts, podmanVolumeArgs, agentMountPath } from "./mounts";
@@ -119,7 +120,7 @@ const RESOURCES: Record<string, Resource> = {
 };
 
 export type Resolved =
-  | { kind: "up" | "down" | "auth" | "version" | "help" | "logs" | "runtime" | "sync" }
+  | { kind: "up" | "worker" | "down" | "auth" | "version" | "help" | "logs" | "runtime" | "sync" }
   | { kind: "get" | "create" | "delete" | "set" | "open" | "close"; resource: Resource }
   | { kind: "backend"; agent: string; mode?: string }
   | { kind: "learn"; args: string[] }
@@ -143,6 +144,10 @@ export function resolveCommand(argv: string[]): Resolved {
       return { kind: "help" };
     case "up":
       return { kind: "up" };
+    case "worker":
+      // `tonoman worker` — same connectors and harness as `up`, with Temporal between the message
+      // and the turn, so a turn survives a restart and can be interrupted rather than raced.
+      return { kind: "worker" };
     case "down":
       return { kind: "down" };
     case "auth":
@@ -212,6 +217,19 @@ async function loadRoster(cfgPath: string): Promise<Config> {
   const cfg = await plane.roster();
   console.log(`tonoman: roster from ${plane.name()} — ${cfg.agents?.length ?? 0} agent(s)`);
   return cfg;
+}
+
+/** `tonoman worker` — serve turns durably through Temporal. Same connectors, same harness as
+ * `up`; the difference is that a turn is a workflow, so it survives a restart, has an identity,
+ * and can be interrupted rather than raced. */
+async function runWorker(cfgPath: string, env: string | undefined): Promise<void> {
+  const cfg = await loadRoster(cfgPath);
+  applyEnv(cfg, env);
+  const ac = new AbortController();
+  const stop = () => ac.abort();
+  process.on("SIGINT", stop);
+  process.on("SIGTERM", stop);
+  await tworker.run(cfg, tworker.workerOptionsFrom(process.env), ac.signal);
 }
 
 async function runUp(cfgPath: string, env: string | undefined): Promise<void> {
@@ -962,6 +980,10 @@ async function main(): Promise<void> {
     case "up":
       echoEnv(env);
       await runUp(cfgPath, env);
+      return;
+    case "worker":
+      echoEnv(env);
+      await runWorker(cfgPath, env);
       return;
     case "down":
       echoEnv(env);
