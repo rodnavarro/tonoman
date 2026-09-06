@@ -177,6 +177,9 @@ export class RegistryControlPlane implements ControlPlane {
       state_root: this.o.stateRoot ?? "/root/.tonoman",
       health_addr: "127.0.0.1:8787",
       agents,
+      // The pod is the sandbox: there is no per-agent container to exec into, because an agent is
+      // a row. `claude` is spawned as a direct child of this process.
+      local_exec: true,
       stream: { cursor: "", edit_interval_ms: 1200 },
     } as Config;
   }

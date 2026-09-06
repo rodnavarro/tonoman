@@ -182,6 +182,11 @@ export interface Config {
   config_repo?: string;
   health_addr: string;
   agents: AgentConfig[];
+  /** Run turns IN THIS PROCESS's container rather than `podman exec` into a per-agent one
+   *  (local-exec). Set by the registry control plane: under Tonoman Cloud an agent is a row, so
+   *  there is no container to exec into and the pod is the isolation boundary. Self-hosted rosters
+   *  leave it unset and keep the per-agent container model. */
+  local_exec?: boolean;
   stream: StreamConfig;
   expose?: ExposeConfig;
   // legacy single-agent shape (back-compat)
@@ -284,7 +289,11 @@ export function validate(c: Config): void {
     const remote = a.harness === "claude-code-http";
     if (remote) {
       if (!a.url) missing.push("url");
-    } else if (!a.container) {
+    } else if (!a.container && !c.local_exec) {
+      // A roster with no container is only valid in local-exec mode, where the POD is the sandbox
+      // and `claude` is spawned as a direct child. That is what a Tonoman Cloud gateway does: an
+      // agent is a row, so there is no per-agent container to exec into. A self-hosted roster still
+      // names one, and still gets the old error if it forgets.
       missing.push("container");
     }
     // Auth backend (backend-config-default): known values only; bedrock needs a region.

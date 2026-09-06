@@ -479,7 +479,13 @@ export function spec(): Spec {
     // Keep ALL Claude Code state in the config volume (incl. the sibling ~/.claude.json
     // profile), so a destroy+recreate comes back fully configured (A2/A11).
     runEnv: { CLAUDE_CONFIG_DIR: CONFIG_HOME },
-    newRunner: (p: RunnerParams) => new Runner({ container: p.container, model: p.model, maxTurns: p.maxTurns }),
+    // No container configured means THIS pod is the sandbox (local-exec): `claude` is spawned as a
+    // direct child instead of through `podman exec`. That is what a Tonoman Cloud gateway does —
+    // an agent is a row, so there is no per-agent container to exec into, and the pod boundary is
+    // the isolation the container used to provide. A self-hosted roster still names a container
+    // and still goes through podman, unchanged.
+    newRunner: (p: RunnerParams) =>
+      new Runner({ container: p.container, local: !p.container, model: p.model, maxTurns: p.maxTurns }),
     newEphemeralRunner: (p: EphemeralParams) =>
       new Runner({ container: p.volumesFrom, model: p.model, ephemeral: { volumesFrom: p.volumesFrom, image: p.image, env: p.env } }),
     loginArgs: ["claude", "auth", "login", "--claudeai"],
