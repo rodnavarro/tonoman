@@ -47,7 +47,11 @@ export interface ConversationInput {
   /** The connector's conversation key — what `reply()` is opened on. */
   conversation: string;
   channel: string;
-  /** The message that opened it, when started via signalWithStart. */
+  /** Only ever set by continueAsNew, to carry a queued message across the history boundary.
+   *
+   *  NOT set by the caller: `signalWithStart` starts the workflow AND delivers the signal, so a
+   *  message passed here as well would be queued twice — which is exactly what made every first
+   *  message of a conversation get two answers. The signal is the only carrier from outside. */
   first?: Inbound;
 }
 

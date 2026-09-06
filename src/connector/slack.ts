@@ -75,6 +75,9 @@ export class SlackConnector implements Connector {
   /** Recently handled event keys, to drop a redelivery if our ack was slow. Bounded — a
    *  redelivery arrives seconds later, so a short memory is enough and never grows. */
   private readonly seen = new Set<string>();
+  /** Content key → when it was last accepted. The second line of defence against one message
+   *  becoming two turns; see normalize(). */
+  private readonly recentContent = new Map<string, number>();
   private botUserID = "";
 
   constructor(private readonly o: SlackOptions) {}
@@ -269,12 +272,36 @@ export class SlackConnector implements Connector {
     if (this.botUserID && e.user === this.botUserID) return null;
     if (this.o.allowedUsers?.length && !this.o.allowedUsers.includes(e.user)) return null;
 
-    // A DM that mentions the bot arrives TWICE — once as message.im and once as app_mention.
-    // Both carry the same ts, so keying on channel+ts collapses them to one turn.
-    const key = `${e.channel}:${e.ts ?? e.event_ts ?? ""}`;
-    if (this.seen.has(key)) return null;
+    // ONE message must be ONE turn, and Slack gives several ways for it not to be: a DM that
+    // mentions the bot arrives as both message.im and app_mention; a socket that drops before our
+    // ack is seen gets the envelope redelivered; and a reconnect can overlap the old connection.
+    //
+    // Two keys, because the first one alone was observed to miss. `channel:ts` collapses the
+    // duplicate delivery of one message. The second is a short-lived content key that catches a
+    // redelivery whose ts we somehow did not match — it can only ever drop a genuine repeat of the
+    // identical text, by the same person, in the same channel, inside a few seconds, which is a far
+    // better failure than answering everything twice.
+    const ts = e.ts ?? e.event_ts ?? "";
+    const key = `${e.channel}:${ts}`;
+    const contentKey = `${e.channel}:${e.user}:${e.text ?? ""}`;
+    const now = Date.now();
+    const recent = this.recentContent.get(contentKey);
+    if (this.seen.has(key) || (recent && now - recent < 5_000)) {
+      if (process.env.TONOMAN_TRACE) {
+        console.log(`slack: dropped duplicate ${e.type} ts=${ts} chan=${e.channel}`);
+      }
+      return null;
+    }
     this.seen.add(key);
+    this.recentContent.set(contentKey, now);
     if (this.seen.size > 500) this.seen.delete(this.seen.values().next().value as string);
+    // Bound the content map the same way; it only needs to remember seconds.
+    if (this.recentContent.size > 200) {
+      for (const [k, t] of this.recentContent) if (now - t > 60_000) this.recentContent.delete(k);
+    }
+    if (process.env.TONOMAN_TRACE) {
+      console.log(`slack: accepted ${e.type} ts=${ts} chan=${e.channel} user=${e.user}`);
+    }
 
     return {
       channel: this.name(),

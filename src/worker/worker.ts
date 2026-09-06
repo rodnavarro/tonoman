@@ -217,10 +217,14 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
             // One call whether or not the conversation is already running. Temporal serializes
             // signals per workflow id, so ordering is free and two people typing at once cannot
             // interleave two turns.
+            // `first` is deliberately NOT in args. signalWithStart on a workflow that does not yet
+            // exist does BOTH things: it starts the workflow with `args` and delivers the signal.
+            // Passing the message in both places queued it twice and answered every first message
+            // of a conversation twice — observed, not theorised. The signal is the only carrier.
             await client.workflow.signalWithStart(conversationWorkflow, {
               workflowId: `${name}:${env.channel}:${env.conversation}`,
               taskQueue: o.taskQueue,
-              args: [{ agent: name, conversation: env.conversation, channel: env.channel, first }],
+              args: [{ agent: name, conversation: env.conversation, channel: env.channel }],
               signal: messageSignal,
               signalArgs: [first],
             });
