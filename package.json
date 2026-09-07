@@ -35,6 +35,7 @@
     "@temporalio/client": "^1.21.0",
     "@temporalio/common": "^1.21.0",
     "@temporalio/worker": "^1.21.0",
-    "@temporalio/workflow": "^1.21.0"
+    "@temporalio/workflow": "^1.21.0",
+    "ical.js": "^2.2.1"
   }
 }
