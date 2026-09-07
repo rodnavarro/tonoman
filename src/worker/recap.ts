@@ -113,8 +113,16 @@ export async function listRecordings(creds: PlaudCreds, limit = 20): Promise<Rec
  *  somebody switching the feature on means by it. */
 export function floorFor(since: string | undefined, now: number, tzOffsetMinutes = 0): number {
   if (since) {
-    const t = Date.parse(since.length === 10 ? `${since}T00:00:00Z` : since);
-    if (!Number.isNaN(t)) return t - tzOffsetMinutes * 60_000;
+    // A bare `YYYY-MM-DD` means local midnight, so it takes the offset. A full instant already
+    // carries its own zone and must NOT be shifted again — doing so moved a floor of 01:35Z four
+    // hours into the FUTURE, which silently stops the poll rather than bounding it.
+    if (/^\d{4}-\d{2}-\d{2}$/.test(since)) {
+      const t = Date.parse(`${since}T00:00:00Z`);
+      if (!Number.isNaN(t)) return t - tzOffsetMinutes * 60_000;
+    } else {
+      const t = Date.parse(since);
+      if (!Number.isNaN(t)) return t;
+    }
   }
   // `tzOffsetMinutes` is minutes EAST of UTC (US Eastern in summer is -240), so local wall-clock
   // time is `now + offset` and turning a local midnight back into an instant subtracts it again.

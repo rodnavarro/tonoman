@@ -74,6 +74,12 @@ describe("floorFor", () => {
     expect(floorFor("2026-09-06T18:30:00Z", 0, 0)).toBe(Date.parse("2026-09-06T18:30:00Z"));
   });
 
+  it("does NOT shift a full instant by the timezone — it already carries its own", () => {
+    // Shifting it moved a floor of 01:35Z four hours into the FUTURE, which stops the poll
+    // outright instead of bounding it.
+    expect(floorFor("2026-09-07T01:35:00Z", 0, EDT)).toBe(Date.parse("2026-09-07T01:35:00Z"));
+  });
+
   it("falls back to today rather than to 1970 when the date is nonsense", () => {
     const now = Date.parse("2026-09-07T01:00:00Z");
     expect(floorFor("not-a-date", now, 0)).toBe(Date.parse("2026-09-07T00:00:00Z"));
