@@ -210,10 +210,19 @@ export async function fetchAccountUsage(token: string): Promise<UsageWindow[]> {
 /** GETs a REMOTE agent runtime's /usage (claude-code-http, k8s split): the agent holds the
  * OAuth credential and reports its own 5h/7d windows, so the gateway — which can't podman-exec
  * across the split — pulls them over HTTP. Bearer-authed like /turn. Returns [] on any failure. */
-export async function fetchRemoteAccountUsage(url: string, token: string | undefined): Promise<UsageWindow[]> {
+export async function fetchRemoteAccountUsage(
+  url: string,
+  token: string | undefined,
+  agent?: string,
+): Promise<UsageWindow[]> {
   if (!url) return [];
   try {
-    const res = await fetch(`${url.replace(/\/$/, "")}/usage`, {
+    // Named, because the headroom is read with the ACCOUNT'S OWN token and each agent now has its
+    // own. Unnamed, every agent reports the same 5h/7d figures whoever they are actually running
+    // as — which is precisely the confusion per-agent credentials exist to remove, and it looks
+    // entirely plausible while being wrong.
+    const q = agent ? `?agent=${encodeURIComponent(agent)}` : "";
+    const res = await fetch(`${url.replace(/\/$/, "")}/usage${q}`, {
       headers: token ? { Authorization: `Bearer ${token}`, Accept: "application/json" } : { Accept: "application/json" },
     });
     if (!res.ok) return [];
@@ -234,10 +243,11 @@ export async function remoteAccountUsageCached(
   token: string | undefined,
   ttlMs = 120_000,
   now: number = Date.now(),
+  agent?: string,
 ): Promise<UsageWindow[]> {
   const hit = usageCache.get(key);
   if (hit && now - hit.at < ttlMs) return hit.windows;
-  const windows = await fetchRemoteAccountUsage(url, token);
+  const windows = await fetchRemoteAccountUsage(url, token, agent);
   usageCache.set(key, { at: now, windows });
   return windows;
 }

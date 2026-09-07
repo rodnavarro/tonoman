@@ -395,7 +395,7 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
   const runtimeUrl = process.env.AGENT_RUNTIME_URL ?? "http://127.0.0.1:8080";
   const runtimeToken = process.env.AGENT_RUNTIME_TOKEN;
   const windowsFor = (name: string): Promise<UsageWindow[]> =>
-    remoteAccountUsageCached(`agent:${name}`, runtimeUrl, runtimeToken);
+    remoteAccountUsageCached(`agent:${name}`, runtimeUrl, runtimeToken, undefined, undefined, name);
 
   /** The footer mode, per conversation. Process-local and deliberately so: it is a display
    *  preference for a thread somebody is looking at right now, not a fact about the tenant. */

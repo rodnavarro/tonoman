@@ -272,7 +272,12 @@ async function handleUsage(req: http.IncomingMessage, res: http.ServerResponse, 
   if (activeHarness() === "codex") {
     windows = await codex.fetchCodexUsage(process.env.CODEX_HOME || codex.CONFIG_HOME);
   } else {
-    const credFile = opts.credFile ?? `${claudecode.CONFIG_HOME}/.credentials.json`;
+    // This agent's own credential: the headroom belongs to whoever's subscription is answering,
+    // and reading the shared file would report one person's quota under everybody's name.
+    const usageAgent = agentOf(req);
+    const credFile = usageAgent
+      ? `${claudecode.configHomeFor(usageAgent)}/.credentials.json`
+      : (opts.credFile ?? `${claudecode.CONFIG_HOME}/.credentials.json`);
     try {
       const raw = await fs.readFile(credFile, "utf8");
       const token = (JSON.parse(raw).claudeAiOauth?.accessToken as string) || null;
