@@ -1,0 +1,244 @@
+// The voice flow as activities: Plaud → transcribe → recap → second brain → wake.
+//
+// This used to be a script run by hand. It is here because a recording that finishes should be
+// noticed by the platform, not by a person remembering to run a command — and because the durable
+// half is exactly what Temporal is for: a poll that must not double-process, a transcription that
+// costs money, and a notification that must not be lost if the pod dies between them.
+//
+// Kept as small activities with a workflow above them, so each step is retried or not on its own
+// merits: listing is cheap and safe to retry, processing is neither.
+
+import { execFile } from "node:child_process";
+import { promises as fs } from "node:fs";
+import * as path from "node:path";
+
+export interface PlaudCreds {
+  /** The captured web token, as JSON — bearer plus the app headers the API insists on. */
+  tokenFile: string;
+}
+
+export interface Recording {
+  id: string;
+  title: string;
+  /** Epoch MILLISECONDS. Plaud sends ms; reading it as seconds gives a meeting in the year 58652. */
+  startTime: number;
+  /** Duration in MILLISECONDS, likewise. */
+  duration: number;
+  /** `YYYY-MM-DD-HHMM`, the folder-per-recording name. */
+  stamp: string;
+}
+
+const PLAUD_BASE = "https://api.plaud.ai";
+
+/** PURE: the second-brain folder name for a recording. Stable, sortable, and unique per minute, so
+ *  re-processing the same recording lands on the same path and is a no-op. */
+export function stampFor(startMs: number): string {
+  const d = new Date(startMs);
+  const p = (n: number): string => String(n).padStart(2, "0");
+  return `${d.toISOString().slice(0, 10)}-${p(d.getUTCHours())}${p(d.getUTCMinutes())}`;
+}
+
+/** PURE: strip the file extension Plaud puts on a recording's name. */
+export function titleFor(raw: string | undefined): string {
+  return (raw || "Untitled meeting").replace(/\.[a-z0-9]+$/i, "");
+}
+
+async function plaudHeaders(creds: PlaudCreds): Promise<Record<string, string>> {
+  const token = JSON.parse(await fs.readFile(creds.tokenFile, "utf8")) as Record<string, string>;
+  if (!token.authorization) throw new Error("plaud: captured token has no authorization — it is dead");
+  const h: Record<string, string> = {
+    authorization: token.authorization,
+    accept: "application/json, text/plain, */*",
+    origin: "https://web.plaud.ai",
+    referer: "https://web.plaud.ai/",
+  };
+  // The API wants the captured app headers too. The bearer alone gets a 401 that looks like an
+  // expired token and is not.
+  for (const k of ["source", "app-language", "app-platform", "edit-from", "timezone", "user-agent", "x-device-id", "x-pld-user"]) {
+    if (token[k]) h[k] = token[k];
+  }
+  return h;
+}
+
+async function plaudGet<T>(creds: PlaudCreds, p: string, params?: Record<string, unknown>): Promise<T> {
+  const url = new URL(PLAUD_BASE + p);
+  for (const [k, v] of Object.entries(params ?? {})) url.searchParams.set(k, String(v));
+  const r = await fetch(url, { headers: await plaudHeaders(creds) });
+  if (!r.ok) throw new Error(`plaud ${p}: ${r.status} ${(await r.text()).slice(0, 200)}`);
+  return (await r.json()) as T;
+}
+
+export async function listRecordings(creds: PlaudCreds, limit = 20): Promise<Recording[]> {
+  const j = await plaudGet<{ data_file_list?: Record<string, unknown>[] }>(creds, "/file/simple/web", {
+    skip: 0,
+    limit,
+    is_trash: 2,
+    sort_by: "start_time",
+    is_desc: true,
+  });
+  return (j.data_file_list ?? []).map((r) => {
+    const startTime = Number(r.start_time ?? 0);
+    return {
+      id: String(r.id),
+      title: titleFor(r.filename as string | undefined),
+      startTime,
+      duration: Number(r.duration ?? 0),
+      stamp: stampFor(startTime),
+    };
+  });
+}
+
+/** Which of these have NOT been published yet.
+ *
+ *  Answered from the second-brain checkout rather than a database table: the repository is the
+ *  record, so "is it published" is a question about the repository. It also means a recap deleted
+ *  by hand is reprocessed, which is the behaviour somebody deleting it would expect. */
+export async function unpublished(recordings: Recording[], brainDir: string): Promise<Recording[]> {
+  const out: Recording[] = [];
+  for (const r of recordings) {
+    const exists = await fs
+      .stat(path.join(brainDir, "Meetings", `${r.stamp}.md`))
+      .then(() => true)
+      .catch(() => false);
+    if (!exists) out.push(r);
+  }
+  return out;
+}
+
+export interface TranscribeResult {
+  text: string;
+  seconds: number;
+}
+
+export async function transcribe(creds: PlaudCreds, rec: Recording, groqKey: string, vocab: string): Promise<TranscribeResult> {
+  const t0 = Date.now();
+  const { temp_url } = await plaudGet<{ temp_url: string }>(creds, `/file/temp-url/${rec.id}`);
+  const audio = Buffer.from(await (await fetch(temp_url)).arrayBuffer());
+
+  const form = new FormData();
+  form.append("file", new Blob([audio], { type: "audio/mpeg" }), `${rec.id}.mp3`);
+  form.append("model", process.env.GROQ_MODEL || "whisper-large-v3-turbo");
+  form.append("response_format", "verbose_json");
+  // Vocabulary bias. Without it the transcriber hears "Plaud" as "plot" and "Tonoman" as
+  // "tournament" — the exact words somebody later searches the second brain for.
+  form.append("prompt", vocab);
+
+  const r = await fetch("https://api.groq.com/openai/v1/audio/transcriptions", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${groqKey}` },
+    body: form,
+  });
+  if (!r.ok) throw new Error(`groq transcribe: ${r.status} ${(await r.text()).slice(0, 300)}`);
+  const j = (await r.json()) as { text: string };
+  return { text: j.text, seconds: (Date.now() - t0) / 1000 };
+}
+
+export interface Recap {
+  summary: string;
+  highlights: string[];
+  decisions: string[];
+  followups: string[];
+}
+
+export async function summarize(transcript: string, title: string, groqKey: string): Promise<Recap> {
+  // Checked against /v1/models rather than assumed — the obvious llama name is not on this account.
+  const model = process.env.GROQ_TEXT_MODEL || "openai/gpt-oss-120b";
+  const system = [
+    "You summarise a recorded business meeting for a searchable knowledge base.",
+    "Be specific and factual. Never invent a name, number, decision or commitment.",
+    "If something is unclear in the transcript, leave it out rather than guessing.",
+    'Reply with STRICT JSON only: {"summary": string, "highlights": string[], "decisions": string[], "followups": string[]}.',
+    "summary: 2-4 sentences. highlights: at most 5, each one line. decisions/followups may be empty.",
+  ].join(" ");
+  const r = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${groqKey}`, "content-type": "application/json" },
+    body: JSON.stringify({
+      model,
+      temperature: 0.2,
+      response_format: { type: "json_object" },
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: `Meeting: ${title}\n\nTranscript:\n${transcript.slice(0, 40000)}` },
+      ],
+    }),
+  });
+  if (!r.ok) throw new Error(`groq summarize: ${r.status} ${(await r.text()).slice(0, 300)}`);
+  const j = (await r.json()) as { choices: { message: { content: string } }[] };
+  return JSON.parse(j.choices[0]!.message.content) as Recap;
+}
+
+const bullets = (xs: string[] | undefined, empty: string): string =>
+  xs?.length ? xs.map((x) => `- ${x}`).join("\n") : `_${empty}_`;
+
+/** PURE: the overview page. Separated from writing it so the layout is testable. */
+export function overviewMarkdown(rec: Recording, recap: Recap): string {
+  return `# ${rec.title}
+
+**When:** ${new Date(rec.startTime).toISOString().replace("T", " ").slice(0, 16)}
+**Recorded on:** Plaud · **Transcribed by:** Groq (\`whisper-large-v3-turbo\`)
+
+## Summary
+
+${recap.summary}
+
+## Highlights
+
+${bullets(recap.highlights, "none")}
+
+## Decisions
+
+${bullets(recap.decisions, "none recorded")}
+
+## Follow-ups
+
+${bullets(recap.followups, "none recorded")}
+
+---
+
+[Full transcript](./${rec.stamp}/Transcript.md)
+`;
+}
+
+function git(dir: string, args: string[], env?: NodeJS.ProcessEnv): Promise<{ code: number; out: string }> {
+  return new Promise((resolve) =>
+    execFile("git", args, { cwd: dir, env: env ?? process.env, maxBuffer: 1 << 24 }, (err, so, se) =>
+      resolve({ code: err ? 1 : 0, out: `${so}${se}` }),
+    ),
+  );
+}
+
+/** Write the recap into the checkout and push it. Returns false when there was nothing to commit,
+ *  which is the normal answer for a recording already published. */
+export async function publish(
+  brainDir: string,
+  rec: Recording,
+  recap: Recap,
+  transcript: string,
+  pushUrl: string,
+): Promise<boolean> {
+  const dir = path.join(brainDir, "Meetings", rec.stamp);
+  await fs.mkdir(dir, { recursive: true });
+  await fs.writeFile(path.join(brainDir, "Meetings", `${rec.stamp}.md`), overviewMarkdown(rec, recap), "utf8");
+  await fs.writeFile(
+    path.join(dir, "Transcript.md"),
+    `# Transcript — ${rec.title}\n\nTranscribed by Groq \`whisper-large-v3-turbo\` from the Plaud recording.\n\n---\n\n${transcript}\n`,
+    "utf8",
+  );
+
+  await git(brainDir, ["add", "-A"]);
+  const c = await git(brainDir, ["commit", "-m", `Meeting recap: ${rec.title} (${rec.stamp})`]);
+  if (c.code !== 0) return false; // nothing to commit
+
+  // The credential rides one command and is never left in .git/config.
+  await git(brainDir, ["remote", "set-url", "origin", pushUrl]);
+  const p = await git(brainDir, ["push", "origin", "HEAD"]);
+  await git(brainDir, ["remote", "set-url", "origin", pushUrl.replace(/\/\/[^@]+@/, "//")]);
+  if (p.code !== 0) throw new Error(`git push failed: ${redact(p.out, pushUrl).slice(0, 200)}`);
+  return true;
+}
+
+/** PURE: never let a tokenised URL reach a log. */
+export function redact(text: string, url: string): string {
+  return text.split(url).join("***").replace(/\/\/[^/@\s]+:[^/@\s]+@/g, "//***:***@");
+}

@@ -25,8 +25,8 @@ import * as secondbrain from "./secondbrain";
 import { serveWake } from "./wake";
 import { promises as fsp } from "node:fs";
 import { defaultHarnesses } from "../gateway";
-import { makeActivities, type TurnRunReq } from "./activities";
-import { conversationWorkflow, messageSignal, type Inbound } from "./workflows";
+import { makeActivities, type TurnRunReq, type VoiceConfig } from "./activities";
+import { conversationWorkflow, messageSignal, plaudPollWorkflow, type Inbound } from "./workflows";
 
 export interface WorkerOptions {
   address: string;
@@ -153,7 +153,68 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
   }, syncEvery);
   signal.addEventListener("abort", () => clearInterval(syncTimer), { once: true });
 
-  const deps = { agent: (name: string) => wired.get(name) };
+  // Open (or reuse) a DM and return the connector's conversation key. Shared by the wake endpoint
+  // and by the voice flow — both need to address a person the agent has no inbound message from.
+  const dmFor = async (name: string, userId: string): Promise<string | undefined> => {
+    const a = wired.get(name);
+    if (!a) return undefined;
+    const j = await (a.conn as SlackConnector).call<{ channel?: { id?: string } }>("conversations.open", {
+      users: userId,
+    });
+    const channel = j.channel?.id;
+    return channel ? `${a.cfg.slack?.team_id ?? ""}/${channel}` : undefined;
+  };
+
+  // The Temporal client is needed by the activities (a woken turn is a signal), so it is created
+  // before them rather than alongside the worker.
+  const conn = await Connection.connect({ address: o.address });
+  const client = new Client({ connection: conn, namespace: o.namespace });
+
+  // The git push credential, resolved once at boot. Held in memory only; the checkout's remote on
+  // disk stays credential-free.
+  const voiceCreds = new Map<string, VoiceConfig>();
+  for (const [name, a] of wired) {
+    const tokenFile = process.env.PLAUD_TOKEN_FILE;
+    const groqKey = process.env.GROQ_API_KEY;
+    const src = a.cfg.secondbrain?.[0];
+    if (!tokenFile || !groqKey || !src) {
+      console.log(`worker: ${name} has no voice flow (needs PLAUD_TOKEN_FILE, GROQ_API_KEY and a second-brain source)`);
+      continue;
+    }
+    const token = await resolveRef(src.secret_ref);
+    const pushUrl = token ? src.repo_url.replace("https://", `https://x-access-token:${token}@`) : src.repo_url;
+    const dir = path.join(process.env.TONOMAN_STATE_ROOT ?? "/root/.tonoman", "secondbrain", name, src.id);
+    voiceCreds.set(name, {
+      creds: { tokenFile },
+      brainDir: src.subpath ? path.join(dir, src.subpath) : dir,
+      pushUrl,
+      groqKey,
+      vocab:
+        process.env.GROQ_PROMPT ??
+        "Tonoman, Tonoman Cloud, Plaud, Murphy Business Sales, Celine, Rod Navarro, Axiplex, agentic AI, Slack, Temporal.",
+    });
+    console.log(`worker: ${name} voice flow ready (brain at ${dir})`);
+  }
+
+  const deps = {
+    agent: (name: string) => wired.get(name),
+    voice: (name: string) => voiceCreds.get(name),
+    say: async (name: string, user: string, text: string) => {
+      const conv = await dmFor(name, user);
+      if (conv) await wired.get(name)?.conn.reply(conv).send(text);
+    },
+    ask: async (name: string, user: string, text: string) => {
+      const conv = await dmFor(name, user);
+      if (!conv) return;
+      await client.workflow.signalWithStart(conversationWorkflow, {
+        workflowId: `${name}:slack:${conv}`,
+        taskQueue: o.taskQueue,
+        args: [{ agent: name, conversation: conv, channel: "slack" }],
+        signal: messageSignal,
+        signalArgs: [{ text, user, ts: String(Date.now()) }],
+      });
+    },
+  };
   const activities = makeActivities(deps);
 
   // The agent asks for its OWN credential, through its own runtime. The login endpoints live in
@@ -204,9 +265,6 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
   });
   const serving = worker.run();
   console.log(`worker: serving ${o.taskQueue} on ${o.address}/${o.namespace} — ${wired.size} agent(s)`);
-
-  const conn = await Connection.connect({ address: o.address });
-  const client = new Client({ connection: conn, namespace: o.namespace });
 
   // Ingress: each connector yields envelopes; each becomes a signal. The connector does nothing
   // else — the durability boundary starts at signalWithStart.
@@ -259,17 +317,7 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
       token: wakeToken,
       deps: {
         has: (name) => wired.has(name),
-        dmFor: async (name, userId) => {
-          const a = wired.get(name);
-          if (!a) return undefined;
-          const j = await (a.conn as SlackConnector).call<{ channel?: { id?: string } }>(
-            "conversations.open",
-            { users: userId },
-          );
-          const channel = j.channel?.id;
-          // The connector's conversation key shape: `<team>/<channel>`. A DM has no thread.
-          return channel ? `${a.cfg.slack?.team_id ?? ""}/${channel}` : undefined;
-        },
+        dmFor,
         say: async (name, conversation, text) => {
           await wired.get(name)?.conn.reply(conversation).send(text);
         },
@@ -294,6 +342,29 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
   );
   if (!wakeServing) {
     console.log("worker: TONOMAN_WAKE_TOKEN is unset — /api/wake is NOT served (no agent can speak first)");
+  }
+
+  // The voice flow, watching by itself. One long-lived workflow per agent, started idempotently:
+  // `WorkflowExecutionAlreadyStarted` is the expected answer on every restart after the first, and
+  // means the poll survived the deploy rather than that something is wrong.
+  const notify = process.env.VOICE_NOTIFY_USER;
+  for (const [name] of voiceCreds) {
+    if (!notify) {
+      console.log(`worker: ${name} voice flow not polling — VOICE_NOTIFY_USER is unset`);
+      continue;
+    }
+    try {
+      await client.workflow.start(plaudPollWorkflow, {
+        workflowId: `voice:${name}`,
+        taskQueue: o.taskQueue,
+        args: [{ agent: name, notify, everySeconds: Number(process.env.VOICE_POLL_SECONDS ?? 120) }],
+      });
+      console.log(`worker: ${name} voice poll started`);
+    } catch (e) {
+      const msg = (e as Error).message ?? "";
+      if (/already started/i.test(msg)) console.log(`worker: ${name} voice poll already running`);
+      else console.error(`worker: ${name} voice poll failed to start: ${msg}`);
+    }
   }
 
   signal.addEventListener("abort", () => worker.shutdown(), { once: true });

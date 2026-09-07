@@ -13,11 +13,28 @@
 import { Context } from "@temporalio/activity";
 import type { Connector, Reply, TurnEvent } from "../core/contracts";
 import type { AgentConfig } from "../config";
+import * as recap from "./recap";
 
 /** How the worker finds an agent's connector and runner. Injected at worker construction so this
  *  module holds no globals and can be unit-tested without Temporal. */
 export interface TurnDeps {
   agent(name: string): { cfg: AgentConfig; conn: Connector; context?: string; run: (req: TurnRunReq) => AsyncIterable<TurnEvent> } | undefined;
+  /** What this agent needs to run the voice flow, or undefined if it is not configured for one. */
+  voice?(name: string): VoiceConfig | undefined;
+  /** Say something verbatim to a person, opening a DM if needed. */
+  say?(agent: string, user: string, text: string): Promise<void>;
+  /** Run text as a turn addressed to a person. */
+  ask?(agent: string, user: string, text: string): Promise<void>;
+}
+
+export interface VoiceConfig {
+  creds: recap.PlaudCreds;
+  /** The second-brain checkout the recap is written into. */
+  brainDir: string;
+  /** Push URL carrying the credential — used for one command, never left on disk. */
+  pushUrl: string;
+  groqKey: string;
+  vocab: string;
 }
 
 export interface TurnRunReq {
@@ -55,14 +72,20 @@ export function makeActivities(deps: TurnDeps) {
       const { conn, run } = found;
 
       const reply: Reply = conn.reply(input.conversation);
-      // In an assistant thread this renders Slack's own "is thinking…" line under the composer.
-      // Everywhere else it is a no-op, and the placeholder below is the cue instead.
+      // The status line IS the cue — "Nelly is thinking…" under the composer. A placeholder message
+      // posted alongside it is worse than nothing: it flashes "…" and then gets overwritten, which
+      // reads as a glitch. So no message is posted until there is something real to put in it.
       await reply.working?.("is thinking").catch(() => {});
-      const msgId = await reply.send("…");
 
       let answer = "";
       let lastEdit = 0;
       let done = false;
+      /** Created on first render, not up front. Empty until then. */
+      let msgId = "";
+      const show = async (text: string): Promise<void> => {
+        if (!msgId) msgId = await reply.send(text);
+        else await reply.update(msgId, text);
+      };
       // Tool narration (Teams parity). Shown ONLY until the first words of the answer arrive, then
       // replaced by the answer itself. A turn that greps the second brain for ten seconds otherwise
       // shows nothing but a placeholder, and silence reads as broken rather than as working.
@@ -73,8 +96,11 @@ export function makeActivities(deps: TurnDeps) {
       ctx.cancelled.catch(() => {
         if (done) return;
         void reply.settle?.().catch(() => {});
+        // Only if something was already on screen. An interrupted turn that had not yet said
+        // anything should leave no trace — the correction is about to be answered instead.
+        if (!msgId) return;
         void reply
-          .finalize(msgId, `${answer.trim() || "_(nothing yet)_"}\n\n_— interrupted; working on your new message_`)
+          .finalize(msgId, `${answer.trim()}\n\n_— interrupted; working on your new message_`)
           .catch(() => {});
       });
 
@@ -107,18 +133,16 @@ export function makeActivities(deps: TurnDeps) {
           const now = Date.now();
           if (now - lastEdit >= EDIT_INTERVAL_MS && answer.trim()) {
             lastEdit = now;
-            await reply.update(msgId, answer).catch(() => {});
+            await show(answer).catch(() => {});
           }
         } else if (ev.kind === "tool" && !answer) {
-          // "🔧 Grep: Meetings/" — the tool and a short detail, the same shape Teams shows.
-          activity = `🔧 ${ev.tool ?? "working"}${ev.text ? `: ${ev.text}` : ""}`;
+          // Tool narration goes ONLY in the status line, never as a message. Slack renders it there
+          // as the agent's activity; as a message it would be a line the answer then overwrites.
+          activity = `${(ev.tool ?? "working").toLowerCase()}${ev.text ? `: ${ev.text}` : ""}`;
           const now = Date.now();
           if (now - lastEdit >= EDIT_INTERVAL_MS) {
             lastEdit = now;
-            // In an assistant thread the tool goes in the status line, where Slack renders it as
-            // the agent's activity rather than as a message that will be overwritten.
-            await reply.working?.(`is ${(ev.tool ?? "working").toLowerCase()}…`).catch(() => {});
-            await reply.update(msgId, `_${activity.slice(0, 200)}_`).catch(() => {});
+            await reply.working?.(`is ${activity}`.slice(0, 100)).catch(() => {});
           }
         } else if (ev.kind === "done" && ev.final) {
           // The authoritative text. A harness that streams deltas AND sends a final would otherwise
@@ -138,7 +162,9 @@ export function makeActivities(deps: TurnDeps) {
       // forgets this looks permanently busy.
       await reply.settle?.().catch(() => {});
       if (ctx.cancellationSignal.aborted) return;
-      await reply.finalize(msgId, answer.trim() || "_(no answer)_");
+      const final = answer.trim() || "_(no answer)_";
+      if (!msgId) msgId = await reply.send(final);
+      else await reply.finalize(msgId, final);
     },
 
     async postNotice(input: NoticeInput): Promise<void> {
@@ -146,6 +172,69 @@ export function makeActivities(deps: TurnDeps) {
       if (!found) return;
       const reply = found.conn.reply(input.conversation);
       await reply.send(input.text);
+    },
+
+    // --- the voice flow -------------------------------------------------------------------------
+
+    /** Which finished recordings have not been published yet. Cheap and safe to retry. */
+    async findNewRecordings(input: { agent: string }): Promise<
+      { id: string; title: string; stamp: string; minutes: number }[]
+    > {
+      const v = deps.voice?.(input.agent);
+      if (!v) return [];
+      const all = await recap.listRecordings(v.creds, 20);
+      const fresh = await recap.unpublished(all, v.brainDir);
+      return fresh.map((r) => ({
+        id: r.id,
+        title: r.title,
+        stamp: r.stamp,
+        minutes: Math.max(1, Math.round(r.duration / 60000)),
+      }));
+    },
+
+    /** Download, transcribe, summarise, publish, push — then ask the agent to say what it found.
+     *
+     *  Everything up to the push is idempotent by path: re-running lands on the same folder and
+     *  commits nothing. The notification is last, so a failure anywhere before it means the person
+     *  is told about a failure rather than promised a recap that does not exist. */
+    async processRecording(input: { agent: string; notify: string; id: string }): Promise<void> {
+      const ctx = Context.current();
+      const v = deps.voice?.(input.agent);
+      if (!v) throw new Error(`no voice configuration for ${input.agent}`);
+
+      const all = await recap.listRecordings(v.creds, 50);
+      const rec = all.find((r) => r.id === input.id);
+      if (!rec) throw new Error(`recording ${input.id} is no longer listed`);
+
+      ctx.heartbeat("transcribing");
+      const { text, seconds } = await recap.transcribe(v.creds, rec, v.groqKey, v.vocab);
+      console.log(`recap: ${rec.title} transcribed in ${seconds.toFixed(1)}s, ${text.length} chars`);
+
+      ctx.heartbeat("summarising");
+      const summary = await recap.summarize(text, rec.title, v.groqKey);
+
+      ctx.heartbeat("publishing");
+      const published = await recap.publish(v.brainDir, rec, summary, text, v.pushUrl);
+      console.log(`recap: ${rec.title} ${published ? "published" : "already present"} at Meetings/${rec.stamp}.md`);
+      if (!published) return; // somebody else got there first; do not announce it twice
+
+      // A real turn, so the agent says it in its own words and can be asked follow-ups in the same
+      // conversation. The three highlights are handed over rather than re-derived.
+      const top = (summary.highlights ?? []).slice(0, 3);
+      await deps.ask?.(
+        input.agent,
+        input.notify,
+        `A recording has just finished processing and is filed in the second brain at ` +
+          `Meetings/${rec.stamp}.md: “${rec.title}”. Write a short message telling them it is ready ` +
+          `and giving the three most useful things from it, in your own words, then offer to answer ` +
+          `questions about it. The three: ${top.map((h, i) => `(${i + 1}) ${h}`).join(" ")}`,
+      );
+    },
+
+    /** Say something verbatim to a person, opening a DM if needed. Used for the acknowledgement and
+     *  for failures, where spending an LLM turn to relay a known sentence is waste. */
+    async sayVerbatim(input: { agent: string; user: string; text: string }): Promise<void> {
+      await deps.say?.(input.agent, input.user, input.text);
     },
   };
 }

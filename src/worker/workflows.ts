@@ -23,6 +23,7 @@ import {
   isCancellation,
   proxyActivities,
   setHandler,
+  sleep,
 } from "@temporalio/workflow";
 import type { Activities } from "./activities";
 
@@ -124,4 +125,80 @@ export async function conversationWorkflow(input: ConversationInput): Promise<vo
 
   // History bound reached. Anything still queued rides along, so no message is dropped at the seam.
   await continueAsNew<typeof conversationWorkflow>({ ...input, first: queue.shift() });
+}
+
+// --- the voice flow -----------------------------------------------------------------------------
+
+const { findNewRecordings, processRecording, sayVerbatim } = proxyActivities<Activities>({
+  // Listing is a cheap HTTP call; processing downloads audio and runs two models.
+  startToCloseTimeout: "15 minutes",
+  heartbeatTimeout: "60 seconds",
+  retry: { maximumAttempts: 2 },
+});
+
+export interface PollInput {
+  /** Roster name of the agent whose second brain receives the recaps. */
+  agent: string;
+  /** Slack user id to notify. */
+  notify: string;
+  /** How often to look, in seconds. */
+  everySeconds?: number;
+}
+
+/**
+ * Watch for finished recordings and turn each into a recap.
+ *
+ * A loop with a timer rather than a Temporal Schedule, because the polling interval wants to be
+ * short (a person who just stopped recording is waiting) and a schedule firing every minute would
+ * create a workflow execution every minute forever. One long-lived workflow that sleeps is cheaper
+ * and keeps "what has been seen" in one place.
+ *
+ * Processing is deliberately NOT retried into oblivion: it spends money and posts to Slack. Two
+ * attempts, then the failure is announced to the person rather than swallowed — a pipeline that
+ * quietly stops is how you end up with a worker that has skipped the same recording for a month.
+ */
+export async function plaudPollWorkflow(input: PollInput): Promise<void> {
+  const every = (input.everySeconds ?? 120) * 1000;
+  // Bounded so history cannot grow forever; the count is arbitrary but small enough that a run is
+  // minutes of history rather than days.
+  for (let i = 0; i < 200; i++) {
+    let found: { id: string; title: string; stamp: string; minutes: number }[] = [];
+    try {
+      found = await findNewRecordings({ agent: input.agent });
+    } catch (e) {
+      // A dead Plaud token is the expected failure — it expires every 24h. Say so once per hour
+      // rather than every two minutes, and keep polling in case it is refreshed.
+      if (i % 30 === 0) {
+        await sayVerbatim({
+          agent: input.agent,
+          user: input.notify,
+          text: `⚠️ I can't reach your Plaud account — ${String((e as Error)?.message ?? e).slice(0, 150)}`,
+        }).catch(() => {});
+      }
+      await sleep(every);
+      continue;
+    }
+
+    for (const rec of found) {
+      // Say it landed BEFORE the slow part, so the person knows it was seen.
+      await sayVerbatim({
+        agent: input.agent,
+        user: input.notify,
+        text: `I've got a new recording — “${rec.title}”, ${rec.minutes} minute${rec.minutes === 1 ? "" : "s"}. Processing it now; I'll send the highlights shortly.`,
+      }).catch(() => {});
+
+      try {
+        await processRecording({ agent: input.agent, notify: input.notify, id: rec.id });
+      } catch (e) {
+        await sayVerbatim({
+          agent: input.agent,
+          user: input.notify,
+          text: `⚠️ I couldn't finish processing “${rec.title}” — ${String((e as Error)?.message ?? e).slice(0, 200)}`,
+        }).catch(() => {});
+      }
+    }
+
+    await sleep(every);
+  }
+  await continueAsNew<typeof plaudPollWorkflow>(input);
 }
