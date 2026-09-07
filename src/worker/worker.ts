@@ -585,11 +585,19 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
       // Update rather than leave it: the interval and the recipient come from the registry, and a
       // schedule that silently keeps yesterday's configuration is the staleness this design was
       // meant to remove.
-      await client.schedule.getHandle(scheduleId).update((prev) => ({
+      const h = client.schedule.getHandle(scheduleId);
+      await h.update((prev) => ({
         ...prev,
         spec: { intervals: [{ every }] },
         action,
       }));
+      // And UNPAUSE it. Turning the flow off pauses the schedule, so leaving this out makes the
+      // switch work in one direction only: a row set back to enabled=true would look on in the
+      // registry and in the boot log while the schedule sat paused and nothing ever ran.
+      if ((await h.describe()).state.paused) {
+        await h.unpause("flow_property enabled=true");
+        console.log(`worker: ${name} voice schedule resumed`);
+      }
       console.log(`worker: ${name} voice schedule updated — every ${every}`);
     }
   }
