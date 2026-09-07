@@ -145,3 +145,29 @@ describe("voiceSettings — whose Plaud account", () => {
     expect(line).not.toContain("DISABLED");
   });
 });
+
+
+describe("voiceSettings — calendars", () => {
+  it("splits the exclusion list a person typed, and drops the blanks", () => {
+    // A trailing comma is the ordinary result of editing this in a form. An empty pattern treated
+    // as a substring match excludes EVERY event and switches calendar matching off silently.
+    const v = voiceSettings({ "calendar.exclude": "Focus Time, Lunch , ,Calendly Meeting Block," });
+    expect(v.calendarExclude).toEqual(["Focus Time", "Lunch", "Calendly Meeting Block"]);
+  });
+
+  it("has no exclusions when nothing is configured", () => {
+    expect(voiceSettings({}).calendarExclude).toEqual([]);
+  });
+
+  it("leaves the window unset so the module's own default applies", () => {
+    // Not defaulted here: two defaults for one number is how they drift apart.
+    expect(voiceSettings({}).calendarPadMinutes).toBeUndefined();
+    expect(voiceSettings({ "calendar.window_minutes": "45" }).calendarPadMinutes).toBe(45);
+  });
+
+  it("has NO timezone setting, because matching does not need one", () => {
+    // Deliberate. Matching is in epoch milliseconds; the old pipeline needed America/New_York only
+    // because it searched a local-day window, which is also why it got DST boundaries wrong.
+    expect(Object.keys(voiceSettings({ "calendar.tz": "America/New_York" }))).not.toContain("calendarTz");
+  });
+});

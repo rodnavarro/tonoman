@@ -39,6 +39,7 @@ import * as gate from "./authgate";
 import * as secondbrain from "./secondbrain";
 import * as recapFloor from "./recap";
 import { describe as describeVoice, voiceSettings } from "./flowcfg";
+import * as calendar from "./calendar";
 import { serveWake } from "./wake";
 import { promises as fsp } from "node:fs";
 import { defaultHarnesses } from "../gateway";
@@ -80,6 +81,40 @@ async function resolveRef(ref: string | null | undefined): Promise<string> {
   try {
     return (await fsp.readFile(path.join(dir, secret, key), "utf8")).trim();
   } catch {
+    return "";
+  }
+}
+
+/**
+ * One credential out of the registry, by ref, as a raw string.
+ *
+ * `resolveRef` reads a MOUNTED Kubernetes secret, which is the arrangement customer credentials
+ * were moved off — a path is a property of the pod, and one pod serves every tenant it has agents
+ * for. A connection's `secret_ref` names a row in the registry's `secret` table instead, and the
+ * decryption happens on the far side of this call: the worker never holds the key.
+ *
+ * Empty rather than throwing. A connection whose credential cannot be read is one calendar that
+ * will not match, and the recap still has to be filed.
+ */
+async function registrySecret(guid: string | undefined, ref: string | undefined): Promise<string> {
+  const baseUrl = process.env.TONOMANCLOUD_API_URL;
+  if (!baseUrl || !guid || !ref) return "";
+  try {
+    const r = await fetch(`${baseUrl}/v1/system/agents/${guid}/secrets/${encodeURIComponent(ref)}`, {
+      headers: { authorization: `Bearer ${process.env.TONOMANCLOUD_API_TOKEN ?? ""}` },
+    });
+    // 404 is "not connected", which is a state rather than a failure. Anything else is worth a line
+    // — a 500 here means the KEK is wrong or the row is unreadable, and silently treating that as
+    // "no calendar" would hide a real fault behind a plausible absence.
+    if (r.status === 404) return "";
+    if (!r.ok) {
+      console.error(`registry: secret ${ref} for ${guid} returned HTTP ${r.status}`);
+      return "";
+    }
+    const j = (await r.json()) as { value?: string };
+    return j.value ?? "";
+  } catch (e) {
+    console.error(`registry: secret ${ref} for ${guid} failed — ${(e as Error).message}`);
     return "";
   }
 }
@@ -369,6 +404,28 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
     // feature on is meant to mean.
     const tzOffset = -new Date().getTimezoneOffset();
     const floorMs = recapFloor.floorFor(voice.since || undefined, Date.now(), tzOffset);
+    // Calendars this agent has been granted. `(kind, alias)` is the identity: the KIND is what
+    // the platform knows how to read, the ALIAS is which one of them this is — so a work calendar
+    // and a personal one coexist without either becoming a second connector.
+    //
+    // Only `connected` ones, and only those whose URL actually resolves. A calendar listed but
+    // unreadable must not silently become "no calendar": it is logged by alias, never by URL,
+    // because a published feed's link IS its credential.
+    const calendars: calendar.CalendarFeed[] = [];
+    for (const c of a.cfg.connections ?? []) {
+      if (c.kind !== "ics") continue; // google and outlook arrive with the OAuth callback
+      if (c.status && c.status !== "connected") {
+        console.log(`worker: ${name} calendar ${c.kind}/${c.alias} is ${c.status}, skipping`);
+        continue;
+      }
+      const url = await registrySecret(a.cfg.guid, c.secret_ref);
+      if (!url) {
+        console.log(`worker: ${name} calendar ${c.kind}/${c.alias} has no readable URL, skipping`);
+        continue;
+      }
+      calendars.push({ kind: c.kind, alias: c.alias, url });
+    }
+
     const token = await resolveRef(src.secret_ref);
     const pushUrl = token ? src.repo_url.replace("https://", `https://x-access-token:${token}@`) : src.repo_url;
     const dir = path.join(process.env.TONOMAN_STATE_ROOT ?? "/root/.tonoman", "secondbrain", name, src.id);
@@ -381,6 +438,9 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
       // API; one that has not is still on the mounted bearer. Per agent, so the two tenants can be
       // on different halves of this migration at the same time.
       creds: { tokenJson, cliAgent: viaCli ? name : undefined },
+      calendars,
+      calendarExclude: (voice.calendarExclude ?? []).filter(Boolean),
+      calendarPadMinutes: voice.calendarPadMinutes,
       brainDir: src.subpath ? path.join(dir, src.subpath) : dir,
       pushUrl,
       groqKey,
@@ -395,7 +455,12 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
       // doing is the failure mode this whole boot line exists to prevent.
       `worker: ${name} voice flow ready — ${describeVoice(viaCli ? { ...voice, credentialRef: `plaud-cli:${name}` } : voice)}` +
         `${viaCli ? " [connected account]" : ""}; ` +
-        `brain at ${dir}; only recordings from ${new Date(floorMs).toISOString()} onwards`,
+        `brain at ${dir}; only recordings from ${new Date(floorMs).toISOString()} onwards` +
+        // Said out loud, because a flow with no calendar and a flow whose calendar failed to
+        // resolve look identical from the outside and are entirely different problems.
+        (calendars.length
+          ? `; calendars: ${calendars.map((c) => `${c.kind}/${c.alias}`).join(", ")}`
+          : "; no calendars attached"),
     );
   }
 

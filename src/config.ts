@@ -161,6 +161,20 @@ export interface AgentConfig {
    *  `route.<id>`. That is what keeps adding a meeting category an INSERT rather than a migration
    *  here and a redeploy there. */
   flows?: Record<string, Record<string, string>>;
+  /** Outside accounts this agent may use, from the registry (§8). Identified by `(kind, alias)`:
+   *  the KIND is what the platform knows how to talk to, the ALIAS is which one of them this is.
+   *  That is what lets a tenant attach a work calendar and a personal one without either becoming
+   *  a second connector. `secret_ref` names the credential; it is never the credential. */
+  connections?: {
+    id: string;
+    kind: string;
+    alias: string;
+    label?: string;
+    external_account?: string;
+    secret_ref?: string;
+    status?: string;
+    expires_at?: string;
+  }[];
   workspace?: Workspace;
   // --- Service-mode (svc-self-channeled / svc-config-env) ----------------------
   /** Service agent: Tonoman boots + lifecycle-manages a long-lived self-channeled server

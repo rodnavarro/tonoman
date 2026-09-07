@@ -14,6 +14,7 @@ import { Context } from "@temporalio/activity";
 import type { Connector, Reply, TurnEvent, TurnUsage } from "../core/contracts";
 import type { AgentConfig } from "../config";
 import * as recap from "./recap";
+import * as calendar from "./calendar";
 import * as worklog from "./worklog";
 import { randomMysticVerb } from "../core/mystic";
 
@@ -84,6 +85,13 @@ export interface VoiceConfig {
    *  backfills the customer's entire Plaud history and announces each one as if it had just
    *  happened. */
   floorMs: number;
+  /** Calendars this agent may read, URLs already resolved from the secret store. Empty is the
+   *  ordinary state and costs nothing: the flow behaves exactly as it did before calendars. */
+  calendars?: calendar.CalendarFeed[];
+  /** Titles that are blocks rather than meetings — "Focus Time", "Lunch". From the registry. */
+  calendarExclude?: string[];
+  /** How far either side of a recording to look. Generous by default; see calendar.ts. */
+  calendarPadMinutes?: number;
 }
 
 export interface TurnRunReq {
@@ -243,16 +251,46 @@ export function makeActivities(deps: TurnDeps) {
       );
       console.log(`recap: ${rec.title} transcribed in ${seconds.toFixed(1)}s, ${text.length} chars`);
 
+      // What was on the calendar around this recording. Gathered BEFORE summarising because the
+      // candidates ride that same call — content decides which meeting this was, and it can only
+      // decide between things it has been shown.
+      let candidates: calendar.CalEvent[] = [];
+      if (v.calendars?.length) {
+        ctx.heartbeat("reading calendars");
+        const w = calendar.windowFor(rec.startTime, rec.startTime + rec.duration, v.calendarPadMinutes);
+        candidates = await calendar.gather(v.calendars, w.from, w.to, {
+          exclude: v.calendarExclude,
+          log: (m) => console.log(m),
+        });
+        console.log(
+          `recap: ${rec.title} — ${candidates.length} calendar candidate(s) from ${v.calendars.length} feed(s)`,
+        );
+      }
+
       ctx.heartbeat("summarising");
-      const summary = await recap.summarize(text, rec.title, v.groqKey, v.journal);
+      const summary = await recap.summarize(text, rec.title, v.groqKey, v.journal, candidates);
+      // The model may only claim a meeting it was shown. Anything else is no match — a
+      // hallucinated meeting name looks entirely correct and files the recap into a series it does
+      // not belong to.
+      const matched = recap.resolveMeeting(candidates, summary.meeting);
+      summary.meeting = matched?.summary ?? "";
 
       ctx.heartbeat("publishing");
       const route = recap.resolveRoute(v.journal, summary.route);
-      const where = recap.pathsFor(v.journal, rec, route, summary.highlights?.[0] ?? summary.summary);
-      const published = await recap.publish(v.brainDir, rec, summary, text, v.pushUrl, v.journal);
+      // A matched meeting names the file. Plaud names an untitled recording after its own clock,
+      // and `2026-09-07-0310-api-team-standup.md` is the difference between a knowledge base
+      // somebody can search and one they cannot.
+      const where = recap.pathsFor(
+        v.journal,
+        rec,
+        route,
+        summary.meeting || summary.highlights?.[0] || summary.summary,
+      );
+      const published = await recap.publish(v.brainDir, rec, summary, text, v.pushUrl, v.journal, candidates);
       console.log(
         `recap: ${rec.title} ${published ? "published" : "already present"} at ${where.page}` +
-          (route ? ` (route ${route}${summary.route && summary.route !== route ? `, model said "${summary.route}"` : ""})` : ""),
+          (route ? ` (route ${route}${summary.route && summary.route !== route ? `, model said "${summary.route}"` : ""})` : "") +
+          (candidates.length ? ` [calendar: ${summary.meeting ? `matched "${summary.meeting}"` : "no match"}]` : ""),
       );
       if (!published) return; // somebody else got there first; do not announce it twice
 

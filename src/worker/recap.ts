@@ -609,12 +609,17 @@ export async function publish(
   transcript: string,
   pushUrl: string,
   journal?: Journal,
+  candidates: CalEvent[] = [],
 ): Promise<boolean> {
   const route = resolveRoute(journal, recap.route);
   const where = pathsFor(journal, rec, route, recap.highlights?.[0] ?? recap.summary);
   const dir = path.join(brainDir, where.folder);
   await fs.mkdir(dir, { recursive: true });
-  await fs.writeFile(path.join(brainDir, where.page), overviewMarkdown(rec, { ...recap, route }, where.folder), "utf8");
+  await fs.writeFile(
+    path.join(brainDir, where.page),
+    overviewMarkdown(rec, { ...recap, route }, where.folder, candidates),
+    "utf8",
+  );
   await fs.writeFile(
     path.join(dir, "Transcript.md"),
     `# Transcript — ${rec.title}\n\nTranscribed by Groq \`whisper-large-v3-turbo\` from the Plaud recording.\n\n---\n\n${transcript}\n`,

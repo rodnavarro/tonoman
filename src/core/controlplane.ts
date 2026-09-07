@@ -75,6 +75,20 @@ export interface RegistryAgent {
     secretRef?: string | null;
     readOnly?: boolean;
   }[];
+  /** Outside accounts this agent has been GRANTED, identified by `(kind, alias)`. The alias is
+   *  what makes more than one of a kind possible — a work calendar and a personal one are both
+   *  `google`. `secretRef` names a row in the registry's `secret` table; the material never
+   *  travels on the roster. */
+  connections?: {
+    id: string;
+    kind: string;
+    alias: string;
+    label?: string | null;
+    externalAccount?: string | null;
+    secretRef?: string | null;
+    status?: string;
+    expiresAt?: string | null;
+  }[];
 }
 
 export interface RegistryOptions {
@@ -195,6 +209,16 @@ export class RegistryControlPlane implements ControlPlane {
           auth_kind: s.authKind,
           secret_ref: s.secretRef,
           read_only: s.readOnly,
+        })),
+        connections: (a.connections ?? []).map((c) => ({
+          id: c.id,
+          kind: c.kind,
+          alias: c.alias,
+          label: c.label ?? undefined,
+          external_account: c.externalAccount ?? undefined,
+          secret_ref: c.secretRef ?? undefined,
+          status: c.status,
+          expires_at: c.expiresAt ?? undefined,
         })),
         channel: "slack",
         slack: {

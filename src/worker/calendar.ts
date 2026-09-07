@@ -364,6 +364,50 @@ export function fetchIcs(url: string, timeoutMs = 20_000): Promise<string> {
 }
 
 
+/** One attached calendar, with its URL already resolved from the secret store. */
+export interface CalendarFeed {
+  kind: string;
+  alias: string;
+  url: string;
+}
+
+/**
+ * Every event around a window, across every calendar an agent has.
+ *
+ * ONE BAD FEED MUST NOT COST THE OTHERS. A revoked share link, an expired token or a provider
+ * having a bad afternoon should remove that calendar from the answer and nothing else — an agent
+ * with a work calendar and a personal one still matches its work meetings while the personal one
+ * is broken. Anything that throws here would instead take down the whole recap, which is a far
+ * worse trade than a partial candidate list the model is already designed to cope with.
+ */
+export async function gather(
+  feeds: CalendarFeed[],
+  from: number,
+  to: number,
+  opts: {
+    exclude?: string[];
+    fetcher?: (url: string) => Promise<string>;
+    log?: (message: string) => void;
+  } = {},
+): Promise<CalEvent[]> {
+  const fetcher = opts.fetcher ?? fetchIcs;
+  const out: CalEvent[] = [];
+  // Sequential rather than parallel, deliberately: this runs inside a Temporal activity that is
+  // already doing the expensive work, the feeds are few, and a burst of simultaneous requests to
+  // the same provider is how a polling client gets rate-limited.
+  for (const f of feeds) {
+    try {
+      const body = await fetcher(f.url);
+      const events = eventsBetween(body, from, to, { kind: f.kind, alias: f.alias });
+      out.push(...events);
+    } catch (e) {
+      // The alias, never the URL. A published feed's link IS its credential.
+      opts.log?.(`calendar: ${f.kind}/${f.alias} could not be read — ${(e as Error).message}`);
+    }
+  }
+  return candidatesFor(out, from, to, { exclude: opts.exclude });
+}
+
 // --- Proving a feed is the RIGHT feed ------------------------------------------------------------
 
 /** How far ahead to look when checking a feed. Long enough that a calendar with only a weekly

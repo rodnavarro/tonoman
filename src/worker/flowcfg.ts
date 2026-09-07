@@ -32,6 +32,16 @@ export interface VoiceSettings {
   since: string;
   /** Where meetings are filed, or undefined for the flat `Meetings/` layout. */
   journal?: Journal;
+  /** Calendar titles that are blocks rather than meetings — "Focus Time", "Lunch",
+   *  "Calendly Meeting Block". Comma-separated in the row, because a person types this.
+   *
+   *  NOTE there is deliberately no `calendar.tz` here. Matching happens in epoch milliseconds, so
+   *  it needs no timezone at all — see calendar.ts. The old pipeline needed one only because it
+   *  searched a LOCAL-DAY window, which is also why it got DST boundaries wrong. */
+  calendarExclude: string[];
+  /** How far either side of a recording to look for events. Generous by default: people start
+   *  recording after a meeting begins, and this only gathers candidates — the content decides. */
+  calendarPadMinutes?: number;
 }
 
 const num = (v: string | undefined, fallback: number): number => {
@@ -69,10 +79,20 @@ export function voiceSettings(props: Record<string, string> = {}, env: NodeJS.Pr
   const journal: Journal | undefined =
     journalPath && fallback ? { path: journalPath, fallback, routes } : undefined;
 
+  // Comma-separated, trimmed, blanks dropped. A trailing comma is the ordinary result of somebody
+  // editing this in a form, and an empty pattern treated as a substring match would exclude every
+  // event and switch calendar matching off without saying so.
+  const calendarExclude = (p("calendar.exclude") ?? "")
+    .split(",")
+    .map((t) => t.trim())
+    .filter(Boolean);
+
   return {
     // Default ON: a tenant that configured a voice flow means to run it. Only an explicit "false"
     // turns it off, so a typo cannot silently stop a pipeline somebody is relying on.
     enabled: (p("enabled") ?? "true").toLowerCase() !== "false",
+    calendarExclude,
+    calendarPadMinutes: p("calendar.window_minutes") ? num(p("calendar.window_minutes"), 30) : undefined,
     // NO environment fallback for these two, deliberately. A channel id and a user id name a place
     // inside ONE workspace, so a worker-wide default is cross-tenant contamination by construction:
     // the second tenant's agent inherited the first tenant's channel and was about to announce a

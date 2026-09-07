@@ -5,6 +5,7 @@ import {
   describe as describeEvent,
   eventsBetween,
   excluded,
+  gather,
   healthLine,
   isCancelled,
   overlaps,
@@ -464,5 +465,92 @@ describe("healthLine — something a person can actually check", () => {
   it("does not claim success outright when the calendar is empty", () => {
     const line = healthLine("X", { ok: true, events: 0, warning: "no events in the next 30 days — is this right?" });
     expect(line).toContain("but");
+  });
+});
+
+
+describe("gather — one bad feed must not cost the others", () => {
+  const FROM = ms("2026-09-07T00:00:00Z");
+  const TO = ms("2026-09-08T00:00:00Z");
+
+  const good = ics(
+    vevent({ UID: "g@x", SUMMARY: "API Team Standup", DTSTART: "20260907T140000Z", DTEND: "20260907T143000Z" }),
+  );
+  const other = ics(
+    vevent({ UID: "o@x", SUMMARY: "Dentist", DTSTART: "20260907T160000Z", DTEND: "20260907T170000Z" }),
+  );
+
+  it("merges every calendar, tagged by which one it came from", async () => {
+    const out = await gather(
+      [
+        { kind: "ics", alias: "foley", url: "https://a.test/c.ics" },
+        { kind: "ics", alias: "personal", url: "https://b.test/c.ics" },
+      ],
+      FROM,
+      TO,
+      { fetcher: async (u) => (u.includes("a.test") ? good : other) },
+    );
+    expect(out.map((e) => `${e.source.alias}:${e.summary}`)).toEqual([
+      "foley:API Team Standup",
+      "personal:Dentist",
+    ]);
+  });
+
+  it("keeps the working calendar when another one is revoked", async () => {
+    // A revoked share link or a provider having a bad afternoon should remove THAT calendar from
+    // the answer and nothing else. Throwing would take the whole recap down instead — a far worse
+    // trade than a partial candidate list, which the content-first design already copes with.
+    const logs: string[] = [];
+    const out = await gather(
+      [
+        { kind: "ics", alias: "broken", url: "https://dead.test/c.ics" },
+        { kind: "ics", alias: "foley", url: "https://a.test/c.ics" },
+      ],
+      FROM,
+      TO,
+      {
+        fetcher: async (u) => {
+          if (u.includes("dead.test")) throw new Error("calendar feed returned HTTP 404");
+          return good;
+        },
+        log: (m) => logs.push(m),
+      },
+    );
+    expect(out.map((e) => e.summary)).toEqual(["API Team Standup"]);
+    expect(logs.join(" ")).toContain("ics/broken");
+  });
+
+  it("names the alias in the log and NEVER the url", async () => {
+    // A published feed's link IS its credential. A failure that logged it would put a working
+    // credential in the pod's stdout, which is the one place it must not be.
+    const logs: string[] = [];
+    await gather([{ kind: "ics", alias: "foley", url: "https://secret.test/very-private-token.ics" }], FROM, TO, {
+      fetcher: async () => {
+        throw new Error("calendar feed returned HTTP 403");
+      },
+      log: (m) => logs.push(m),
+    });
+    expect(logs.join(" ")).toContain("foley");
+    expect(logs.join(" ")).not.toContain("very-private-token");
+  });
+
+  it("applies the exclusions across all of them at once", async () => {
+    const withBlock = ics(
+      vevent({ UID: "f@x", SUMMARY: "Focus Time", DTSTART: "20260907T140000Z", DTEND: "20260907T160000Z" }),
+    );
+    const out = await gather(
+      [
+        { kind: "ics", alias: "a", url: "https://a.test/c.ics" },
+        { kind: "ics", alias: "b", url: "https://b.test/c.ics" },
+      ],
+      FROM,
+      TO,
+      { fetcher: async (u) => (u.includes("a.test") ? good : withBlock), exclude: ["focus time"] },
+    );
+    expect(out.map((e) => e.summary)).toEqual(["API Team Standup"]);
+  });
+
+  it("returns nothing, not an error, when an agent has no calendars", async () => {
+    expect(await gather([], FROM, TO)).toEqual([]);
   });
 });
