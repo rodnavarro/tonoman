@@ -342,6 +342,12 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
           noteText = text;
           noteId = (await reply.note?.(noteId || undefined, text)) ?? "";
         }
+        // Checked AGAIN, after the note write. The guard at the top of this function was true
+        // when the tick started, and a note post takes ~300ms — long enough for the turn to end
+        // and settle the cue in between. Setting the status after that leaves "Sapien is
+        // working…" under the composer of a thread that has already answered, and nothing ever
+        // clears it: `working` and `settle` are the same Slack call, so the last writer wins.
+        if (done || ctx.cancellationSignal.aborted) return;
         await reply.working?.(worklog.statusFor(current, verb)).catch(() => {});
       } catch {
         /* a dropped work log must never cost a turn */
@@ -349,7 +355,21 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
         posting = false;
       }
     };
-    const ticker = setInterval(() => void tick(), TICK_MS);
+    /** The tick currently in flight, so the end of the turn can wait for it rather than race it.
+     *  The re-check above closes the window on its own; this closes it without depending on when
+     *  the scheduler resumes a suspended tick. */
+    let inflight: Promise<void> = Promise.resolve();
+    const runTick = (): Promise<void> => (inflight = tick());
+    const ticker = setInterval(() => void runTick(), TICK_MS);
+    /** Take down the live cue for good: stop the timer, let any tick already running finish, and
+     *  only then clear the status. Every path out of a turn goes through here — answered, failed
+     *  or interrupted — because a status line that outlives its turn is the one artefact a person
+     *  cannot dismiss themselves. */
+    const settleCue = async (): Promise<void> => {
+      clearInterval(ticker);
+      await inflight.catch(() => {});
+      await reply.settle?.().catch(() => {});
+    };
     /** Remove the log entirely — for an interrupted turn, whose work nobody will see the result
      *  of, so a trace of it left on screen is only confusing. */
     const dropLog = (): void => {
@@ -436,7 +456,7 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
           // cue changes the moment a tool starts rather than on the next tick.
           current = { tool: ev.tool ?? "working", detail: ev.text };
           calls.push(current);
-          if (!answer) await tick();
+          if (!answer) await runTick();
         } else if (ev.kind === "done") {
           // The authoritative text. A harness that streams deltas AND sends a final would
           // otherwise leave whatever the last edit happened to catch; one that only sends a final
@@ -483,7 +503,7 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
       // workflow posts lands UNDER a stale "⚙️ Working…" note, and "Nelly is thinking…" stays
       // under the composer for good — the turn reads as still running, forever.
       dropLog();
-      await reply.settle?.().catch(() => {});
+      await settleCue();
       throw e;
     } finally {
       clearInterval(ticker);
@@ -493,7 +513,7 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
     if (usage) deps.recordUsage?.(input.conversation, usage);
     // Slack leaves "is thinking…" on screen until it is cleared, so an answered turn that
     // forgets this looks permanently busy.
-    await reply.settle?.().catch(() => {});
+    await settleCue();
     if (ctx.cancellationSignal.aborted) {
       dropLog();
       return;
