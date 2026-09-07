@@ -120,22 +120,38 @@ export function makeActivities(deps: TurnDeps) {
       let current: worklog.ToolCall | undefined;
       let noteId = "";
       let noteText = "";
+      /** One note write at a time. Without this the FIRST write is still in flight (a post is
+       *  ~300ms) while a second tool event fires a second tick: `noteId` is still empty, so that
+       *  tick posts a SECOND note, and whichever resolves last wins the id — leaving the other
+       *  stranded in the channel forever as "⚙️ Working… 1s". Two tool events inside one post
+       *  latency is not a corner case; it is what any turn that greps the second brain looks like. */
+      let posting = false;
+      let lastTick = 0;
       const tick = async (): Promise<void> => {
         if (done || ctx.cancellationSignal.aborted) return;
         // Once the answer is streaming, the answer IS the progress. Freezing the log here also
         // keeps it above the reply: a note posted after the answer's message would read below it.
-        if (answer) return;
-        const elapsed = Date.now() - started;
-        const text = worklog.liveNote(calls, elapsed);
-        if (text !== noteText) {
-          noteText = text;
-          try {
+        if (answer || posting) return;
+        // Tool events call this directly, so the timer is not the only rate limiter. Each tick is
+        // a message edit AND a status set; ten tool calls in two seconds would be twenty Slack
+        // calls, which is the burst TICK_MS exists to avoid.
+        const now = Date.now();
+        if (now - lastTick < EDIT_INTERVAL_MS) return;
+        lastTick = now;
+        posting = true;
+        try {
+          const elapsed = now - started;
+          const text = worklog.liveNote(calls, elapsed);
+          if (text !== noteText) {
+            noteText = text;
             noteId = (await reply.note?.(noteId || undefined, text)) ?? "";
-          } catch {
-            /* a dropped work log must never cost a turn */
           }
+          await reply.working?.(worklog.statusFor(current, elapsed)).catch(() => {});
+        } catch {
+          /* a dropped work log must never cost a turn */
+        } finally {
+          posting = false;
         }
-        await reply.working?.(worklog.statusFor(current, elapsed)).catch(() => {});
       };
       const ticker = setInterval(() => void tick(), TICK_MS);
       /** Remove the log entirely — for an interrupted turn, whose work nobody will see the result
@@ -211,6 +227,13 @@ export function makeActivities(deps: TurnDeps) {
           // killed for being slow.
           ctx.heartbeat(answer.length);
         }
+      } catch (e) {
+        // A failed turn still owes the person a finished-looking channel. Without this the ⚠️ the
+        // workflow posts lands UNDER a stale "⚙️ Working…" note, and "Nelly is thinking…" stays
+        // under the composer for good — the turn reads as still running, forever.
+        dropLog();
+        await reply.settle?.().catch(() => {});
+        throw e;
       } finally {
         clearInterval(ticker);
       }
