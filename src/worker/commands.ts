@@ -48,6 +48,11 @@ export interface CommandDeps {
   /** Forget this conversation's history and start it over. Optional: a deployment that keeps no
    *  session has nothing to forget, and `!new` says so instead of claiming a reset. */
   resetSession?(agent: string, conversation: string): void;
+  /** Connect this agent's Plaud account. Returns the text to post — a login link the person
+   *  opens themselves, because the account being connected is theirs and not ours. */
+  connectPlaud?(agent: string, conversation: string): Promise<string>;
+  /** Whether this agent already has a Plaud account connected. */
+  plaudConnected?(agent: string): Promise<boolean>;
 }
 
 const HELP = [
@@ -55,6 +60,7 @@ const HELP = [
   "• `!status` — token use for the last turn and how much of your Claude plan is left",
   `• \`!statusline ${STATUS_MODES.join("|")}\` — whether that shows under every answer`,
   "• `!model` — which model this conversation runs; `!model <name>` to change it here only",
+  "• `!connect` — connect your Plaud account, so I can pick up your recordings",
   "• `!new` — forget this thread and start over",
   "• `!help` — this",
 ].join("\n");
@@ -90,6 +96,17 @@ export async function run(
     case "help":
     case "commands":
       return HELP;
+
+    case "connect":
+    case "plaud": {
+      if (!deps.connectPlaud) return "I have no way to connect a Plaud account on this deployment.";
+      if (cmd.arg.toLowerCase() !== "again" && (await deps.plaudConnected?.(agent).catch(() => false))) {
+        // Reconnecting revokes nothing but does replace the tokens, so it is worth one sentence
+        // rather than silently doing it to somebody who typed the wrong thing.
+        return "✅ Your Plaud account is already connected. Type `!connect again` if you want to sign in with a different one.";
+      }
+      return deps.connectPlaud(agent, conversation);
+    }
 
     case "new":
       if (!deps.resetSession) return NEW_NOOP;

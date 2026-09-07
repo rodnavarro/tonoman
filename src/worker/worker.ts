@@ -22,6 +22,7 @@ import type { Config, AgentConfig } from "../config";
 import type { Connector, TurnEvent, TurnRunner, TurnUsage } from "../core/contracts";
 import { SlackConnector } from "../connector/slack";
 import * as cmds from "./commands";
+import * as plaudcli from "./plaudcli";
 import {
   parseStatusMode,
   remoteAccountUsageCached,
@@ -449,6 +450,36 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
     lastUsage: (conversation) => lastUsage.get(conversation),
     windows: windowsFor,
     resetSession: (name, conversation) => void resetSession(name, conversation).catch(() => {}),
+    plaudConnected: (name) => plaudcli.connected(name),
+    connectPlaud: async (name, conversation) => {
+      // The link goes to the person, and the confirmation comes back in the same thread when they
+      // finish — so a login is one message, a browser tab, and a reply, rather than a support call.
+      const started = await plaudcli.startLogin({ agent: name });
+      if (!started.url) {
+        return "I couldn't start the Plaud sign-in — the CLI didn't hand me a link. That's mine to fix, not yours.";
+      }
+      const reply = wired.get(name)?.conn.reply(conversation);
+      void started.done
+        .then(async (ok) => {
+          if (!ok) {
+            await reply?.send("That sign-in didn't complete. Type `!connect` and I'll send a fresh link.").catch(() => {});
+            return;
+          }
+          const where = voiceCreds.get(name)?.notifyChannel;
+          await reply
+            ?.send(
+              `✅ Your Plaud account is connected.\n\nRecord something and I'll pick it up within five minutes — ` +
+                `I'll post what I find ${where ? `in <#${where}>` : "here"}.`,
+            )
+            .catch(() => {});
+        })
+        .catch(() => {});
+      return (
+        `Let's connect your Plaud account. Open this and sign in as yourself:\n\n${started.url}` +
+        `${started.code ? `\n\nThe code is *${started.code}*.` : ""}` +
+        `\n\n_I'll tell you here as soon as it's done — nothing to copy back._`
+      );
+    },
     // What THIS conversation runs: its own choice, else whatever the roster row says.
     getModel: (name, conversation) => models.get(conversation) ?? wired.get(name)?.cfg.model,
     setModel: (_name, conversation, model) => {

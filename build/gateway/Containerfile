@@ -43,6 +43,12 @@ RUN apt-get update \
 RUN npm install -g @anthropic-ai/claude-code \
  && claude --version
 
+# The official Plaud CLI. Its OAuth tokens last about 300 days and renew themselves; the
+# captured web bearer it replaces lasted 24 hours and needed a real browser on somebody's
+# laptop to renew, which is not a thing a customer can be asked to run every morning.
+RUN npm install -g @plaud-ai/cli \
+ && plaud version
+
 # Container-root git must trust bind-mounted workspaces, or "dubious ownership" blocks commits.
 RUN git config --system --add safe.directory '*'
 
