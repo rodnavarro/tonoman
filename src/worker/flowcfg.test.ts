@@ -80,3 +80,21 @@ describe("describe", () => {
     expect(describeVoice(voiceSettings({ notify_user: "U1" }, {}))).toContain("DM with U1");
   });
 });
+
+describe("voiceSettings — the off switch", () => {
+  it("is ON by default, because configuring a flow means meaning to run it", () => {
+    expect(voiceSettings({}, {}).enabled).toBe(true);
+    expect(voiceSettings({ notify_channel: "C1" }, {}).enabled).toBe(true);
+  });
+
+  it("only an explicit false turns it off, so a typo cannot silently stop a pipeline", () => {
+    expect(voiceSettings({ enabled: "false" }, {}).enabled).toBe(false);
+    expect(voiceSettings({ enabled: "FALSE" }, {}).enabled).toBe(false);
+    expect(voiceSettings({ enabled: "no" }, {}).enabled).toBe(true);
+    expect(voiceSettings({ enabled: "" }, {}).enabled).toBe(true);
+  });
+
+  it("says so loudly in the boot line — a silent flow looks identical to a working one", () => {
+    expect(describeVoice(voiceSettings({ enabled: "false" }, {}))).toContain("DISABLED");
+  });
+});

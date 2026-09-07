@@ -12,6 +12,12 @@ import type { Journal } from "./recap";
 
 /** What the voice flow needs, as the registry holds it. */
 export interface VoiceSettings {
+  /** Whether this agent watches for recordings at all.
+   *
+   *  A switch, because "has a second brain and a Plaud token" is not the same as "should be filing
+   *  meetings". Two tenants sharing one Plaud account both see every recording, so turning one of
+   *  them off has to be a row somebody can set — not a redeploy, and not deleting a credential. */
+  enabled: boolean;
   /** Slack channel id where recaps are announced. Empty = DM the notify user. */
   notifyChannel: string;
   /** Slack user id: who a DM would go to, and who the agent addresses. */
@@ -59,6 +65,9 @@ export function voiceSettings(props: Record<string, string> = {}, env: NodeJS.Pr
     journalPath && fallback ? { path: journalPath, fallback, routes } : undefined;
 
   return {
+    // Default ON: a tenant that configured a voice flow means to run it. Only an explicit "false"
+    // turns it off, so a typo cannot silently stop a pipeline somebody is relying on.
+    enabled: (p("enabled") ?? "true").toLowerCase() !== "false",
     notifyChannel: p("notify_channel") ?? (env.VOICE_NOTIFY_CHANNEL ?? "").trim(),
     notifyUser: p("notify_user") ?? (env.VOICE_NOTIFY_USER ?? "").trim(),
     pollSeconds: num(p("poll_seconds") ?? env.VOICE_POLL_SECONDS, 300),
@@ -70,6 +79,7 @@ export function voiceSettings(props: Record<string, string> = {}, env: NodeJS.Pr
 /** A one-line summary for the boot log. What is configured is worth saying out loud: a flow that
  *  silently files everything under `unclassified` looks identical to one that is working. */
 export function describe(v: VoiceSettings): string {
+  if (!v.enabled) return "DISABLED (flow_property enabled=false)";
   const where = v.notifyChannel ? `channel ${v.notifyChannel}` : `a DM with ${v.notifyUser || "nobody"}`;
   const filing = v.journal
     ? `${v.journal.path}/{${v.journal.routes.map((r) => r.id).join(",") || "—"}} → ${v.journal.fallback}`

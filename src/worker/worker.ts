@@ -234,6 +234,10 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
     // only a fallback for a tenant that has no rows yet — a deployment is the wrong place for
     // "where do Celine's meetings go".
     const voice = voiceSettings(a.cfg.flows?.voice, process.env);
+    if (!voice.enabled) {
+      console.log(`worker: ${name} voice flow is switched off (flow_property enabled=false)`);
+      continue;
+    }
     if (!tokenFile || !groqKey || !src) {
       console.log(`worker: ${name} has no voice flow (needs PLAUD_TOKEN_FILE, GROQ_API_KEY and a second-brain source)`);
       continue;
