@@ -25,6 +25,9 @@ import {
   setHandler,
 } from "@temporalio/workflow";
 import type { Activities } from "./activities";
+// PURE string helpers only. A workflow must stay deterministic, and these do no I/O — which is
+// exactly why the "is this an auth failure" decision lives as a regex rather than as a probe.
+import { isNotLoggedInError, notLoggedInNotice } from "../authflow";
 
 const { runTurn, postNotice } = proxyActivities<Activities>({
   // A turn is a person waiting on an LLM: minutes, not seconds. The heartbeat is what makes a dead
@@ -111,11 +114,20 @@ export async function conversationWorkflow(input: ConversationInput): Promise<vo
       }
       // Never die silently: a turn that failed still owes the person an explanation, or they are
       // left watching a message that never finishes.
+      //
+      // And "no inference credential" gets its OWN explanation. "I hit an error" is true and
+      // useless there: retrying cannot help, because nothing is wrong with the message — the agent
+      // has nothing to answer on. The gate normally catches it first, from `auth_state`, but that
+      // is a snapshot; a credential expiring between roster refreshes leaves the gate open and the
+      // turn failing, and the person reads a stack-trace fragment.
+      const why = String((e as Error)?.message ?? e);
       await postNotice({
         agent: input.agent,
         conversation: input.conversation,
         channel: input.channel,
-        text: `⚠️ I hit an error and couldn't finish that — ${String((e as Error)?.message ?? e).slice(0, 200)}`,
+        text: isNotLoggedInError(why)
+          ? notLoggedInNotice()
+          : `⚠️ I hit an error and couldn't finish that — ${why.slice(0, 200)}`,
       }).catch(() => {});
     } finally {
       inFlight = undefined;
