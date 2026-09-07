@@ -30,6 +30,27 @@ export const IMAGE = "localhost/tonoman/claudecode:latest";
 // volume is bind-mounted here so the OAuth credential store persists (A11).
 export const CONFIG_HOME = "/root/.claude";
 
+/** One agent's Claude credential directory, under the shared config volume.
+ *
+ *  A subscription belongs to a PERSON, and one worker pod runs every agent a deployment has. With
+ *  a single CLAUDE_CONFIG_DIR they all shared one login: the second person to sign in replaced the
+ *  first, and every agent then answered — and billed — on whoever had authenticated most recently.
+ *  Celine's assistant must run on Celine's subscription and Rod's on Rod's, and where that is true
+ *  is here.
+ *
+ *  The name is sanitised because it arrives over the wire on the login endpoints. Anything that is
+ *  not a plain name would let a caller choose a path, and this path is where credentials live. */
+export function configHomeFor(agent: string | undefined, root: string = CONFIG_HOME): string {
+  // No agent named at all: a self-hosted roster with one login, which should not grow a directory
+  // level for a distinction it does not have.
+  if (!agent) return root;
+  const safe = agent.replace(/[^A-Za-z0-9_-]/g, "");
+  // A name that was GIVEN but sanitises away is not the same thing as no name. Falling back to the
+  // shared home there would hand the pool's credential to whatever nonsense was supplied — so it
+  // gets a directory of its own that is nobody's and works for nothing.
+  return `${root}/agents/${safe || "_invalid"}`;
+}
+
 /** Where the per-agent identity dir (AGENTS.md/persona) bind-mounts READ-ONLY; the
  * turn-runner injects it via --append-system-prompt-file <identity>/AGENTS.md (A2). */
 export const IDENTITY_HOME = "/root/agent";
@@ -46,6 +67,9 @@ export interface RunnerOptions {
   // OWN tool taxonomy + its own knob, so this deliberately lives on the claude-code harness, not in
   // the harness-neutral roster. (`--allowedTools` is NOT used: it keeps schemas and ADDS guidance.)
   disallowedTools?: string[];
+  /** Where THIS runner's Claude credential lives. Defaults to the shared home, which is right for
+   *  a self-hosted roster with one login; a multi-tenant pool passes one per agent. */
+  configHome?: string;
   extraArgs?: string[]; // MUST NOT include --bare or --resume
   settingSources?: string; // default "user" (discovers the preset skill, A2)
   // Ephemeral mode (gw-command-btw): instead of `podman exec <container>`, run a throwaway
@@ -75,8 +99,12 @@ export type BackendMode = "subscription" | "bedrock";
  *  - "subscription": clear CLAUDE_CODE_USE_BEDROCK / CLAUDE_CODE_USE_MANTLE / ANTHROPIC_MODEL so the
  *    OAuth credential resolves and no Bedrock model id leaks onto the subscription path.
  *  - undefined: leave whatever backend the pod env declares (back-compat). */
-export function localEnv(base: NodeJS.ProcessEnv, backend?: BackendMode): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { ...base, IS_SANDBOX: "1", CLAUDE_CONFIG_DIR: CONFIG_HOME };
+export function localEnv(
+  base: NodeJS.ProcessEnv,
+  backend?: BackendMode,
+  configHome: string = CONFIG_HOME,
+): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...base, IS_SANDBOX: "1", CLAUDE_CONFIG_DIR: configHome };
   delete env.ANTHROPIC_API_KEY;
   if (backend === "bedrock") {
     env.CLAUDE_CODE_USE_BEDROCK = "1";
@@ -187,7 +215,7 @@ export class Runner implements TurnRunner {
     let child;
     if (this.o.local) {
       // Backend-aware env (backend-*): bedrock sets CLAUDE_CODE_USE_BEDROCK, subscription clears it.
-      const env = localEnv(process.env, this.o.backend);
+      const env = localEnv(process.env, this.o.backend, this.o.configHome ?? CONFIG_HOME);
       child = spawn(bin, this.localArgs(req), { windowsHide: true, env });
     } else {
       const podman = this.o.podman ?? "podman";
@@ -494,6 +522,7 @@ export function spec(): Spec {
         model: p.model,
         maxTurns: p.maxTurns,
         disallowedTools: p.disallowedTools,
+        configHome: configHomeFor(p.agent),
       }),
     newEphemeralRunner: (p: EphemeralParams) =>
       new Runner({ container: p.volumesFrom, model: p.model, ephemeral: { volumesFrom: p.volumesFrom, image: p.image, env: p.env } }),

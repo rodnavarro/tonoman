@@ -34,6 +34,10 @@ export interface RunnerParams {
   /** Harness-specific tool names to drop from every turn. Harness-specific by nature — Claude
    *  Code's taxonomy is not Codex's — so a harness that does not understand a name ignores it. */
   disallowedTools?: string[];
+  /** Which agent this runner serves, when one process serves several. Decides whose Claude
+   *  subscription the turn runs on — a subscription belongs to a person, and a pool that shares
+   *  one login has every agent answering on whoever authenticated most recently. */
+  agent?: string;
 }
 
 /** Inputs for an EPHEMERAL turn-runner (gw-command-btw): a throwaway sandbox spun from

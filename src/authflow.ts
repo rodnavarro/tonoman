@@ -131,6 +131,9 @@ export interface AuthOps {
   startHeadless(): Promise<string>;
   /** deliver the code; ok is OUTCOME-TRUE (the credential file actually changed) */
   submitCode(code: string): Promise<{ ok: boolean; status: string; loginTail: string }>;
+  /** optional: what the harness reports about the credential in use — which account, which plan.
+   *  Optional because not every transport can ask; callers show what they get and nothing more. */
+  status?(): Promise<string>;
 }
 
 /** LOCAL agents: drive the login through `podman exec` (the original roster-auth-headless path). */
@@ -146,7 +149,7 @@ export function podmanAuthOps(container: string, loginArgs: string[], statusArgs
  * credential store, so it runs the PTY dance itself (same reason /usage lives agent-side).
  * We send only the CODE, never a command: the login argv comes from the agent's harness spec,
  * so this can never become a remote-exec primitive. */
-export function httpAuthOps(baseUrl: string, token?: string): AuthOps {
+export function httpAuthOps(baseUrl: string, token?: string, agent?: string): AuthOps {
   const base = baseUrl.replace(/\/$/, "");
   const headers: Record<string, string> = { "content-type": "application/json" };
   if (token) headers["authorization"] = `Bearer ${token}`;
@@ -168,15 +171,25 @@ export function httpAuthOps(baseUrl: string, token?: string): AuthOps {
     return parsed;
   };
 
+  // Whose subscription this login is for. One runtime serves every agent in a pool, so a login
+  // that does not say who it belongs to lands in a shared directory and the last person to sign
+  // in owns them all.
+  const who = agent ? { agent } : {};
+
   return {
     async startHeadless(): Promise<string> {
-      const r = await call("/auth/login", {});
+      const r = await call("/auth/login", who);
       const url = typeof r.url === "string" ? r.url : "";
       if (!url) throw new Error("auth: the agent runtime started a login but produced no URL");
       return url;
     },
+    /** What the harness reports for THIS agent: which account, which plan. */
+    async status(): Promise<string> {
+      const r = await call(`/auth/status${agent ? `?agent=${encodeURIComponent(agent)}` : ""}`);
+      return String(r.status ?? "");
+    },
     async submitCode(code: string): Promise<{ ok: boolean; status: string; loginTail: string }> {
-      const r = await call("/auth/code", { code });
+      const r = await call("/auth/code", { code, ...who });
       return { ok: r.ok === true, status: String(r.status ?? ""), loginTail: String(r.loginTail ?? "") };
     },
   };

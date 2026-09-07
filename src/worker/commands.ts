@@ -40,6 +40,12 @@ export interface CommandDeps {
   lastUsage(conversation: string): TurnUsage | undefined;
   /** Account headroom (5h / 7d). Fetched from the agent's own runtime; [] when unavailable. */
   windows(agent: string): Promise<UsageWindow[]>;
+  /** Which Claude account THIS agent runs on. Empty when the deployment cannot say.
+   *
+   *  Worth a line in `!status` because it is otherwise unknowable from the outside: two agents
+   *  answering identically may be spending two different people's subscriptions, or the same one
+   *  twice, and nothing in a reply distinguishes those. */
+  claudeAccount?(agent: string): Promise<string>;
   /** Which model THIS conversation runs. Scoped to the conversation, never to the process: one
    *  worker serves every thread in the tenant, so a process-wide knob meant one person's `!model`
    *  changed the model under everybody else mid-conversation. */
@@ -161,10 +167,15 @@ export async function run(
     case "status":
     case "usage": {
       const windows = await deps.windows(agent).catch(() => [] as UsageWindow[]);
+      const account = (await deps.claudeAccount?.(agent).catch(() => "")) ?? "";
+      const who = account ? `🔑 Claude account: ${account}` : "";
       const u = deps.lastUsage(conversation);
       // Account headroom is always answerable; per-turn numbers only after a turn has run here.
-      if (!u) return `${renderWindows(windows, now)}\n\n_No turn has run in this thread yet, so there is nothing per-turn to report._`;
-      return renderStatus("full", u, deps.getModel(agent, conversation), windows, now) ?? renderWindows(windows, now);
+      const body =
+        u === undefined
+          ? `${renderWindows(windows, now)}\n\n_No turn has run in this thread yet, so there is nothing per-turn to report._`
+          : (renderStatus("full", u, deps.getModel(agent, conversation), windows, now) ?? renderWindows(windows, now));
+      return who ? `${who}\n\n${body}` : body;
     }
 
     case "statusline": {

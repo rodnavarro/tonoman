@@ -141,6 +141,7 @@ function wire(cfg: Config): Map<string, Wired> {
     // ran Bash, found the operator's email in the runtime, and told a customer about it. An agent
     // that answers from meetings and notes has no use for a shell anyway.
     const runner = spec.newRunner({
+      agent: a.name,
       container: a.container,
       model: a.model,
       maxTurns: a.max_turns,
@@ -461,6 +462,15 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
     setMode: (conversation, mode) => statusModes.set(conversation, mode),
     lastUsage: (conversation) => lastUsage.get(conversation),
     windows: windowsFor,
+    // Which Claude account this agent is signed in as. Straight from `claude auth status` in the
+    // agent's own credential directory, trimmed to its first line — the point is to make "whose
+    // subscription is this?" answerable from Slack, which it has never been.
+    claudeAccount: async (name) => {
+      const ops = authDeps.ops(name);
+      const raw = (await ops?.status?.().catch(() => "")) ?? "";
+      const line = raw.split(/\r?\n/).map((l) => l.trim()).filter(Boolean).find((l) => /@|account|email/i.test(l));
+      return (line ?? raw.split(/\r?\n/).find((l) => l.trim()) ?? "").slice(0, 120);
+    },
     resetSession: (name, conversation) => void resetSession(name, conversation).catch(() => {}),
     plaudConnected: (name) => plaudcli.connected(name),
     disconnectPlaud: async (name) => {
@@ -507,7 +517,9 @@ Copy the whole address out of your browser bar and send it back here as \`!code 
   // process that owns the credential and nowhere else — it never transits the control plane.
   const authBase = process.env.AGENT_RUNTIME_URL ?? "http://127.0.0.1:8080";
   const authDeps: gate.AuthGateDeps = {
-    ops: (name) => (wired.has(name) ? httpAuthOps(authBase, process.env.AGENT_RUNTIME_TOKEN) : undefined),
+    // Named, so the login lands in THIS agent's credential directory. Without the name every
+    // agent in the pool shares one Claude subscription and the last person to sign in owns them.
+    ops: (name) => (wired.has(name) ? httpAuthOps(authBase, process.env.AGENT_RUNTIME_TOKEN, name) : undefined),
     conn: (name) => wired.get(name)?.conn as SlackConnector | undefined,
     setAuthState: async (name, state) => {
       const a = wired.get(name);
