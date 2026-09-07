@@ -63,6 +63,13 @@ export function workerOptionsFrom(env: NodeJS.ProcessEnv): WorkerOptions {
     // One or two turns per worker. Each spawns a claude process; admitting more trades a queue for
     // OOM kills on a small node, and Temporal already holds the excess safely.
     maxConcurrentTurns: Number(env.MAX_CONCURRENT_TURNS ?? 2),
+    // Where Temporal loads the workflow code from. It defaults beside this file, which is right in
+    // the image — `dist/worker/workflows.js` sits next to `dist/worker/worker.js`.
+    //
+    // Running from SOURCE it is wrong: the sibling is `workflows.ts`, and Temporal's bundler is
+    // handed a path that does not exist. That failure reads as a Temporal problem rather than as a
+    // path one, so this is an env var rather than something to rediscover.
+    workflowsPath: env.TEMPORAL_WORKFLOWS_PATH || undefined,
   };
 }
 

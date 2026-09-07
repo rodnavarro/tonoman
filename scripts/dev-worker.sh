@@ -46,12 +46,18 @@ KEEP_CLUSTER=0
 
 RESTORE="kubectl -n $NS scale deploy/$DEPLOY --replicas=1"
 PF_PIDS=()
+TMP_DIRS=()
 SCALED=0
 
 cleanup() {
   echo
   for pid in "${PF_PIDS[@]:-}"; do
     [ -n "$pid" ] && { taskkill //F //T //PID "$pid" >/dev/null 2>&1 || kill "$pid" 2>/dev/null || true; }
+  done
+  for d in "${TMP_DIRS[@]:-}"; do
+    # Wiped whatever happened. A Slack bot token left in a temp directory is the sort of thing
+    # nobody finds again until it turns up in a backup.
+    [ -n "$d" ] && [ -d "$d" ] && rm -rf "$d"
   done
   if [ "$SCALED" = 1 ]; then
     echo "dev-worker: handing the agents back to the cluster"
@@ -103,6 +109,27 @@ if [ -n "${WSEC:-}" ]; then
   GROQ=$(kubectl -n "$NS" get secret "$WSEC" -o jsonpath='{.data.GROQ_API_KEY}' 2>/dev/null | base64 -d || true)
 fi
 
+# --- the Slack tokens ------------------------------------------------------------------------------
+#
+# The roster hands out REFS (`sapien-slack:SLACK_BOT_TOKEN`), not tokens, and the worker reads them
+# from a mounted secret tree. In the pod that tree is a Kubernetes volume; here it has to be built.
+#
+# This is the one genuine cost of running locally: bot tokens that otherwise never leave the cluster
+# briefly exist on this disk. So the directory is a MKTEMP one, wiped on exit alongside everything
+# else, rather than a convenient permanent copy in the repo — the exposure lasts as long as the
+# session and not a day longer. Nothing is echoed.
+SECRETS_DIR=$(mktemp -d 2>/dev/null || mktemp -d -t tonoman-dev)
+TMP_DIRS+=("$SECRETS_DIR")
+export TONOMAN_SECRETS_DIR="$SECRETS_DIR"
+
+python scripts/mirror-secrets.py "$NS" "$DEPLOY" "$SECRETS_DIR"
+
+
+
+# Temporal loads workflow code from a path that defaults beside the compiled worker. From source
+# the sibling is a .ts, and the resulting failure reads as a Temporal problem rather than a path one.
+export TEMPORAL_WORKFLOWS_PATH="$PWD/src/worker/workflows.ts"
+
 export TONOMANCLOUD_API_URL="http://127.0.0.1:$API_PORT"
 export TONOMANCLOUD_API_TOKEN="$TOKEN"
 export TEMPORAL_ADDRESS="127.0.0.1:$TEMPORAL_PORT"
@@ -118,5 +145,8 @@ echo "dev-worker: agents ${TONOMAN_AGENTS:-<all>}"
 echo "dev-worker: Slack arrives over Socket Mode — outbound, so no tunnel is needed"
 echo
 
+# `worker`, not `runtime`: `runtime` is the per-agent HTTP harness, and the tenant worker — the
+# thing that holds the Slack sockets and polls the Temporal queue — is what the deployment runs.
+#
 # tsx, not a build: the whole point is that a change is a restart rather than an image.
-exec npx tsx src/cli.ts runtime
+exec npx tsx src/cli.ts worker
