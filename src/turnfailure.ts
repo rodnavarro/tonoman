@@ -23,9 +23,15 @@
  *  fragment of a stack trace.
  *
  *  Deliberately narrow. Over-matching would hide real faults behind "sign in again", and somebody
- *  would sign in repeatedly while the actual problem went unreported. */
+ *  would sign in repeatedly while the actual problem went unreported.
+ *
+ *  MATCHED AGAINST STRINGS THE HARNESS ACTUALLY EMITS, not against guesses at them. The first
+ *  version was written from imagination and read well - and then the real thing,
+ *  "Failed to authenticate: OAuth session expired and could not be refreshed", matched none of it,
+ *  so an expired subscription reached Slack as "I hit an error and couldn't finish that". Every
+ *  alternative below is quoted in the test from a log, and any new one should arrive the same way. */
 export function isNotLoggedInError(msg: string): boolean {
-  return /not logged ?in|please run \/login|no credentials found|invalid api key|oauth token (has )?expired|authentication_error/i.test(
+  return /not logged ?in|please run \/login|no credentials found|invalid api key|oauth (token|session) (has )?expired|could not be refreshed|authentication_error/i.test(
     msg || "",
   );
 }

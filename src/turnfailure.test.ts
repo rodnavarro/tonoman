@@ -25,6 +25,14 @@ describe("isNotLoggedInError — the failure that retrying cannot fix", () => {
     expect(isNotLoggedInError("invalid api key")).toBe(true);
   });
 
+  // OBSERVED, not imagined. Everything above was written from a guess at what the harness says, and
+  // the line the harness ACTUALLY produced when a subscription's refresh token had been rotated
+  // away matched none of it - so the person got "I hit an error and couldn't finish that", the
+  // generic message this whole function exists to replace. Copied from the worker log verbatim.
+  it("matches what the harness really says when the subscription is gone", () => {
+    expect(isNotLoggedInError("Failed to authenticate: OAuth session expired and could not be refreshed")).toBe(true);
+  });
+
   it("does not swallow ordinary failures", () => {
     // Over-matching would hide a real bug behind "sign in again", and somebody would sign in
     // repeatedly while the actual fault went unreported.
