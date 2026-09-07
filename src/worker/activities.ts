@@ -574,10 +574,11 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
 
     const footer = await deps.footer?.(input.agent, input.conversation, usage).catch(() => null);
     const body = answer.trim() || "_(no answer)_";
-    // Three newlines, not one blank line. The footer is metadata about the turn, not the last
-    // paragraph of it, and at one blank line Slack renders it tight enough to read as part of the
-    // answer.
-    const final = footer ? `${body}\n\n\n${footer}` : body;
+    // ONE blank line. This was three newlines - two blank lines - on the reasoning that the footer
+    // is metadata rather than the last paragraph of the answer, and so wanted visible separation.
+    // In Slack it reads as detached instead: a stray line floating below the message, far enough
+    // away that it stops looking related to it. One blank line is the separation that was wanted.
+    const final = footer ? `${body}\n\n${footer}` : body;
     if (!msgId) msgId = await reply.send(final);
     else await reply.finalize(msgId, final);
 }
