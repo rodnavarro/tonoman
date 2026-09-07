@@ -417,7 +417,9 @@ async function handleAuthCode(req: http.IncomingMessage, res: http.ServerRespons
   // The SAME agent the login was started for - taken from the pending login rather than from
   // this request, so a mistyped follow-up cannot check one person's credential to bless
   // another's login.
-  const credFile = credFileFor(opts, pendingLogin?.agent);
+  // Falls back to the agent named on THIS request only when the pending login recorded none —
+  // an older client that sent it one way and not the other should still be judged per agent.
+  const credFile = credFileFor(opts, pendingLogin?.agent ?? agentOf(req));
   const before = await credStamp(credFile);
 
   pendingLogin.child.stdin?.write(`${code}\n`);

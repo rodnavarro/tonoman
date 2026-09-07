@@ -174,11 +174,18 @@ export function httpAuthOps(baseUrl: string, token?: string, agent?: string): Au
   // Whose subscription this login is for. One runtime serves every agent in a pool, so a login
   // that does not say who it belongs to lands in a shared directory and the last person to sign
   // in owns them all.
+  //
+  // On the QUERY STRING, not only in the body. Sent in the body alone the runtime never saw it —
+  // its login handler reads the URL, not the payload — so the name was silently dropped and the
+  // credential went to the shared home anyway. The endpoint reported success, because the login
+  // HAD succeeded; it just belonged to the wrong agent. Both are sent now: the query is what is
+  // read, the body costs nothing and keeps the two halves honest if the handler ever changes.
+  const q = agent ? `?agent=${encodeURIComponent(agent)}` : "";
   const who = agent ? { agent } : {};
 
   return {
     async startHeadless(): Promise<string> {
-      const r = await call("/auth/login", who);
+      const r = await call(`/auth/login${q}`, who);
       const url = typeof r.url === "string" ? r.url : "";
       if (!url) throw new Error("auth: the agent runtime started a login but produced no URL");
       return url;
@@ -189,7 +196,7 @@ export function httpAuthOps(baseUrl: string, token?: string, agent?: string): Au
       return String(r.status ?? "");
     },
     async submitCode(code: string): Promise<{ ok: boolean; status: string; loginTail: string }> {
-      const r = await call("/auth/code", { code, ...who });
+      const r = await call(`/auth/code${q}`, { code, ...who });
       return { ok: r.ok === true, status: String(r.status ?? ""), loginTail: String(r.loginTail ?? "") };
     },
   };
