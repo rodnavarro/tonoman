@@ -484,7 +484,7 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
         })
         .catch(() => {});
       return (
-        `Let's connect your Plaud account. Open this and sign in as yourself:\n\n${started.url}` +
+        `Let's connect your Plaud account.\n\n*First, quit the Plaud desktop app* if it is running - it listens on the same port I do, and it will swallow the sign-in before it reaches me.\n\nThen open this and sign in as yourself:\n\n${started.url}` +
         `${started.code ? `\n\nThe code is *${started.code}*.` : ""}` +
         `\n\n*One more step:* after you sign in the page will fail to load. That is expected - it is trying to reach me and cannot.\n\nCopy the whole address from your browser bar and send it back here as \`!code <address>\``
       );
