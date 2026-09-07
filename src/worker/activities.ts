@@ -64,6 +64,8 @@ export interface VoiceConfig {
   journal?: recap.Journal;
   /** How often the poll looks, from the registry. */
   pollSeconds?: number;
+  /** Who a DM would go to, when no channel is configured. */
+  notifyUser?: string;
   /** Epoch ms before which a recording is none of our business. Without it the first poll
    *  backfills the customer's entire Plaud history and announces each one as if it had just
    *  happened. */

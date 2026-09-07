@@ -1,20 +1,24 @@
 import { describe, expect, it } from "vitest";
 import { describe as describeVoice, voiceSettings } from "./flowcfg";
 
-describe("voiceSettings — the registry decides, the environment only fills gaps", () => {
-  it("prefers a registry row over the environment", () => {
-    const v = voiceSettings({ notify_channel: "C_FROM_DB" }, { VOICE_NOTIFY_CHANNEL: "C_FROM_ENV" });
+describe("voiceSettings — the registry decides", () => {
+  it("reads the channel and the recipient from the tenant's own rows", () => {
+    const v = voiceSettings({ notify_channel: "C_FROM_DB", notify_user: "U_DB" }, {});
     expect(v.notifyChannel).toBe("C_FROM_DB");
+    expect(v.notifyUser).toBe("U_DB");
   });
 
-  it("falls back to the environment for a tenant with no rows yet", () => {
-    const v = voiceSettings({}, { VOICE_NOTIFY_CHANNEL: "C_FROM_ENV", VOICE_POLL_SECONDS: "300" });
-    expect(v.notifyChannel).toBe("C_FROM_ENV");
-    expect(v.pollSeconds).toBe(300);
+  it("NEVER takes a channel or a recipient from the environment", () => {
+    // A worker-wide default is cross-tenant contamination by construction: a channel id names a
+    // place inside ONE workspace, and the second tenant inherited the first tenant's channel —
+    // about to announce a person's private recaps into a customer's Slack.
+    const v = voiceSettings({}, { VOICE_NOTIFY_CHANNEL: "C_FROM_ENV", VOICE_NOTIFY_USER: "U_ENV" });
+    expect(v.notifyChannel).toBe("");
+    expect(v.notifyUser).toBe("");
   });
 
-  it("treats an empty row as absent, so a blanked field does not beat the fallback", () => {
-    expect(voiceSettings({ notify_channel: "" }, { VOICE_NOTIFY_CHANNEL: "C_ENV" }).notifyChannel).toBe("C_ENV");
+  it("still takes the harmless, non-identifying settings from the environment", () => {
+    expect(voiceSettings({}, { VOICE_POLL_SECONDS: "300" }).pollSeconds).toBe(300);
   });
 
   it("defaults the poll to five minutes rather than to zero", () => {

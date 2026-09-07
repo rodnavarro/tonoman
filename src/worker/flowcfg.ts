@@ -68,8 +68,13 @@ export function voiceSettings(props: Record<string, string> = {}, env: NodeJS.Pr
     // Default ON: a tenant that configured a voice flow means to run it. Only an explicit "false"
     // turns it off, so a typo cannot silently stop a pipeline somebody is relying on.
     enabled: (p("enabled") ?? "true").toLowerCase() !== "false",
-    notifyChannel: p("notify_channel") ?? (env.VOICE_NOTIFY_CHANNEL ?? "").trim(),
-    notifyUser: p("notify_user") ?? (env.VOICE_NOTIFY_USER ?? "").trim(),
+    // NO environment fallback for these two, deliberately. A channel id and a user id name a place
+    // inside ONE workspace, so a worker-wide default is cross-tenant contamination by construction:
+    // the second tenant's agent inherited the first tenant's channel and was about to announce a
+    // person's private recaps into a customer's Slack. Whose channel it is, is a fact about the
+    // tenant, and there is no sensible default for it.
+    notifyChannel: p("notify_channel") ?? "",
+    notifyUser: p("notify_user") ?? "",
     pollSeconds: num(p("poll_seconds") ?? env.VOICE_POLL_SECONDS, 300),
     since: p("since") ?? (env.VOICE_SINCE ?? "").trim(),
     journal,

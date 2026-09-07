@@ -201,8 +201,19 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
 
   await syncAll();
   const syncEvery = Number(process.env.SECONDBRAIN_SYNC_SECONDS ?? 60) * 1000;
+  // One sync at a time. A first clone of a large wiki takes longer than the interval, so the timer
+  // fired again into a checkout git was still building and the two processes collided on
+  // `.git/shallow.lock` — reported as "failed to sync" for a repository that was in fact fine.
+  // Skipping a tick is free; the next one is a minute away.
+  let syncing = false;
   const syncTimer = setInterval(() => {
-    void syncAll().catch(() => {});
+    if (syncing) return;
+    syncing = true;
+    void syncAll()
+      .catch(() => {})
+      .finally(() => {
+        syncing = false;
+      });
   }, syncEvery);
   signal.addEventListener("abort", () => clearInterval(syncTimer), { once: true });
 
@@ -254,6 +265,7 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
     const dir = path.join(process.env.TONOMAN_STATE_ROOT ?? "/root/.tonoman", "secondbrain", name, src.id);
     voiceCreds.set(name, {
       notifyChannel: voice.notifyChannel || undefined,
+      notifyUser: voice.notifyUser || undefined,
       journal: voice.journal,
       pollSeconds: voice.pollSeconds,
       creds: { tokenFile },
@@ -507,11 +519,12 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
   // restarting a pod, and `overlapPolicy: SKIP` is the "do not double-process" guarantee that
   // otherwise has to be written by hand. The loop only made sense if the workflow carried state
   // between ticks, and it never did — what has been published is answered from the git checkout.
-  const notify = process.env.VOICE_NOTIFY_USER;
   for (const [name, v] of voiceCreds) {
-    const recipient = v.notifyChannel ? notify ?? "" : notify;
+    const recipient = v.notifyUser ?? "";
     if (!recipient && !v.notifyChannel) {
-      console.log(`worker: ${name} voice flow not scheduled — nobody to tell (no channel, no VOICE_NOTIFY_USER)`);
+      // Nowhere to send a recap is not a state to run in: the pipeline would transcribe, summarise,
+      // commit and then have nobody to tell.
+      console.log(`worker: ${name} voice flow not scheduled — nobody to tell (set notify_channel or notify_user)`);
       continue;
     }
     const scheduleId = `voice:${name}`;
