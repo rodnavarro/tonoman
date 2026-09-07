@@ -427,7 +427,20 @@ async function handleAuthCode(req: http.IncomingMessage, res: http.ServerRespons
 
   const after = await credStamp(credFile);
   const statusArgs = opts.statusArgs ?? activeSpec().statusArgs ?? [];
-  const status = statusArgs.length ? (await run(statusArgs[0], statusArgs.slice(1))).trim() : "";
+  // The SAME directory the login wrote to. Asked without it, this reads the shared home, reports
+  // "loggedIn": false for a login that worked perfectly, and tells the person their code failed —
+  // which is exactly what it did: the credential file had changed, and the status check was
+  // looking somewhere else entirely.
+  const codeAgent = pendingLogin?.agent ?? agentOf(req);
+  const status = statusArgs.length
+    ? (
+        await run(
+          statusArgs[0],
+          statusArgs.slice(1),
+          codeAgent ? { CLAUDE_CONFIG_DIR: claudecode.configHomeFor(codeAgent) } : undefined,
+        )
+      ).trim()
+    : "";
   const authLog = opts.authLog ?? DEFAULT_AUTH_LOG;
   const loginTail = (await fs.readFile(authLog, "utf8").catch(() => "")).slice(-400);
 
