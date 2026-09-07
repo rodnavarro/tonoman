@@ -51,6 +51,8 @@ export interface CommandDeps {
   /** Connect this agent's Plaud account. Returns the text to post — a login link the person
    *  opens themselves, because the account being connected is theirs and not ours. */
   connectPlaud?(agent: string, conversation: string): Promise<string>;
+  /** Finish a connection with the callback URL the person pasted back. */
+  finishPlaud?(agent: string, pasted: string): Promise<string>;
   /** Whether this agent already has a Plaud account connected. */
   plaudConnected?(agent: string): Promise<boolean>;
 }
@@ -96,6 +98,16 @@ export async function run(
     case "help":
     case "commands":
       return HELP;
+
+    // The pasted-back callback. Recognised as a command in its own right so the person can just
+    // paste the dead URL — asking somebody to remember a command name while they are holding a
+    // failed browser tab is how a two-step login becomes a support ticket.
+    case "code":
+    case "callback": {
+      if (!deps.finishPlaud) return "There is no connection waiting for a code here.";
+      if (!cmd.arg) return "Paste the whole address from your browser after `!code`, including the part after the `?`.";
+      return deps.finishPlaud(agent, cmd.arg);
+    }
 
     case "connect":
     case "plaud": {

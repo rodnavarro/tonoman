@@ -451,6 +451,15 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
     windows: windowsFor,
     resetSession: (name, conversation) => void resetSession(name, conversation).catch(() => {}),
     plaudConnected: (name) => plaudcli.connected(name),
+    finishPlaud: async (name, pasted) => {
+      const ok = await plaudcli.completeLogin(pasted);
+      if (!ok) {
+        return "That doesn't look like the address from the sign-in page — it needs the part with `code=` in it. Paste the whole thing.";
+      }
+      // The listener took the code; whether the exchange succeeded is the login process's business
+      // and it reports that on its own, in this thread, through connectPlaud's `done`.
+      return "Got it — finishing the connection now.";
+    },
     connectPlaud: async (name, conversation) => {
       // The link goes to the person, and the confirmation comes back in the same thread when they
       // finish — so a login is one message, a browser tab, and a reply, rather than a support call.
@@ -477,7 +486,7 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
       return (
         `Let's connect your Plaud account. Open this and sign in as yourself:\n\n${started.url}` +
         `${started.code ? `\n\nThe code is *${started.code}*.` : ""}` +
-        `\n\n_I'll tell you here as soon as it's done — nothing to copy back._`
+        `\n\n*One more step:* after you sign in the page will fail to load. That is expected - it is trying to reach me and cannot.\n\nCopy the whole address from your browser bar and send it back here as \`!code <address>\``
       );
     },
     // What THIS conversation runs: its own choice, else whatever the roster row says.

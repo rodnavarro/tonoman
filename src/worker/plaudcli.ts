@@ -111,6 +111,41 @@ export async function startLogin(o: RunOpts): Promise<Started> {
   return first;
 }
 
+/** The CLI's redirect_uri is hardcoded to http://localhost:8199/auth/callback, and it is the
+ *  LOGIN PROCESS that listens there — inside this pod. The person signing in is somewhere else
+ *  entirely, so their browser lands on a page that cannot load, with the authorization code
+ *  sitting in the address bar.
+ *
+ *  That dead URL is the code delivery mechanism. They paste it back, and we replay it against the
+ *  listener that has been waiting for it all along, which finishes the PKCE exchange and writes
+ *  the tokens. It is the same shape as the Claude login already in use here: link out, code in.
+ *
+ *  Accepts the whole URL or just the query, because people paste what they have. */
+export function callbackUrl(pasted: string): string | undefined {
+  const t = (pasted ?? "").trim().replace(/^<|>$/g, "");
+  const q = t.includes("?") ? t.slice(t.indexOf("?") + 1) : t;
+  const p = new URLSearchParams(q);
+  if (!p.get("code")) return undefined;
+  return `http://127.0.0.1:${CALLBACK_PORT}/auth/callback?${p.toString()}`;
+}
+
+/** Fixed by the CLI; a login cannot use any other port. */
+export const CALLBACK_PORT = 8199;
+
+/** Hand the pasted code to the waiting login process. */
+export async function completeLogin(pasted: string): Promise<boolean> {
+  const url = callbackUrl(pasted);
+  if (!url) return false;
+  try {
+    const r = await fetch(url, { redirect: "manual" });
+    // Any answer at all means the listener took it; the login process decides the rest and we
+    // learn the outcome from its exit, not from this response.
+    return r.status > 0;
+  } catch {
+    return false;
+  }
+}
+
 /** Has this agent connected a Plaud account? The CLI's own token file is the only authority —
  *  a row saying "connected" that the CLI disagrees with would be worse than no row. */
 export async function connected(agent: string, root?: string): Promise<boolean> {
