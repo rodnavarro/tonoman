@@ -25,8 +25,12 @@ function run(cmd: string, args: string[], opts: { cwd?: string; env?: NodeJS.Pro
 }
 
 export interface PlaudCreds {
-  /** The captured web token, as JSON — bearer plus the app headers the API insists on. */
-  tokenFile: string;
+  /** The captured web token, as JSON — bearer plus the app headers the API insists on.
+   *
+   *  The CONTENT, not a path. A path is a property of the pod, and one pod serves every tenant it
+   *  has agents for, so a path meant one Plaud account for all of them. Whose account this is has
+   *  to be a property of the agent, and the only thing the agent knows is a secret reference. */
+  tokenJson: string;
 }
 
 export interface Recording {
@@ -56,7 +60,7 @@ export function titleFor(raw: string | undefined): string {
 }
 
 async function plaudHeaders(creds: PlaudCreds): Promise<Record<string, string>> {
-  const token = JSON.parse(await fs.readFile(creds.tokenFile, "utf8")) as Record<string, string>;
+  const token = JSON.parse(creds.tokenJson) as Record<string, string>;
   if (!token.authorization) throw new Error("plaud: captured token has no authorization — it is dead");
   const h: Record<string, string> = {
     authorization: token.authorization,

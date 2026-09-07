@@ -73,7 +73,16 @@ describe("voiceSettings — routing is N rows", () => {
 describe("describe", () => {
   it("says where recaps go and how they are filed, because silence looks like success", () => {
     const line = describeVoice(
-      voiceSettings({ notify_channel: "C1", "journal.path": "MJ", "journal.fallback": "unclassified", "route.a": "A" }, {}),
+      voiceSettings(
+        {
+          credential_ref: "plaud-murphy:PLAUD_TOKEN",
+          notify_channel: "C1",
+          "journal.path": "MJ",
+          "journal.fallback": "unclassified",
+          "route.a": "A",
+        },
+        {},
+      ),
     );
     expect(line).toContain("channel C1");
     expect(line).toContain("MJ/{a}");
@@ -81,7 +90,9 @@ describe("describe", () => {
   });
 
   it("names the DM recipient when there is no channel", () => {
-    expect(describeVoice(voiceSettings({ notify_user: "U1" }, {}))).toContain("DM with U1");
+    expect(
+      describeVoice(voiceSettings({ credential_ref: "plaud-murphy:PLAUD_TOKEN", notify_user: "U1" }, {})),
+    ).toContain("DM with U1");
   });
 });
 
@@ -99,6 +110,38 @@ describe("voiceSettings — the off switch", () => {
   });
 
   it("says so loudly in the boot line — a silent flow looks identical to a working one", () => {
+    expect(
+      describeVoice(voiceSettings({ credential_ref: "plaud-murphy:PLAUD_TOKEN", enabled: "false" }, {})),
+    ).toContain("DISABLED");
+  });
+
+  it("reports a switched-off flow as OFF, not as waiting for a login", () => {
+    // Both are true of a flow with neither; only one of them tells the reader what to do about it.
     expect(describeVoice(voiceSettings({ enabled: "false" }, {}))).toContain("DISABLED");
+  });
+});
+
+describe("voiceSettings — whose Plaud account", () => {
+  it("takes the credential from the tenant's own row", () => {
+    expect(voiceSettings({ credential_ref: "plaud-murphy:PLAUD_TOKEN" }, {}).credentialRef).toBe(
+      "plaud-murphy:PLAUD_TOKEN",
+    );
+  });
+
+  it("NEVER falls back to a worker-wide credential", () => {
+    // PLAUD_TOKEN_FILE was one path on one pod, and one pod runs every agent this worker has — so
+    // both tenants polled whichever account happened to be mounted, and the second person to log
+    // in would have replaced the first. Same mistake as a worker-wide notify channel, except the
+    // contents are somebody's recordings rather than somebody's channel.
+    const v = voiceSettings({}, { PLAUD_TOKEN_FILE: "/etc/tonoman/recap/plaud.json" });
+    expect(v.credentialRef).toBe("");
+  });
+
+  it("says it is waiting for a login, which is a state and not a fault", () => {
+    // A tenant before its person has logged in is the NORMAL state, and the boot line has to read
+    // that way — "waiting for Celine", not "broken".
+    const line = describeVoice(voiceSettings({ notify_channel: "C1" }, {}));
+    expect(line).toContain("waiting for a Plaud login");
+    expect(line).not.toContain("DISABLED");
   });
 });

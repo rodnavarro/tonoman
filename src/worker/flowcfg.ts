@@ -12,6 +12,11 @@ import type { Journal } from "./recap";
 
 /** What the voice flow needs, as the registry holds it. */
 export interface VoiceSettings {
+  /** `<secret>:<key>` naming the Plaud credential for THIS tenant. No environment fallback, for
+   *  the same reason `notifyChannel` has none: a worker-wide default is one customer's account
+   *  read on another customer's behalf. Empty means the flow has no credential yet — which is
+   *  exactly the state a tenant is in before the person has logged in. */
+  credentialRef: string;
   /** Whether this agent watches for recordings at all.
    *
    *  A switch, because "has a second brain and a Plaud token" is not the same as "should be filing
@@ -75,6 +80,10 @@ export function voiceSettings(props: Record<string, string> = {}, env: NodeJS.Pr
     // tenant, and there is no sensible default for it.
     notifyChannel: p("notify_channel") ?? "",
     notifyUser: p("notify_user") ?? "",
+    // Whose Plaud account this is. Same rule, same reason: `PLAUD_TOKEN_FILE` was one path on one
+    // pod, and one pod runs every agent the worker has — so both tenants polled whichever account
+    // had been mounted, and a second person logging in would have replaced the first.
+    credentialRef: p("credential_ref") ?? "",
     pollSeconds: num(p("poll_seconds") ?? env.VOICE_POLL_SECONDS, 300),
     since: p("since") ?? (env.VOICE_SINCE ?? "").trim(),
     journal,
@@ -85,6 +94,10 @@ export function voiceSettings(props: Record<string, string> = {}, env: NodeJS.Pr
  *  silently files everything under `unclassified` looks identical to one that is working. */
 export function describe(v: VoiceSettings): string {
   if (!v.enabled) return "DISABLED (flow_property enabled=false)";
+  // Checked after the off switch: a flow somebody turned off is a decision, and calling that
+  // "waiting for a login" would send the reader to fix the wrong thing. Checked before everything
+  // else, because where recaps would be filed does not matter while there is no account to read.
+  if (!v.credentialRef) return "waiting for a Plaud login (no credential_ref for this tenant)";
   const where = v.notifyChannel ? `channel ${v.notifyChannel}` : `a DM with ${v.notifyUser || "nobody"}`;
   const filing = v.journal
     ? `${v.journal.path}/{${v.journal.routes.map((r) => r.id).join(",") || "—"}} → ${v.journal.fallback}`

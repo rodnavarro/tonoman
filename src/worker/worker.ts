@@ -310,7 +310,6 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
   /** Agents whose voice flow is off, so their schedule can be paused rather than left ticking. */
   const disabledFlows = new Set<string>();
   for (const [name, a] of wired) {
-    const tokenFile = process.env.PLAUD_TOKEN_FILE;
     const groqKey = process.env.GROQ_API_KEY;
     const src = a.cfg.secondbrain?.[0];
     // Per agent, from the REGISTRY: which channel, which folder, which routes. The environment is
@@ -326,8 +325,20 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
       disabledFlows.add(name);
       continue;
     }
-    if (!tokenFile || !groqKey || !src) {
-      console.log(`worker: ${name} has no voice flow (needs PLAUD_TOKEN_FILE, GROQ_API_KEY and a second-brain source)`);
+    // Whose Plaud account this agent watches — from the registry, per tenant. An agent with no
+    // credential is not misconfigured; it is a tenant whose person has not logged in yet, and
+    // saying that plainly is the difference between "waiting for Celine" and "broken".
+    const tokenJson = await resolveRef(voice.credentialRef);
+    if (!tokenJson) {
+      console.log(
+        `worker: ${name} voice flow is waiting for a Plaud login` +
+          `${voice.credentialRef ? ` (credential ${voice.credentialRef} is empty or unmounted)` : " (no credential_ref row)"}`,
+      );
+      disabledFlows.add(name);
+      continue;
+    }
+    if (!groqKey || !src) {
+      console.log(`worker: ${name} has no voice flow (needs GROQ_API_KEY and a second-brain source)`);
       continue;
     }
     // How far back the poll may reach. "Not in the second brain" is NOT the same question as
@@ -345,7 +356,7 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
       notifyUser: voice.notifyUser || undefined,
       journal: voice.journal,
       pollSeconds: voice.pollSeconds,
-      creds: { tokenFile },
+      creds: { tokenJson },
       brainDir: src.subpath ? path.join(dir, src.subpath) : dir,
       pushUrl,
       groqKey,
