@@ -554,6 +554,9 @@ async function runAgent(
           heartbeatMs: 0,
           maxLen: 4000,
           prefixStream: true,
+          // Teams collapses "\n\n" to one break, so the footer needs a zero-width-space paragraph
+          // to sit under a blank line. Slack does not, and gets a plain "\n\n".
+          collapsesBlankLines: true,
         }
       : {
           cursor: cfg.stream.cursor,
