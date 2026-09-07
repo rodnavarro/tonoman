@@ -10,7 +10,19 @@
 
 import { execFile } from "node:child_process";
 import { promises as fs } from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
+
+/** Run a command and collect its output. Never throws: the caller decides what a non-zero exit
+ *  means, which differs — a failed `git commit` means "nothing to commit", a failed ffmpeg means
+ *  the recording is unusable. */
+function run(cmd: string, args: string[], opts: { cwd?: string; env?: NodeJS.ProcessEnv } = {}): Promise<{ code: number; out: string }> {
+  return new Promise((resolve) =>
+    execFile(cmd, args, { cwd: opts.cwd, env: opts.env ?? process.env, maxBuffer: 1 << 24 }, (err, so, se) =>
+      resolve({ code: err ? 1 : 0, out: `${so}${se}` }),
+    ),
+  );
+}
 
 export interface PlaudCreds {
   /** The captured web token, as JSON — bearer plus the app headers the API insists on. */
@@ -110,13 +122,64 @@ export interface TranscribeResult {
   seconds: number;
 }
 
-export async function transcribe(creds: PlaudCreds, rec: Recording, groqKey: string, vocab: string): Promise<TranscribeResult> {
-  const t0 = Date.now();
-  const { temp_url } = await plaudGet<{ temp_url: string }>(creds, `/file/temp-url/${rec.id}`);
-  const audio = Buffer.from(await (await fetch(temp_url)).arrayBuffer());
+/** How long each piece of audio sent to Groq is.
+ *
+ *  Groq refuses an upload over its size cap with a flat 413 — which is exactly what a real meeting
+ *  hit the first time the poll found one: the recording was posted, announced, and then failed on
+ *  upload. Ten minutes of 16 kHz mono FLAC is roughly 10 MB, comfortably under any of Groq's tiers,
+ *  and short enough that a chunk that does fail costs one retry rather than the whole meeting. */
+const SEGMENT_SECONDS = Number(process.env.RECAP_SEGMENT_SECONDS ?? 600);
 
+/** PURE: join the per-chunk transcripts into one.
+ *
+ *  Blank line between chunks and nothing else: a marker like "[part 2]" would end up quoted back
+ *  by the summariser as if the meeting had sections, and the chunk boundary is an artefact of the
+ *  upload limit, not of the conversation. */
+export function joinChunks(parts: string[]): string {
+  return parts
+    .map((p) => p.trim())
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+/** Re-encode to what a speech model actually wants, in pieces small enough to upload.
+ *
+ *  16 kHz mono is Whisper's own working format, so downsampling loses nothing it would have used
+ *  and cuts a stereo 48 kHz recording by an order of magnitude before the size cap is even in
+ *  question. The segment muxer does the split in the same pass. */
+async function segments(srcPath: string, outDir: string): Promise<string[]> {
+  const pattern = path.join(outDir, "part-%03d.flac");
+  const r = await run("ffmpeg", [
+    "-nostdin",
+    "-hide_banner",
+    "-loglevel",
+    "error",
+    "-i",
+    srcPath,
+    "-vn",
+    "-ac",
+    "1",
+    "-ar",
+    "16000",
+    "-c:a",
+    "flac",
+    "-f",
+    "segment",
+    "-segment_time",
+    String(SEGMENT_SECONDS),
+    pattern,
+  ]);
+  if (r.code !== 0) throw new Error(`ffmpeg: ${r.out.slice(0, 300)}`);
+  const files = (await fs.readdir(outDir)).filter((f) => f.startsWith("part-")).sort();
+  if (files.length === 0) throw new Error("ffmpeg produced no audio segments");
+  return files.map((f) => path.join(outDir, f));
+}
+
+/** One chunk through Groq. Separated so a retry, a log line, or a heartbeat is per chunk. */
+async function transcribeChunk(file: string, groqKey: string, vocab: string): Promise<string> {
+  const audio = await fs.readFile(file);
   const form = new FormData();
-  form.append("file", new Blob([audio], { type: "audio/mpeg" }), `${rec.id}.mp3`);
+  form.append("file", new Blob([audio], { type: "audio/flac" }), path.basename(file));
   form.append("model", process.env.GROQ_MODEL || "whisper-large-v3-turbo");
   form.append("response_format", "verbose_json");
   // Vocabulary bias. Without it the transcriber hears "Plaud" as "plot" and "Tonoman" as
@@ -130,7 +193,40 @@ export async function transcribe(creds: PlaudCreds, rec: Recording, groqKey: str
   });
   if (!r.ok) throw new Error(`groq transcribe: ${r.status} ${(await r.text()).slice(0, 300)}`);
   const j = (await r.json()) as { text: string };
-  return { text: j.text, seconds: (Date.now() - t0) / 1000 };
+  return j.text ?? "";
+}
+
+export async function transcribe(
+  creds: PlaudCreds,
+  rec: Recording,
+  groqKey: string,
+  vocab: string,
+  onProgress?: (done: number, total: number) => void,
+): Promise<TranscribeResult> {
+  const t0 = Date.now();
+  const { temp_url } = await plaudGet<{ temp_url: string }>(creds, `/file/temp-url/${rec.id}`);
+  const audio = Buffer.from(await (await fetch(temp_url)).arrayBuffer());
+
+  // A scratch directory per recording, removed whether or not this succeeds. The audio is the
+  // customer's meeting; it has no business outliving the transcription.
+  const work = await fs.mkdtemp(path.join(os.tmpdir(), "recap-"));
+  try {
+    const src = path.join(work, "source");
+    await fs.writeFile(src, audio);
+    const parts = await segments(src, work);
+    console.log(`recap: ${rec.title} — ${(audio.length / 1e6).toFixed(1)}MB in ${parts.length} chunk(s)`);
+
+    const texts: string[] = [];
+    for (const [i, file] of parts.entries()) {
+      // Sequential on purpose: the chunks are one conversation, and a rate-limited burst would
+      // fail a whole meeting to save a few seconds on one.
+      texts.push(await transcribeChunk(file, groqKey, vocab));
+      onProgress?.(i + 1, parts.length);
+    }
+    return { text: joinChunks(texts), seconds: (Date.now() - t0) / 1000 };
+  } finally {
+    await fs.rm(work, { recursive: true, force: true }).catch(() => {});
+  }
 }
 
 export interface Recap {
@@ -201,11 +297,7 @@ ${bullets(recap.followups, "none recorded")}
 }
 
 function git(dir: string, args: string[], env?: NodeJS.ProcessEnv): Promise<{ code: number; out: string }> {
-  return new Promise((resolve) =>
-    execFile("git", args, { cwd: dir, env: env ?? process.env, maxBuffer: 1 << 24 }, (err, so, se) =>
-      resolve({ code: err ? 1 : 0, out: `${so}${se}` }),
-    ),
-  );
+  return run("git", args, { cwd: dir, env });
 }
 
 /** Write the recap into the checkout and push it. Returns false when there was nothing to commit,

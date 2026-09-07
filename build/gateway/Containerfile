@@ -29,8 +29,12 @@ FROM docker.io/library/node:22-bookworm-slim
 
 # git + openssh-client: the second-brain tool clones and pushes over SSH (cfg-ssh-key).
 # ca-certificates: Slack, Anthropic and Harbor are all TLS.
+# ffmpeg: the voice flow re-encodes a recording to 16 kHz mono and splits it before upload. Not a
+# nicety — a real meeting is larger than a transcription API will accept in one request, and
+# without this the pipeline fails with a 413 at the end, after the person has already been told
+# their recording was picked up.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends git openssh-client ca-certificates curl \
+ && apt-get install -y --no-install-recommends git openssh-client ca-certificates curl ffmpeg \
  && rm -rf /var/lib/apt/lists/*
 
 # The harness drives this CLI as a subprocess; the Agent SDK resolves the subscription

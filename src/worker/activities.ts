@@ -275,7 +275,11 @@ export function makeActivities(deps: TurnDeps) {
       if (!rec) throw new Error(`recording ${input.id} is no longer listed`);
 
       ctx.heartbeat("transcribing");
-      const { text, seconds } = await recap.transcribe(v.creds, rec, v.groqKey, v.vocab);
+      // Per chunk, not per recording: a long meeting is many uploads, and a heartbeat only at the
+      // start would let Temporal declare a perfectly healthy transcription dead halfway through.
+      const { text, seconds } = await recap.transcribe(v.creds, rec, v.groqKey, v.vocab, (done, total) =>
+        ctx.heartbeat(`transcribing ${done}/${total}`),
+      );
       console.log(`recap: ${rec.title} transcribed in ${seconds.toFixed(1)}s, ${text.length} chars`);
 
       ctx.heartbeat("summarising");
