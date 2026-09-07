@@ -7,60 +7,98 @@
 // line said it plainly: `⟳ 12 · ctx 7%` on the first answer, `⟳ 1 · ctx 2%` on the second. Every
 // message was a fresh `claude` run.
 
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import * as fsp from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import { serializer } from "./activities";
 import { sessionStore } from "./worker";
 
 describe("sessionStore — a thread continues one session", () => {
+  let dir = "";
   const ids = (): (() => string) => {
     let n = 0;
     return () => `uuid-${++n}`;
   };
+  const store = (): ReturnType<typeof sessionStore> => sessionStore(dir, ids());
 
-  it("creates once, then resumes: the SECOND turn in a thread is not a new session", () => {
-    const s = sessionStore(ids());
-    const first = s.claim("nelly", "T1");
-    const second = s.claim("nelly", "T1");
+  beforeEach(async () => {
+    dir = await fsp.mkdtemp(path.join(os.tmpdir(), "tonoman-sessions-"));
+  });
+  afterEach(async () => {
+    await fsp.rm(dir, { recursive: true, force: true }).catch(() => {});
+  });
+
+  it("creates once, then resumes: the SECOND turn in a thread is not a new session", async () => {
+    const s = store();
+    const first = await s.claim("nelly", "T1");
+    const second = await s.claim("nelly", "T1");
     expect(first).toEqual({ id: "uuid-1", isNew: true });
     // Same session, and no longer new — `--resume`, not `--session-id`.
     expect(second).toEqual({ id: "uuid-1", isNew: false });
   });
 
-  it("marks a session used on the way OUT, not after the turn succeeds", () => {
+  it("SURVIVES a restart — which is the whole reason it is on disk", async () => {
+    // The in-memory version answered every question correctly until the pod was replaced, and then
+    // silently forgot. Rod watched the turn counter go from 6 back to 1 mid-conversation. A second
+    // store over the same directory is exactly what the next pod is.
+    const first = await store().claim("nelly", "T1");
+    const afterRestart = await store().claim("nelly", "T1");
+    expect(afterRestart).toEqual({ id: first.id, isNew: false });
+  });
+
+  it("marks a session used on the way OUT, not after the turn succeeds", async () => {
     // The asymmetry is the whole point. A turn that dies before writing its session file leaves an
     // id pointing at nothing, and the next turn's `--resume` misses — which oneTurn repairs. The
     // other direction has no repair: `--session-id` against a file that already exists is a hard
     // error, and it would recur on every turn in that thread forever. So claiming is eager.
-    const s = sessionStore(ids());
-    s.claim("nelly", "T1"); // imagine this turn throws
-    expect(s.claim("nelly", "T1").isNew).toBe(false);
+    const s = store();
+    await s.claim("nelly", "T1"); // imagine this turn throws
+    expect((await s.claim("nelly", "T1")).isNew).toBe(false);
   });
 
-  it("NEVER lets one agent resume another's conversation", () => {
+  it("NEVER lets one agent resume another's conversation", async () => {
     // A Slack conversation key is a thread timestamp — unique within one workspace and nowhere
     // else. This worker serves Murphy and Axiplex, in two different workspaces. Keyed by the
     // thread alone, Sapien would resume Nelly's session and answer Rod out of a customer's
     // transcript: the same mistake as the worker-wide notify channel, with worse contents.
-    const s = sessionStore(ids());
-    const nelly = s.claim("nelly", "1757200000.000100");
-    const sapien = s.claim("sapien", "1757200000.000100");
+    const s = store();
+    const nelly = await s.claim("nelly", "1757200000.000100");
+    const sapien = await s.claim("sapien", "1757200000.000100");
     expect(sapien.id).not.toBe(nelly.id);
     expect(sapien.isNew).toBe(true);
   });
 
-  it("keeps separate threads of ONE agent separate", () => {
-    const s = sessionStore(ids());
-    expect(s.claim("nelly", "T1").id).not.toBe(s.claim("nelly", "T2").id);
+  it("keeps separate threads of ONE agent separate", async () => {
+    const s = store();
+    expect((await s.claim("nelly", "T1")).id).not.toBe((await s.claim("nelly", "T2")).id);
   });
 
-  it("reset hands back a genuinely new session, ready to be created", () => {
-    const s = sessionStore(ids());
-    const before = s.claim("nelly", "T1");
-    const after = s.reset("nelly", "T1");
+  it("survives a conversation key with slashes in it, which every Slack key has", async () => {
+    // `T0BV.../D0C0.../1788771650.197619` — a path separator inside a filename.
+    const s = store();
+    const key = "T0BV5R3NXGB/D0C01GQT7MF/1788771650.197619";
+    const first = await s.claim("sapien", key);
+    expect(await s.claim("sapien", key)).toEqual({ id: first.id, isNew: false });
+  });
+
+  it("reset hands back a genuinely new session, ready to be created", async () => {
+    const s = store();
+    const before = await s.claim("nelly", "T1");
+    const after = await s.reset("nelly", "T1");
     expect(after.id).not.toBe(before.id);
     expect(after.isNew).toBe(true);
     // And the thread carries on in the NEW one.
-    expect(s.claim("nelly", "T1")).toEqual({ id: after.id, isNew: false });
+    expect(await s.claim("nelly", "T1")).toEqual({ id: after.id, isNew: false });
+  });
+
+  it("answers the turn even when the pointer cannot be written", async () => {
+    // An unwritable volume costs memory, which is the behaviour we had yesterday. It must never
+    // cost the answer, which is the behaviour we have never had.
+    const s = sessionStore(path.join(dir, "nested", "\u0000bad"), ids());
+    const got = await s.claim("nelly", "T1");
+    expect(got.id).toBe("uuid-1");
+    expect(got.isNew).toBe(true);
   });
 });
 

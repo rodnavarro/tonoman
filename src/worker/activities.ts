@@ -48,10 +48,10 @@ export interface TurnDeps {
    *  Claiming rather than peeking is what keeps `--session-id` to exactly one use per id, which is
    *  its contract. Every later turn resumes, and the one way that can be wrong — no session on disk
    *  — is the one case `resetSession` below repairs. */
-  claimSession?(agent: string, conversation: string): { id: string; isNew: boolean };
+  claimSession?(agent: string, conversation: string): Promise<{ id: string; isNew: boolean }>;
   /** Abandon this conversation's session and hand back a fresh one. The resume-miss repair, and
    *  what `!new` does. */
-  resetSession?(agent: string, conversation: string): { id: string; isNew: boolean };
+  resetSession?(agent: string, conversation: string): Promise<{ id: string; isNew: boolean }>;
 }
 
 export interface VoiceConfig {
@@ -435,7 +435,7 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
     // The session this thread continues in. Claimed, not peeked at: `--session-id` creates and
     // may be used once, every later turn resumes, and the one thing that can go wrong with that —
     // no session on disk to resume — is repaired below rather than left to fail forever.
-    let session = deps.claimSession?.(input.agent, input.conversation);
+    let session = await deps.claimSession?.(input.agent, input.conversation);
 
     const consume = async (): Promise<void> => {
       for await (const ev of run(
@@ -502,7 +502,7 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
           `worker: ${input.agent} could not resume session ${session.id} ` +
             `(${String((e as Error)?.message ?? e).slice(0, 140)}); starting a fresh one`,
         );
-        session = deps.resetSession?.(input.agent, input.conversation);
+        session = await deps.resetSession?.(input.agent, input.conversation);
         await reply.reset?.().catch(() => {});
         await consume();
       }

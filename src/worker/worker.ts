@@ -178,30 +178,49 @@ function wire(cfg: Config): Map<string, Wired> {
  *  the thing it names have one lifetime; persisting the id would only outlive the file it points
  *  at, and turn a restart from "forgets" into "fails". What it costs is memory across a deploy —
  *  the next message in a thread starts fresh, which is exactly today's behaviour and no worse. */
-export function sessionStore(newId: () => string = randomUUID): {
-  claim: (agent: string, conversation: string) => { id: string; isNew: boolean };
-  reset: (agent: string, conversation: string) => { id: string; isNew: boolean };
+export function sessionStore(
+  dir: string = path.join(process.env.TONOMAN_STATE_ROOT ?? "/root/.tonoman", "sessions"),
+  newId: () => string = randomUUID,
+): {
+  claim: (agent: string, conversation: string) => Promise<{ id: string; isNew: boolean }>;
+  reset: (agent: string, conversation: string) => Promise<{ id: string; isNew: boolean }>;
 } {
-  const sessions = new Map<string, { id: string; isNew: boolean }>();
-  const key = (agent: string, conversation: string): string => `${agent}/${conversation}`;
+  /** One file per conversation, under the agent that owns it — which is also what keeps two agents
+   *  in two workspaces from colliding on a thread timestamp that is only unique within one of
+   *  them. The conversation key is encoded because it contains `/`. */
+  const fileFor = (agent: string, conversation: string): string =>
+    path.join(dir, encodeURIComponent(agent), `${encodeURIComponent(conversation)}.json`);
+
   /** Hand out this conversation's session AND record that it is now in use — so `--session-id`
    *  (create) is used exactly once per id and every later turn resumes it. Claiming rather than
    *  peeking is what keeps that invariant true even for a turn that dies before writing anything;
    *  the resume miss that follows is repairable, a duplicate create is not. */
-  const claim = (agent: string, conversation: string): { id: string; isNew: boolean } => {
-    const k = key(agent, conversation);
-    const cur = sessions.get(k);
-    if (cur) return { ...cur };
+  const claim = async (agent: string, conversation: string): Promise<{ id: string; isNew: boolean }> => {
+    const f = fileFor(agent, conversation);
+    try {
+      const j = JSON.parse(await fsp.readFile(f, "utf8")) as { uuid?: string };
+      if (j.uuid) return { id: j.uuid, isNew: false };
+    } catch {
+      /* no pointer yet, or an unreadable one → mint a new session rather than fail the turn */
+    }
     const made = { id: newId(), isNew: true };
-    sessions.set(k, { ...made, isNew: false });
+    try {
+      await fsp.mkdir(path.dirname(f), { recursive: true });
+      await fsp.writeFile(f, JSON.stringify({ uuid: made.id, started: true }), "utf8");
+    } catch (e) {
+      // A pointer we could not persist is this pod's problem only: the turn still runs, and the
+      // next one starts a fresh session. Losing memory is the old behaviour; losing the turn is
+      // not, so this never throws.
+      console.error(`worker: could not persist session for ${agent} — ${(e as Error).message}`);
+    }
     return made;
   };
   return {
     claim,
     /** Abandon this conversation's session and hand back a fresh one — the resume-miss repair, and
-     *  what `!new` does. Nothing is deleted; the old transcript is simply no longer continued. */
-    reset: (agent: string, conversation: string) => {
-      sessions.delete(key(agent, conversation));
+     *  what `!new` does. The transcript itself is left alone; it is simply no longer continued. */
+    reset: async (agent: string, conversation: string) => {
+      await fsp.rm(fileFor(agent, conversation), { force: true }).catch(() => {});
       return claim(agent, conversation);
     },
   };
@@ -418,7 +437,7 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
     setMode: (conversation, mode) => statusModes.set(conversation, mode),
     lastUsage: (conversation) => lastUsage.get(conversation),
     windows: windowsFor,
-    resetSession: (name, conversation) => void resetSession(name, conversation),
+    resetSession: (name, conversation) => void resetSession(name, conversation).catch(() => {}),
     // What THIS conversation runs: its own choice, else whatever the roster row says.
     getModel: (name, conversation) => models.get(conversation) ?? wired.get(name)?.cfg.model,
     setModel: (_name, conversation, model) => {
