@@ -177,6 +177,14 @@ export function makeActivities(deps: TurnDeps) {
       const found = deps.agent(input.agent);
       if (!found) return;
       const reply = found.conn.reply(input.conversation);
+      // Clear the working cue first, because the commonest reason this notice exists is that the
+      // turn which set that cue is no longer running to clear it itself — a pod replaced during a
+      // deploy, an activity that lost its heartbeat. Slack disables the composer while a status is
+      // set, so without this the person is told something went wrong in a thread they can no
+      // longer type in, which is a worse place to leave them than the error was.
+      //
+      // Best-effort and before the message: an unclearable cue is the part that traps them.
+      await reply.settle?.().catch(() => {});
       await reply.send(input.text);
     },
 
