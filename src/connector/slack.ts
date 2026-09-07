@@ -377,6 +377,27 @@ export function firstInputValue(values?: Record<string, Record<string, { value?:
   return "";
 }
 
+/** PURE: every input a modal collected, keyed by BLOCK id.
+ *
+ *  `firstInputValue` answers "the one thing they typed", which is right for a dialog that asks for
+ *  a code. A connector that collects a name AND a URL needs them apart, and the block id is the
+ *  only name the sender controls — so the modal sets one block per field and reads them back here.
+ *  Empty inputs are dropped rather than returned blank, so a caller can ask "is it there". */
+export function inputValues(
+  values?: Record<string, Record<string, { value?: string }>>,
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [blockId, block] of Object.entries(values ?? {})) {
+    for (const input of Object.values(block)) {
+      if (input?.value && input.value.trim()) {
+        out[blockId] = input.value.trim();
+        break;
+      }
+    }
+  }
+  return out;
+}
+
 /** PURE: drop the leading `<@U123>` the platform prepends to an app_mention, so the harness sees
  *  the sentence the person actually typed rather than an id it has no use for. Unit-tested. */
 export function stripMention(text: string): string {
