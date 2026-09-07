@@ -1,28 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { fmtElapsed, liveNote, settledNote, statusFor, tally } from "./worklog";
+import { liveNote, settledNote, statusFor, tally } from "./worklog";
+import type { MysticVerb } from "../core/mystic";
 
-describe("fmtElapsed", () => {
-  it("reads in seconds under a minute", () => {
-    expect(fmtElapsed(0)).toBe("0s");
-    expect(fmtElapsed(4_200)).toBe("4s");
-    expect(fmtElapsed(59_999)).toBe("59s");
-  });
-
-  it("pads the seconds once minutes appear, so the number does not jump width", () => {
-    expect(fmtElapsed(64_000)).toBe("1m 04s");
-    expect(fmtElapsed(190_000)).toBe("3m 10s");
-  });
-
-  it("never renders a negative elapsed", () => {
-    expect(fmtElapsed(-5_000)).toBe("0s");
-  });
-});
+const MARINATE: MysticVerb = { ing: "Marinating", ed: "Marinated" };
 
 describe("tally", () => {
   it("counts repeats and keeps first-use order", () => {
-    expect(
-      tally([{ tool: "Grep" }, { tool: "Read" }, { tool: "Grep" }, { tool: "Grep" }]),
-    ).toEqual([
+    expect(tally([{ tool: "Grep" }, { tool: "Read" }, { tool: "Grep" }, { tool: "Grep" }])).toEqual([
       { tool: "Grep", n: 3 },
       { tool: "Read", n: 1 },
     ]);
@@ -30,50 +14,69 @@ describe("tally", () => {
 });
 
 describe("liveNote", () => {
-  it("is just the clock before any tool runs", () => {
-    expect(liveNote([], 3_000)).toBe("⚙️ *Working…* 3s");
+  it("is the bot marker, the verb and the clock before any tool runs", () => {
+    expect(liveNote([], 3_000, MARINATE)).toBe("🤖 Marinating… 3s");
   });
 
-  it("shows the detail when the harness gave one", () => {
-    expect(liveNote([{ tool: "Grep", detail: "valuation" }], 1_000)).toContain("`Grep` — valuation");
+  it("omits the clock under a second — a count that starts at 0 reads as broken", () => {
+    expect(liveNote([], 400, MARINATE)).toBe("🤖 Marinating…");
+  });
+
+  it("puts the tools above and the ticking verb line last", () => {
+    const out = liveNote([{ tool: "Grep", detail: "valuation" }], 12_000, MARINATE);
+    expect(out).toBe("🔧 `Grep` — valuation\n🤖 Marinating… 12s");
+  });
+
+  it("steps in 10s after a minute, so a long wait does not churn", () => {
+    expect(liveNote([], 70_000, MARINATE)).toBe("🤖 Marinating… 1m10s");
+    expect(liveNote([], 60_000, MARINATE)).toBe("🤖 Marinating… 1m");
   });
 
   it("keeps the last few steps and says how many it dropped", () => {
     const calls = Array.from({ length: 8 }, (_, i) => ({ tool: `T${i}` }));
-    const out = liveNote(calls, 10_000);
+    const out = liveNote(calls, 10_000, MARINATE);
     expect(out).toContain("_…3 earlier steps_");
     expect(out).toContain("`T7`");
     expect(out).not.toContain("`T2`");
+    expect(out.endsWith("🤖 Marinating… 10s")).toBe(true);
   });
 
   it("trims a long detail rather than wrapping the note", () => {
-    const out = liveNote([{ tool: "Bash", detail: "x".repeat(300) }], 1_000);
-    expect(out.length).toBeLessThan(140);
+    const out = liveNote([{ tool: "Bash", detail: "x".repeat(300) }], 1_000, MARINATE);
+    expect(out.length).toBeLessThan(150);
   });
 });
 
 describe("settledNote", () => {
   it("is null when nothing was used — no clutter above a plain answer", () => {
-    expect(settledNote([], 2_000)).toBeNull();
+    expect(settledNote([], 2_000, MARINATE)).toBeNull();
   });
 
-  it("summarises the tools with counts", () => {
-    expect(settledNote([{ tool: "Grep" }, { tool: "Grep" }, { tool: "Read" }], 12_000)).toBe(
-      "⚙️ Worked for 12s · Grep ×2, Read",
-    );
+  it("reads in past tense with a whole duration, and drops the bot marker", () => {
+    const out = settledNote([{ tool: "Grep" }, { tool: "Grep" }, { tool: "Read" }], 14_000, MARINATE);
+    expect(out).toBe("Marinated for 14 seconds · Grep ×2, Read");
+    expect(out).not.toContain("🤖");
+  });
+
+  it("says minutes for a long turn", () => {
+    expect(settledNote([{ tool: "Bash" }], 130_000, MARINATE)).toBe("Marinated for 2 minutes · Bash");
+  });
+
+  it("never says 0 seconds", () => {
+    expect(settledNote([{ tool: "Bash" }], 200, MARINATE)).toBe("Marinated for 1 second · Bash");
   });
 });
 
 describe("statusFor", () => {
-  it("names the running tool and the clock", () => {
-    expect(statusFor({ tool: "Bash" }, 5_000)).toBe("is running bash · 5s");
+  it("uses the turn's own verb before any tool has run", () => {
+    expect(statusFor(undefined, MARINATE)).toBe("is marinating");
   });
 
-  it("falls back to thinking before any tool", () => {
-    expect(statusFor(undefined, 1_000)).toBe("is thinking · 1s");
+  it("names the running tool once one starts", () => {
+    expect(statusFor({ tool: "Bash" }, MARINATE)).toBe("is running bash");
   });
 
   it("never exceeds Slack's status limit", () => {
-    expect(statusFor({ tool: "T".repeat(300) }, 1_000).length).toBeLessThanOrEqual(100);
+    expect(statusFor({ tool: "T".repeat(300) }, MARINATE).length).toBeLessThanOrEqual(100);
   });
 });

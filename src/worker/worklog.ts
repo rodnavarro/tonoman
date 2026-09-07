@@ -1,18 +1,24 @@
 // The visible work log: what the agent is doing, and for how long.
 //
-// Slack's assistant status line ("Nelly is thinking…") holds ONE short string and disappears the
-// moment the turn settles. That is the right place for the current activity and the wrong place
-// for a record of it — a person who watched the agent grep the second brain three times and read
-// two files has no way to see that afterwards, and during the turn the status text does not move
-// unless a new event happens to arrive.
+// Slack's assistant status line holds ONE short string and disappears the moment the turn settles.
+// That is the right place for the current activity and the wrong place for a record of it — a
+// person who watched the agent grep the second brain three times and read two files has no way to
+// see that afterwards, and during the turn the status text does not move unless a new event
+// happens to arrive.
 //
 // So the tool trace is a standalone NOTE (Reply.note): a message the turn owns, updated on a timer
-// so the elapsed time actually ticks, and settled to one compact line when the answer lands. It is
-// never the message the answer is written into — that was the "…" placeholder Rod saw flash and be
+// so the clock actually ticks, and settled to one line when the answer lands. It is never the
+// message the answer is written into — that was the "…" placeholder that flashed and got
 // overwritten, and it reads as a glitch.
 //
-// Everything here is PURE. The activity owns the timer and the posting; this module owns what the
-// person reads.
+// The voice is Teams': the 🤖 marker with a mystic verb while it runs, past tense once it is done —
+// `🤖 Marinating… 12s` becoming `Marinated for 14 seconds`. Shared from core/mystic rather than
+// re-invented, because an agent that is whimsical on Teams and terse on Slack is two agents.
+//
+// Everything here is PURE. The activity owns the timer, the verb, and the posting; this module
+// owns what the person reads.
+
+import { activeLine, settledLine, type MysticVerb } from "../core/mystic";
 
 export interface ToolCall {
   /** The harness's tool name, e.g. "Bash", "Grep". */
@@ -25,15 +31,8 @@ export interface ToolCall {
  *  what it is doing NOW plus enough history to see the shape of it. */
 const TRACE_LINES = 5;
 
-/** Elapsed, in the form a person reads at a glance: `4s`, `1m 12s`, `3m 04s`. */
-export function fmtElapsed(ms: number): string {
-  const s = Math.max(0, Math.floor(ms / 1000));
-  if (s < 60) return `${s}s`;
-  return `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, "0")}s`;
-}
-
-/** Collapse consecutive-or-not repeats into `name ×n`, preserving first-use order. This is what
- *  makes the settled line readable: "Grep ×4, Read ×2" rather than six identical bullets. */
+/** Collapse repeats into `name ×n`, preserving first-use order. This is what makes the settled line
+ *  readable: "Grep ×4, Read ×2" rather than six identical bullets. */
 export function tally(calls: ToolCall[]): { tool: string; n: number }[] {
   const order: string[] = [];
   const counts = new Map<string, number>();
@@ -48,41 +47,47 @@ export function tally(calls: ToolCall[]): { tool: string; n: number }[] {
  *  note that wraps to four lines per call stops being scannable. */
 function traceLine(c: ToolCall): string {
   const detail = (c.detail ?? "").replace(/\s+/g, " ").trim();
-  return detail ? `• \`${c.tool}\` — ${detail.slice(0, 80)}` : `• \`${c.tool}\``;
+  return detail ? `🔧 \`${c.tool}\` — ${detail.slice(0, 80)}` : `🔧 \`${c.tool}\``;
 }
 
 /**
- * The live note, re-rendered on every tick.
+ * The live note, re-rendered on every tick: the tools above, the 🤖 verb and the clock below.
  *
- * The elapsed time is first because it is the part that moves: it is the difference between "the
- * agent is working" and "the agent is stuck", and it is the whole reason this is on a timer rather
- * than only on tool events.
+ * That order is Teams': the tools are what changed, the verb line is what is still true. It is also
+ * why the clock is on the bottom line — it is the part that moves, and a moving line is the
+ * difference between "the agent is working" and "the agent is stuck".
  */
-export function liveNote(calls: ToolCall[], elapsedMs: number): string {
-  const head = `⚙️ *Working…* ${fmtElapsed(elapsedMs)}`;
-  if (calls.length === 0) return head;
+export function liveNote(calls: ToolCall[], elapsedMs: number, verb: MysticVerb): string {
+  const lines: string[] = [];
   const shown = calls.slice(-TRACE_LINES);
   const hidden = calls.length - shown.length;
-  const lines = [head, ...shown.map(traceLine)];
-  if (hidden > 0) lines.splice(1, 0, `_…${hidden} earlier step${hidden === 1 ? "" : "s"}_`);
+  if (hidden > 0) lines.push(`_…${hidden} earlier step${hidden === 1 ? "" : "s"}_`);
+  lines.push(...shown.map(traceLine));
+  lines.push(activeLine(verb, elapsedMs));
   return lines.join("\n");
 }
 
 /**
- * The settled note: what the turn actually did, in one line, kept above the answer.
+ * The settled note: past tense, a whole duration, and what the turn actually used.
+ *
+ * `Marinated for 14 seconds · Grep ×4, Read ×2`
  *
  * Null means "delete the note instead" — a turn that answered from the model alone in a couple of
- * seconds has nothing to show, and leaving a "Worked for 2s" line above every trivial reply is
- * clutter that makes the real traces harder to notice.
+ * seconds has nothing to show, and a "Pondered for 2 seconds" above every trivial reply is clutter
+ * that makes the real traces harder to notice.
  */
-export function settledNote(calls: ToolCall[], elapsedMs: number): string | null {
+export function settledNote(calls: ToolCall[], elapsedMs: number, verb: MysticVerb): string | null {
   if (calls.length === 0) return null;
-  const parts = tally(calls).map((t) => (t.n > 1 ? `${t.tool} ×${t.n}` : t.tool));
-  return `⚙️ Worked for ${fmtElapsed(elapsedMs)} · ${parts.join(", ")}`;
+  const used = tally(calls).map((t) => (t.n > 1 ? `${t.tool} ×${t.n}` : t.tool));
+  return `${settledLine(verb, elapsedMs)} · ${used.join(", ")}`;
 }
 
-/** The Slack status-line text for the current activity, bounded to Slack's 100-char limit. */
-export function statusFor(current: ToolCall | undefined, elapsedMs: number): string {
-  const base = current ? `is running ${current.tool.toLowerCase()}` : "is thinking";
-  return `${base} · ${fmtElapsed(elapsedMs)}`.slice(0, 100);
+/** The Slack status-line text under the composer, bounded to Slack's 100-character limit.
+ *
+ *  Slack prefixes it with the agent's name, so this reads "Nelly is running grep" or, before any
+ *  tool has run, "Nelly is marinating" — the same verb the note is using, lower-cased to sit in
+ *  the sentence. */
+export function statusFor(current: ToolCall | undefined, verb: MysticVerb): string {
+  const what = current ? `running ${current.tool.toLowerCase()}` : verb.ing.toLowerCase();
+  return `is ${what}`.slice(0, 100);
 }

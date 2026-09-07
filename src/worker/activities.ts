@@ -15,6 +15,7 @@ import type { Connector, Reply, TurnEvent, TurnUsage } from "../core/contracts";
 import type { AgentConfig } from "../config";
 import * as recap from "./recap";
 import * as worklog from "./worklog";
+import { randomMysticVerb } from "../core/mystic";
 
 /** How the worker finds an agent's connector and runner. Injected at worker construction so this
  *  module holds no globals and can be unit-tested without Temporal. */
@@ -93,11 +94,14 @@ export function makeActivities(deps: TurnDeps) {
       const { conn, run } = found;
 
       const reply: Reply = conn.reply(input.conversation);
+      // One verb for the whole turn, picked before the first cue. Re-picking mid-turn would read
+      // as a different agent taking over the answer.
+      const verb = randomMysticVerb();
       // The status line IS the immediate cue — "Nelly is thinking…" under the composer. A
       // placeholder MESSAGE posted alongside it is worse than nothing: it flashes "…" and is then
       // overwritten, which reads as a glitch. So no message is posted until there is something real
       // to put in it, and the work log below is a separate note rather than the answer's message.
-      await reply.working?.("is thinking").catch(() => {});
+      await reply.working?.(worklog.statusFor(undefined, verb)).catch(() => {});
 
       const started = Date.now();
       let answer = "";
@@ -141,12 +145,12 @@ export function makeActivities(deps: TurnDeps) {
         posting = true;
         try {
           const elapsed = now - started;
-          const text = worklog.liveNote(calls, elapsed);
+          const text = worklog.liveNote(calls, elapsed, verb);
           if (text !== noteText) {
             noteText = text;
             noteId = (await reply.note?.(noteId || undefined, text)) ?? "";
           }
-          await reply.working?.(worklog.statusFor(current, elapsed)).catch(() => {});
+          await reply.working?.(worklog.statusFor(current, verb)).catch(() => {});
         } catch {
           /* a dropped work log must never cost a turn */
         } finally {
@@ -251,7 +255,7 @@ export function makeActivities(deps: TurnDeps) {
       // Settle the work log into one line of what the turn actually did, or take it down when
       // there is nothing worth keeping above the answer.
       if (noteId) {
-        const settled = worklog.settledNote(calls, Date.now() - started);
+        const settled = worklog.settledNote(calls, Date.now() - started, verb);
         await reply.note?.(noteId, settled).catch(() => {});
       }
 
