@@ -150,6 +150,38 @@ export function podmanAuthOps(container: string, loginArgs: string[], statusArgs
   };
 }
 
+/** PURE: what actually went wrong, when `fetch` refuses to say.
+ *
+ *  Node's fetch throws a bare `TypeError("fetch failed")` for every transport problem and hides the
+ *  real reason in `cause`. Unwrapped, that reached a person in Slack as
+ *  "I need an inference login, but I couldn't start one - fetch failed", which names neither what
+ *  was unreachable nor even that anything was: a connection refused, a DNS miss and a TLS failure
+ *  all read identically, and all read like a bug in the login rather than a missing process.
+ *
+ *  `cause` is sometimes an AggregateError - several addresses tried, IPv6 first - and its own
+ *  `code` is undefined, so reading `cause.code` alone would ship "fetch failed - undefined", which
+ *  is worse than what it replaced. Hence the walk: the first error carrying a code wins, and the
+ *  URL is named either way, because "which address" is half of what makes this actionable. */
+export function transportFailure(e: unknown, base: string): string {
+  const codes: string[] = [];
+  const messages: string[] = [];
+  const walk = (x: unknown, depth: number): void => {
+    if (!x || typeof x !== "object" || depth > 4) return;
+    const err = x as { code?: unknown; errors?: unknown; cause?: unknown; message?: unknown };
+    if (typeof err.code === "string") codes.push(err.code);
+    // "fetch failed" is the wrapper's own message and never the reason, so it is dropped here
+    // rather than allowed to win by being outermost.
+    if (typeof err.message === "string" && err.message && err.message !== "fetch failed") messages.push(err.message);
+    if (Array.isArray(err.errors)) for (const sub of err.errors) walk(sub, depth + 1);
+    walk(err.cause, depth + 1);
+  };
+  walk(e, 0);
+  // A code when there is one; otherwise the DEEPEST message, which is the one closest to the
+  // actual syscall - undici's "bad port" beats the "fetch failed" wrapped around it.
+  const why = codes[0] || messages[messages.length - 1] || (e instanceof Error && e.message) || "unknown error";
+  return `couldn't reach the agent runtime at ${base} (${why})`;
+}
+
 /** REMOTE agents (k8s split): drive the login through the agent's OWN HTTP runtime. There is no
  * podman and no shared filesystem here — the agent is the only half holding `claude` and the
  * credential store, so it runs the PTY dance itself (same reason /usage lives agent-side).
@@ -161,11 +193,18 @@ export function httpAuthOps(baseUrl: string, token?: string, agent?: string): Au
   if (token) headers["authorization"] = `Bearer ${token}`;
 
   const call = async (path: string, body?: unknown): Promise<Record<string, unknown>> => {
-    const res = await fetch(`${base}${path}`, {
-      method: body === undefined ? "GET" : "POST",
-      headers,
-      body: body === undefined ? undefined : JSON.stringify(body),
-    });
+    let res: Response;
+    try {
+      res = await fetch(`${base}${path}`, {
+        method: body === undefined ? "GET" : "POST",
+        headers,
+        body: body === undefined ? undefined : JSON.stringify(body),
+      });
+    } catch (e) {
+      // TRANSPORT failure, which is a different thing from the runtime answering badly - and the
+      // one this function used to let through unexplained. See transportFailure().
+      throw new Error(transportFailure(e, base));
+    }
     const text = await res.text();
     let parsed: Record<string, unknown> = {};
     try {

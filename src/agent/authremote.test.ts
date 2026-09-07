@@ -11,7 +11,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { Server } from "node:http";
 import { serveRuntime } from "./server";
-import { httpAuthOps } from "../authflow";
+import { httpAuthOps, transportFailure } from "../authflow";
 
 const TOKEN = "test-token";
 const URL_IN_LOGIN = "https://claude.com/cai/oauth/authorize?code=true&client_id=abc&state=xyz";
@@ -134,5 +134,48 @@ describe("roster-auth-remote — headless login over the agent's own HTTP runtim
     await ops().startHeadless();
     const url = await ops().startHeadless(); // must not hang or 409
     expect(url).toBe(URL_IN_LOGIN);
+  });
+
+  // A runtime that is NOT THERE is the failure a person actually meets: the sidecar is down, or
+  // the worker is running somewhere the sidecar isn't. It reached Slack as "fetch failed".
+  it("names the address and the reason when the runtime cannot be reached", async () => {
+    // A real connection attempt to a port nothing is listening on - not a mock, and not one of
+    // undici's BLOCKED ports (1, 7, 9, 11 ...), which fail with "bad port" before any connect.
+    await expect(httpAuthOps("http://127.0.0.1:49999", TOKEN).startHeadless()).rejects.toThrow(
+      /couldn't reach the agent runtime at http:\/\/127\.0\.0\.1:49999 \((ECONNREFUSED|ECONNRESET)\)/,
+    );
+  });
+});
+
+describe("transportFailure", () => {
+  it("digs the code out of a bare fetch failure", () => {
+    const e = Object.assign(new TypeError("fetch failed"), {
+      cause: Object.assign(new Error("connect ECONNREFUSED"), { code: "ECONNREFUSED" }),
+    });
+    expect(transportFailure(e, "http://host:8080")).toBe(
+      "couldn't reach the agent runtime at http://host:8080 (ECONNREFUSED)",
+    );
+  });
+
+  it("digs it out of an AggregateError, whose own code is undefined", () => {
+    // Node tries every resolved address - IPv6 first - and reports the set. Reading `cause.code`
+    // alone would have produced "(undefined)", which is worse than the message it replaced.
+    const agg = Object.assign(new AggregateError([], "all attempts failed"), {
+      errors: [Object.assign(new Error("connect ECONNREFUSED ::1:8080"), { code: "ECONNREFUSED" })],
+    });
+    const e = Object.assign(new TypeError("fetch failed"), { cause: agg });
+    expect(transportFailure(e, "http://host:8080")).toMatch(/\(ECONNREFUSED\)$/);
+  });
+
+  it("prefers the innermost message over the wrapper's own, when there is no code", () => {
+    // undici rejects a reserved port before it ever connects, and says so only on the cause.
+    const e = Object.assign(new TypeError("fetch failed"), { cause: new Error("bad port") });
+    expect(transportFailure(e, "http://host:1")).toBe("couldn't reach the agent runtime at http://host:1 (bad port)");
+  });
+
+  it("falls back to the wrapper rather than saying undefined", () => {
+    expect(transportFailure(new TypeError("fetch failed"), "http://host:8080")).toBe(
+      "couldn't reach the agent runtime at http://host:8080 (fetch failed)",
+    );
   });
 });

@@ -108,7 +108,9 @@ export async function ask(deps: AuthGateDeps, agent: string, agentLabel: string,
     url = await ops.startHeadless();
   } catch (e) {
     await conn.reply(conversation).send(
-      `⚠️ I need an inference login, but I couldn't start one — ${(e as Error).message.slice(0, 200)}`,
+      // The REASON, not just that there was one. `startHeadless` now names the address and the
+      // failure code, so this line stopped being "couldn't start one - fetch failed".
+      `⚠️ I need an inference login, but starting one failed — ${(e as Error).message.slice(0, 200)}`,
     );
     return false;
   }
