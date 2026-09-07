@@ -149,10 +149,39 @@ interface Wired {
 
 /** Builds one connector + runner per agent in the roster. An agent whose channel has no connector
  *  is skipped with a reason rather than failing the worker — one bad row must not silence the rest. */
-function wire(cfg: Config): Map<string, Wired> {
+/** PURE: which agents this process is willing to serve.
+ *
+ *  Empty means all of them, which is every deployment today. A list means THIS worker takes only
+ *  those, and it exists for one reason: to make a worker runnable on a laptop against the real
+ *  cluster without stealing another tenant's agent.
+ *
+ *  Two workers cannot share an agent. Slack delivers a Socket Mode event to exactly ONE of the
+ *  connections holding that app token, so two processes with the same agent answer alternately and
+ *  unpredictably — which looks like a flaky bug rather than like two workers. Splitting by agent is
+ *  what makes "run the one I am changing locally, leave the customer's on the cluster" safe rather
+ *  than a coin flip.
+ *
+ *  Names are the ROSTER names — `axiplex-sapien`, `murphy-nelly` — because that is what the logs
+ *  say and what somebody will copy. */
+export function agentsAllowed(names: string | undefined): Set<string> {
+  return new Set(
+    (names ?? "")
+      .split(",")
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean),
+  );
+}
+
+function wire(cfg: Config, only: Set<string> = new Set()): Map<string, Wired> {
   const harnesses = defaultHarnesses();
   const out = new Map<string, Wired>();
   for (const a of cfg.agents ?? []) {
+    if (only.size > 0 && !only.has(a.name.toLowerCase())) {
+      // Said out loud rather than skipped quietly: "why is my agent not answering" is otherwise
+      // answered only by remembering an environment variable somebody set days ago.
+      console.log(`worker: not serving ${a.name} — TONOMAN_AGENTS does not list it`);
+      continue;
+    }
     const channel = a.channel ?? (a.slack ? "slack" : a.teams ? "teams" : "telegram");
     if (channel !== "slack") {
       console.error(`worker: skipping ${a.name} — channel "${channel}" has no worker connector yet`);
@@ -268,7 +297,11 @@ export function sessionStore(
 }
 
 export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): Promise<void> {
-  const wired = wire(cfg);
+  const only = agentsAllowed(process.env.TONOMAN_AGENTS);
+  if (only.size > 0) {
+    console.log(`worker: serving only ${[...only].join(", ")} (TONOMAN_AGENTS)`);
+  }
+  const wired = wire(cfg, only);
   if (wired.size === 0) {
     // Loudly: a worker with no connectors looks perfectly healthy while answering nobody.
     console.error("worker: NO agents have a usable channel binding — nothing will be answered.");
