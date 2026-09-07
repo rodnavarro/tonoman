@@ -17,10 +17,11 @@ describe("voiceSettings — the registry decides, the environment only fills gap
     expect(voiceSettings({ notify_channel: "" }, { VOICE_NOTIFY_CHANNEL: "C_ENV" }).notifyChannel).toBe("C_ENV");
   });
 
-  it("defaults the poll to two minutes rather than to zero", () => {
-    expect(voiceSettings({}, {}).pollSeconds).toBe(120);
-    expect(voiceSettings({ poll_seconds: "0" }, {}).pollSeconds).toBe(120);
-    expect(voiceSettings({ poll_seconds: "nonsense" }, {}).pollSeconds).toBe(120);
+  it("defaults the poll to five minutes rather than to zero", () => {
+    // Five, matching the cadence the existing plaud-cron schedule has been running at.
+    expect(voiceSettings({}, {}).pollSeconds).toBe(300);
+    expect(voiceSettings({ poll_seconds: "0" }, {}).pollSeconds).toBe(300);
+    expect(voiceSettings({ poll_seconds: "nonsense" }, {}).pollSeconds).toBe(300);
   });
 });
 

@@ -61,7 +61,7 @@ export function voiceSettings(props: Record<string, string> = {}, env: NodeJS.Pr
   return {
     notifyChannel: p("notify_channel") ?? (env.VOICE_NOTIFY_CHANNEL ?? "").trim(),
     notifyUser: p("notify_user") ?? (env.VOICE_NOTIFY_USER ?? "").trim(),
-    pollSeconds: num(p("poll_seconds") ?? env.VOICE_POLL_SECONDS, 120),
+    pollSeconds: num(p("poll_seconds") ?? env.VOICE_POLL_SECONDS, 300),
     since: p("since") ?? (env.VOICE_SINCE ?? "").trim(),
     journal,
   };

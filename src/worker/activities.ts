@@ -383,7 +383,7 @@ export function makeActivities(deps: TurnDeps) {
 
       ctx.heartbeat("publishing");
       const route = recap.resolveRoute(v.journal, summary.route);
-      const where = recap.pathsFor(v.journal, rec, route);
+      const where = recap.pathsFor(v.journal, rec, route, summary.highlights?.[0] ?? summary.summary);
       const published = await recap.publish(v.brainDir, rec, summary, text, v.pushUrl, v.journal);
       console.log(
         `recap: ${rec.title} ${published ? "published" : "already present"} at ${where.page}` +

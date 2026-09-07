@@ -23,7 +23,6 @@ import {
   isCancellation,
   proxyActivities,
   setHandler,
-  sleep,
 } from "@temporalio/workflow";
 import type { Activities } from "./activities";
 
@@ -141,64 +140,61 @@ export interface PollInput {
   agent: string;
   /** Slack user id to notify. */
   notify: string;
-  /** How often to look, in seconds. */
+  /** Kept for compatibility with schedules created before the interval moved to the schedule
+   *  itself. Unused: the cadence is the schedule's, which is the point of using one. */
   everySeconds?: number;
 }
 
 /**
- * Watch for finished recordings and turn each into a recap.
+ * ONE pass: find the finished recordings nobody has filed yet, and file them.
  *
- * A loop with a timer rather than a Temporal Schedule, because the polling interval wants to be
- * short (a person who just stopped recording is waiting) and a schedule firing every minute would
- * create a workflow execution every minute forever. One long-lived workflow that sleeps is cheaper
- * and keeps "what has been seen" in one place.
+ * A Temporal SCHEDULE drives this now, not a timer loop inside the workflow. The loop was the wrong
+ * call and the reason it was wrong is worth keeping: I justified it with "a schedule would create an
+ * execution every few minutes forever", which is precisely what schedules are for and what
+ * retention handles. The test that actually matters is whether the workflow carries state between
+ * iterations — and it does not. "Has this been published?" is answered from the git checkout and
+ * the floor comes from configuration, so there was nothing for a long-lived execution to hold.
  *
- * Processing is deliberately NOT retried into oblivion: it spends money and posts to Slack. Two
- * attempts, then the failure is announced to the person rather than swallowed — a pipeline that
- * quietly stops is how you end up with a worker that has skipped the same recording for a month.
+ * What the loop cost was operational. Stopping it meant terminating a running workflow and
+ * restarting a pod; a schedule has a pause button. Changing the interval meant a deploy. Not
+ * double-processing meant care in the code; a schedule has an overlap policy. And the history had
+ * to be bounded by hand with continueAsNew, which is complexity that only existed because of the
+ * loop.
+ *
+ * So this is now what one tick does, and nothing else.
  */
 export async function plaudPollWorkflow(input: PollInput): Promise<void> {
-  const every = (input.everySeconds ?? 120) * 1000;
-  // Bounded so history cannot grow forever; the count is arbitrary but small enough that a run is
-  // minutes of history rather than days.
-  for (let i = 0; i < 200; i++) {
-    let found: { id: string; title: string; stamp: string; minutes: number }[] = [];
-    try {
-      found = await findNewRecordings({ agent: input.agent });
-    } catch (e) {
-      // A dead Plaud token is the expected failure — it expires every 24h. Say so once per hour
-      // rather than every two minutes, and keep polling in case it is refreshed.
-      if (i % 30 === 0) {
-        await sayVerbatim({
-          agent: input.agent,
-          user: input.notify,
-          text: `⚠️ I can't reach your Plaud account — ${String((e as Error)?.message ?? e).slice(0, 150)}`,
-        }).catch(() => {});
-      }
-      await sleep(every);
-      continue;
-    }
+  let found: { id: string; title: string; stamp: string; minutes: number }[] = [];
+  try {
+    found = await findNewRecordings({ agent: input.agent });
+  } catch (e) {
+    // A dead Plaud token is the expected failure — it expires every 24h. Say so, once, and let the
+    // schedule try again on its own cadence rather than swallowing it.
+    await sayVerbatim({
+      agent: input.agent,
+      user: input.notify,
+      text: `⚠️ I can't reach your Plaud account — ${String((e as Error)?.message ?? e).slice(0, 150)}`,
+    }).catch(() => {});
+    throw e;
+  }
 
-    for (const rec of found) {
-      // Say it landed BEFORE the slow part, so the person knows it was seen.
+  for (const rec of found) {
+    // Say it landed BEFORE the slow part, so the person knows it was seen.
+    await sayVerbatim({
+      agent: input.agent,
+      user: input.notify,
+      text: `I've got a new recording — “${rec.title}”, ${rec.minutes} minute${rec.minutes === 1 ? "" : "s"}. Processing it now; I'll send the highlights shortly.`,
+    }).catch(() => {});
+
+    try {
+      await processRecording({ agent: input.agent, notify: input.notify, id: rec.id });
+    } catch (e) {
+      // One recording failing must not abandon the rest of the batch.
       await sayVerbatim({
         agent: input.agent,
         user: input.notify,
-        text: `I've got a new recording — “${rec.title}”, ${rec.minutes} minute${rec.minutes === 1 ? "" : "s"}. Processing it now; I'll send the highlights shortly.`,
+        text: `⚠️ I couldn't finish processing “${rec.title}” — ${String((e as Error)?.message ?? e).slice(0, 200)}`,
       }).catch(() => {});
-
-      try {
-        await processRecording({ agent: input.agent, notify: input.notify, id: rec.id });
-      } catch (e) {
-        await sayVerbatim({
-          agent: input.agent,
-          user: input.notify,
-          text: `⚠️ I couldn't finish processing “${rec.title}” — ${String((e as Error)?.message ?? e).slice(0, 200)}`,
-        }).catch(() => {});
-      }
     }
-
-    await sleep(every);
   }
-  await continueAsNew<typeof plaudPollWorkflow>(input);
 }

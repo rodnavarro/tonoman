@@ -13,7 +13,8 @@
 // WebSocket that something has to hold anyway; making that the same process that runs turns removes
 // a hop and a deployment.
 
-import { Client, Connection } from "@temporalio/client";
+import { Client, Connection, ScheduleOverlapPolicy } from "@temporalio/client";
+import type { Duration } from "@temporalio/common";
 import { NativeConnection, Worker } from "@temporalio/worker";
 import * as path from "node:path";
 import type { Config, AgentConfig } from "../config";
@@ -36,7 +37,7 @@ import { serveWake } from "./wake";
 import { promises as fsp } from "node:fs";
 import { defaultHarnesses } from "../gateway";
 import { makeActivities, type TurnRunReq, type VoiceConfig } from "./activities";
-import { conversationWorkflow, messageSignal, plaudPollWorkflow, type Inbound } from "./workflows";
+import { conversationWorkflow, messageSignal, plaudPollWorkflow, type Inbound, type PollInput } from "./workflows";
 
 export interface WorkerOptions {
   address: string;
@@ -495,42 +496,64 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
   // The voice flow, watching by itself. One long-lived workflow per agent, started idempotently:
   // `WorkflowExecutionAlreadyStarted` is the expected answer on every restart after the first, and
   // means the poll survived the deploy rather than that something is wrong.
+  // The voice flow runs on a SCHEDULE, not a timer loop inside a workflow.
+  //
+  // A schedule is what this always should have been: the cadence is visible on a page and editable
+  // without a deploy, pausing is a button rather than terminating a running execution and
+  // restarting a pod, and `overlapPolicy: SKIP` is the "do not double-process" guarantee that
+  // otherwise has to be written by hand. The loop only made sense if the workflow carried state
+  // between ticks, and it never did — what has been published is answered from the git checkout.
   const notify = process.env.VOICE_NOTIFY_USER;
-  for (const [name] of voiceCreds) {
-    if (!notify) {
-      console.log(`worker: ${name} voice flow not polling — VOICE_NOTIFY_USER is unset`);
+  for (const [name, v] of voiceCreds) {
+    const recipient = v.notifyChannel ? notify ?? "" : notify;
+    if (!recipient && !v.notifyChannel) {
+      console.log(`worker: ${name} voice flow not scheduled — nobody to tell (no channel, no VOICE_NOTIFY_USER)`);
       continue;
     }
+    const scheduleId = `voice:${name}`;
+    const every: Duration = `${v.pollSeconds ?? 300} seconds`;
+    const action = {
+      type: "startWorkflow" as const,
+      workflowType: plaudPollWorkflow,
+      taskQueue: o.taskQueue,
+      args: [{ agent: name, notify: recipient ?? "" }] as [PollInput],
+    };
+
+    // The loop's execution, if this pod is the one replacing it. Left running it would poll in
+    // parallel with the schedule and announce everything twice — the double-answer bug in a
+    // different costume.
     try {
-      await client.workflow.start(plaudPollWorkflow, {
-        workflowId: `voice:${name}`,
-        taskQueue: o.taskQueue,
-        args: [{ agent: name, notify, everySeconds: voiceCreds.get(name)?.pollSeconds ?? 120 }],
-      });
-      const ch = voiceCreds.get(name)?.notifyChannel;
-      console.log(
-        `worker: ${name} voice poll started — announcing in ${ch ? `channel ${ch}` : `a DM with ${notify}`}`,
-      );
-      if (ch) {
-        // Our scopes carry neither chat:write.public nor channels:join, so an uninvited bot gets
-        // `not_in_channel` and every recap is lost silently. Prove it can post NOW, at boot, rather
-        // than discovering it when a meeting goes missing.
-        const conv = await voiceConversation(name, "");
-        await wired
-          .get(name)
-          ?.conn.reply(conv!)
-          .send(`_Recaps for ${name} will be posted here._`)
-          .catch((e) =>
-            console.error(
-              `worker: ${name} CANNOT post to ${ch} — ${(e as Error).message}. ` +
-                `Invite the bot to the channel (/invite) or recaps will be lost.`,
-            ),
-          );
+      const old = client.workflow.getHandle(scheduleId);
+      const d = await old.describe();
+      if (d.status.name === "RUNNING") {
+        await old.terminate("superseded by the voice schedule");
+        console.log(`worker: ${name} terminated the old polling workflow — a schedule drives it now`);
       }
+    } catch {
+      /* nothing running under that id, which is the normal case */
+    }
+
+    try {
+      await client.schedule.create({
+        scheduleId,
+        spec: { intervals: [{ every }] },
+        // SKIP, not BUFFER: a tick that lands while the previous one is still transcribing has
+        // nothing new to say, and queueing it would only guarantee a pile-up behind a slow meeting.
+        policies: { overlap: ScheduleOverlapPolicy.SKIP },
+        action,
+      });
+      console.log(`worker: ${name} voice schedule created — every ${every}`);
     } catch (e) {
-      const msg = (e as Error).message ?? "";
-      if (/already started/i.test(msg)) console.log(`worker: ${name} voice poll already running`);
-      else console.error(`worker: ${name} voice poll failed to start: ${msg}`);
+      if (!/already exists/i.test((e as Error).message ?? "")) throw e;
+      // Update rather than leave it: the interval and the recipient come from the registry, and a
+      // schedule that silently keeps yesterday's configuration is the staleness this design was
+      // meant to remove.
+      await client.schedule.getHandle(scheduleId).update((prev) => ({
+        ...prev,
+        spec: { intervals: [{ every }] },
+        action,
+      }));
+      console.log(`worker: ${name} voice schedule updated — every ${every}`);
     }
   }
 

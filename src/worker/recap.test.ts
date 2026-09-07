@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { floorFor, joinChunks, overviewMarkdown, redact, stampFor, titleFor } from "./recap";
+import { floorFor, isTimestampTitle, joinChunks, overviewMarkdown, pathsFor, redact, slugFor, stampFor, titleFor } from "./recap";
 
 describe("stampFor", () => {
   it("is stable, sortable and unique per minute, so re-processing lands on the same path", () => {
@@ -83,5 +83,32 @@ describe("floorFor", () => {
   it("falls back to today rather than to 1970 when the date is nonsense", () => {
     const now = Date.parse("2026-09-07T01:00:00Z");
     expect(floorFor("not-a-date", now, 0)).toBe(Date.parse("2026-09-07T00:00:00Z"));
+  });
+});
+
+describe("naming a recording", () => {
+  it("refuses a slug when Plaud only gave it a timestamp", () => {
+    // This produced `2026-09-07-0310-2026-09-06-23-10-46.md`: the date twice, in two formats.
+    expect(isTimestampTitle("2026-09-06 23:10:46")).toBe(true);
+    expect(isTimestampTitle("2026-09-06T23:10")).toBe(true);
+    expect(slugFor("2026-09-06 23:10:46")).toBe("");
+  });
+
+  it("keeps a real title, including one that merely starts with a date", () => {
+    expect(isTimestampTitle("08-28 Interview Panel")).toBe(false);
+    expect(slugFor("Jobs and Gates Reflect")).toBe("jobs-and-gates-reflect");
+  });
+
+  it("falls back to what the meeting was about when the title is a clock", () => {
+    const rec = { id: "1", title: "2026-09-06 23:10:46", startTime: Date.UTC(2026, 8, 7, 3, 10), duration: 60000, stamp: "2026-09-07-0310" };
+    const j = { path: "MJ", fallback: "unclassified", routes: [{ id: "axiplex", when: "..." }] };
+    const p = pathsFor(j, rec, "axiplex", "Reviewed the Tonoman Cloud demo plan");
+    expect(p.page).toBe("MJ/axiplex/2026-09-07-0310-reviewed-the-tonoman-cloud-demo-plan.md");
+  });
+
+  it("uses the bare stamp when there is nothing to name it after at all", () => {
+    const rec = { id: "1", title: "2026-09-06 23:10:46", startTime: 0, duration: 0, stamp: "2026-09-07-0310" };
+    const j = { path: "MJ", fallback: "unclassified", routes: [] };
+    expect(pathsFor(j, rec, "unclassified", "").page).toBe("MJ/unclassified/2026-09-07-0310.md");
   });
 });

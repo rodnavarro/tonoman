@@ -324,10 +324,20 @@ export interface Journal {
   routes: { id: string; when: string }[];
 }
 
+/** PURE: is this title just a timestamp?
+ *
+ *  Plaud names an untitled recording after its own clock — "2026-09-06 23:10:46". Slugged, that
+ *  produced `2026-09-07-0310-2026-09-06-23-10-46.md`: the date twice, in two formats, and nothing
+ *  a person could recognise in a folder listing. A knowledge base is searched by name. */
+export function isTimestampTitle(title: string): boolean {
+  return /^\s*\d{4}[-/]\d{2}[-/]\d{2}[\sT_-]*\d{2}[:.-]?\d{2}([:.-]?\d{2})?\s*$/.test(title || "");
+}
+
 /** PURE: a filename-safe slug from a meeting title, matching the vault's existing convention
  *  (`2026-07-03-1819-jobs-and-gates-reflect`). Empty when the title yields nothing usable, so the
  *  caller falls back to the bare stamp rather than writing a file called "-.md". */
 export function slugFor(title: string): string {
+  if (isTimestampTitle(title)) return "";
   return (title || "")
     .normalize("NFKD")
     .replace(/[̀-ͯ]/g, "")
@@ -354,11 +364,25 @@ export function resolveRoute(journal: Journal | undefined, proposed: string | un
 }
 
 /** PURE: where a recording's page and its folder live, given the journal (or the flat default). */
-export function pathsFor(journal: Journal | undefined, rec: Recording, route: string): { page: string; folder: string } {
-  const slug = slugFor(rec.title);
+export function pathsFor(
+  journal: Journal | undefined,
+  rec: Recording,
+  route: string,
+  slugHint?: string,
+): { page: string; folder: string } {
+  // The recording's own title first; when Plaud only gave it a timestamp, a few words from what the
+  // meeting was actually about. Naming it after the clock twice helps nobody find it later.
+  const slug = slugFor(rec.title) || slugFor(slugHint ?? "");
   const name = slug ? `${rec.stamp}-${slug}` : rec.stamp;
-  if (!journal) return { page: path.join("Meetings", `${rec.stamp}.md`), folder: path.join("Meetings", rec.stamp) };
-  return { page: path.join(journal.path, route, `${name}.md`), folder: path.join(journal.path, route, name) };
+  // posix.join, not join: these are paths INSIDE a git repository, and a backslash would be a
+  // literal character in a filename rather than a separator the moment anyone runs this on Windows.
+  if (!journal) {
+    return { page: path.posix.join("Meetings", `${rec.stamp}.md`), folder: path.posix.join("Meetings", rec.stamp) };
+  }
+  return {
+    page: path.posix.join(journal.path, route, `${name}.md`),
+    folder: path.posix.join(journal.path, route, name),
+  };
 }
 
 export async function summarize(
@@ -477,7 +501,7 @@ export async function publish(
   journal?: Journal,
 ): Promise<boolean> {
   const route = resolveRoute(journal, recap.route);
-  const where = pathsFor(journal, rec, route);
+  const where = pathsFor(journal, rec, route, recap.highlights?.[0] ?? recap.summary);
   const dir = path.join(brainDir, where.folder);
   await fs.mkdir(dir, { recursive: true });
   await fs.writeFile(path.join(brainDir, where.page), overviewMarkdown(rec, { ...recap, route }, where.folder), "utf8");
