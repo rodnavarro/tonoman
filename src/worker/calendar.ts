@@ -362,3 +362,87 @@ export function fetchIcs(url: string, timeoutMs = 20_000): Promise<string> {
     req.on("error", (e) => reject(new Error(`calendar feed failed: ${e.message}`)));
   });
 }
+
+
+// --- Proving a feed is the RIGHT feed ------------------------------------------------------------
+
+/** How far ahead to look when checking a feed. Long enough that a calendar with only a weekly
+ *  meeting on it still shows something, short enough that the answer means "current". */
+const PROBE_DAYS = 30;
+
+/** What a person is told after attaching a calendar. */
+export interface FeedHealth {
+  ok: boolean;
+  /** Events found in the probe window. Zero is suspicious, not fatal — see `warning`. */
+  events: number;
+  /** The soonest one. This is the field that actually proves anything: a count says a calendar was
+   *  reached, a NAME says it is the calendar they meant. */
+  next?: { summary: string; start: number };
+  /** Set when the feed answered but the answer is not reassuring. */
+  warning?: string;
+  /** Set when it did not work at all. Written for the person who pasted the link. */
+  problem?: string;
+}
+
+/**
+ * Fetch a feed and say something a human can judge.
+ *
+ * The point is NOT "did an HTTP request succeed". A wrong-but-valid calendar, an empty one, and a
+ * revoked share link that now serves a sign-in page all return happily at the transport level and
+ * then quietly match nothing forever. The recap keeps getting filed, just never with a meeting
+ * name, and there is nothing to notice.
+ *
+ * So this reports the next meeting BY NAME. A count proves a calendar was reached; a name is the
+ * only thing that proves it is the right one.
+ */
+export async function checkIcs(
+  url: string,
+  now: number = Date.now(),
+  fetcher: (u: string) => Promise<string> = fetchIcs,
+): Promise<FeedHealth> {
+  let body: string;
+  try {
+    body = await fetcher(url);
+  } catch (e) {
+    return { ok: false, events: 0, problem: (e as Error).message };
+  }
+
+  // A published link that has been revoked or needs re-publishing serves a sign-in PAGE, with a
+  // cheerful 200. Saying "that link returns a web page, not a calendar" points at the actual
+  // problem; "0 events" would send somebody to look at their calendar instead of their link.
+  if (!/BEGIN:VCALENDAR/i.test(body)) {
+    return {
+      ok: false,
+      events: 0,
+      problem:
+        "that link returned a web page rather than a calendar — the share link may have been revoked, or need re-publishing",
+    };
+  }
+
+  const to = now + PROBE_DAYS * 24 * 60 * 60 * 1000;
+  const events = eventsBetween(body, now, to, { kind: "ics", alias: "probe" });
+  if (events.length === 0) {
+    // Reachable and real, but nothing to match against. Usually the wrong calendar, occasionally a
+    // genuinely empty month — so a warning rather than a refusal.
+    return {
+      ok: true,
+      events: 0,
+      warning: `no events in the next ${PROBE_DAYS} days — is this the calendar you meant?`,
+    };
+  }
+  const soonest = events.reduce((a, b) => (a.start <= b.start ? a : b));
+  return { ok: true, events: events.length, next: { summary: soonest.summary, start: soonest.start } };
+}
+
+/** PURE: how the health reads in a channel.
+ *
+ *  Deliberately concrete. "Connected." tells somebody nothing they can check; naming the next
+ *  meeting lets them recognise their own calendar at a glance, which is the whole point of doing a
+ *  check rather than just saving the URL. */
+export function healthLine(name: string, h: FeedHealth): string {
+  if (!h.ok) return `Could not read *${name}*: ${h.problem}`;
+  if (h.events === 0) return `Connected *${name}*, but ${h.warning}`;
+  const when = h.next ? new Date(h.next.start).toISOString().replace("T", " ").slice(0, 16) : "";
+  const next = h.next ? ` Next up: *${h.next.summary}* at ${when} UTC.` : "";
+  return `Connected *${name}* — ${h.events} event${h.events === 1 ? "" : "s"} in the next ${PROBE_DAYS} days.${next}`;
+}

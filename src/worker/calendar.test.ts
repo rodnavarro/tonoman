@@ -1,9 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
   candidatesFor,
+  checkIcs,
   describe as describeEvent,
   eventsBetween,
   excluded,
+  healthLine,
   isCancelled,
   overlaps,
   windowFor,
@@ -378,5 +380,89 @@ describe("describe — what a person reads is what the model read", () => {
     expect(line).toContain("ics/foley");
     expect(line).toContain("Rod Navarro");
     expect(line).toContain("Teams");
+  });
+});
+
+
+describe("checkIcs — proving it is the RIGHT calendar, not just A calendar", () => {
+  const NOW = Date.parse("2026-09-07T00:00:00Z");
+
+  const feed = (...v: string[]) => async () => ics(...v);
+
+  it("names the next meeting, because a count proves nothing", () => {
+    // A wrong-but-valid calendar returns a happy count. Only a NAME lets somebody recognise their
+    // own calendar, which is the entire reason for checking rather than just saving the URL.
+    return checkIcs(
+      "https://example.test/c.ics",
+      NOW,
+      feed(
+        vevent({ UID: "1@x", SUMMARY: "API Team Standup", DTSTART: "20260908T140000Z", DTEND: "20260908T143000Z" }),
+        vevent({ UID: "2@x", SUMMARY: "Later thing", DTSTART: "20260915T140000Z", DTEND: "20260915T150000Z" }),
+      ),
+    ).then((h) => {
+      expect(h.ok).toBe(true);
+      expect(h.events).toBe(2);
+      expect(h.next?.summary).toBe("API Team Standup");
+    });
+  });
+
+  it("calls a revoked share link what it is, rather than reporting zero events", async () => {
+    // A revoked or unpublished link serves a SIGN-IN PAGE with a cheerful 200. "0 events" would
+    // send somebody to stare at their calendar; naming the real problem sends them to the link.
+    const h = await checkIcs("https://example.test/c.ics", NOW, async () => "<html>Sign in</html>");
+    expect(h.ok).toBe(false);
+    expect(h.problem).toMatch(/web page/i);
+  });
+
+  it("warns rather than refuses when a real calendar is simply empty", async () => {
+    // Usually the wrong calendar; occasionally a genuinely quiet month. Not grounds for refusing
+    // to save it, but absolutely grounds for saying so.
+    const h = await checkIcs("https://example.test/c.ics", NOW, feed());
+    expect(h.ok).toBe(true);
+    expect(h.events).toBe(0);
+    expect(h.warning).toMatch(/is this the calendar you meant/i);
+  });
+
+  it("reports a transport failure without swallowing it", async () => {
+    const h = await checkIcs("https://example.test/c.ics", NOW, async () => {
+      throw new Error("calendar feed returned HTTP 404");
+    });
+    expect(h.ok).toBe(false);
+    expect(h.problem).toContain("404");
+  });
+
+  it("ignores events already past, so a dead calendar cannot look alive", async () => {
+    const h = await checkIcs(
+      "https://example.test/c.ics",
+      NOW,
+      feed(vevent({ UID: "old@x", SUMMARY: "Last year", DTSTART: "20250908T140000Z", DTEND: "20250908T150000Z" })),
+    );
+    expect(h.events).toBe(0);
+  });
+});
+
+describe("healthLine — something a person can actually check", () => {
+  it("names the calendar and the next meeting on it", () => {
+    const line = healthLine("Foley Outlook ICS", {
+      ok: true,
+      events: 12,
+      next: { summary: "API Team Standup", start: Date.parse("2026-09-08T14:00:00Z") },
+    });
+    expect(line).toContain("Foley Outlook ICS");
+    expect(line).toContain("12 events");
+    expect(line).toContain("API Team Standup");
+  });
+
+  it("says one event, not 1 events", () => {
+    expect(healthLine("X", { ok: true, events: 1, next: { summary: "S", start: 0 } })).toContain("1 event in");
+  });
+
+  it("leads with the failure when it failed", () => {
+    expect(healthLine("X", { ok: false, events: 0, problem: "HTTP 404" })).toMatch(/^Could not read/);
+  });
+
+  it("does not claim success outright when the calendar is empty", () => {
+    const line = healthLine("X", { ok: true, events: 0, warning: "no events in the next 30 days — is this right?" });
+    expect(line).toContain("but");
   });
 });
