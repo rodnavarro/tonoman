@@ -14,6 +14,7 @@
 //   2. Slack rotates the socket every ~10-60 minutes and warns first (`disconnect`). We treat that
 //      as ordinary, not an error: reconnect and keep yielding from the same iterator.
 
+import { toMrkdwn } from "./mrkdwn";
 import type { Connector, Envelope, Reply } from "../core/contracts";
 
 export interface SlackOptions {
@@ -388,7 +389,9 @@ class SlackReply implements Reply {
   async send(text: string): Promise<string> {
     const res = await this.c.call<{ ts?: string }>("chat.postMessage", {
       channel: this.target.channel,
-      text: text || "…",
+      // Slack speaks mrkdwn, not markdown. Converting here rather than at each call site means
+      // every outbound path — answers, notices, the work log — is translated exactly once.
+      text: toMrkdwn(text) || "…",
       // Stay in the thread we were addressed in; a top-level mention answers top-level.
       ...(this.target.threadTs ? { thread_ts: this.target.threadTs } : {}),
       unfurl_links: false,
@@ -408,7 +411,7 @@ class SlackReply implements Reply {
   private async edit(msgID: string, text: string): Promise<void> {
     if (!msgID) return;
     try {
-      await this.c.call("chat.update", { channel: this.target.channel, ts: msgID, text: text || "…" });
+      await this.c.call("chat.update", { channel: this.target.channel, ts: msgID, text: toMrkdwn(text) || "…" });
     } catch (e) {
       // Slack rejects an edit that changes nothing, and rate-limits a fast stream. Neither is
       // worth failing a turn over — the next update carries the same text forward.

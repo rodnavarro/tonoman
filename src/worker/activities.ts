@@ -85,6 +85,12 @@ const EDIT_INTERVAL_MS = 1200;
  *  straight from the model in two seconds leaves no trace, and only real work gets narrated. */
 const TICK_MS = 2500;
 
+/** The work log's cadence while the ANSWER is streaming. Slower, because the answer's own message
+ *  is being edited on EDIT_INTERVAL_MS at the same time and they share one per-channel budget. The
+ *  clock stepping every five seconds still reads as running; two writers at one second each does
+ *  not read at all, because one of them gets a 429. */
+const ANSWERING_TICK_MS = 5000;
+
 export function makeActivities(deps: TurnDeps) {
   return {
     async runTurn(input: TurnInput): Promise<void> {
@@ -133,14 +139,19 @@ export function makeActivities(deps: TurnDeps) {
       let lastTick = 0;
       const tick = async (): Promise<void> => {
         if (done || ctx.cancellationSignal.aborted) return;
-        // Once the answer is streaming, the answer IS the progress. Freezing the log here also
-        // keeps it above the reply: a note posted after the answer's message would read below it.
-        if (answer || posting) return;
+        if (posting) return;
+        // Once the answer is streaming, do not CREATE a note: it would post below the reply and
+        // read as a footnote. But an EXISTING one keeps ticking — freezing it is what made the
+        // clock sit at "2s" for a whole answer and then land on "Moonwalked for 14 seconds", which
+        // reads as a jump rather than as time passing.
+        if (answer && !noteId) return;
         // Tool events call this directly, so the timer is not the only rate limiter. Each tick is
         // a message edit AND a status set; ten tool calls in two seconds would be twenty Slack
-        // calls, which is the burst TICK_MS exists to avoid.
+        // calls, which is the burst TICK_MS exists to avoid. While the answer is streaming it is
+        // ALSO editing its own message roughly every second, so the log backs off to share the
+        // channel's budget rather than race it.
         const now = Date.now();
-        if (now - lastTick < EDIT_INTERVAL_MS) return;
+        if (now - lastTick < (answer ? ANSWERING_TICK_MS : EDIT_INTERVAL_MS)) return;
         lastTick = now;
         posting = true;
         try {
