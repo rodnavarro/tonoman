@@ -41,6 +41,10 @@ export interface VoiceConfig {
   pushUrl: string;
   groqKey: string;
   vocab: string;
+  /** Epoch ms before which a recording is none of our business. Without it the first poll
+   *  backfills the customer's entire Plaud history and announces each one as if it had just
+   *  happened. */
+  floorMs: number;
 }
 
 export interface TurnRunReq {
@@ -251,7 +255,7 @@ export function makeActivities(deps: TurnDeps) {
       const v = deps.voice?.(input.agent);
       if (!v) return [];
       const all = await recap.listRecordings(v.creds, 20);
-      const fresh = await recap.unpublished(all, v.brainDir);
+      const fresh = await recap.unpublished(all, v.brainDir, v.floorMs);
       return fresh.map((r) => ({
         id: r.id,
         title: r.title,
@@ -273,6 +277,13 @@ export function makeActivities(deps: TurnDeps) {
       const all = await recap.listRecordings(v.creds, 50);
       const rec = all.find((r) => r.id === input.id);
       if (!rec) throw new Error(`recording ${input.id} is no longer listed`);
+      // Checked again here, not only at selection: a workflow run that queued a list of recordings
+      // before the floor existed would otherwise keep working through it across a redeploy, which
+      // is the difference between "fixed" and "fixed for the next poll".
+      if (rec.startTime < v.floorMs) {
+        console.log(`recap: skipping ${rec.title} — before the floor`);
+        return;
+      }
 
       ctx.heartbeat("transcribing");
       // Per chunk, not per recording: a long meeting is many uploads, and a heartbeat only at the

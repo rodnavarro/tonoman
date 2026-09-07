@@ -100,14 +100,39 @@ export async function listRecordings(creds: PlaudCreds, limit = 20): Promise<Rec
   });
 }
 
-/** Which of these have NOT been published yet.
+/** PURE: the floor, as epoch ms. Recordings that started before it are not ours to process.
  *
- *  Answered from the second-brain checkout rather than a database table: the repository is the
- *  record, so "is it published" is a question about the repository. It also means a recap deleted
- *  by hand is reprocessed, which is the behaviour somebody deleting it would expect. */
-export async function unpublished(recordings: Recording[], brainDir: string): Promise<Recording[]> {
+ *  This is NOT an optimisation. "Not in the second brain" and "should be transcribed" are different
+ *  questions, and treating them as one turns the first poll into a backfill of the customer's
+ *  entire Plaud history — every recording transcribed, summarised, committed, and ANNOUNCED in
+ *  Slack as if it had just happened. Which is exactly what it did: a 48-minute meeting from nine
+ *  days ago arrived as "I've got a new recording".
+ *
+ *  `since` is an explicit ISO date when the operator sets one. Absent that the floor is the start
+ *  of the day the worker booted, in the operator's timezone — "from today onwards", which is what
+ *  somebody switching the feature on means by it. */
+export function floorFor(since: string | undefined, now: number, tzOffsetMinutes = 0): number {
+  if (since) {
+    const t = Date.parse(since.length === 10 ? `${since}T00:00:00Z` : since);
+    if (!Number.isNaN(t)) return t - tzOffsetMinutes * 60_000;
+  }
+  // `tzOffsetMinutes` is minutes EAST of UTC (US Eastern in summer is -240), so local wall-clock
+  // time is `now + offset` and turning a local midnight back into an instant subtracts it again.
+  const local = new Date(now + tzOffsetMinutes * 60_000);
+  const midnight = Date.UTC(local.getUTCFullYear(), local.getUTCMonth(), local.getUTCDate());
+  return midnight - tzOffsetMinutes * 60_000;
+}
+
+/** Which of these are new enough to process and have NOT been published yet.
+ *
+ *  Publication is answered from the second-brain checkout rather than a database table: the
+ *  repository is the record, so "is it published" is a question about the repository. It also means
+ *  a recap deleted by hand is reprocessed, which is what somebody deleting it would expect — and
+ *  the floor is what keeps that from meaning "reprocess nine days of history". */
+export async function unpublished(recordings: Recording[], brainDir: string, floorMs = 0): Promise<Recording[]> {
   const out: Recording[] = [];
   for (const r of recordings) {
+    if (r.startTime < floorMs) continue;
     const exists = await fs
       .stat(path.join(brainDir, "Meetings", `${r.stamp}.md`))
       .then(() => true)

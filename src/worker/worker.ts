@@ -30,6 +30,7 @@ import {
 import { httpAuthOps } from "../authflow";
 import * as gate from "./authgate";
 import * as secondbrain from "./secondbrain";
+import * as recapFloor from "./recap";
 import { serveWake } from "./wake";
 import { promises as fsp } from "node:fs";
 import { defaultHarnesses } from "../gateway";
@@ -200,6 +201,13 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
       console.log(`worker: ${name} has no voice flow (needs PLAUD_TOKEN_FILE, GROQ_API_KEY and a second-brain source)`);
       continue;
     }
+    // How far back the poll may reach. "Not in the second brain" is NOT the same question as
+    // "should be transcribed": without a floor the first poll backfills the customer's entire
+    // Plaud history and announces each old meeting in Slack as if it had just happened.
+    // Unset means "from today onwards" in the pod's own timezone, which is what switching the
+    // feature on is meant to mean.
+    const tzOffset = -new Date().getTimezoneOffset();
+    const floorMs = recapFloor.floorFor(process.env.VOICE_SINCE, Date.now(), tzOffset);
     const token = await resolveRef(src.secret_ref);
     const pushUrl = token ? src.repo_url.replace("https://", `https://x-access-token:${token}@`) : src.repo_url;
     const dir = path.join(process.env.TONOMAN_STATE_ROOT ?? "/root/.tonoman", "secondbrain", name, src.id);
@@ -208,11 +216,14 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
       brainDir: src.subpath ? path.join(dir, src.subpath) : dir,
       pushUrl,
       groqKey,
+      floorMs,
       vocab:
         process.env.GROQ_PROMPT ??
         "Tonoman, Tonoman Cloud, Plaud, Murphy Business Sales, Celine, Rod Navarro, Axiplex, agentic AI, Slack, Temporal.",
     });
-    console.log(`worker: ${name} voice flow ready (brain at ${dir})`);
+    console.log(
+      `worker: ${name} voice flow ready (brain at ${dir}; only recordings from ${new Date(floorMs).toISOString()} onwards)`,
+    );
   }
 
   // --- the status bar -------------------------------------------------------------------------
