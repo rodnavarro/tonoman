@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { floorFor, isTimestampTitle, joinChunks, overviewMarkdown, pathsFor, redact, slugFor, stampFor, titleFor } from "./recap";
+import { calendarSection, floorFor, isTimestampTitle, joinChunks, overviewMarkdown, pathsFor, redact, resolveMeeting, slugFor, stampFor, titleFor } from "./recap";
 
 describe("stampFor", () => {
   it("is stable, sortable and unique per minute, so re-processing lands on the same path", () => {
@@ -110,5 +110,124 @@ describe("naming a recording", () => {
     const rec = { id: "1", title: "2026-09-06 23:10:46", startTime: 0, duration: 0, stamp: "2026-09-07-0310" };
     const j = { path: "MJ", fallback: "unclassified", routes: [] };
     expect(pathsFor(j, rec, "unclassified", "").page).toBe("MJ/unclassified/2026-09-07-0310.md");
+  });
+});
+
+
+// --- The calendar match -------------------------------------------------------------------------
+
+const ev = (summary: string, from: string, to: string, attendees: string[] = []) => ({
+  summary,
+  start: Date.parse(from),
+  end: Date.parse(to),
+  attendees,
+  attendeeEmails: [],
+  uid: "",
+  location: "",
+  source: { kind: "ics", alias: "foley" },
+});
+
+const CANDIDATES = [
+  ev("API Team Standup", "2026-09-07T14:00:00Z", "2026-09-07T14:30:00Z", ["Rod Navarro"]),
+  ev("Entity Sync Touch Base", "2026-09-07T14:15:00Z", "2026-09-07T15:00:00Z"),
+];
+
+describe("resolveMeeting — a closed set, because a wrong name looks right", () => {
+  it("accepts a name the model was actually shown", () => {
+    expect(resolveMeeting(CANDIDATES, "API Team Standup")?.summary).toBe("API Team Standup");
+  });
+
+  it("is tolerant of case and surrounding whitespace", () => {
+    expect(resolveMeeting(CANDIDATES, "  api team standup ")?.summary).toBe("API Team Standup");
+  });
+
+  it("REFUSES a plausible name that was not among the candidates", () => {
+    // The failure this exists to stop. Unlike a wrong route — which lands in a folder somebody
+    // reviews — a hallucinated meeting name puts a confident, wrong title on the page and files
+    // the recording into a series it does not belong to. It looks entirely correct.
+    expect(resolveMeeting(CANDIDATES, "API Team Sync")).toBeUndefined();
+    expect(resolveMeeting(CANDIDATES, "Weekly Standup")).toBeUndefined();
+  });
+
+  it("treats no answer as no match, which is the common case", () => {
+    // Most recordings are not on anybody's calendar.
+    expect(resolveMeeting(CANDIDATES, "")).toBeUndefined();
+    expect(resolveMeeting(CANDIDATES, undefined)).toBeUndefined();
+    expect(resolveMeeting([], "API Team Standup")).toBeUndefined();
+  });
+});
+
+describe("calendarSection — what it chose between, not just what it chose", () => {
+  const recap = {
+    summary: "s",
+    highlights: [],
+    decisions: [],
+    followups: [],
+    meeting: "API Team Standup",
+    meetingReason: "the transcript opens with the standup round-robin",
+  };
+
+  it("marks the winner and still lists the ones it passed over", () => {
+    // "Why is this filed under the wrong meeting" is unanswerable from a page that shows only the
+    // winner, and a bad calendar match fails quietly — plausible title, deliberate-looking folder.
+    const md = calendarSection(recap, CANDIDATES);
+    expect(md).toContain("**→**");
+    expect(md).toContain("API Team Standup");
+    expect(md).toContain("Entity Sync Touch Base");
+    expect(md).toContain("the transcript opens with the standup round-robin");
+  });
+
+  it("says plainly that nothing matched rather than looking broken", () => {
+    const md = calendarSection({ ...recap, meeting: "", meetingReason: "" }, CANDIDATES);
+    expect(md).toContain("No calendar entry matched");
+  });
+
+  it("names which calendar each candidate came from", () => {
+    expect(calendarSection(recap, CANDIDATES)).toContain("ics/foley");
+  });
+
+  it("is empty when no calendar is connected, so the page is what it is today", () => {
+    expect(calendarSection(recap, [])).toBe("");
+  });
+});
+
+describe("overviewMarkdown with a calendar", () => {
+  const rec = {
+    id: "r1",
+    title: "API Team Standup",
+    startTime: Date.parse("2026-09-07T14:00:00Z"),
+    duration: 1_800_000,
+    stamp: "2026-09-07-1400",
+  };
+  const recap = {
+    summary: "s",
+    highlights: [],
+    decisions: [],
+    followups: [],
+    meeting: "API Team Standup",
+  };
+
+  it("puts the meeting in frontmatter, so a series is queryable from the vault", () => {
+    // "Every API Team Standup" is the question a knowledge base exists to answer, and it cannot be
+    // asked of prose.
+    expect(overviewMarkdown(rec, recap, undefined, CANDIDATES)).toContain('meeting: "API Team Standup"');
+  });
+
+  it("omits the meeting and the section entirely when there is no calendar", () => {
+    const md = overviewMarkdown(rec, { summary: "s", highlights: [], decisions: [], followups: [] });
+    expect(md).not.toContain("meeting:");
+    expect(md).not.toContain("## Calendar");
+  });
+});
+
+describe("pathsFor — a matched meeting names the file", () => {
+  it("uses the meeting name when Plaud only gave a timestamp", () => {
+    // The whole parity win, and it reuses the hint that already existed for exactly this: Plaud
+    // names an untitled recording after its own clock, which helps nobody find it later.
+    const rec = { id: "1", title: "2026-09-06 23:10:46", startTime: 0, duration: 0, stamp: "2026-09-07-0310" };
+    const j = { path: "MJ", fallback: "unclassified", routes: [] };
+    expect(pathsFor(j, rec, "foley", "API Team Standup").page).toBe(
+      "MJ/foley/2026-09-07-0310-api-team-standup.md",
+    );
   });
 });

@@ -25,6 +25,7 @@ function run(cmd: string, args: string[], opts: { cwd?: string; env?: NodeJS.Pro
 }
 
 import * as plaudapi from "./plaudapi";
+import type { CalEvent } from "./calendar";
 
 export interface PlaudCreds {
   /** The captured web token, as JSON — bearer plus the app headers the API insists on.
@@ -325,6 +326,12 @@ export interface Recap {
   route?: string;
   /** One line on WHY, so a misfiling is auditable and correctable rather than mysterious. */
   routeReason?: string;
+  /** Which calendar entry this recording was, when one matched. The event's own summary — so a
+   *  recurring meeting is named the same way every week, which is what makes a series findable. */
+  meeting?: string;
+  /** Why that entry and not another. The Overview shows it beside every candidate considered,
+   *  because "why is this filed under the wrong meeting" is otherwise unanswerable. */
+  meetingReason?: string;
 }
 
 /** Where meetings are filed, as configuration rather than code.
@@ -383,6 +390,21 @@ export function resolveRoute(journal: Journal | undefined, proposed: string | un
   return hit ? hit.id : journal.fallback;
 }
 
+/** PURE: the calendar entry to actually claim.
+ *
+ *  A CLOSED set, for the same reason `resolveRoute` is one: the model may only choose from what it
+ *  was shown. A name it invented or half-remembered would put a confident, wrong meeting title on
+ *  the page and file the recording into a series it does not belong to — and unlike a wrong route,
+ *  which lands somewhere a person reviews, a wrong meeting name looks entirely correct.
+ *
+ *  Empty is a legitimate answer and the common one: people record things that are not on anybody's
+ *  calendar. */
+export function resolveMeeting(candidates: CalEvent[], proposed: string | undefined): CalEvent | undefined {
+  const want = (proposed ?? "").trim().toLowerCase();
+  if (!want) return undefined;
+  return candidates.find((c) => c.summary.trim().toLowerCase() === want);
+}
+
 /** PURE: where a recording's page and its folder live, given the journal (or the flat default). */
 export function pathsFor(
   journal: Journal | undefined,
@@ -410,6 +432,7 @@ export async function summarize(
   title: string,
   groqKey: string,
   journal?: Journal,
+  candidates: CalEvent[] = [],
 ): Promise<Recap> {
   // Checked against /v1/models rather than assumed — the obvious llama name is not on this account.
   const model = process.env.GROQ_TEXT_MODEL || "openai/gpt-oss-120b";
@@ -425,6 +448,27 @@ export async function summarize(
         `Add "route" (one of the ids above) and "routeReason" (one short sentence) to the JSON.`,
       ].join(" ")
     : "";
+  // Which calendar entry this was rides the same call, for the same reason routing does — the
+  // transcript is already here and already paid for.
+  //
+  // CONTENT decides, not time. Two meetings overlap, a recording starts in the gap between them,
+  // and the only thing that knows which one this was is what people actually said. Picking the
+  // nearest start time is what the old pipeline did first and had to undo.
+  const calendaring = candidates.length
+    ? [
+        "A calendar shows these entries around the time of this recording.",
+        "Decide which ONE the recording actually is:",
+        candidates
+          .map(
+            (c, i) =>
+              `${i + 1}. "${c.summary}"${c.attendees.length ? ` — with ${c.attendees.slice(0, 6).join(", ")}` : ""}`,
+          )
+          .join(" | "),
+        'Add "meeting" to the JSON: the chosen entry\'s text EXACTLY as written above, or "" if the transcript does not clearly match any of them.',
+        '"" is a correct and common answer — people record things that are not on a calendar, and a wrong match renames the meeting and files it into a series it does not belong to.',
+        'Also add "meetingReason": one short sentence naming what in the transcript decided it.',
+      ].join(" ")
+    : "";
   const system = [
     "You summarise a recorded business meeting for a searchable knowledge base.",
     "Be specific and factual. Never invent a name, number, decision or commitment.",
@@ -432,6 +476,7 @@ export async function summarize(
     'Reply with STRICT JSON only: {"summary": string, "highlights": string[], "decisions": string[], "followups": string[]}.',
     "summary: 2-4 sentences. highlights: at most 5, each one line. decisions/followups may be empty.",
     routing,
+    calendaring,
   ]
     .filter(Boolean)
     .join(" ");
@@ -456,13 +501,55 @@ export async function summarize(
 const bullets = (xs: string[] | undefined, empty: string): string =>
   xs?.length ? xs.map((x) => `- ${x}`).join("\n") : `_${empty}_`;
 
+/** PURE: `14:00–14:30` in UTC, for the candidate list. Short because the date is already at the
+ *  top of the page, and the only question the reader has here is which slot. */
+const span = (a: number, b: number): string => {
+  const hm = (t: number): string => new Date(t).toISOString().slice(11, 16);
+  return `${hm(a)}–${hm(b)}`;
+};
+
+/** PURE: the Calendar section — the match, and everything it was chosen from.
+ *
+ *  Showing the REJECTED candidates is the point, not padding. "Why is this filed under the wrong
+ *  meeting" is unanswerable from a page that shows only the winner, and a calendar match that goes
+ *  wrong goes wrong quietly: the title looks plausible and the folder looks deliberate. Listing
+ *  what the model saw turns that into something a person can correct in one glance.
+ *
+ *  Empty string when no calendar is connected, so the page is exactly what it is today. */
+export function calendarSection(recap: Recap, candidates: CalEvent[]): string {
+  if (!candidates.length) return "";
+  const chosen = (recap.meeting ?? "").trim().toLowerCase();
+  const lines = candidates.map((c) => {
+    const mark = c.summary.trim().toLowerCase() === chosen ? "**→**" : "·";
+    const who = c.attendees.length ? ` — ${c.attendees.slice(0, 4).join(", ")}` : "";
+    return `${mark} \`${span(c.start, c.end)}\` ${c.summary}${who}  <sub>${c.source.kind}/${c.source.alias}</sub>`;
+  });
+  const verdict = recap.meeting
+    ? `Matched **${recap.meeting}**${recap.meetingReason ? ` — ${recap.meetingReason}` : ""}`
+    : // Not a failure. Most recordings are not on anybody's calendar, and saying so plainly stops
+      // the absence of a match reading as a bug.
+      `No calendar entry matched${recap.meetingReason ? ` — ${recap.meetingReason}` : ""}.`;
+  return `
+## Calendar
+
+${verdict}
+
+${lines.join("\n")}
+`;
+}
+
 /** PURE: the overview page. Separated from writing it so the layout is testable.
  *
  *  The frontmatter matches the convention already in the vault — `recording_id`, `source`,
  *  `datetime`, `title`, `route` — rather than inventing a second one alongside it. `route` in
  *  particular already existed and was always "unclassified"; filling it in is the whole point, and
  *  keeping it in frontmatter means re-filing a meeting is a `git mv` and one edited line. */
-export function overviewMarkdown(rec: Recording, recap: Recap, folder?: string): string {
+export function overviewMarkdown(
+  rec: Recording,
+  recap: Recap,
+  folder?: string,
+  candidates: CalEvent[] = [],
+): string {
   const when = new Date(rec.startTime).toISOString().replace("T", " ").slice(0, 16);
   const transcript = folder ? `${path.posix.basename(folder)}/Transcript.md` : `./${rec.stamp}/Transcript.md`;
   const head = [
@@ -475,6 +562,9 @@ export function overviewMarkdown(rec: Recording, recap: Recap, folder?: string):
     `title: ${JSON.stringify(rec.title)}`,
     ...(recap.route ? [`route: ${recap.route}`] : []),
     ...(recap.routeReason ? [`route_reason: ${JSON.stringify(recap.routeReason)}`] : []),
+    // In frontmatter so the series is queryable from the vault — "every API Team Standup" is the
+    // question a knowledge base exists to answer, and it cannot be asked of prose.
+    ...(recap.meeting ? [`meeting: ${JSON.stringify(recap.meeting)}`] : []),
     "---",
     "",
   ].join("\n");
@@ -499,7 +589,7 @@ ${bullets(recap.decisions, "none recorded")}
 ## Follow-ups
 
 ${bullets(recap.followups, "none recorded")}
-
+${calendarSection(recap, candidates)}
 ---
 
 [Full transcript](${transcript})
