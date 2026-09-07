@@ -330,7 +330,11 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
     // credential is not misconfigured; it is a tenant whose person has not logged in yet, and
     // saying that plainly is the difference between "waiting for Celine" and "broken".
     const tokenJson = await resolveRef(voice.credentialRef);
-    if (!tokenJson) {
+    // Either credential counts. An agent that connected its own account through !connect needs no
+    // mounted secret at all — which is the whole point of the connect flow, and the state every
+    // tenant should end up in.
+    const viaCli = await plaudcli.connected(name);
+    if (!tokenJson && !viaCli) {
       console.log(
         `worker: ${name} voice flow is waiting for a Plaud login` +
           `${voice.credentialRef ? ` (credential ${voice.credentialRef} is empty or unmounted)` : " (no credential_ref row)"}`,
@@ -357,7 +361,10 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
       notifyUser: voice.notifyUser || undefined,
       journal: voice.journal,
       pollSeconds: voice.pollSeconds,
-      creds: { tokenJson },
+      // An agent that has connected its own account through !connect reads from the third-party
+      // API; one that has not is still on the mounted bearer. Per agent, so the two tenants can be
+      // on different halves of this migration at the same time.
+      creds: { tokenJson, cliAgent: viaCli ? name : undefined },
       brainDir: src.subpath ? path.join(dir, src.subpath) : dir,
       pushUrl,
       groqKey,
@@ -367,7 +374,11 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
         "Tonoman, Tonoman Cloud, Plaud, Murphy Business Sales, Celine, Rod Navarro, Axiplex, agentic AI, Slack, Temporal.",
     });
     console.log(
-      `worker: ${name} voice flow ready — ${describeVoice(voice)}; ` +
+      // A connected account IS a credential, so the line must not still read "waiting for a login"
+      // for an agent that is about to start polling. A flow reporting the opposite of what it is
+      // doing is the failure mode this whole boot line exists to prevent.
+      `worker: ${name} voice flow ready — ${describeVoice(viaCli ? { ...voice, credentialRef: `plaud-cli:${name}` } : voice)}` +
+        `${viaCli ? " [connected account]" : ""}; ` +
         `brain at ${dir}; only recordings from ${new Date(floorMs).toISOString()} onwards`,
     );
   }

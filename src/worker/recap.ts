@@ -24,6 +24,8 @@ function run(cmd: string, args: string[], opts: { cwd?: string; env?: NodeJS.Pro
   );
 }
 
+import * as plaudapi from "./plaudapi";
+
 export interface PlaudCreds {
   /** The captured web token, as JSON — bearer plus the app headers the API insists on.
    *
@@ -31,6 +33,14 @@ export interface PlaudCreds {
    *  has agents for, so a path meant one Plaud account for all of them. Whose account this is has
    *  to be a property of the agent, and the only thing the agent knows is a secret reference. */
   tokenJson: string;
+  /** When set, this agent has connected its own Plaud account through the official CLI, and the
+   *  recordings come from the third-party API rather than the captured web bearer.
+   *
+   *  Both shapes exist on purpose and only for now: one tenant is on OAuth tokens that renew
+   *  themselves, the other is still on a bearer that expires every 24 hours, and moving them both
+   *  in one step would have meant no working pipeline at all while it was tried. The bearer path
+   *  goes when the second tenant has connected. */
+  cliAgent?: string;
 }
 
 export interface Recording {
@@ -85,6 +95,7 @@ async function plaudGet<T>(creds: PlaudCreds, p: string, params?: Record<string,
 }
 
 export async function listRecordings(creds: PlaudCreds, limit = 20): Promise<Recording[]> {
+  if (creds.cliAgent) return plaudapi.list(creds.cliAgent, limit);
   const j = await plaudGet<{ data_file_list?: Record<string, unknown>[] }>(creds, "/file/simple/web", {
     skip: 0,
     limit,
@@ -275,8 +286,13 @@ export async function transcribe(
   onProgress?: (done: number, total: number) => void,
 ): Promise<TranscribeResult> {
   const t0 = Date.now();
-  const { temp_url } = await plaudGet<{ temp_url: string }>(creds, `/file/temp-url/${rec.id}`);
-  const audio = Buffer.from(await (await fetch(temp_url)).arrayBuffer());
+  // The audio, and ONLY the audio. Plaud will also hand over its own transcript and summary, and
+  // taking them would put the quality of every recap in somebody else's model, tuned for somebody
+  // else's purpose, with our vocabulary hints discarded. ffmpeg and Groq stay.
+  const tempUrl = creds.cliAgent
+    ? await plaudapi.audioUrl(creds.cliAgent, rec.id)
+    : (await plaudGet<{ temp_url: string }>(creds, `/file/temp-url/${rec.id}`)).temp_url;
+  const audio = Buffer.from(await (await fetch(tempUrl)).arrayBuffer());
 
   // A scratch directory per recording, removed whether or not this succeeds. The audio is the
   // customer's meeting; it has no business outliving the transcription.
