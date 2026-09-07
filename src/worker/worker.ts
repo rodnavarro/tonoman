@@ -23,6 +23,7 @@ import type { Connector, TurnEvent, TurnRunner, TurnUsage } from "../core/contra
 import { SlackConnector } from "../connector/slack";
 import * as cmds from "./commands";
 import * as plaudcli from "./plaudcli";
+import * as claudecode from "../harness/claudecode";
 import * as plaudauth from "./plaudauth";
 import {
   parseStatusMode,
@@ -482,6 +483,17 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
     },
     resetSession: (name, conversation) => void resetSession(name, conversation).catch(() => {}),
     plaudConnected: (name) => plaudcli.connected(name),
+    disconnectClaude: async (name) => {
+      // Removing the credential IS the sign-out: the harness reads it from this directory on every
+      // turn, so a deleted file means the next message finds no login and the connect gate offers
+      // one. Only THIS agent's directory, so signing Nelly out never touches Sapien.
+      const dir = claudecode.configHomeFor(name);
+      await fsp.rm(path.join(dir, ".credentials.json"), { force: true }).catch(() => {});
+      const a = wired.get(name);
+      // So the gate offers a login on the very next message rather than after a restart.
+      if (a) a.cfg.auth_state = "unconfigured";
+      return "🔓 Signed out of Claude. Send me anything and I'll offer you a fresh login.";
+    },
     disconnectPlaud: async (name) => {
       await plaudauth.disconnect(name);
       // The flow keeps its resolved credential until the worker restarts, so say that rather than

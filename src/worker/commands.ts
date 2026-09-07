@@ -59,6 +59,8 @@ export interface CommandDeps {
   connectPlaud?(agent: string, conversation: string): Promise<string>;
   /** Forget this agent's Plaud account and revoke it upstream. */
   disconnectPlaud?(agent: string): Promise<string>;
+  /** Sign this agent out of its Claude subscription. */
+  disconnectClaude?(agent: string): Promise<string>;
   /** Finish a connection with the callback URL the person pasted back. */
   finishPlaud?(agent: string, pasted: string): Promise<string>;
   /** Whether this agent already has a Plaud account connected. */
@@ -72,6 +74,7 @@ const HELP = [
   "• `!model` — which model this conversation runs; `!model <name>` to change it here only",
   "• `!connect plaud` — connect your Plaud account, so I can pick up your recordings",
   "• `!disconnect plaud` — forget it again",
+  "• `!disconnect claude` — sign out of the Claude subscription I answer on",
   "• `!new` — forget this thread and start over",
   "• `!help` — this",
 ].join("\n");
@@ -105,7 +108,7 @@ export function splitConnector(arg: string): { which: string; rest: string } {
 }
 
 function unknownConnector(which: string): string {
-  return `I don't have a "${which}" connector. Today it is just \`plaud\`.`;
+  return `I don't have a "${which}" connector. Today it is \`plaud\` or \`claude\`.`;
 }
 
 /** Runs a command. Returns the text to post, or null when the input was not a command we own —
@@ -140,7 +143,11 @@ export async function run(
     case "disconnect":
     case "logout": {
       const { which } = splitConnector(cmd.arg);
-      if (!which) return "Which one? Right now there is `!disconnect plaud`.";
+      if (!which) return "Which one? `!disconnect plaud` or `!disconnect claude`.";
+      if (which === "claude") {
+        if (!deps.disconnectClaude) return "I have no way to sign out of Claude on this deployment.";
+        return deps.disconnectClaude(agent);
+      }
       if (which !== "plaud") return unknownConnector(which);
       if (!deps.disconnectPlaud) return "I have no way to disconnect an account on this deployment.";
       return deps.disconnectPlaud(agent);
