@@ -20,7 +20,7 @@ import { randomMysticVerb } from "../core/mystic";
 /** How the worker finds an agent's connector and runner. Injected at worker construction so this
  *  module holds no globals and can be unit-tested without Temporal. */
 export interface TurnDeps {
-  agent(name: string): { cfg: AgentConfig; conn: Connector; context?: string; run: (req: TurnRunReq) => AsyncIterable<TurnEvent> } | undefined;
+  agent(name: string): { cfg: AgentConfig; conn: Connector; context?: string; run: (req: TurnRunReq, signal?: AbortSignal) => AsyncIterable<TurnEvent> } | undefined;
   /** What this agent needs to run the voice flow, or undefined if it is not configured for one. */
   voice?(name: string): VoiceConfig | undefined;
   /** Say something verbatim to a person, opening a DM if needed. */
@@ -38,6 +38,20 @@ export interface TurnDeps {
    *  people meant `!model opus` in one thread silently moved everybody else too — which is what
    *  happened the first time two users shared this worker. */
   modelFor?(conversation: string): string | undefined;
+  /** The harness session this conversation continues in, MARKED AS IN USE by the act of asking.
+   *
+   *  Without one, every message is a fresh `claude` run: the agent answers a question perfectly and
+   *  then cannot remember it thirty seconds later ("I don't have anything above this to convert —
+   *  this looks like the start of our conversation"). The window is not re-sent on stdin because
+   *  the harness holds it; only the new message rides in the prompt.
+   *
+   *  Claiming rather than peeking is what keeps `--session-id` to exactly one use per id, which is
+   *  its contract. Every later turn resumes, and the one way that can be wrong — no session on disk
+   *  — is the one case `resetSession` below repairs. */
+  claimSession?(agent: string, conversation: string): { id: string; isNew: boolean };
+  /** Abandon this conversation's session and hand back a fresh one. The resume-miss repair, and
+   *  what `!new` does. */
+  resetSession?(agent: string, conversation: string): { id: string; isNew: boolean };
 }
 
 export interface VoiceConfig {
@@ -77,6 +91,10 @@ export interface TurnRunReq {
   systemPromptFile?: string;
   /** The model for THIS turn. Per conversation, never per process — see `modelFor`. */
   model?: string;
+  /** The harness session to run in, so the agent remembers the rest of the thread. */
+  sessionId?: string;
+  /** true = create it (`--session-id`); false = continue it (`--resume`). */
+  sessionNew?: boolean;
 }
 
 export interface TurnInput {
@@ -117,206 +135,43 @@ const TICK_MS = 2500;
  *  not read at all, because one of them gets a 429. */
 const ANSWERING_TICK_MS = 5000;
 
+/** One turn at a time per conversation.
+ *
+ *  Temporal's default activity cancellation is TRY_CANCEL: when a new message steers a turn, the
+ *  WORKFLOW moves straight on to the next one without waiting for this activity to unwind. With a
+ *  harness session that is not merely untidy — turn N+1 opens `--resume` on the same session file
+ *  that turn N is still writing, and two `claude` processes appending to one transcript is how a
+ *  remembered conversation becomes a corrupted one.
+ *
+ *  Chained rather than rejected, because the second message is a correction the person is waiting
+ *  on, not a duplicate to drop. The wait is short: the steered turn is aborted through the run
+ *  signal, so its child is killed rather than left to finish. */
+export function serializer(): <T>(key: string, fn: () => Promise<T>) => Promise<T> {
+  const tails = new Map<string, Promise<void>>();
+  return <T>(key: string, fn: () => Promise<T>): Promise<T> => {
+    const prev = tails.get(key) ?? Promise.resolve();
+    // `then(fn, fn)` — the next turn runs whether the previous one answered or threw. A failed
+    // turn that wedged the lock would silence the conversation for good.
+    const run = prev.then(fn, fn);
+    const tail = run.then(
+      () => {},
+      () => {},
+    );
+    tails.set(key, tail);
+    void tail.then(() => {
+      if (tails.get(key) === tail) tails.delete(key);
+    });
+    return run;
+  };
+}
+
 export function makeActivities(deps: TurnDeps) {
+  const serialize = serializer();
   return {
     async runTurn(input: TurnInput): Promise<void> {
-      const ctx = Context.current();
-      const found = deps.agent(input.agent);
-      if (!found) throw new Error(`worker: no agent "${input.agent}" in the roster`);
-      const { conn, run } = found;
-
-      const reply: Reply = conn.reply(input.conversation);
-      // One verb for the whole turn, picked before the first cue. Re-picking mid-turn would read
-      // as a different agent taking over the answer.
-      const verb = randomMysticVerb();
-      // The status line IS the immediate cue — "Nelly is thinking…" under the composer. A
-      // placeholder MESSAGE posted alongside it is worse than nothing: it flashes "…" and is then
-      // overwritten, which reads as a glitch. So no message is posted until there is something real
-      // to put in it, and the work log below is a separate note rather than the answer's message.
-      await reply.working?.(worklog.statusFor(undefined, verb)).catch(() => {});
-
-      const started = Date.now();
-      let answer = "";
-      let usage: TurnUsage | undefined;
-      let lastEdit = 0;
-      let done = false;
-      /** Created on first render, not up front. Empty until then. */
-      let msgId = "";
-      const show = async (text: string): Promise<void> => {
-        if (!msgId) msgId = await reply.send(text);
-        else await reply.update(msgId, text);
-      };
-
-      // --- the work log ---------------------------------------------------------------------
-      // Teams parity, and the thing that was missing: which tools ran, and how long the agent has
-      // been at it. It lives in its own note above the answer and is driven by a TIMER rather than
-      // by events — a turn that greps the second brain for ten seconds emits one event, and a line
-      // that does not move is indistinguishable from being stuck.
-      const calls: worklog.ToolCall[] = [];
-      let current: worklog.ToolCall | undefined;
-      let noteId = "";
-      let noteText = "";
-      /** One note write at a time. Without this the FIRST write is still in flight (a post is
-       *  ~300ms) while a second tool event fires a second tick: `noteId` is still empty, so that
-       *  tick posts a SECOND note, and whichever resolves last wins the id — leaving the other
-       *  stranded in the channel forever as "⚙️ Working… 1s". Two tool events inside one post
-       *  latency is not a corner case; it is what any turn that greps the second brain looks like. */
-      let posting = false;
-      let lastTick = 0;
-      const tick = async (): Promise<void> => {
-        if (done || ctx.cancellationSignal.aborted) return;
-        if (posting) return;
-        // Once the answer is streaming, do not CREATE a note: it would post below the reply and
-        // read as a footnote. But an EXISTING one keeps ticking — freezing it is what made the
-        // clock sit at "2s" for a whole answer and then land on "Moonwalked for 14 seconds", which
-        // reads as a jump rather than as time passing.
-        if (answer && !noteId) return;
-        // Tool events call this directly, so the timer is not the only rate limiter. Each tick is
-        // a message edit AND a status set; ten tool calls in two seconds would be twenty Slack
-        // calls, which is the burst TICK_MS exists to avoid. While the answer is streaming it is
-        // ALSO editing its own message roughly every second, so the log backs off to share the
-        // channel's budget rather than race it.
-        const now = Date.now();
-        if (now - lastTick < (answer ? ANSWERING_TICK_MS : EDIT_INTERVAL_MS)) return;
-        lastTick = now;
-        posting = true;
-        try {
-          const elapsed = now - started;
-          const text = worklog.liveNote(calls, elapsed, verb);
-          if (text !== noteText) {
-            noteText = text;
-            noteId = (await reply.note?.(noteId || undefined, text)) ?? "";
-          }
-          await reply.working?.(worklog.statusFor(current, verb)).catch(() => {});
-        } catch {
-          /* a dropped work log must never cost a turn */
-        } finally {
-          posting = false;
-        }
-      };
-      const ticker = setInterval(() => void tick(), TICK_MS);
-      /** Remove the log entirely — for an interrupted turn, whose work nobody will see the result
-       *  of, so a trace of it left on screen is only confusing. */
-      const dropLog = (): void => {
-        clearInterval(ticker);
-        if (noteId) void reply.note?.(noteId, null).catch(() => {});
-      };
-
-      // Temporal cancels the scope when a new message arrives. Leave the partial visible and say
-      // what happened — a reply that silently stops looks like a broken bot.
-      ctx.cancelled.catch(() => {
-        if (done) return;
-        dropLog();
-        void reply.settle?.().catch(() => {});
-        // Only if something was already on screen. An interrupted turn that had not yet said
-        // anything should leave no trace — the correction is about to be answered instead.
-        if (!msgId) return;
-        void reply
-          .finalize(msgId, `${answer.trim()}\n\n_— interrupted; working on your new message_`)
-          .catch(() => {});
-      });
-
-      // What the agent can read, and who is asking. Without the first the second brain is present
-      // on disk but the model has no reason to look at it; without the second "Hi Celine" is a
-      // guess rather than a fact from the registry.
-      // Who is asking, from the registry — never guessed from a display name, which is spoofable.
-      const known = (found.cfg.principals ?? []).find(
-        (p) => p.kind === "slack_user_id" && p.value === input.user,
-      );
-      const parts = [
-        found.context ?? "",
-        known
-          ? `You are speaking with ${known.label}.`
-          : input.user
-            ? `You are speaking with someone you don't recognise (${input.user}); ask who they are before sharing anything specific.`
-            // No sender at all means a system notification, not an unknown person. Treating it as
-            // a stranger made the agent refuse to discuss the meeting it had just been handed.
-            : "This turn was started by the system, not by a person. Write it as a message to the person in this conversation.",
-        input.afterInterruption
-          ? "(your previous answer was interrupted by a new message; continue from what the user now says)"
-          : "",
-        // The runtime is not evidence about the person.
-        //
-        // Asked who it was speaking to, the agent inspected its own environment, found the
-        // operator's account email, and told a customer it looked like a mismatch. It was being
-        // honest — and it was reporting infrastructure as if it were a fact about them. The
-        // platform is the only authority on identity; everything else in this container belongs to
-        // whoever runs the service.
-        "You are running on shared platform infrastructure. Its account, credentials, environment " +
-          "and file paths say nothing about who you are talking to, and are not yours to inspect " +
-          "or mention. Identity comes only from what you are told above. If that is missing, ask " +
-          "the person — never infer it from the machine.",
-      ].filter(Boolean);
-      const preamble = parts.length ? `${parts.join("\n\n")}\n\n` : "";
-
-      try {
-        for await (const ev of run({
-          prompt: `${preamble}${input.text}`,
-          systemPromptFile: found.cfg.system_prompt_file,
-          model: deps.modelFor?.(input.conversation),
-        })) {
-          if (ctx.cancellationSignal.aborted) return;
-          if (ev.kind === "text" && ev.text) {
-            answer += ev.text;
-            const now = Date.now();
-            if (now - lastEdit >= EDIT_INTERVAL_MS && answer.trim()) {
-              lastEdit = now;
-              await show(answer).catch(() => {});
-            }
-          } else if (ev.kind === "tool") {
-            // Recorded for the work log, and mirrored into the status line straight away so the
-            // cue changes the moment a tool starts rather than on the next tick.
-            current = { tool: ev.tool ?? "working", detail: ev.text };
-            calls.push(current);
-            if (!answer) await tick();
-          } else if (ev.kind === "done") {
-            // The authoritative text. A harness that streams deltas AND sends a final would
-            // otherwise leave whatever the last edit happened to catch; one that only sends a final
-            // would otherwise post nothing at all.
-            if (ev.final) answer = ev.final;
-            // The turn's own tokens — what the status footer and `!status` report.
-            if (ev.usage) usage = ev.usage;
-          } else if (ev.kind === "error" && ev.err) {
-            throw ev.err;
-          }
-          // Heartbeat on real progress, so a wedged model is detected quickly but a slow one is not
-          // killed for being slow.
-          ctx.heartbeat(answer.length);
-        }
-      } catch (e) {
-        // A failed turn still owes the person a finished-looking channel. Without this the ⚠️ the
-        // workflow posts lands UNDER a stale "⚙️ Working…" note, and "Nelly is thinking…" stays
-        // under the composer for good — the turn reads as still running, forever.
-        dropLog();
-        await reply.settle?.().catch(() => {});
-        throw e;
-      } finally {
-        clearInterval(ticker);
-      }
-
-      done = true;
-      if (usage) deps.recordUsage?.(input.conversation, usage);
-      // Slack leaves "is thinking…" on screen until it is cleared, so an answered turn that
-      // forgets this looks permanently busy.
-      await reply.settle?.().catch(() => {});
-      if (ctx.cancellationSignal.aborted) {
-        dropLog();
-        return;
-      }
-
-      // Settle the work log into one line of what the turn actually did, or take it down when
-      // there is nothing worth keeping above the answer.
-      if (noteId) {
-        const settled = worklog.settledNote(calls, Date.now() - started, verb);
-        await reply.note?.(noteId, settled).catch(() => {});
-      }
-
-      const footer = await deps.footer?.(input.agent, input.conversation, usage).catch(() => null);
-      const body = answer.trim() || "_(no answer)_";
-      const final = footer ? `${body}\n\n${footer}` : body;
-      if (!msgId) msgId = await reply.send(final);
-      else await reply.finalize(msgId, final);
+      return serialize(`${input.agent}/${input.conversation}`, () => oneTurn(deps, input));
     },
+
 
     async postNotice(input: NoticeInput): Promise<void> {
       const found = deps.agent(input.agent);
@@ -415,3 +270,245 @@ export function makeActivities(deps: TurnDeps) {
 }
 
 export type Activities = ReturnType<typeof makeActivities>;
+
+
+/** One turn, start to finish. Split out of the activity so the serializer above owns exactly
+ *  one thing — when a turn may run — and this owns what a turn IS. */
+async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
+    const ctx = Context.current();
+    const found = deps.agent(input.agent);
+    if (!found) throw new Error(`worker: no agent "${input.agent}" in the roster`);
+    const { conn, run } = found;
+
+    const reply: Reply = conn.reply(input.conversation);
+    // One verb for the whole turn, picked before the first cue. Re-picking mid-turn would read
+    // as a different agent taking over the answer.
+    const verb = randomMysticVerb();
+    // The status line IS the immediate cue — "Nelly is thinking…" under the composer. A
+    // placeholder MESSAGE posted alongside it is worse than nothing: it flashes "…" and is then
+    // overwritten, which reads as a glitch. So no message is posted until there is something real
+    // to put in it, and the work log below is a separate note rather than the answer's message.
+    await reply.working?.(worklog.statusFor(undefined, verb)).catch(() => {});
+
+    const started = Date.now();
+    let answer = "";
+    let usage: TurnUsage | undefined;
+    let lastEdit = 0;
+    let done = false;
+    /** Created on first render, not up front. Empty until then. */
+    let msgId = "";
+    const show = async (text: string): Promise<void> => {
+      if (!msgId) msgId = await reply.send(text);
+      else await reply.update(msgId, text);
+    };
+
+    // --- the work log ---------------------------------------------------------------------
+    // Teams parity, and the thing that was missing: which tools ran, and how long the agent has
+    // been at it. It lives in its own note above the answer and is driven by a TIMER rather than
+    // by events — a turn that greps the second brain for ten seconds emits one event, and a line
+    // that does not move is indistinguishable from being stuck.
+    const calls: worklog.ToolCall[] = [];
+    let current: worklog.ToolCall | undefined;
+    let noteId = "";
+    let noteText = "";
+    /** One note write at a time. Without this the FIRST write is still in flight (a post is
+     *  ~300ms) while a second tool event fires a second tick: `noteId` is still empty, so that
+     *  tick posts a SECOND note, and whichever resolves last wins the id — leaving the other
+     *  stranded in the channel forever as "⚙️ Working… 1s". Two tool events inside one post
+     *  latency is not a corner case; it is what any turn that greps the second brain looks like. */
+    let posting = false;
+    let lastTick = 0;
+    const tick = async (): Promise<void> => {
+      if (done || ctx.cancellationSignal.aborted) return;
+      if (posting) return;
+      // Once the answer is streaming, do not CREATE a note: it would post below the reply and
+      // read as a footnote. But an EXISTING one keeps ticking — freezing it is what made the
+      // clock sit at "2s" for a whole answer and then land on "Moonwalked for 14 seconds", which
+      // reads as a jump rather than as time passing.
+      if (answer && !noteId) return;
+      // Tool events call this directly, so the timer is not the only rate limiter. Each tick is
+      // a message edit AND a status set; ten tool calls in two seconds would be twenty Slack
+      // calls, which is the burst TICK_MS exists to avoid. While the answer is streaming it is
+      // ALSO editing its own message roughly every second, so the log backs off to share the
+      // channel's budget rather than race it.
+      const now = Date.now();
+      if (now - lastTick < (answer ? ANSWERING_TICK_MS : EDIT_INTERVAL_MS)) return;
+      lastTick = now;
+      posting = true;
+      try {
+        const elapsed = now - started;
+        const text = worklog.liveNote(calls, elapsed, verb);
+        if (text !== noteText) {
+          noteText = text;
+          noteId = (await reply.note?.(noteId || undefined, text)) ?? "";
+        }
+        await reply.working?.(worklog.statusFor(current, verb)).catch(() => {});
+      } catch {
+        /* a dropped work log must never cost a turn */
+      } finally {
+        posting = false;
+      }
+    };
+    const ticker = setInterval(() => void tick(), TICK_MS);
+    /** Remove the log entirely — for an interrupted turn, whose work nobody will see the result
+     *  of, so a trace of it left on screen is only confusing. */
+    const dropLog = (): void => {
+      clearInterval(ticker);
+      if (noteId) void reply.note?.(noteId, null).catch(() => {});
+    };
+
+    // Temporal cancels the scope when a new message arrives. Leave the partial visible and say
+    // what happened — a reply that silently stops looks like a broken bot.
+    ctx.cancelled.catch(() => {
+      if (done) return;
+      dropLog();
+      void reply.settle?.().catch(() => {});
+      // Only if something was already on screen. An interrupted turn that had not yet said
+      // anything should leave no trace — the correction is about to be answered instead.
+      if (!msgId) return;
+      void reply
+        .finalize(msgId, `${answer.trim()}\n\n_— interrupted; working on your new message_`)
+        .catch(() => {});
+    });
+
+    // What the agent can read, and who is asking. Without the first the second brain is present
+    // on disk but the model has no reason to look at it; without the second "Hi Celine" is a
+    // guess rather than a fact from the registry.
+    // Who is asking, from the registry — never guessed from a display name, which is spoofable.
+    const known = (found.cfg.principals ?? []).find(
+      (p) => p.kind === "slack_user_id" && p.value === input.user,
+    );
+    const parts = [
+      found.context ?? "",
+      known
+        ? `You are speaking with ${known.label}.`
+        : input.user
+          ? `You are speaking with someone you don't recognise (${input.user}); ask who they are before sharing anything specific.`
+          // No sender at all means a system notification, not an unknown person. Treating it as
+          // a stranger made the agent refuse to discuss the meeting it had just been handed.
+          : "This turn was started by the system, not by a person. Write it as a message to the person in this conversation.",
+      input.afterInterruption
+        ? "(your previous answer was interrupted by a new message; continue from what the user now says)"
+        : "",
+      // The runtime is not evidence about the person.
+      //
+      // Asked who it was speaking to, the agent inspected its own environment, found the
+      // operator's account email, and told a customer it looked like a mismatch. It was being
+      // honest — and it was reporting infrastructure as if it were a fact about them. The
+      // platform is the only authority on identity; everything else in this container belongs to
+      // whoever runs the service.
+      "You are running on shared platform infrastructure. Its account, credentials, environment " +
+        "and file paths say nothing about who you are talking to, and are not yours to inspect " +
+        "or mention. Identity comes only from what you are told above. If that is missing, ask " +
+        "the person — never infer it from the machine.",
+    ].filter(Boolean);
+    const preamble = parts.length ? `${parts.join("\n\n")}\n\n` : "";
+
+    // The session this thread continues in. Claimed, not peeked at: `--session-id` creates and
+    // may be used once, every later turn resumes, and the one thing that can go wrong with that —
+    // no session on disk to resume — is repaired below rather than left to fail forever.
+    let session = deps.claimSession?.(input.agent, input.conversation);
+
+    const consume = async (): Promise<void> => {
+      for await (const ev of run(
+        {
+          prompt: `${preamble}${input.text}`,
+          systemPromptFile: found.cfg.system_prompt_file,
+          model: deps.modelFor?.(input.conversation),
+          sessionId: session?.id,
+          sessionNew: session?.isNew,
+        },
+        // Passing the signal is what makes a steer actually stop the model. Without it the child
+        // ran to completion after the person had already moved on — paid for, unread, and still
+        // holding the session file the next turn wants to resume.
+        ctx.cancellationSignal,
+      )) {
+        if (ctx.cancellationSignal.aborted) return;
+        if (ev.kind === "text" && ev.text) {
+          answer += ev.text;
+          const now = Date.now();
+          if (now - lastEdit >= EDIT_INTERVAL_MS && answer.trim()) {
+            lastEdit = now;
+            await show(answer).catch(() => {});
+          }
+        } else if (ev.kind === "tool") {
+          // Recorded for the work log, and mirrored into the status line straight away so the
+          // cue changes the moment a tool starts rather than on the next tick.
+          current = { tool: ev.tool ?? "working", detail: ev.text };
+          calls.push(current);
+          if (!answer) await tick();
+        } else if (ev.kind === "done") {
+          // The authoritative text. A harness that streams deltas AND sends a final would
+          // otherwise leave whatever the last edit happened to catch; one that only sends a final
+          // would otherwise post nothing at all.
+          if (ev.final) answer = ev.final;
+          // The turn's own tokens — what the status footer and `!status` report.
+          if (ev.usage) usage = ev.usage;
+        } else if (ev.kind === "error" && ev.err) {
+          throw ev.err;
+        }
+        // Heartbeat on real progress, so a wedged model is detected quickly but a slow one is not
+        // killed for being slow.
+        ctx.heartbeat(answer.length);
+      }
+    };
+
+    try {
+      try {
+        await consume();
+      } catch (e) {
+        // A session that cannot be resumed is a lost memory, not a failed turn.
+        //
+        // The pod holds both halves of this — the id in memory, the transcript on its disk — so
+        // they are normally lost together. Normally: a turn killed mid-write, or a `claude` that
+        // never got far enough to create the file, leaves an id pointing at nothing, and every
+        // future turn in that thread would then fail on the same missing file. Amnesia is a bad
+        // day; a thread that answers nothing ever again is a broken agent.
+        //
+        // Only when the turn produced NOTHING, which is what a resume miss looks like — it fails
+        // at startup, before a token. A turn that broke halfway through said something first, and
+        // re-running it would say it twice.
+        const produced = answer.trim().length > 0 || calls.length > 0;
+        if (!session || produced || ctx.cancellationSignal.aborted) throw e;
+        console.error(
+          `worker: ${input.agent} could not resume session ${session.id} ` +
+            `(${String((e as Error)?.message ?? e).slice(0, 140)}); starting a fresh one`,
+        );
+        session = deps.resetSession?.(input.agent, input.conversation);
+        await reply.reset?.().catch(() => {});
+        await consume();
+      }
+    } catch (e) {
+      // A failed turn still owes the person a finished-looking channel. Without this the ⚠️ the
+      // workflow posts lands UNDER a stale "⚙️ Working…" note, and "Nelly is thinking…" stays
+      // under the composer for good — the turn reads as still running, forever.
+      dropLog();
+      await reply.settle?.().catch(() => {});
+      throw e;
+    } finally {
+      clearInterval(ticker);
+    }
+
+    done = true;
+    if (usage) deps.recordUsage?.(input.conversation, usage);
+    // Slack leaves "is thinking…" on screen until it is cleared, so an answered turn that
+    // forgets this looks permanently busy.
+    await reply.settle?.().catch(() => {});
+    if (ctx.cancellationSignal.aborted) {
+      dropLog();
+      return;
+    }
+
+    // Settle the work log into one line of what the turn actually did, or take it down when
+    // there is nothing worth keeping above the answer.
+    if (noteId) {
+      const settled = worklog.settledNote(calls, Date.now() - started, verb);
+      await reply.note?.(noteId, settled).catch(() => {});
+    }
+
+    const footer = await deps.footer?.(input.agent, input.conversation, usage).catch(() => null);
+    const body = answer.trim() || "_(no answer)_";
+    const final = footer ? `${body}\n\n${footer}` : body;
+    if (!msgId) msgId = await reply.send(final);
+    else await reply.finalize(msgId, final);
+}

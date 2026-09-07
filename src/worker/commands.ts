@@ -45,6 +45,9 @@ export interface CommandDeps {
    *  changed the model under everybody else mid-conversation. */
   getModel(agent: string, conversation: string): string | undefined;
   setModel(agent: string, conversation: string, model: string | undefined): void;
+  /** Forget this conversation's history and start it over. Optional: a deployment that keeps no
+   *  session has nothing to forget, and `!new` says so instead of claiming a reset. */
+  resetSession?(agent: string, conversation: string): void;
 }
 
 const HELP = [
@@ -52,16 +55,23 @@ const HELP = [
   "• `!status` — token use for the last turn and how much of your Claude plan is left",
   `• \`!statusline ${STATUS_MODES.join("|")}\` — whether that shows under every answer`,
   "• `!model` — which model this conversation runs; `!model <name>` to change it here only",
-  "• `!new` — how to start a fresh conversation",
+  "• `!new` — forget this thread and start over",
   "• `!help` — this",
 ].join("\n");
 
-/** How a new conversation actually works here.
+/** `!new`, when there IS something to clear.
  *
- *  Not a command that clears anything: the workflow id IS the Slack thread, so a new thread is a
- *  new conversation by construction. Saying that plainly is more useful than a `!new` that
- *  pretends to reset something. */
-const NEW = [
+ *  This text used to say the opposite — "I keep no memory across them" — and it was true then,
+ *  because a thread had no memory to keep. Now that a thread continues one harness session, `!new`
+ *  drops it and the next message starts over. A command that describes the behaviour it had
+ *  BEFORE the feature landed is worse than no command at all. */
+const NEW_DONE = [
+  "🧹 Forgotten. This thread starts over from your next message.",
+  "_Nothing is deleted — I just stop reading back past here._",
+].join("\n");
+
+/** `!new` where the deployment keeps no session at all: say so rather than claim a reset. */
+const NEW_NOOP = [
   "Every thread is its own conversation — I keep no memory across them.",
   "Start a fresh one with the ✏️ *New chat* button at the top of this pane, or by replying in a new thread.",
   "That is what `/new` did on Telegram and Teams; in Slack the thread already is it.",
@@ -82,7 +92,9 @@ export async function run(
       return HELP;
 
     case "new":
-      return NEW;
+      if (!deps.resetSession) return NEW_NOOP;
+      deps.resetSession(agent, conversation);
+      return NEW_DONE;
 
     case "status":
     case "usage": {

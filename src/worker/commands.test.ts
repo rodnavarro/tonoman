@@ -99,9 +99,26 @@ describe("run", () => {
     expect(setModel).toHaveBeenCalledWith("nelly", "c", undefined);
   });
 
-  it("answers !new with how a fresh conversation is actually started here", async () => {
+  it("!new actually forgets the thread — it does not just describe forgetting", async () => {
+    // It used to only print "I keep no memory across them", which was true when a thread had no
+    // memory to keep. A thread now continues one harness session, so a `!new` that printed the
+    // old text would be describing the behaviour of the release before it.
+    const forgotten: string[][] = [];
+    const out = await run(
+      deps({ resetSession: (agent, conversation) => forgotten.push([agent, conversation]) }),
+      "nelly",
+      "c",
+      { name: "new", arg: "" },
+    );
+    expect(forgotten).toEqual([["nelly", "c"]]);
+    expect(out).toContain("Forgotten");
+  });
+
+  it("says how a fresh conversation is started when there is no session to forget", async () => {
+    // A deployment with no session memory must not claim a reset it did not perform.
     const out = await run(deps(), "nelly", "c", { name: "new", arg: "" });
     expect(out).toContain("New chat");
+    expect(out).not.toContain("Forgotten");
   });
 
   it("degrades to [] windows rather than failing when the runtime is unreachable", async () => {

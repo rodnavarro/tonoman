@@ -16,6 +16,7 @@
 import { Client, Connection, ScheduleOverlapPolicy } from "@temporalio/client";
 import type { Duration } from "@temporalio/common";
 import { NativeConnection, Worker } from "@temporalio/worker";
+import { randomUUID } from "node:crypto";
 import * as path from "node:path";
 import type { Config, AgentConfig } from "../config";
 import type { Connector, TurnEvent, TurnRunner, TurnUsage } from "../core/contracts";
@@ -149,11 +150,61 @@ function wire(cfg: Config): Map<string, Wired> {
       cfg: a,
       conn,
       runner,
-      run: (r: TurnRunReq) =>
-        runner.run({ prompt: r.prompt, systemPromptFile: r.systemPromptFile, model: r.model }),
+      run: (r: TurnRunReq, signal?: AbortSignal) =>
+        runner.run(
+          {
+            prompt: r.prompt,
+            systemPromptFile: r.systemPromptFile,
+            model: r.model,
+            sessionId: r.sessionId,
+            sessionNew: r.sessionNew,
+          },
+          signal,
+        ),
     });
   }
   return out;
+}
+
+/** The harness session each conversation is continuing in.
+ *
+ *  Keyed by AGENT and conversation, not by conversation alone. A Slack conversation key is a thread
+ *  timestamp: unique inside one workspace and nowhere else — and this worker serves two tenants in
+ *  two different workspaces. Keyed by the thread alone, Sapien would eventually resume Nelly's
+ *  conversation, which is the same shape of mistake as a worker-wide notify channel, with a
+ *  customer's transcript on the other end of it.
+ *
+ *  In memory, deliberately. The session's transcript is a file on THIS pod's disk, so the id and
+ *  the thing it names have one lifetime; persisting the id would only outlive the file it points
+ *  at, and turn a restart from "forgets" into "fails". What it costs is memory across a deploy —
+ *  the next message in a thread starts fresh, which is exactly today's behaviour and no worse. */
+export function sessionStore(newId: () => string = randomUUID): {
+  claim: (agent: string, conversation: string) => { id: string; isNew: boolean };
+  reset: (agent: string, conversation: string) => { id: string; isNew: boolean };
+} {
+  const sessions = new Map<string, { id: string; isNew: boolean }>();
+  const key = (agent: string, conversation: string): string => `${agent}/${conversation}`;
+  /** Hand out this conversation's session AND record that it is now in use — so `--session-id`
+   *  (create) is used exactly once per id and every later turn resumes it. Claiming rather than
+   *  peeking is what keeps that invariant true even for a turn that dies before writing anything;
+   *  the resume miss that follows is repairable, a duplicate create is not. */
+  const claim = (agent: string, conversation: string): { id: string; isNew: boolean } => {
+    const k = key(agent, conversation);
+    const cur = sessions.get(k);
+    if (cur) return { ...cur };
+    const made = { id: newId(), isNew: true };
+    sessions.set(k, { ...made, isNew: false });
+    return made;
+  };
+  return {
+    claim,
+    /** Abandon this conversation's session and hand back a fresh one — the resume-miss repair, and
+     *  what `!new` does. Nothing is deleted; the old transcript is simply no longer continued. */
+    reset: (agent: string, conversation: string) => {
+      sessions.delete(key(agent, conversation));
+      return claim(agent, conversation);
+    },
+  };
 }
 
 export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): Promise<void> {
@@ -312,6 +363,7 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
    *  every agent in the tenant and every thread they are in, and the harness's own knob is a single
    *  variable — so `!model opus` in one thread moved everyone. */
   const models = new Map<string, string>();
+  const { claim: claimSession, reset: resetSession } = sessionStore();
 
   /** Where THIS agent's voice flow speaks: its configured channel, else a DM with the recipient.
    *
@@ -331,6 +383,8 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
     voice: (name: string) => voiceCreds.get(name),
     recordUsage: (conversation: string, u: TurnUsage) => lastUsage.set(conversation, u),
     modelFor: (conversation: string) => models.get(conversation),
+    claimSession,
+    resetSession,
     footer: async (name: string, conversation: string, u: TurnUsage | undefined): Promise<string | null> => {
       const mode = modeFor(conversation);
       if (mode === "none" || !u) return null;
@@ -364,6 +418,7 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
     setMode: (conversation, mode) => statusModes.set(conversation, mode),
     lastUsage: (conversation) => lastUsage.get(conversation),
     windows: windowsFor,
+    resetSession: (name, conversation) => void resetSession(name, conversation),
     // What THIS conversation runs: its own choice, else whatever the roster row says.
     getModel: (name, conversation) => models.get(conversation) ?? wired.get(name)?.cfg.model,
     setModel: (_name, conversation, model) => {
