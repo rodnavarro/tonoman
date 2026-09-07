@@ -25,6 +25,7 @@ import * as cmds from "./commands";
 import * as plaudcli from "./plaudcli";
 import * as claudecode from "../harness/claudecode";
 import * as plaudauth from "./plaudauth";
+import * as plaudgate from "./plaudgate";
 import {
   parseStatusMode,
   remoteAccountUsageCached,
@@ -511,18 +512,19 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
 Record something and I'll pick it up within five minutes - I'll post what I find ${where ? `in <#${where}>` : "here"}.`
       );
     },
-    connectPlaud: async (name) => {
+    connectPlaud: async (name, conversation) => {
+      // Buttons and a private dialog, the same shape as connecting Claude. Two mechanisms for
+      // one idea is something a person has to learn twice, and the typed version put an
+      // authorization code into channel history.
+      const asked = await plaudgate.ask(plaudDeps, name, conversation).catch(() => false);
+      // The blocks ARE the message. Returning text as well would post the whole thing twice.
+      if (asked) return "";
+      // A client that cannot render blocks still gets a working, if wordier, flow.
       const p = await plaudauth.begin(name);
       return (
-        `Let's connect your Plaud account. Open this and sign in as yourself:
-
-${p.url}` +
-        `
-
-*Then:* the page it sends you to will fail to load. That is expected - it is trying to reach me and cannot.` +
-        `
-
-Copy the whole address out of your browser bar and send it back here as \`!code <address>\``
+        `Let's connect your Plaud account. Open this and sign in as yourself:\n\n${p.url}` +
+        `\n\n*Then:* the page it sends you to will fail to load - that is expected. Copy the whole address 
+         out of your browser bar and send it back as \`!code plaud <address>\``
       );
     },
     // What THIS conversation runs: its own choice, else whatever the roster row says.
@@ -562,11 +564,26 @@ Copy the whole address out of your browser bar and send it back here as \`!code 
     },
   };
 
+  const plaudDeps: plaudgate.PlaudGateDeps = {
+    conn: (name) => wired.get(name)?.conn as SlackConnector | undefined,
+    begin: async (name) => (await plaudauth.begin(name)).url,
+    complete: (name, pasted) => plaudauth.complete(name, pasted),
+    notifyChannel: (name) => voiceCreds.get(name)?.notifyChannel,
+  };
+
   // Interactions are wired per connector below, at construction.
   for (const [name, a] of wired) {
     (a.conn as SlackConnector).setInteractionHandler?.((it) => {
-      void gate
-        .handleInteraction(authDeps, name, it)
+      // Two gates now, and each claims only what it recognises: connecting Claude and connecting
+      // Plaud both end in a dialog, so the router asks the Plaud one first and falls through when
+      // the interaction is not its own.
+      const mine =
+        it.actionId?.startsWith(plaudgate.PLAUD_CONNECT_ACTION) ||
+        it.callbackId === plaudgate.PLAUD_CONNECT_ACTION;
+      const run = mine
+        ? plaudgate.handleInteraction(plaudDeps, name, it)
+        : gate.handleInteraction(authDeps, name, it);
+      void run
         .then((msg) => console.log(`worker: ${name} interaction — ${msg}`))
         .catch((e) => console.error(`worker: ${name} interaction failed: ${(e as Error).message}`));
     });
@@ -604,7 +621,10 @@ Copy the whole address out of your browser bar and send it back here as \`!code 
             // Null means it is not one of ours. An unknown `!word` is far more likely to be
             // ordinary emphasis than a typo'd command, so it falls through to a real turn.
             if (out !== null) {
-              await a.conn.reply(env.conversation).send(out).catch(() => {});
+              // An EMPTY string means the command already said its piece another way - `!connect
+              // plaud` posts Block Kit buttons itself. Sending "" on top would post a blank
+              // message under them.
+              if (out !== "") await a.conn.reply(env.conversation).send(out).catch(() => {});
               continue;
             }
           }

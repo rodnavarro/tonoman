@@ -46,6 +46,10 @@ export interface SlackInteraction {
   actionId?: string;
   /** Opaque state carried on the button, so a modal knows which conversation it belongs to. */
   value?: string;
+  /** Which modal was submitted. There is more than one now — connecting Claude and connecting
+   *  Plaud both end in a dialog — and without this a handler cannot tell them apart, so the first
+   *  one registered would take a Plaud address and try it as a Claude authorization code. */
+  callbackId?: string;
   /** For view_submission: the modal's private_metadata, and the values the person typed. */
   privateMetadata?: string;
   values?: Record<string, Record<string, { value?: string }>>;
@@ -345,11 +349,16 @@ export function normalizeInteraction(p: Record<string, unknown>): SlackInteracti
   }
   if (p.type === "view_submission") {
     const view = p.view as
-      | { private_metadata?: string; state?: { values?: Record<string, Record<string, { value?: string }>> } }
+      | {
+          callback_id?: string;
+          private_metadata?: string;
+          state?: { values?: Record<string, Record<string, { value?: string }>> };
+        }
       | undefined;
     return {
       kind: "view_submission",
       userId: user,
+      callbackId: view?.callback_id,
       privateMetadata: view?.private_metadata,
       values: view?.state?.values,
     };

@@ -129,7 +129,13 @@ export async function handleInteraction(deps: AuthGateDeps, agent: string, it: S
     return "opened code modal";
   }
 
-  if (it.kind === "view_submission") {
+  // Only THIS modal. There is a second one now (connecting Plaud), and a handler that takes every
+  // view_submission would feed a pasted Plaud address into the Claude login as an authorization
+  // code — failing in a way that blames the person for the wrong thing.
+  //
+  // Undefined is treated as ours: a modal opened by a build before callback_id was carried through
+  // should still complete rather than be silently ignored mid-login.
+  if (it.kind === "view_submission" && (it.callbackId === undefined || it.callbackId === CONNECT_ACTION)) {
     const meta = safeParse(it.privateMetadata);
     const conversation = String(meta.conversation ?? "");
     const code = firstInputValue(it.values);
