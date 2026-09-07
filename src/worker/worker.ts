@@ -463,6 +463,12 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
     windows: windowsFor,
     resetSession: (name, conversation) => void resetSession(name, conversation).catch(() => {}),
     plaudConnected: (name) => plaudcli.connected(name),
+    disconnectPlaud: async (name) => {
+      await plaudauth.disconnect(name);
+      // The flow keeps its resolved credential until the worker restarts, so say that rather than
+      // let somebody believe the account is already unhooked when the next poll still reads it.
+      return "Disconnected - I've forgotten your Plaud account and asked Plaud to revoke it. The running flow finishes its current cycle first.";
+    },
     finishPlaud: async (name, pasted) => {
       const r = await plaudauth.complete(name, pasted);
       if (!r.ok) return `That didn't work - ${r.problem}.`;

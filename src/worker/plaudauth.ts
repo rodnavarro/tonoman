@@ -25,6 +25,7 @@ import * as fsp from "node:fs/promises";
 import * as path from "node:path";
 import { homeFor } from "./plaudcli";
 
+const API_BASE = process.env.PLAUD_API_BASE ?? "https://platform.plaud.ai/developer/api";
 const AUTH_URL = process.env.PLAUD_AUTH_URL ?? "https://web.plaud.ai/platform/oauth";
 const TOKEN_URL =
   process.env.PLAUD_TOKEN_URL ?? "https://platform.plaud.ai/developer/api/oauth/third-party/access-token";
@@ -84,6 +85,29 @@ export interface Finished {
   problem?: string;
 }
 
+/** Disconnect: forget this agent's tokens and tell Plaud to revoke them.
+ *
+ *  Local first, and revocation best-effort. If the network call fails we have still stopped reading
+ *  the account, which is the part the person asked for; a disconnect that refuses because a remote
+ *  call failed leaves them connected to something they just said to drop. */
+export async function disconnect(agent: string, root?: string): Promise<void> {
+  const token = await (async (): Promise<string | undefined> => {
+    try {
+      return (JSON.parse(await fsp.readFile(tokenPath(agent, root), "utf8")) as { access_token?: string })
+        .access_token;
+    } catch {
+      return undefined;
+    }
+  })();
+  await fsp.rm(tokenPath(agent, root), { force: true }).catch(() => {});
+  await fsp.rm(pendingPath(agent, root), { force: true }).catch(() => {});
+  if (!token) return;
+  await fetch(`${API_BASE}/open/third-party/users/current/revoke`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}` },
+  }).catch(() => {});
+}
+
 /** Finish a login with the pasted callback, and store the tokens where the poll reads them. */
 export async function complete(agent: string, pasted: string, root?: string): Promise<Finished> {
   const { code, state } = codeFrom(pasted);
@@ -93,13 +117,13 @@ export async function complete(agent: string, pasted: string, root?: string): Pr
   try {
     pending = JSON.parse(await fsp.readFile(pendingPath(agent, root), "utf8")) as Pending;
   } catch {
-    return { ok: false, problem: "I don't have a sign-in waiting — start again with `!connect`" };
+    return { ok: false, problem: "I don't have a sign-in waiting — start again with `!connect plaud`" };
   }
   // The state is what stops a code from somewhere else being pasted in here, deliberately or by
   // accident. It is cheap to check and the only thing standing between a stray link and a
   // connected account.
   if (state && pending.state && state !== pending.state) {
-    return { ok: false, problem: "that address is from a different sign-in — run `!connect` and use the newest link" };
+    return { ok: false, problem: "that address is from a different sign-in — run `!connect plaud` and use the newest link" };
   }
 
   const res = await fetch(TOKEN_URL, {
@@ -125,7 +149,7 @@ export async function complete(agent: string, pasted: string, root?: string): Pr
       ok: false,
       problem:
         res.status === 400 || res.status === 401
-          ? "Plaud wouldn't accept that code — they expire quickly and only work once. `!connect` for a fresh link"
+          ? "Plaud wouldn't accept that code — they expire quickly and only work once. `!connect plaud` for a fresh link"
           : `Plaud answered ${res.status}`,
     };
   }

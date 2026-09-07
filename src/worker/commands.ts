@@ -51,6 +51,8 @@ export interface CommandDeps {
   /** Connect this agent's Plaud account. Returns the text to post — a login link the person
    *  opens themselves, because the account being connected is theirs and not ours. */
   connectPlaud?(agent: string, conversation: string): Promise<string>;
+  /** Forget this agent's Plaud account and revoke it upstream. */
+  disconnectPlaud?(agent: string): Promise<string>;
   /** Finish a connection with the callback URL the person pasted back. */
   finishPlaud?(agent: string, pasted: string): Promise<string>;
   /** Whether this agent already has a Plaud account connected. */
@@ -62,7 +64,8 @@ const HELP = [
   "• `!status` — token use for the last turn and how much of your Claude plan is left",
   `• \`!statusline ${STATUS_MODES.join("|")}\` — whether that shows under every answer`,
   "• `!model` — which model this conversation runs; `!model <name>` to change it here only",
-  "• `!connect` — connect your Plaud account, so I can pick up your recordings",
+  "• `!connect plaud` — connect your Plaud account, so I can pick up your recordings",
+  "• `!disconnect plaud` — forget it again",
   "• `!new` — forget this thread and start over",
   "• `!help` — this",
 ].join("\n");
@@ -85,6 +88,20 @@ const NEW_NOOP = [
   "That is what `/new` did on Telegram and Teams; in Slack the thread already is it.",
 ].join("\n");
 
+/** The connector a connection command names, and whatever follows it. A pasted callback address
+ *  is one long token, so the split is on the FIRST word only. */
+export function splitConnector(arg: string): { which: string; rest: string } {
+  const t = (arg ?? "").trim();
+  if (!t) return { which: "", rest: "" };
+  const i = t.search(/\s/);
+  if (i < 0) return { which: t.toLowerCase(), rest: "" };
+  return { which: t.slice(0, i).toLowerCase(), rest: t.slice(i + 1).trim() };
+}
+
+function unknownConnector(which: string): string {
+  return `I don't have a "${which}" connector. Today it is just \`plaud\`.`;
+}
+
 /** Runs a command. Returns the text to post, or null when the input was not a command we own —
  *  in which case the caller must treat it as an ordinary message. */
 export async function run(
@@ -99,23 +116,39 @@ export async function run(
     case "commands":
       return HELP;
 
-    // The pasted-back callback. Recognised as a command in its own right so the person can just
-    // paste the dead URL — asking somebody to remember a command name while they are holding a
-    // failed browser tab is how a two-step login becomes a support ticket.
+    // Both connection commands name the connector: `!connect plaud`, `!code plaud <address>`.
+    //
+    // Plaud is the only one today, so the word is redundant right now and deliberately required
+    // anyway. Calendars are already on the list, and the moment a second connector exists a bare
+    // `!connect` becomes ambiguous — at which point every instruction written down, and every
+    // person who learned the short form, is wrong. Cheaper to be explicit while there is one.
     case "code":
     case "callback": {
       if (!deps.finishPlaud) return "There is no connection waiting for a code here.";
-      if (!cmd.arg) return "Paste the whole address from your browser after `!code`, including the part after the `?`.";
-      return deps.finishPlaud(agent, cmd.arg);
+      const { which, rest } = splitConnector(cmd.arg);
+      if (which && which !== "plaud") return unknownConnector(which);
+      if (!rest) return "Paste the whole address from your browser after `!code plaud`, including the part after the `?`.";
+      return deps.finishPlaud(agent, rest);
     }
 
-    case "connect":
-    case "plaud": {
-      if (!deps.connectPlaud) return "I have no way to connect a Plaud account on this deployment.";
-      if (cmd.arg.toLowerCase() !== "again" && (await deps.plaudConnected?.(agent).catch(() => false))) {
+    case "disconnect":
+    case "logout": {
+      const { which } = splitConnector(cmd.arg);
+      if (!which) return "Which one? Right now there is `!disconnect plaud`.";
+      if (which !== "plaud") return unknownConnector(which);
+      if (!deps.disconnectPlaud) return "I have no way to disconnect an account on this deployment.";
+      return deps.disconnectPlaud(agent);
+    }
+
+    case "connect": {
+      if (!deps.connectPlaud) return "I have no way to connect an account on this deployment.";
+      const { which, rest } = splitConnector(cmd.arg);
+      if (!which) return "Which one? Right now I can connect `!connect plaud`.";
+      if (which !== "plaud") return unknownConnector(which);
+      if (rest.toLowerCase() !== "again" && (await deps.plaudConnected?.(agent).catch(() => false))) {
         // Reconnecting revokes nothing but does replace the tokens, so it is worth one sentence
         // rather than silently doing it to somebody who typed the wrong thing.
-        return "✅ Your Plaud account is already connected. Type `!connect again` if you want to sign in with a different one.";
+        return "✅ Your Plaud account is already connected. Type `!connect plaud again` to sign in with a different one.";
       }
       return deps.connectPlaud(agent, conversation);
     }

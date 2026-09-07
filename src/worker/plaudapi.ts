@@ -126,12 +126,18 @@ function stamp(t: TokenSet): TokenSet {
   return secs ? { ...t, expires_at: Date.now() + secs * 1000 } : t;
 }
 
-/** `YYYY-MM-DD-HHMM` in the pod's timezone — the folder-per-recording name the rest of the
- *  pipeline already files by. */
+/** `YYYY-MM-DD-HHMM` in UTC — the folder-per-recording name the rest of the pipeline files by.
+ *
+ *  UTC, and not the pod's local time, because the OTHER path that writes these stamps uses UTC.
+ *  Written in local time the same recording got two names — `2026-09-07-1057` from one agent and
+ *  `2026-09-07-0657` from the other — and since "already published" is decided by looking for the
+ *  stamp in the second brain, a recording filed by one path is invisible to the other. It gets
+ *  transcribed again, published again, and announced again. Two names for one meeting is not a
+ *  cosmetic problem; it is a duplicate that costs money every poll. */
 export function stampFor(startMs: number): string {
   const d = new Date(startMs);
   const p = (n: number): string => String(n).padStart(2, "0");
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}`;
+  return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())}-${p(d.getUTCHours())}${p(d.getUTCMinutes())}`;
 }
 
 /** An instant, from either shape this API uses. `start_at` arrives as an ISO string with no zone

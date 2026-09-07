@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { parse, run, type CommandDeps } from "./commands";
+import { parse, run, splitConnector, type CommandDeps } from "./commands";
 import type { StatusMode } from "../statusline";
 
 describe("parse", () => {
@@ -125,5 +125,25 @@ describe("run", () => {
     const d = deps({ windows: async () => { throw new Error("connect ECONNREFUSED"); } });
     const out = await run(d, "nelly", "c", { name: "status", arg: "" });
     expect(out).toContain("n/a");
+  });
+});
+
+describe("connection commands name their connector", () => {
+  it("splits the connector off the first word, leaving a pasted address intact", () => {
+    // The callback address is one long token with its own `?` and `&`; splitting on anything but
+    // the first space would tear it apart.
+    const { which, rest } = splitConnector("plaud http://localhost:8199/auth/callback?code=abc&state=xyz");
+    expect(which).toBe("plaud");
+    expect(rest).toBe("http://localhost:8199/auth/callback?code=abc&state=xyz");
+  });
+
+  it("asks which one rather than assuming, even while there is only one", () => {
+    // Calendars are next. A bare `!connect` that silently means Plaud today is a bare `!connect`
+    // that means something else later, and every written instruction becomes wrong at that moment.
+    expect(splitConnector("")).toEqual({ which: "", rest: "" });
+  });
+
+  it("takes a lone word as the connector with nothing after it", () => {
+    expect(splitConnector("  PLAUD  ")).toEqual({ which: "plaud", rest: "" });
   });
 });
