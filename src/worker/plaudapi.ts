@@ -12,39 +12,16 @@
 // lived 24 hours, and was renewed by a scheduled task on one laptop. These tokens come from the
 // account's owner, last about 300 days, and refresh themselves.
 
-import * as fsp from "node:fs/promises";
-import * as path from "node:path";
-import { homeFor } from "./plaudcli";
 import type { Recording } from "./recap";
+import { stamp, storeFor, type TokenSet } from "./tokenstore";
 
 const API_BASE = process.env.PLAUD_API_BASE ?? "https://platform.plaud.ai/developer/api";
 const REFRESH_URL =
   process.env.PLAUD_REFRESH_URL ?? "https://platform.plaud.ai/developer/api/oauth/third-party/access-token/refresh";
 const CLIENT_ID = process.env.PLAUD_CLI_CLIENT_ID ?? "client_f9e0b214-c11f-434b-8b95-c4497d1feb81";
 
-/** What the CLI writes to ~/.plaud/tokens.json. Field names are its, not ours. */
-interface TokenSet {
-  access_token?: string;
-  refresh_token?: string;
-  /** What the token endpoint returns: seconds of life, not a deadline. */
-  expires_in?: number;
-  /** Ours: the deadline we computed when we stored it, so a restart does not think a token
-   *  minted yesterday is fresh. */
-  expires_at?: number;
-  [k: string]: unknown;
-}
-
-function tokenPath(agent: string, root?: string): string {
-  return path.join(homeFor(agent, root), ".plaud", "tokens.json");
-}
-
-async function read(agent: string, root?: string): Promise<TokenSet | undefined> {
-  try {
-    return JSON.parse(await fsp.readFile(tokenPath(agent, root), "utf8")) as TokenSet;
-  } catch {
-    return undefined;
-  }
-}
+// Where the tokens live is no longer this file's business — see tokenstore.ts. `root` stays in
+// every signature below because the tests use it, and because the volume store still honours it.
 
 /** Renew ahead of the deadline rather than on a 401.
  *
@@ -59,7 +36,7 @@ const RENEW_BEFORE_MS = 10 * 60 * 1000;
 /** The access token for this agent, refreshed if it is close to expiring. Undefined means the
  *  tenant has not connected an account, which is a state and not a failure. */
 export async function accessToken(agent: string, root?: string): Promise<string | undefined> {
-  const t = await read(agent, root);
+  const t = await storeFor(root).load(agent);
   if (!t?.access_token) return undefined;
 
   const expMs = typeof t.expires_at === "number" ? (t.expires_at > 1e12 ? t.expires_at : t.expires_at * 1000) : 0;
@@ -86,8 +63,9 @@ export async function accessToken(agent: string, root?: string): Promise<string 
     if (!res.ok) return t.access_token; // still valid for now; say nothing and try again next poll
     const next = (await res.json()) as TokenSet;
     if (!next.access_token) return t.access_token;
-    // Written back through the CLI's own file, so `plaud` and this agree about who is signed in.
-    await fsp.writeFile(tokenPath(agent, root), JSON.stringify(stamp({ ...t, ...next }), null, 2), "utf8");
+    // Written back wherever the store keeps them. A refresh that renewed the token but failed to
+    // persist it would renew again on every poll, and burn the refresh token's rotation budget.
+    await storeFor(root).save(agent, stamp({ ...t, ...next }));
     return next.access_token;
   } catch {
     return t.access_token;
@@ -118,12 +96,6 @@ interface ApiFile {
   duration?: number;
   created_at?: string | number;
   presigned_url?: string;
-}
-
-/** Record when a token set was stored, since the endpoint reports a lifetime and not a deadline. */
-function stamp(t: TokenSet): TokenSet {
-  const secs = typeof t.expires_in === "number" ? t.expires_in : 0;
-  return secs ? { ...t, expires_at: Date.now() + secs * 1000 } : t;
 }
 
 /** `YYYY-MM-DD-HHMM` in UTC — the folder-per-recording name the rest of the pipeline files by.
@@ -192,5 +164,5 @@ export async function audioUrl(agent: string, id: string, root?: string): Promis
 
 /** Whether this agent has a usable connected account, without making a request. */
 export async function connected(agent: string, root?: string): Promise<boolean> {
-  return Boolean((await read(agent, root))?.access_token);
+  return Boolean((await storeFor(root).load(agent))?.access_token);
 }

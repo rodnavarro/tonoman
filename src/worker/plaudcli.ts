@@ -165,13 +165,13 @@ export async function completeLogin(pasted: string): Promise<boolean> {
   }
 }
 
-/** Has this agent connected a Plaud account? The CLI's own token file is the only authority —
- *  a row saying "connected" that the CLI disagrees with would be worse than no row. */
+/** Has this agent connected a Plaud account? Whatever holds the tokens is the only authority — a
+ *  row saying "connected" that the credential disagrees with would be worse than no row.
+ *
+ *  A store that THROWS is not "no": a 500 from a failed decrypt means there is a credential we
+ *  could not read, and answering false would offer to reconnect an account that is connected —
+ *  and then overwrite it. Undefined is no, an error is an error. */
 export async function connected(agent: string, root?: string): Promise<boolean> {
-  try {
-    const raw = await fsp.readFile(path.join(homeFor(agent, root), ".plaud", "tokens.json"), "utf8");
-    return Boolean(JSON.parse(raw));
-  } catch {
-    return false;
-  }
+  const { storeFor } = await import("./tokenstore");
+  return Boolean(await storeFor(root).load(agent));
 }

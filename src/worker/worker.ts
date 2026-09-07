@@ -25,6 +25,7 @@ import * as cmds from "./commands";
 import * as plaudcli from "./plaudcli";
 import * as claudecode from "../harness/claudecode";
 import * as plaudauth from "./plaudauth";
+import * as tokenstore from "./tokenstore";
 import * as plaudgate from "./plaudgate";
 import {
   parseStatusMode,
@@ -237,6 +238,17 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
     // Loudly: a worker with no connectors looks perfectly healthy while answering nobody.
     console.error("worker: NO agents have a usable channel binding — nothing will be answered.");
   }
+
+  // Where connected-account credentials live, decided once, here. Cloud when there is a registry
+  // to talk to; the volume otherwise, so a self-hosted install does not change by upgrading.
+  //
+  // The guid lookup is the whole reason this is installed at boot rather than resolved per call:
+  // the API addresses secrets by agent and derives the TENANT itself, so a worker can never name a
+  // tenant it does not belong to. An agent with no guid has no registry, and falls through to the
+  // volume rather than failing.
+  const store = tokenstore.chooseStore(process.env, (name) => wired.get(name)?.cfg.guid);
+  tokenstore.useStore(store);
+  console.log(`worker: connected-account credentials live in ${store.where}`);
 
   /** Pull every granted source and refresh the agent's context note.
    *

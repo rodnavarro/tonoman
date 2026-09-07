@@ -24,6 +24,7 @@ import { createHash, randomBytes } from "node:crypto";
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
 import { homeFor } from "./plaudcli";
+import { stamp, storeFor } from "./tokenstore";
 
 const API_BASE = process.env.PLAUD_API_BASE ?? "https://platform.plaud.ai/developer/api";
 const AUTH_URL = process.env.PLAUD_AUTH_URL ?? "https://web.plaud.ai/platform/oauth";
@@ -44,10 +45,6 @@ export interface Pending {
  *  silently make their pasted code meaningless. */
 function pendingPath(agent: string, root?: string): string {
   return path.join(homeFor(agent, root), "pending-login.json");
-}
-
-function tokenPath(agent: string, root?: string): string {
-  return path.join(homeFor(agent, root), ".plaud", "tokens.json");
 }
 
 /** Begin a login: the URL to put in front of the person, and the secret that finishes it. */
@@ -91,15 +88,11 @@ export interface Finished {
  *  the account, which is the part the person asked for; a disconnect that refuses because a remote
  *  call failed leaves them connected to something they just said to drop. */
 export async function disconnect(agent: string, root?: string): Promise<void> {
-  const token = await (async (): Promise<string | undefined> => {
-    try {
-      return (JSON.parse(await fsp.readFile(tokenPath(agent, root), "utf8")) as { access_token?: string })
-        .access_token;
-    } catch {
-      return undefined;
-    }
-  })();
-  await fsp.rm(tokenPath(agent, root), { force: true }).catch(() => {});
+  const token = await storeFor(root)
+    .load(agent)
+    .then((t) => t?.access_token)
+    .catch(() => undefined);
+  await storeFor(root).clear(agent);
   await fsp.rm(pendingPath(agent, root), { force: true }).catch(() => {});
   if (!token) return;
   await fetch(`${API_BASE}/open/third-party/users/current/revoke`, {
@@ -154,14 +147,17 @@ export async function complete(agent: string, pasted: string, root?: string): Pr
     };
   }
 
-  const tokens = (await res.json()) as { access_token?: string; expires_in?: number };
-  if (!tokens.access_token) return { ok: false, problem: "Plaud's answer had no access token in it" };
+  // Named `granted` rather than `tokens`, which is now the store.
+  const granted = (await res.json()) as { access_token?: string; expires_in?: number };
+  if (!granted.access_token) return { ok: false, problem: "Plaud's answer had no access token in it" };
 
-  const withDeadline = tokens.expires_in
-    ? { ...tokens, expires_at: Date.now() + tokens.expires_in * 1000 }
-    : tokens;
-  await fsp.mkdir(path.dirname(tokenPath(agent, root)), { recursive: true });
-  await fsp.writeFile(tokenPath(agent, root), JSON.stringify(withDeadline, null, 2), "utf8");
+  // Storing is allowed to fail loudly. Reporting a connection that was not persisted is worse
+  // than reporting a failure: the person believes they are done, and nothing ever polls.
+  try {
+    await storeFor(root).save(agent, stamp(granted));
+  } catch (e) {
+    return { ok: false, problem: `I signed in but couldn't store the credential — ${(e as Error).message}` };
+  }
   // The pending secret has done its job; leaving it lying about serves nobody.
   await fsp.rm(pendingPath(agent, root), { force: true }).catch(() => {});
   return { ok: true };
