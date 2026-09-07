@@ -344,8 +344,27 @@ export async function publish(
   );
 
   await git(brainDir, ["add", "-A"]);
-  const c = await git(brainDir, ["commit", "-m", `Meeting recap: ${rec.title} (${rec.stamp})`]);
-  if (c.code !== 0) return false; // nothing to commit
+  // The identity is passed per-command rather than assumed. A container has no git config, so the
+  // commit fails with "please tell me who you are" — and because the old code read ANY non-zero
+  // exit as "nothing to commit", that failure was reported as success-with-nothing-to-do. The recap
+  // was never committed, the 60-second second-brain `reset --hard` then deleted the untracked file,
+  // and the next poll transcribed the same recording again. Every two minutes. That is what
+  // exhausted the transcription quota.
+  const c = await git(brainDir, [
+    "-c",
+    "user.name=Tonoman",
+    "-c",
+    "user.email=agent@tonoman.local",
+    "commit",
+    "-m",
+    `Meeting recap: ${rec.title} (${rec.stamp})`,
+  ]);
+  if (c.code !== 0) {
+    // "nothing to commit" is the ONE benign non-zero exit, and it is now distinguished from every
+    // other. A commit that fails for any other reason is a failure, and says so.
+    if (/nothing to commit|nothing added to commit/i.test(c.out)) return false;
+    throw new Error(`git commit failed: ${redact(c.out, pushUrl).slice(0, 200)}`);
+  }
 
   // The credential rides one command and is never left in .git/config.
   await git(brainDir, ["remote", "set-url", "origin", pushUrl]);
