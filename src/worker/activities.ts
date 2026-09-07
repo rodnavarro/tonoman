@@ -284,6 +284,14 @@ export function makeActivities(deps: TurnDeps) {
         console.log(`recap: skipping ${rec.title} — before the floor`);
         return;
       }
+      // And re-check publication, for the same reason: a queued list is a snapshot, and the same
+      // recording was summarised three times because each run of the list re-derived a slightly
+      // different summary and so had something to commit. `publish` cannot catch this — a changed
+      // summary IS a change.
+      if ((await recap.unpublished([rec], v.brainDir, v.floorMs)).length === 0) {
+        console.log(`recap: skipping ${rec.title} — already published`);
+        return;
+      }
 
       ctx.heartbeat("transcribing");
       // Per chunk, not per recording: a long meeting is many uploads, and a heartbeat only at the
