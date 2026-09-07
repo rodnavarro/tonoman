@@ -23,6 +23,7 @@ import type { Connector, TurnEvent, TurnRunner, TurnUsage } from "../core/contra
 import { SlackConnector } from "../connector/slack";
 import * as cmds from "./commands";
 import * as plaudcli from "./plaudcli";
+import * as plaudauth from "./plaudauth";
 import {
   parseStatusMode,
   remoteAccountUsageCached,
@@ -463,41 +464,28 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
     resetSession: (name, conversation) => void resetSession(name, conversation).catch(() => {}),
     plaudConnected: (name) => plaudcli.connected(name),
     finishPlaud: async (name, pasted) => {
-      const ok = await plaudcli.completeLogin(pasted);
-      if (!ok) {
-        return "That doesn't look like the address from the sign-in page — it needs the part with `code=` in it. Paste the whole thing.";
-      }
-      // The listener took the code; whether the exchange succeeded is the login process's business
-      // and it reports that on its own, in this thread, through connectPlaud's `done`.
-      return "Got it — finishing the connection now.";
-    },
-    connectPlaud: async (name, conversation) => {
-      // The link goes to the person, and the confirmation comes back in the same thread when they
-      // finish — so a login is one message, a browser tab, and a reply, rather than a support call.
-      const started = await plaudcli.startLogin({ agent: name });
-      if (!started.url) {
-        return "I couldn't start the Plaud sign-in — the CLI didn't hand me a link. That's mine to fix, not yours.";
-      }
-      const reply = wired.get(name)?.conn.reply(conversation);
-      void started.done
-        .then(async (ok) => {
-          if (!ok) {
-            await reply?.send("That sign-in didn't complete. Type `!connect` and I'll send a fresh link.").catch(() => {});
-            return;
-          }
-          const where = voiceCreds.get(name)?.notifyChannel;
-          await reply
-            ?.send(
-              `✅ Your Plaud account is connected.\n\nRecord something and I'll pick it up within five minutes — ` +
-                `I'll post what I find ${where ? `in <#${where}>` : "here"}.`,
-            )
-            .catch(() => {});
-        })
-        .catch(() => {});
+      const r = await plaudauth.complete(name, pasted);
+      if (!r.ok) return `That didn't work - ${r.problem}.`;
+      const where = voiceCreds.get(name)?.notifyChannel;
       return (
-        `Let's connect your Plaud account.\n\n*First, quit the Plaud desktop app* if it is running - it listens on the same port I do, and it will swallow the sign-in before it reaches me.\n\nThen open this and sign in as yourself:\n\n${started.url}` +
-        `${started.code ? `\n\nThe code is *${started.code}*.` : ""}` +
-        `\n\n*One more step:* after you sign in the page will fail to load. That is expected - it is trying to reach me and cannot.\n\nCopy the whole address from your browser bar and send it back here as \`!code <address>\``
+        "✅ Your Plaud account is connected." +
+        `
+
+Record something and I'll pick it up within five minutes - I'll post what I find ${where ? `in <#${where}>` : "here"}.`
+      );
+    },
+    connectPlaud: async (name) => {
+      const p = await plaudauth.begin(name);
+      return (
+        `Let's connect your Plaud account. Open this and sign in as yourself:
+
+${p.url}` +
+        `
+
+*Then:* the page it sends you to will fail to load. That is expected - it is trying to reach me and cannot.` +
+        `
+
+Copy the whole address out of your browser bar and send it back here as \`!code <address>\``
       );
     },
     // What THIS conversation runs: its own choice, else whatever the roster row says.

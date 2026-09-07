@@ -26,6 +26,10 @@ const CLIENT_ID = process.env.PLAUD_CLI_CLIENT_ID ?? "client_f9e0b214-c11f-434b-
 interface TokenSet {
   access_token?: string;
   refresh_token?: string;
+  /** What the token endpoint returns: seconds of life, not a deadline. */
+  expires_in?: number;
+  /** Ours: the deadline we computed when we stored it, so a restart does not think a token
+   *  minted yesterday is fresh. */
   expires_at?: number;
   [k: string]: unknown;
 }
@@ -44,9 +48,13 @@ async function read(agent: string, root?: string): Promise<TokenSet | undefined>
 
 /** Renew ahead of the deadline rather than on a 401.
  *
- *  A day of margin, because the alternative is discovering the expiry inside a poll that a person
- *  is waiting on — and these tokens last months, so spending a day of that early costs nothing. */
-const RENEW_BEFORE_MS = 24 * 60 * 60 * 1000;
+ *  Ten minutes, measured against the real thing: the access token comes back with
+ *  `expires_in: 86400`, so it lives a day, and the 300 days in Plaud's own documentation belongs
+ *  to the refresh token behind it. A day of margin here would have refreshed on every single poll.
+ *
+ *  Ten is enough to cover a poll that takes a while — a long recording is minutes of ffmpeg and
+ *  transcription — without spending the token's life ahead of time. */
+const RENEW_BEFORE_MS = 10 * 60 * 1000;
 
 /** The access token for this agent, refreshed if it is close to expiring. Undefined means the
  *  tenant has not connected an account, which is a state and not a failure. */
@@ -55,19 +63,31 @@ export async function accessToken(agent: string, root?: string): Promise<string 
   if (!t?.access_token) return undefined;
 
   const expMs = typeof t.expires_at === "number" ? (t.expires_at > 1e12 ? t.expires_at : t.expires_at * 1000) : 0;
+  // No stored deadline means a token written by something that did not record one (the CLI's own
+  // login, for instance). Treat it as due rather than as immortal.
   if (!t.refresh_token || !expMs || expMs - Date.now() > RENEW_BEFORE_MS) return t.access_token;
 
   try {
+    // Form-encoded with a Basic header, as OAuth specifies and as the endpoint insists: sent as
+    // JSON it answers 422 saying the fields are missing, which reads like a bad request rather
+    // than the wrong encoding.
     const res = await fetch(REFRESH_URL, {
       method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ refresh_token: t.refresh_token, client_id: CLIENT_ID }),
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        authorization: `Basic ${Buffer.from(`${CLIENT_ID}:`).toString("base64")}`,
+      },
+      body: new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: t.refresh_token,
+        client_id: CLIENT_ID,
+      }),
     });
     if (!res.ok) return t.access_token; // still valid for now; say nothing and try again next poll
     const next = (await res.json()) as TokenSet;
     if (!next.access_token) return t.access_token;
     // Written back through the CLI's own file, so `plaud` and this agree about who is signed in.
-    await fsp.writeFile(tokenPath(agent, root), JSON.stringify({ ...t, ...next }, null, 2), "utf8");
+    await fsp.writeFile(tokenPath(agent, root), JSON.stringify(stamp({ ...t, ...next }), null, 2), "utf8");
     return next.access_token;
   } catch {
     return t.access_token;
@@ -87,13 +107,23 @@ async function call<T>(agent: string, pathname: string, root?: string): Promise<
   return (await res.json()) as T;
 }
 
+/** Verified against the live API, not inferred:
+ *    { id, name, created_at, serial_number, start_at, duration, presigned_url, source_list, note_list }
+ *  `start_at` is an ISO string ("2026-09-07T03:10:46.379000"), NOT epoch milliseconds, and
+ *  `duration` is already milliseconds. */
 interface ApiFile {
   id: string;
   name?: string;
-  start_at?: number;
+  start_at?: string | number;
   duration?: number;
-  created_at?: number;
+  created_at?: string | number;
   presigned_url?: string;
+}
+
+/** Record when a token set was stored, since the endpoint reports a lifetime and not a deadline. */
+function stamp(t: TokenSet): TokenSet {
+  const secs = typeof t.expires_in === "number" ? t.expires_in : 0;
+  return secs ? { ...t, expires_at: Date.now() + secs * 1000 } : t;
 }
 
 /** `YYYY-MM-DD-HHMM` in the pod's timezone — the folder-per-recording name the rest of the
@@ -104,11 +134,16 @@ export function stampFor(startMs: number): string {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}`;
 }
 
-/** Plaud sends milliseconds. Reading them as seconds put a meeting in the year 58652 once already,
- *  so anything too small to be a recent instant is treated as seconds and promoted. */
-export function toMs(v: number | undefined): number {
+/** An instant, from either shape this API uses. `start_at` arrives as an ISO string with no zone
+ *  ("2026-09-07T03:10:46.379000"), which JavaScript reads as LOCAL time — and the pod runs UTC,
+ *  which is the zone Plaud means. Numbers are milliseconds; anything too small to be a recent
+ *  instant is seconds and gets promoted, because reading one as the other once filed a meeting
+ *  under the year 58652. */
+export function toMs(v: string | number | undefined): number {
   if (!v) return 0;
-  return v > 1e11 ? v : v * 1000;
+  if (typeof v === "number") return v > 1e11 ? v : v * 1000;
+  const t = Date.parse(/[Zz]|[+-]\d\d:?\d\d$/.test(v) ? v : `${v}Z`);
+  return Number.isFinite(t) ? t : 0;
 }
 
 export function toRecording(f: ApiFile): Recording {
@@ -117,25 +152,24 @@ export function toRecording(f: ApiFile): Recording {
     id: f.id,
     title: (f.name ?? "").trim() || stampFor(startTime),
     startTime,
-    duration: toMs(f.duration) === 0 ? 0 : f.duration && f.duration > 1e7 ? f.duration : (f.duration ?? 0) * 1000,
+    // Already milliseconds: a 31-second recording reports 31000.
+    duration: f.duration ?? 0,
     stamp: stampFor(startTime),
   };
 }
 
 /** The recent recordings on this agent's connected account, newest first. */
 export async function list(agent: string, pageSize = 20, root?: string): Promise<Recording[]> {
-  const body = await call<{ data?: ApiFile[]; items?: ApiFile[] } | ApiFile[]>(
-    agent,
-    `/open/third-party/files/?page=1&page_size=${pageSize}`,
-    root,
-  );
-  const rows = Array.isArray(body) ? body : (body.data ?? body.items ?? []);
-  return rows.map(toRecording).sort((a, b) => b.startTime - a.startTime);
+  // The API refuses a page smaller than ten, and says so with a 422 that names the constraint.
+  const size = Math.max(10, Math.min(100, pageSize));
+  const body = await call<{ data?: ApiFile[] }>(agent, `/open/third-party/files/?page=1&page_size=${size}`, root);
+  return (body.data ?? []).map(toRecording).sort((a, b) => b.startTime - a.startTime);
 }
 
 /** A time-limited download URL for one recording's audio. Signed on demand and short-lived, so it
  *  is fetched at the moment of use and never stored. */
 export async function audioUrl(agent: string, id: string, root?: string): Promise<string> {
+  // The detail response is the file itself, with no envelope around it.
   const f = await call<ApiFile>(agent, `/open/third-party/files/${encodeURIComponent(id)}`, root);
   if (!f.presigned_url) {
     // Their own client distinguishes these two, and so should we: a recording that has not
