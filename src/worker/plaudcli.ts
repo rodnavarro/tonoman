@@ -68,8 +68,27 @@ export async function startLogin(o: RunOpts): Promise<Started> {
   const home = homeFor(o.agent, o.root);
   await fsp.mkdir(home, { recursive: true });
 
+  // The CLI opens a browser and only PRINTS the URL when opening fails:
+  //     open(url).catch(() => console.log("Could not open browser. Open this URL manually: ..."))
+  // In a pod that call succeeds against nothing, so the link is generated, never shown, and the
+  // person is told the sign-in could not start. Rather than depend on a failure, we give it an
+  // opener that prints — which is what "open a browser" honestly means on a machine with no
+  // screen, and is how the CLI's own docs describe using it on a headless server.
+  const bin = path.join(home, "bin");
+  await fsp.mkdir(bin, { recursive: true });
+  const shim = path.join(bin, "xdg-open");
+  const script = ["#!/bin/sh", 'echo "PLAUD_OPEN $1"'].join("\n") + "\n";
+  await fsp.writeFile(shim, script, { mode: 0o755 });
+  await fsp.chmod(shim, 0o755).catch(() => {});
+
   const child = spawn(o.bin ?? "plaud", ["login"], {
-    env: { ...process.env, HOME: home, USERPROFILE: home, NO_COLOR: "1", BROWSER: "none" },
+    env: {
+      ...process.env,
+      HOME: home,
+      USERPROFILE: home,
+      NO_COLOR: "1",
+      PATH: `${bin}:${process.env.PATH ?? ""}`,
+    },
     stdio: ["ignore", "pipe", "pipe"],
   });
 
