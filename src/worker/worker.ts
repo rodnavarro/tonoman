@@ -537,6 +537,18 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
   // In-channel commands. They read and write the same maps the status footer uses, so what
   // `!status` reports is exactly what the footer would have shown.
   const commandDeps: cmds.CommandDeps = {
+    // Straight off the roster this worker already holds, rather than a call back to the registry.
+    // The roster IS the worker's view of an agent, and answering from anything else would let
+    // `!connections` disagree with what the flow is actually using — which is precisely the
+    // question somebody types it to settle.
+    connections: async (name) =>
+      (wired.get(name)?.cfg.connections ?? []).map((c) => ({
+        kind: c.kind,
+        alias: c.alias,
+        label: c.label,
+        status: c.status,
+        externalAccount: c.external_account,
+      })),
     getMode: modeFor,
     setMode: (conversation, mode) => statusModes.set(conversation, mode),
     lastUsage: (conversation) => lastUsage.get(conversation),

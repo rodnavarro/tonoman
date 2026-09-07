@@ -22,17 +22,70 @@ export interface Command {
   arg: string;
 }
 
+/** Every command this agent answers. The ONE list — the help text, the unknown-command reply and
+ *  the dispatch all read from it, so a command cannot exist in one and not the others. */
+export const KNOWN = [
+  "help",
+  "commands",
+  "status",
+  "usage",
+  "statusline",
+  "model",
+  "connect",
+  "connections",
+  "disconnect",
+  "logout",
+  "code",
+  "callback",
+  "new",
+] as const;
+
+/** What starts a command.
+ *
+ *  `!` is the conventional bot prefix and Slack does nothing special with it. `.` is here because
+ *  `!` is also how Claude Code runs a shell command, and somebody who lives in that terminal reaches
+ *  for it by habit — two characters of regex is a cheap way to let a habit differ from a default.
+ *
+ *  `/` is deliberately NOT one of them, and used to be. Slack owns that namespace: an unregistered
+ *  slash command is intercepted by Slack, answered with Slack's own error, and never delivered
+ *  here. So `/status` has never once reached this function — the support was real in the code and
+ *  imaginary in practice, which is worse than not having it. */
+const PREFIX = /^[!.]/;
+
 /** Recognise a command. Returns undefined for ordinary text, which is the common case — so this
  *  runs on every inbound message and must not be clever about it. */
 export function parse(text: string): Command | undefined {
   const t = (text ?? "").trim();
-  if (!/^[!/][a-z]/i.test(t)) return undefined;
-  const m = /^[!/](\S+)\s*([\s\S]*)$/.exec(t);
+  if (!PREFIX.test(t) || !/^[!.][a-z]/i.test(t)) return undefined;
+  const m = /^[!.](\S+)\s*([\s\S]*)$/.exec(t);
   if (!m) return undefined;
   return { name: m[1]!.toLowerCase(), arg: (m[2] ?? "").trim() };
 }
 
+/** PURE: the closest command to something somebody typed, or undefined.
+ *
+ *  Prefix matching in both directions rather than an edit distance: `!connections` should suggest
+ *  `!connect`, and `!conn` should too. That is the actual shape of the mistake — people guess at a
+ *  longer or shorter form of a command they half-remember, not at an anagram of one. */
+export function nearest(name: string, known: readonly string[] = KNOWN): string | undefined {
+  const n = name.toLowerCase();
+  const hit = known.find((k) => k === n) ?? known.find((k) => n.startsWith(k) || k.startsWith(n));
+  return hit;
+}
+
+/** One outside account, as a person needs to see it: what it is, what they called it, and whether
+ *  it is actually working. */
+export interface ConnectionLine {
+  kind: string;
+  alias: string;
+  label?: string;
+  status?: string;
+  externalAccount?: string;
+}
+
 export interface CommandDeps {
+  /** What this agent is connected to. Absent on a deployment with no registry behind it. */
+  connections?(agent: string): Promise<ConnectionLine[]>;
   /** The conversation's status-footer mode. */
   getMode(conversation: string): StatusMode;
   setMode(conversation: string, mode: StatusMode): void;
@@ -75,8 +128,11 @@ const HELP = [
   "• `!connect plaud` — connect your Plaud account, so I can pick up your recordings",
   "• `!disconnect plaud` — forget it again",
   "• `!disconnect claude` — sign out of the Claude subscription I answer on",
+  "• `!connections` — what this agent is connected to",
   "• `!new` — forget this thread and start over",
   "• `!help` — this",
+  "",
+  "_`.` works too, if you prefer it to `!`._",
 ].join("\n");
 
 /** `!new`, when there IS something to clear.
@@ -213,7 +269,43 @@ export async function run(
       return `🧠 Model set to *${cmd.arg}* for this conversation — from the next message.`;
     }
 
-    default:
-      return null;
+    case "connections": {
+      if (!deps.connections) return "I can't see connections on this deployment.";
+      const list = await deps.connections(agent);
+      if (list.length === 0) {
+        // Not an error, and worth saying in words. An empty list and a broken lookup look identical
+        // if the answer is a blank line.
+        return "Nothing is connected yet. `!connect plaud` to start, or ask me to add a calendar.";
+      }
+      const lines = list.map((c) => {
+        // The NAME first, because that is what a person gave it and what they will use to refer to
+        // it. The kind is a detail; `Foley Outlook ICS` means something, `ics` does not.
+        const name = c.label || c.alias;
+        const who = c.externalAccount ? ` — ${c.externalAccount}` : "";
+        // Only when it is NOT connected. A green tick on every line trains people to stop reading;
+        // a line that says something only when something is wrong keeps its meaning.
+        const bad = c.status && c.status !== "connected" ? `  ⚠️ ${c.status}` : "";
+        return `• *${name}* (\`${c.kind}/${c.alias}\`)${who}${bad}`;
+      });
+      return [`*Connected* — ${list.length} thing${list.length === 1 ? "" : "s"}:`, ...lines].join("\n");
+    }
+
+    default: {
+      // NEVER fall through to a turn.
+      //
+      // It used to return null here, which handed `!connections` to the harness as ordinary text —
+      // and the harness, being Claude Code, answered confidently about ITS OWN connectors: Google
+      // Drive, Gmail, MCP. A plausible answer to a question nobody asked, about a different system
+      // entirely. Silence would have been better; this is better than silence.
+      //
+      // The prefix is deliberate and learned, so anything wearing it is a command attempt. Saying
+      // so costs one message; guessing wrong costs somebody their afternoon.
+      const guess = nearest(cmd.name);
+      return (
+        `I don't know \`!${cmd.name}\`.` +
+        (guess ? ` Did you mean \`!${guess}\`?` : "") +
+        `\n\n${HELP}`
+      );
+    }
   }
 }

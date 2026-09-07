@@ -8,8 +8,24 @@ describe("parse", () => {
     expect(parse("  !statusline full  ")).toEqual({ name: "statusline", arg: "full" });
   });
 
-  it("accepts / too, so a registered slash command uses the same dispatch", () => {
-    expect(parse("/model sonnet")).toEqual({ name: "model", arg: "sonnet" });
+  it("does NOT accept /, because Slack owns that namespace", () => {
+    // This used to be supported and never once worked. Slack intercepts an unregistered slash
+    // command, answers with its own error, and never delivers the message — so `/model` has never
+    // reached this function. Support that is real in the code and imaginary in practice is worse
+    // than no support: it reads as a working path nobody can use.
+    expect(parse("/model sonnet")).toBeUndefined();
+  });
+
+  it("accepts . as well as !, so a habit can differ from the default", () => {
+    // `!` is also how Claude Code runs a shell command, and somebody who lives in that terminal
+    // reaches for it. Two characters of regex; customers still get the conventional `!`.
+    expect(parse(".connect plaud")).toEqual({ name: "connect", arg: "plaud" });
+    expect(parse("!connect plaud")).toEqual({ name: "connect", arg: "plaud" });
+  });
+
+  it("still ignores ordinary prose that happens to start with punctuation", () => {
+    expect(parse("... anyway, that worked")).toBeUndefined();
+    expect(parse("!!! this broke")).toBeUndefined();
   });
 
   it("lower-cases the command but not the argument", () => {
@@ -41,8 +57,50 @@ function deps(over: Partial<CommandDeps> = {}): CommandDeps {
 }
 
 describe("run", () => {
-  it("returns null for a command it does not own, so the turn still happens", async () => {
-    expect(await run(deps(), "nelly", "c", { name: "deploy", arg: "" })).toBeNull();
+  it("NEVER lets an unknown command become a turn", async () => {
+    // It used to return null here, handing `!connections` to the harness as ordinary text — and the
+    // harness, being Claude Code, answered confidently about ITS OWN connectors: Google Drive,
+    // Gmail, MCP. A plausible answer to a question nobody asked, about a different system. The
+    // prefix is deliberate and learned, so anything wearing it is a command attempt.
+    const out = await run(deps(), "nelly", "c", { name: "deploy", arg: "" });
+    expect(out).not.toBeNull();
+    expect(out).toContain("deploy");
+    expect(out).toContain("!help");
+  });
+
+  it("suggests the command somebody was probably reaching for", async () => {
+    // The real shape of the mistake: a longer or shorter form of a half-remembered command, not an
+    // anagram of one.
+    expect(await run(deps(), "nelly", "c", { name: "conn", arg: "" })).toContain("`!connect`");
+    expect(await run(deps(), "nelly", "c", { name: "statuss", arg: "" })).toContain("`!status`");
+  });
+
+  it("lists connections by the name a person gave them, not by kind", async () => {
+    // `Foley Outlook ICS` means something to somebody. `ics` does not.
+    const d = {
+      ...deps(),
+      connections: async () => [
+        { kind: "ics", alias: "foley", label: "Foley Outlook ICS", status: "connected" },
+        { kind: "google", alias: "personal", status: "expired", externalAccount: "rod@rodnavarro.com" },
+      ],
+    };
+    const out = (await run(d, "sapien", "c", { name: "connections", arg: "" })) ?? "";
+    expect(out).toContain("Foley Outlook ICS");
+    expect(out).toContain("rod@rodnavarro.com");
+    // Flagged only when it is NOT working — a tick on every line trains people to stop reading.
+    expect(out).toContain("expired");
+    expect(out.match(/⚠️/g)?.length).toBe(1);
+  });
+
+  it("says plainly when nothing is connected", async () => {
+    // An empty list and a broken lookup look identical if the answer is a blank line.
+    const d = { ...deps(), connections: async () => [] };
+    expect(await run(d, "sapien", "c", { name: "connections", arg: "" })).toContain("Nothing is connected");
+  });
+
+  it("does not invent a suggestion when there is nothing close", async () => {
+    const out = await run(deps(), "nelly", "c", { name: "zzzz", arg: "" });
+    expect(out).not.toContain("Did you mean");
   });
 
   it("answers !status from account headroom even before any turn has run", async () => {
