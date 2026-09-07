@@ -237,6 +237,8 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
   // The git push credential, resolved once at boot. Held in memory only; the checkout's remote on
   // disk stays credential-free.
   const voiceCreds = new Map<string, VoiceConfig>();
+  /** Agents whose voice flow is off, so their schedule can be paused rather than left ticking. */
+  const disabledFlows = new Set<string>();
   for (const [name, a] of wired) {
     const tokenFile = process.env.PLAUD_TOKEN_FILE;
     const groqKey = process.env.GROQ_API_KEY;
@@ -247,6 +249,11 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
     const voice = voiceSettings(a.cfg.flows?.voice, process.env);
     if (!voice.enabled) {
       console.log(`worker: ${name} voice flow is switched off (flow_property enabled=false)`);
+      // Switching the flow off has to switch the SCHEDULE off. Left running it keeps firing into an
+      // agent with no voice configuration — harmless, because the activity finds nothing to do, but
+      // it fills the schedule list with executions that look like work and reports "off" in one
+      // place while ticking in another.
+      disabledFlows.add(name);
       continue;
     }
     if (!tokenFile || !groqKey || !src) {
@@ -519,6 +526,19 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
   // restarting a pod, and `overlapPolicy: SKIP` is the "do not double-process" guarantee that
   // otherwise has to be written by hand. The loop only made sense if the workflow carried state
   // between ticks, and it never did — what has been published is answered from the git checkout.
+  for (const name of disabledFlows) {
+    // Best effort and idempotent: a flow that was never scheduled has nothing to pause.
+    try {
+      const h = client.schedule.getHandle(`voice:${name}`);
+      if (!(await h.describe()).state.paused) {
+        await h.pause("flow_property enabled=false");
+        console.log(`worker: ${name} voice schedule paused — the flow is switched off`);
+      }
+    } catch {
+      /* no schedule under that id, which is the normal case for a flow that was never on */
+    }
+  }
+
   for (const [name, v] of voiceCreds) {
     const recipient = v.notifyUser ?? "";
     if (!recipient && !v.notifyChannel) {
