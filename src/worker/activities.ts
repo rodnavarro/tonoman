@@ -536,7 +536,10 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
 
     const footer = await deps.footer?.(input.agent, input.conversation, usage).catch(() => null);
     const body = answer.trim() || "_(no answer)_";
-    const final = footer ? `${body}\n\n${footer}` : body;
+    // Three newlines, not one blank line. The footer is metadata about the turn, not the last
+    // paragraph of it, and at one blank line Slack renders it tight enough to read as part of the
+    // answer.
+    const final = footer ? `${body}\n\n\n${footer}` : body;
     if (!msgId) msgId = await reply.send(final);
     else await reply.finalize(msgId, final);
 }

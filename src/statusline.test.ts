@@ -78,7 +78,9 @@ describe("statusline pure helpers (gw-command-statusline)", () => {
       { key: "7d", usedPct: 19, resetAt: "2026-06-23T03:00:00Z" },
     ];
     const line = renderSmall(U, "sonnet", w, now);
-    expect(line).toContain("📊");
+    // No icon, and no orphaned separator where it used to be.
+    expect(line).not.toContain("📊");
+    expect(line.startsWith("sonnet")).toBe(true);
     expect(line).toContain("sonnet"); // model shown (falls back to the passed model)
     expect(line).toContain("21.1k tok");
     expect(line).toContain("ctx 11%");
@@ -127,7 +129,7 @@ describe("statusline pure helpers (gw-command-statusline)", () => {
   it("renderStatus: none → null, small/full → text; null usage → null", () => {
     expect(renderStatus("none", U, "sonnet", [], 0)).toBeNull();
     expect(renderStatus("small", undefined, "sonnet", [], 0)).toBeNull();
-    expect(renderStatus("small", U, "sonnet", [], 0)).toContain("📊");
+    expect(renderStatus("small", U, "sonnet", [], 0)).toContain("sonnet");
     expect(renderStatus("full", U, "sonnet", [], 0)).toContain("Usage — this turn");
   });
 });

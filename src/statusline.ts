@@ -129,7 +129,12 @@ function modelLabel(u: TurnUsage, model?: string): string | undefined {
 /** One compact status line. `now` drives the per-window time-to-reset (⏳). */
 export function renderSmall(u: TurnUsage, model: string | undefined, windows: UsageWindow[], now: number = Date.now()): string {
   const ml = modelLabel(u, model);
-  const parts = [`📊${ml ? " " + ml : ""}`, `${compactTokens(totalTokens(u))} tok`, `ctx ${contextPercent(u)}%`];
+  // No icon. This line sits under every answer the agent gives, so it is the most-repeated
+  // element in the whole product — and an emoji there reads as a label on the answer rather than
+  // as the quiet meter it is. The words carry it.
+  const parts = [ml, `${compactTokens(totalTokens(u))} tok`, `ctx ${contextPercent(u)}%`].filter(
+    (p): p is string => Boolean(p),
+  );
   // Agentic iterations the turn took (⟳ N), when the harness reports it — shows how hard the turn
   // worked and how close it ran to its step cap (gw-command-statusline / 40-turn cap).
   if (u.iterationsUsed != null) parts.push(`⟳ ${u.iterationsUsed}`);
