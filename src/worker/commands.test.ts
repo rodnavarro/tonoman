@@ -35,6 +35,7 @@ function deps(over: Partial<CommandDeps> = {}): CommandDeps {
     lastUsage: () => undefined,
     windows: async () => [{ key: "5h", usedPct: 9, resetAt: undefined }],
     getModel: () => "sonnet",
+    setModel: () => {},
     ...over,
   };
 }
@@ -73,17 +74,29 @@ describe("run", () => {
     expect(d.getMode("c")).toBe("small");
   });
 
-  it("reports the model, and sets it when the harness has a switch", async () => {
+  it("reports the model and sets it for THIS conversation only", async () => {
     const setModel = vi.fn();
     const d = deps({ setModel });
     expect(await run(d, "nelly", "c", { name: "model", arg: "" })).toContain("*sonnet*");
     expect(await run(d, "nelly", "c", { name: "model", arg: "opus" })).toContain("next message");
-    expect(setModel).toHaveBeenCalledWith("nelly", "opus");
+    // The conversation is carried through, which is the whole point: one person changing the model
+    // must not move it under everybody else the worker is serving.
+    expect(setModel).toHaveBeenCalledWith("nelly", "c", "opus");
   });
 
-  it("says so plainly when the harness has no model switch", async () => {
-    const d = deps({ setModel: undefined });
-    expect(await run(d, "nelly", "c", { name: "model", arg: "opus" })).toContain("no model switch");
+  it("scopes the change to the conversation it was typed in", async () => {
+    const setModel = vi.fn();
+    const d = deps({ setModel });
+    await run(d, "nelly", "celine-thread", { name: "model", arg: "opus" });
+    expect(setModel).toHaveBeenCalledWith("nelly", "celine-thread", "opus");
+    expect(setModel).not.toHaveBeenCalledWith("nelly", "rod-thread", "opus");
+  });
+
+  it("'default' clears the override rather than setting a model named default", async () => {
+    const setModel = vi.fn();
+    const d = deps({ setModel });
+    expect(await run(d, "nelly", "c", { name: "model", arg: "default" })).toContain("default model");
+    expect(setModel).toHaveBeenCalledWith("nelly", "c", undefined);
   });
 
   it("answers !new with how a fresh conversation is actually started here", async () => {

@@ -76,6 +76,24 @@ async function resolveRef(ref: string | null | undefined): Promise<string> {
   }
 }
 
+/** Tools withheld from every turn this worker runs.
+ *
+ *  The default is not empty, deliberately. The pod is the sandbox AND it holds the credential that
+ *  buys the inference, so anything that can execute or write is a way for a customer-facing turn to
+ *  reach the platform's own secrets. Reading and searching are what a second brain needs; a shell
+ *  is not. Override with CLAUDE_CODE_DISALLOWED_TOOLS when an agent genuinely needs more, and
+ *  understand what is being handed over. */
+const DEFAULT_DISALLOWED = ["Bash", "Write", "Edit", "NotebookEdit", "WebFetch", "Task"];
+
+function disallowedTools(): string[] {
+  const env = (process.env.CLAUDE_CODE_DISALLOWED_TOOLS ?? "").trim();
+  if (!env) return DEFAULT_DISALLOWED;
+  // An explicit "none" is how an operator says they mean it, rather than an empty string that
+  // could just as easily be an unset variable.
+  if (env.toLowerCase() === "none") return [];
+  return env.split(",").map((s) => s.trim()).filter(Boolean);
+}
+
 /** One wired agent: the roster row, its channel, its harness, and the second-brain note the turn
  *  is given. The runner is kept alongside `run` because the model knob (`!model`) lives on it. */
 interface Wired {
@@ -111,13 +129,26 @@ function wire(cfg: Config): Map<string, Wired> {
       continue;
     }
     // No container: the pod is the sandbox (an agent is a row, not a container).
-    const runner = spec.newRunner({ container: a.container, model: a.model, maxTurns: a.max_turns, url: a.url });
+    //
+    // And because the pod is the sandbox, the tools it hands the model are the security boundary.
+    // This pod holds the operator's Claude subscription credential, so a shell here can read the
+    // account behind it — which is exactly what happened: asked who it was talking to, the agent
+    // ran Bash, found the operator's email in the runtime, and told a customer about it. An agent
+    // that answers from meetings and notes has no use for a shell anyway.
+    const runner = spec.newRunner({
+      container: a.container,
+      model: a.model,
+      maxTurns: a.max_turns,
+      url: a.url,
+      disallowedTools: disallowedTools(),
+    });
 
     out.set(a.name, {
       cfg: a,
       conn,
       runner,
-      run: (r: TurnRunReq) => runner.run({ prompt: r.prompt, systemPromptFile: r.systemPromptFile }),
+      run: (r: TurnRunReq) =>
+        runner.run({ prompt: r.prompt, systemPromptFile: r.systemPromptFile, model: r.model }),
     });
   }
   return out;
@@ -211,7 +242,11 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
     const token = await resolveRef(src.secret_ref);
     const pushUrl = token ? src.repo_url.replace("https://", `https://x-access-token:${token}@`) : src.repo_url;
     const dir = path.join(process.env.TONOMAN_STATE_ROOT ?? "/root/.tonoman", "secondbrain", name, src.id);
+    // Per agent. One worker runs every agent the tenant has, and where each announces its recaps
+    // is a separate question — even though today there is one agent and one variable.
+    const notifyChannel = (process.env.VOICE_NOTIFY_CHANNEL ?? "").trim() || undefined;
     voiceCreds.set(name, {
+      notifyChannel,
       creds: { tokenFile },
       brainDir: src.subpath ? path.join(dir, src.subpath) : dir,
       pushUrl,
@@ -244,11 +279,29 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
   const modeFor = (conversation: string): StatusMode => statusModes.get(conversation) ?? defaultMode;
   /** The last turn's usage per conversation, so `!status` can report it without spending a turn. */
   const lastUsage = new Map<string, TurnUsage>();
+  /** The model each conversation has chosen. Per conversation, NOT per process: this worker serves
+   *  every agent in the tenant and every thread they are in, and the harness's own knob is a single
+   *  variable — so `!model opus` in one thread moved everyone. */
+  const models = new Map<string, string>();
+
+  /** Where THIS agent's voice flow speaks: its configured channel, else a DM with the recipient.
+   *
+   *  A channel because a recap is team news; a DM makes it one person's news that everyone else has
+   *  to be told about again — and from the outside there is no way to tell whether it went to Rod
+   *  or to Celine. */
+  const voiceConversation = async (name: string, user: string): Promise<string | undefined> => {
+    const a = wired.get(name);
+    if (!a) return undefined;
+    const channel = voiceCreds.get(name)?.notifyChannel;
+    if (channel) return `${a.cfg.slack?.team_id ?? ""}/${channel}`;
+    return dmFor(name, user);
+  };
 
   const deps = {
     agent: (name: string) => wired.get(name),
     voice: (name: string) => voiceCreds.get(name),
     recordUsage: (conversation: string, u: TurnUsage) => lastUsage.set(conversation, u),
+    modelFor: (conversation: string) => models.get(conversation),
     footer: async (name: string, conversation: string, u: TurnUsage | undefined): Promise<string | null> => {
       const mode = modeFor(conversation);
       if (mode === "none" || !u) return null;
@@ -258,11 +311,11 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
       return renderStatus(mode, u, wired.get(name)?.runner.getModel?.(), windows, Date.now());
     },
     say: async (name: string, user: string, text: string) => {
-      const conv = await dmFor(name, user);
+      const conv = await voiceConversation(name, user);
       if (conv) await wired.get(name)?.conn.reply(conv).send(text);
     },
     ask: async (name: string, user: string, text: string) => {
-      const conv = await dmFor(name, user);
+      const conv = await voiceConversation(name, user);
       if (!conv) return;
       await client.workflow.signalWithStart(conversationWorkflow, {
         workflowId: `${name}:slack:${conv}`,
@@ -282,12 +335,12 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
     setMode: (conversation, mode) => statusModes.set(conversation, mode),
     lastUsage: (conversation) => lastUsage.get(conversation),
     windows: windowsFor,
-    getModel: (name) => wired.get(name)?.runner.getModel?.() ?? wired.get(name)?.cfg.model,
-    // Only offered when the harness actually has the knob — `!model x` on a harness without one
-    // must say so rather than accept the change and silently ignore it.
-    setModel: [...wired.values()].some((w) => w.runner.setModel)
-      ? (name, model) => wired.get(name)?.runner.setModel?.(model)
-      : undefined,
+    // What THIS conversation runs: its own choice, else whatever the roster row says.
+    getModel: (name, conversation) => models.get(conversation) ?? wired.get(name)?.cfg.model,
+    setModel: (_name, conversation, model) => {
+      if (model) models.set(conversation, model);
+      else models.delete(conversation);
+    },
   };
 
   // The agent asks for its OWN credential, through its own runtime. The login endpoints live in
@@ -449,7 +502,26 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
         taskQueue: o.taskQueue,
         args: [{ agent: name, notify, everySeconds: Number(process.env.VOICE_POLL_SECONDS ?? 120) }],
       });
-      console.log(`worker: ${name} voice poll started`);
+      const ch = voiceCreds.get(name)?.notifyChannel;
+      console.log(
+        `worker: ${name} voice poll started — announcing in ${ch ? `channel ${ch}` : `a DM with ${notify}`}`,
+      );
+      if (ch) {
+        // Our scopes carry neither chat:write.public nor channels:join, so an uninvited bot gets
+        // `not_in_channel` and every recap is lost silently. Prove it can post NOW, at boot, rather
+        // than discovering it when a meeting goes missing.
+        const conv = await voiceConversation(name, "");
+        await wired
+          .get(name)
+          ?.conn.reply(conv!)
+          .send(`_Recaps for ${name} will be posted here._`)
+          .catch((e) =>
+            console.error(
+              `worker: ${name} CANNOT post to ${ch} — ${(e as Error).message}. ` +
+                `Invite the bot to the channel (/invite) or recaps will be lost.`,
+            ),
+          );
+      }
     } catch (e) {
       const msg = (e as Error).message ?? "";
       if (/already started/i.test(msg)) console.log(`worker: ${name} voice poll already running`);
@@ -463,3 +535,6 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
   await nativeConn.close();
   console.log("worker: stopped");
 }
+
+/** Pure helpers exposed for tests. Not part of the module's contract. */
+export const __testing = { disallowedTools, DEFAULT_DISALLOWED };

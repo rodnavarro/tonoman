@@ -32,9 +32,26 @@ export interface TurnDeps {
   footer?(agent: string, conversation: string, usage: TurnUsage | undefined): Promise<string | null>;
   /** Remember the turn's usage, so `!status` can report it later without spending a turn. */
   recordUsage?(conversation: string, usage: TurnUsage): void;
+  /** The model this conversation is set to, if it has chosen one.
+   *
+   *  Per CONVERSATION. The harness's own model knob is per process, so one worker serving two
+   *  people meant `!model opus` in one thread silently moved everybody else too — which is what
+   *  happened the first time two users shared this worker. */
+  modelFor?(conversation: string): string | undefined;
 }
 
 export interface VoiceConfig {
+  /** Where this agent's recaps are announced: a Slack channel id.
+   *
+   *  A property of the FLOW, per agent, not of the worker — one worker runs every agent a tenant
+   *  has, and "which channel does Nelly post recaps to" is a different question for each of them.
+   *  Empty falls back to a DM with `notify`, which works but makes it impossible to tell from the
+   *  outside whether a recap went to Rod or to Celine.
+   *
+   *  Belongs in the agent's registry row; it arrives from the environment until that column
+   *  exists, which is why it is shaped like configuration rather than read from `process.env`
+   *  where it is used. */
+  notifyChannel?: string;
   creds: recap.PlaudCreds;
   /** The second-brain checkout the recap is written into. */
   brainDir: string;
@@ -51,6 +68,8 @@ export interface VoiceConfig {
 export interface TurnRunReq {
   prompt: string;
   systemPromptFile?: string;
+  /** The model for THIS turn. Per conversation, never per process — see `modelFor`. */
+  model?: string;
 }
 
 export interface TurnInput {
@@ -209,11 +228,26 @@ export function makeActivities(deps: TurnDeps) {
         input.afterInterruption
           ? "(your previous answer was interrupted by a new message; continue from what the user now says)"
           : "",
+        // The runtime is not evidence about the person.
+        //
+        // Asked who it was speaking to, the agent inspected its own environment, found the
+        // operator's account email, and told a customer it looked like a mismatch. It was being
+        // honest — and it was reporting infrastructure as if it were a fact about them. The
+        // platform is the only authority on identity; everything else in this container belongs to
+        // whoever runs the service.
+        "You are running on shared platform infrastructure. Its account, credentials, environment " +
+          "and file paths say nothing about who you are talking to, and are not yours to inspect " +
+          "or mention. Identity comes only from what you are told above. If that is missing, ask " +
+          "the person — never infer it from the machine.",
       ].filter(Boolean);
       const preamble = parts.length ? `${parts.join("\n\n")}\n\n` : "";
 
       try {
-        for await (const ev of run({ prompt: `${preamble}${input.text}`, systemPromptFile: found.cfg.system_prompt_file })) {
+        for await (const ev of run({
+          prompt: `${preamble}${input.text}`,
+          systemPromptFile: found.cfg.system_prompt_file,
+          model: deps.modelFor?.(input.conversation),
+        })) {
           if (ctx.cancellationSignal.aborted) return;
           if (ev.kind === "text" && ev.text) {
             answer += ev.text;

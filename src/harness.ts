@@ -31,6 +31,9 @@ export interface RunnerParams {
   /** initial auth backend (backend-*): "subscription" | "bedrock". The gateway's backend knob
    * flips it live thereafter. */
   backend?: "subscription" | "bedrock";
+  /** Harness-specific tool names to drop from every turn. Harness-specific by nature — Claude
+   *  Code's taxonomy is not Codex's — so a harness that does not understand a name ignores it. */
+  disallowedTools?: string[];
 }
 
 /** Inputs for an EPHEMERAL turn-runner (gw-command-btw): a throwaway sandbox spun from

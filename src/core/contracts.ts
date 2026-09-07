@@ -82,6 +82,10 @@ export interface TurnRequest {
   sessionId?: string;
   /** true = this session doesn't exist yet → CREATE it (--session-id); false = RESUME it. */
   sessionNew?: boolean;
+  /** optional: the model for THIS turn only. The harness's own `setModel` knob is per-process and
+   * therefore shared by every conversation the process serves — which made one person's `/model`
+   * silently change everybody else's. A turn that names its model does not have that problem. */
+  model?: string;
 }
 
 /** Drives one harness turn and yields normalized events (A2). The iterable

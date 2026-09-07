@@ -40,16 +40,18 @@ export interface CommandDeps {
   lastUsage(conversation: string): TurnUsage | undefined;
   /** Account headroom (5h / 7d). Fetched from the agent's own runtime; [] when unavailable. */
   windows(agent: string): Promise<UsageWindow[]>;
-  /** The harness's model knob, when the harness has one. */
-  getModel(agent: string): string | undefined;
-  setModel?(agent: string, model: string | undefined): void;
+  /** Which model THIS conversation runs. Scoped to the conversation, never to the process: one
+   *  worker serves every thread in the tenant, so a process-wide knob meant one person's `!model`
+   *  changed the model under everybody else mid-conversation. */
+  getModel(agent: string, conversation: string): string | undefined;
+  setModel(agent: string, conversation: string, model: string | undefined): void;
 }
 
 const HELP = [
   "*Commands* — type these as an ordinary message.",
   "• `!status` — token use for the last turn and how much of your Claude plan is left",
   `• \`!statusline ${STATUS_MODES.join("|")}\` — whether that shows under every answer`,
-  "• `!model` — which model I am running; `!model <name>` to change it",
+  "• `!model` — which model this conversation runs; `!model <name>` to change it here only",
   "• `!new` — how to start a fresh conversation",
   "• `!help` — this",
 ].join("\n");
@@ -88,7 +90,7 @@ export async function run(
       const u = deps.lastUsage(conversation);
       // Account headroom is always answerable; per-turn numbers only after a turn has run here.
       if (!u) return `${renderWindows(windows, now)}\n\n_No turn has run in this thread yet, so there is nothing per-turn to report._`;
-      return renderStatus("full", u, deps.getModel(agent), windows, now) ?? renderWindows(windows, now);
+      return renderStatus("full", u, deps.getModel(agent, conversation), windows, now) ?? renderWindows(windows, now);
     }
 
     case "statusline": {
@@ -102,13 +104,21 @@ export async function run(
     }
 
     case "model": {
-      const current = deps.getModel(agent);
-      if (!cmd.arg) return current ? `🧠 I'm running *${current}*.` : "🧠 This harness has no model switch.";
-      if (!deps.setModel) return "🧠 This harness has no model switch.";
-      deps.setModel(agent, cmd.arg);
+      const current = deps.getModel(agent, conversation);
+      if (!cmd.arg) {
+        return current
+          ? `🧠 This conversation is running *${current}*.`
+          : "🧠 This conversation is on the default model.";
+      }
+      if (cmd.arg.toLowerCase() === "default") {
+        deps.setModel(agent, conversation, undefined);
+        return "🧠 Back to the default model from the next message.";
+      }
+      deps.setModel(agent, conversation, cmd.arg);
       // Deliberately not validated here: the harness owns the list of valid names, and an invalid
       // one surfaces on the next turn as the harness's own error rather than as our guess at it.
-      return `🧠 Model set to *${cmd.arg}* — it takes effect on the next message.`;
+      // Scoped to THIS conversation — it does not move anybody else's model.
+      return `🧠 Model set to *${cmd.arg}* for this conversation — from the next message.`;
     }
 
     default:

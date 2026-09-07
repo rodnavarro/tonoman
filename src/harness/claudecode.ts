@@ -131,7 +131,10 @@ export class Runner implements TurnRunner {
       args.push("--disallowedTools", this.o.disallowedTools.join(","));
     }
     if (req.systemPromptFile) args.push("--append-system-prompt-file", req.systemPromptFile);
-    if (this.model) args.push("--model", this.model); // mutable: /model switches it per turn
+    // Per-TURN model first, then the process-wide knob. The knob is right for a single-agent
+    // gateway and wrong for a worker serving many conversations at once.
+    const model = req.model ?? this.model;
+    if (model) args.push("--model", model);
     // Cap the internal agentic tool-loop so one open-ended turn (e.g. a research rabbit hole)
     // can't loop unbounded and drain the account's usage window. Hitting the cap exits with an
     // error result (subtype "error_max_turns") — parseLine treats that as DONE so the partial
@@ -485,7 +488,13 @@ export function spec(): Spec {
     // the isolation the container used to provide. A self-hosted roster still names a container
     // and still goes through podman, unchanged.
     newRunner: (p: RunnerParams) =>
-      new Runner({ container: p.container, local: !p.container, model: p.model, maxTurns: p.maxTurns }),
+      new Runner({
+        container: p.container,
+        local: !p.container,
+        model: p.model,
+        maxTurns: p.maxTurns,
+        disallowedTools: p.disallowedTools,
+      }),
     newEphemeralRunner: (p: EphemeralParams) =>
       new Runner({ container: p.volumesFrom, model: p.model, ephemeral: { volumesFrom: p.volumesFrom, image: p.image, env: p.env } }),
     loginArgs: ["claude", "auth", "login", "--claudeai"],
