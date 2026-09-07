@@ -16,11 +16,12 @@ describe("parse", () => {
     expect(parse("/model sonnet")).toBeUndefined();
   });
 
-  it("accepts . as well as !, so a habit can differ from the default", () => {
-    // `!` is also how Claude Code runs a shell command, and somebody who lives in that terminal
-    // reaches for it. Two characters of regex; customers still get the conventional `!`.
-    expect(parse(".connect plaud")).toEqual({ name: "connect", arg: "plaud" });
+  it("takes ! and nothing else", () => {
+    // `.` was briefly accepted too, for the Claude Code habit. Withdrawn on the reasoning that
+    // settles it: that interception happens INSIDE Claude Code, before anything is sent, so a
+    // second prefix here cannot help with a keystroke this code never sees.
     expect(parse("!connect plaud")).toEqual({ name: "connect", arg: "plaud" });
+    expect(parse(".connect plaud")).toBeUndefined();
   });
 
   it("still ignores ordinary prose that happens to start with punctuation", () => {
@@ -203,5 +204,51 @@ describe("connection commands name their connector", () => {
 
   it("takes a lone word as the connector with nothing after it", () => {
     expect(splitConnector("  PLAUD  ")).toEqual({ which: "plaud", rest: "" });
+  });
+});
+
+describe("run — connecting a calendar provider", () => {
+  const withOauth = (over: Partial<Record<string, unknown>> = {}) => ({
+    ...deps(),
+    beginOauth: async () => ({ url: "https://accounts.google.test/auth?x=1" }),
+    ...over,
+  });
+
+  it("hands over a link and promises nothing has to come back", async () => {
+    // The whole point of owning the redirect: a customer never copies a broken URL out of a
+    // browser bar, which is what the Plaud flow still requires because that redirect is not ours.
+    const out = (await run(withOauth(), "sapien", "c", { name: "connect", arg: "google" })) ?? "";
+    expect(out).toContain("https://accounts.google.test/auth?x=1");
+    expect(out).toContain("Nothing to copy back");
+  });
+
+  it("names the connection after what the person called it", async () => {
+    let seen = "";
+    const d = withOauth({ beginOauth: async (_a: string, _p: string, alias: string) => { seen = alias; return { url: "https://x.test" }; } });
+    await run(d, "sapien", "c", { name: "connect", arg: "google work" });
+    expect(seen).toBe("work");
+  });
+
+  it("slugs a name rather than refusing it", async () => {
+    // Somebody types "My Work Calendar". The alias ends up inside a secret ref, so it has to be
+    // safe — but rejecting the input would be a worse answer than cleaning it.
+    let seen = "";
+    const d = withOauth({ beginOauth: async (_a: string, _p: string, alias: string) => { seen = alias; return { url: "https://x.test" }; } });
+    await run(d, "sapien", "c", { name: "connect", arg: "outlook  My Work Calendar!! " });
+    expect(seen).toBe("my-work-calendar");
+  });
+
+  it("passes the registry's own reason through when it refuses", async () => {
+    // The registry knows which providers are configured and this process does not, so paraphrasing
+    // would turn a specific answer into a vague one.
+    const d = withOauth({ beginOauth: async () => ({ problem: 'no "outlook" provider is configured (available: google)' }) });
+    const out = (await run(d, "sapien", "c", { name: "connect", arg: "outlook" })) ?? "";
+    expect(out).toContain("no \"outlook\" provider is configured");
+  });
+
+  it("still asks which one when given nothing", async () => {
+    const out = (await run(withOauth(), "sapien", "c", { name: "connect", arg: "" })) ?? "";
+    expect(out).toContain("google");
+    expect(out).toContain("plaud");
   });
 });

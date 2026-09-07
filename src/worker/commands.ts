@@ -40,24 +40,27 @@ export const KNOWN = [
   "new",
 ] as const;
 
-/** What starts a command.
+/** What starts a command. One character, on purpose.
  *
- *  `!` is the conventional bot prefix and Slack does nothing special with it. `.` is here because
- *  `!` is also how Claude Code runs a shell command, and somebody who lives in that terminal reaches
- *  for it by habit — two characters of regex is a cheap way to let a habit differ from a default.
+ *  `!` is the conventional bot prefix and Slack does nothing special with it.
  *
- *  `/` is deliberately NOT one of them, and used to be. Slack owns that namespace: an unregistered
+ *  `.` was briefly accepted too, because `!` is also how Claude Code runs a shell command.
+ *  Withdrawn on the reasoning that settles it: that interception happens INSIDE Claude Code, before
+ *  anything is ever sent — so a second prefix here cannot help with a keystroke this code never
+ *  sees. It was surface for a collision that cannot occur.
+ *
+ *  `/` is deliberately not one either, and used to be. Slack owns that namespace: an unregistered
  *  slash command is intercepted by Slack, answered with Slack's own error, and never delivered
- *  here. So `/status` has never once reached this function — the support was real in the code and
+ *  here. So `/status` has never once reached this function — support that is real in the code and
  *  imaginary in practice, which is worse than not having it. */
-const PREFIX = /^[!.]/;
+const PREFIX = /^!/;
 
 /** Recognise a command. Returns undefined for ordinary text, which is the common case — so this
  *  runs on every inbound message and must not be clever about it. */
 export function parse(text: string): Command | undefined {
   const t = (text ?? "").trim();
-  if (!PREFIX.test(t) || !/^[!.][a-z]/i.test(t)) return undefined;
-  const m = /^[!.](\S+)\s*([\s\S]*)$/.exec(t);
+  if (!PREFIX.test(t) || !/^![a-z]/i.test(t)) return undefined;
+  const m = /^!(\S+)\s*([\s\S]*)$/.exec(t);
   if (!m) return undefined;
   return { name: m[1]!.toLowerCase(), arg: (m[2] ?? "").trim() };
 }
@@ -86,6 +89,15 @@ export interface ConnectionLine {
 export interface CommandDeps {
   /** What this agent is connected to. Absent on a deployment with no registry behind it. */
   connections?(agent: string): Promise<ConnectionLine[]>;
+  /** Start a three-legged login and return the URL to put in front of the person, or a problem to
+   *  show them. The registry owns the flow — it holds the client secret and the pending state; the
+   *  worker only carries the answer into the channel. */
+  beginOauth?(
+    agent: string,
+    provider: string,
+    alias: string,
+    conversation: string,
+  ): Promise<{ url?: string; problem?: string }>;
   /** The conversation's status-footer mode. */
   getMode(conversation: string): StatusMode;
   setMode(conversation: string, mode: StatusMode): void;
@@ -126,13 +138,13 @@ const HELP = [
   `• \`!statusline ${STATUS_MODES.join("|")}\` — whether that shows under every answer`,
   "• `!model` — which model this conversation runs; `!model <name>` to change it here only",
   "• `!connect plaud` — connect your Plaud account, so I can pick up your recordings",
+  "• `!connect google` / `!connect outlook` — add a calendar, so I know which meeting a recording was",
+  "•  …add a name to keep more than one: `!connect google work`",
   "• `!disconnect plaud` — forget it again",
   "• `!disconnect claude` — sign out of the Claude subscription I answer on",
   "• `!connections` — what this agent is connected to",
   "• `!new` — forget this thread and start over",
   "• `!help` — this",
-  "",
-  "_`.` works too, if you prefer it to `!`._",
 ].join("\n");
 
 /** `!new`, when there IS something to clear.
@@ -164,7 +176,7 @@ export function splitConnector(arg: string): { which: string; rest: string } {
 }
 
 function unknownConnector(which: string): string {
-  return `I don't have a "${which}" connector. Today it is \`plaud\` or \`claude\`.`;
+  return `I don't have a "${which}" connector. Today: \`plaud\`, \`google\`, \`outlook\` or \`claude\`.`;
 }
 
 /** Runs a command. Returns the text to post, or null when the input was not a command we own —
@@ -210,9 +222,31 @@ export async function run(
     }
 
     case "connect": {
-      if (!deps.connectPlaud) return "I have no way to connect an account on this deployment.";
       const { which, rest } = splitConnector(cmd.arg);
-      if (!which) return "Which one? Right now I can connect `!connect plaud`.";
+      if (!which) return "Which one? `!connect plaud`, `!connect google` or `!connect outlook`.";
+
+      // The calendar providers. Three-legged, and they land on our OWN callback rather than on a
+      // dead page somebody has to copy out of a browser bar — those apps are ours, so we chose the
+      // redirect. Nothing comes back through the channel at all.
+      if (which === "google" || which === "outlook") {
+        if (!deps.beginOauth) return "I can't connect that on this deployment.";
+        // Everything after the connector name is what they want to CALL it — "work", "personal".
+        // A tenant can have several of each, and this is how a person tells them apart afterwards.
+        const alias =
+          (rest || "default").toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40) ||
+          "default";
+        const r = await deps.beginOauth(agent, which, alias, conversation);
+        if (!r.url) return `⚠️ I couldn't start that — ${r.problem ?? "no reason given"}.`;
+        const what = which === "google" ? "Google Calendar" : "Outlook Calendar";
+        return (
+          `*Connect ${what}* — <${r.url}|open this and approve>.\n` +
+          "You'll land on a page that says it worked. Nothing to copy back.\n" +
+          `I'll file it as *${alias}*` +
+          (alias === "default" ? " — put a name after the command if you want more than one." : ".")
+        );
+      }
+
+      if (!deps.connectPlaud) return "I have no way to connect an account on this deployment.";
       if (which !== "plaud") return unknownConnector(which);
       if (rest.toLowerCase() !== "again" && (await deps.plaudConnected?.(agent).catch(() => false))) {
         // Reconnecting revokes nothing but does replace the tokens, so it is worth one sentence

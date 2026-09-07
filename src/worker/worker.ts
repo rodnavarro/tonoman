@@ -541,6 +541,36 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
     // The roster IS the worker's view of an agent, and answering from anything else would let
     // `!connections` disagree with what the flow is actually using — which is precisely the
     // question somebody types it to settle.
+    // Start a three-legged login. The registry owns the whole flow — it holds the client secret,
+    // the pending state and the PKCE verifier, and it is what the provider redirects back to. The
+    // worker's only job is to carry the URL into the channel, which is why nothing about Google or
+    // Microsoft appears in this process at all.
+    beginOauth: async (name, provider, alias, conversation) => {
+      const baseUrl = process.env.TONOMANCLOUD_API_URL;
+      const guid = wired.get(name)?.cfg.guid;
+      if (!baseUrl || !guid) return { problem: "this deployment has no registry behind it" };
+      try {
+        const r = await fetch(`${baseUrl}/v1/system/agents/${guid}/oauth/${encodeURIComponent(provider)}/begin`, {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${process.env.TONOMANCLOUD_API_TOKEN ?? ""}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({ alias, conversation }),
+        });
+        const j = (await r.json()) as { url?: string; error?: string; available?: string[] };
+        if (!r.ok || !j.url) {
+          // The registry's own words. It knows which providers are configured on this deployment
+          // and this process does not, so paraphrasing would replace a specific answer with a vague
+          // one — "Outlook isn't set up here" versus "that didn't work".
+          const avail = j.available?.length ? ` (available: ${j.available.join(", ")})` : "";
+          return { problem: `${j.error ?? `HTTP ${r.status}`}${avail}` };
+        }
+        return { url: j.url };
+      } catch (e) {
+        return { problem: (e as Error).message };
+      }
+    },
     connections: async (name) =>
       (wired.get(name)?.cfg.connections ?? []).map((c) => ({
         kind: c.kind,
