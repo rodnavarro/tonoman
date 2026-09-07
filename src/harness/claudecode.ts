@@ -28,7 +28,13 @@ export const IMAGE = "localhost/tonoman/claudecode:latest";
 
 // Where Claude Code keeps its state inside the sandbox; the per-agent config
 // volume is bind-mounted here so the OAuth credential store persists (A11).
-export const CONFIG_HOME = "/root/.claude";
+/** Where every agent's Claude credential directory lives.
+ *
+ *  `/root/.claude` in the pod, which is where the config volume is mounted. Overridable because the
+ *  worker is not always in that pod: running it on a workstation to iterate (architecture.md §11)
+ *  needs somewhere writable that is not the machine's own Claude login — mixing those would have a
+ *  developer's personal subscription answering as a customer's agent. */
+export const CONFIG_HOME = process.env.CLAUDE_CONFIG_ROOT || "/root/.claude";
 
 /** One agent's Claude credential directory, under the shared config volume.
  *

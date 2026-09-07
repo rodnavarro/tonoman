@@ -70,35 +70,15 @@ export function resumeResetNotice(): string {
   return "↻ My previous session had expired, so I started a fresh one and ran your message on it.";
 }
 
-/** PURE: did this turn fail because there is no working inference credential?
- *
- *  A DIFFERENT failure from every other one, and it deserves a different sentence. "I hit an error"
- *  is true and useless: the person can retry forever and it will never work, because nothing is
- *  wrong with their message — the agent has no subscription to answer on.
- *
- *  The auth gate normally catches this before a turn is ever attempted, from `auth_state` in the
- *  registry. That is the right source (a FACT about the agent, never a file check — jarvis reported
- *  healthy for 54 days over a credential that had expired). But `auth_state` is a snapshot: a
- *  credential that expires between roster refreshes leaves the gate open and the turn failing, and
- *  the customer sees a stack-trace fragment. This is the floor under the gate. */
-export function isNotLoggedInError(msg: string): boolean {
-  return /not logged ?in|please run \/login|no credentials found|invalid api key|oauth token (has )?expired|authentication_error/i.test(
-    msg || "",
-  );
-}
-
-/** What to say when there is no inference credential. Names the fix, because there is exactly one
- *  and the person cannot guess it. */
-export function notLoggedInNotice(): string {
-  return (
-    "⚠️ I can't answer — I'm not signed in to an inference provider right now.\n" +
-    "Send `!connect claude` and I'll walk you through it."
-  );
-}
-
 /** The never-silent FLOOR (gw-turn-ended-actionable): a turn that failed for a reason we can't
  * auto-recover still gets an explicit, non-alarming message — never a dead typing cue. Keeps the
  * detail short (the full error is in the gateway log) and carries no secrets (harness/infra text). */
+// Re-exported rather than defined here: a Temporal workflow is bundled with no Node built-ins,
+// and this file imports `node:child_process` to drive the harness. A workflow importing it fails
+// the webpack build with `Module not found: node:child_process` and the worker never starts —
+// which presents as a hang, not as a bad import. Definitions live in `turnfailure.ts`.
+export { isNotLoggedInError, notLoggedInNotice } from "./turnfailure";
+
 export function turnErrorNotice(agentName: string, msg: string): string {
   const detail = (msg || "").replace(/\s+/g, " ").trim().slice(0, 200);
   return `⚠️ I hit an error and couldn't finish that${detail ? ` — ${detail}` : ""}.\nIt's logged; try again, or send /new to start a fresh session.`;

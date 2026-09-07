@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { extractAuthUrl, looksLoggedIn, isAuthError, authNotice, isStaleSessionError, resumeResetNotice, turnErrorNotice, isNotLoggedInError, notLoggedInNotice } from "./authflow";
+import { extractAuthUrl, looksLoggedIn, isAuthError, authNotice, isStaleSessionError, resumeResetNotice, turnErrorNotice } from "./authflow";
 
 // roster-auth-headless — the URL extractor is the pure, tricky bit: it must recover the
 // complete OAuth URL from a real PTY transcript (ANSI escapes, cursor-column moves, 80-col
@@ -94,31 +94,5 @@ describe("isStaleSessionError + notices (gw-turn-ended-actionable)", () => {
 
   it("resumeResetNotice tells the user a fresh session started", () => {
     expect(resumeResetNotice().toLowerCase()).toContain("fresh one");
-  });
-});
-
-describe("isNotLoggedInError — the failure that retrying cannot fix", () => {
-  it("recognises what the harness actually says", () => {
-    // Observed verbatim from a worker with no credential: `Not logged in · Please run /login`.
-    expect(isNotLoggedInError("Not logged in · Please run /login")).toBe(true);
-    expect(isNotLoggedInError("Error: not logged in")).toBe(true);
-    expect(isNotLoggedInError("OAuth token expired")).toBe(true);
-    expect(isNotLoggedInError("invalid api key")).toBe(true);
-  });
-
-  it("does not swallow ordinary failures", () => {
-    // Over-matching here would hide a real bug behind "sign in again", and somebody would sign in
-    // repeatedly while the actual fault went unreported.
-    expect(isNotLoggedInError("ECONNREFUSED 127.0.0.1:443")).toBe(false);
-    expect(isNotLoggedInError("rate limit exceeded")).toBe(false);
-    expect(isNotLoggedInError("")).toBe(false);
-  });
-
-  it("names the one thing that fixes it", () => {
-    // "I hit an error" is true and useless: nothing is wrong with the message, and retrying is
-    // guaranteed not to work.
-    const n = notLoggedInNotice();
-    expect(n).toContain("!connect claude");
-    expect(n).not.toContain("try again");
   });
 });

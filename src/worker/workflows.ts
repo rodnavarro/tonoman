@@ -25,9 +25,11 @@ import {
   setHandler,
 } from "@temporalio/workflow";
 import type { Activities } from "./activities";
-// PURE string helpers only. A workflow must stay deterministic, and these do no I/O — which is
-// exactly why the "is this an auth failure" decision lives as a regex rather than as a probe.
-import { isNotLoggedInError, notLoggedInNotice } from "../authflow";
+// From `turnfailure`, NOT from `authflow`. A workflow is bundled into a sandbox with no Node
+// built-ins, and `authflow` imports `node:child_process` to drive the harness — importing it here
+// fails the webpack build and the worker never starts, which looks like a hang rather than a bad
+// import. These are pure string functions, which is also what keeps the workflow deterministic.
+import { isNotLoggedInError, notLoggedInNotice } from "../turnfailure";
 
 const { runTurn, postNotice } = proxyActivities<Activities>({
   // A turn is a person waiting on an LLM: minutes, not seconds. The heartbeat is what makes a dead
