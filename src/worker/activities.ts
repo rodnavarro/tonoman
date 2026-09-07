@@ -11,9 +11,10 @@
 // leaves that partial visible and labelled rather than vanishing.
 
 import { Context } from "@temporalio/activity";
-import type { Connector, Reply, TurnEvent } from "../core/contracts";
+import type { Connector, Reply, TurnEvent, TurnUsage } from "../core/contracts";
 import type { AgentConfig } from "../config";
 import * as recap from "./recap";
+import * as worklog from "./worklog";
 
 /** How the worker finds an agent's connector and runner. Injected at worker construction so this
  *  module holds no globals and can be unit-tested without Temporal. */
@@ -25,6 +26,11 @@ export interface TurnDeps {
   say?(agent: string, user: string, text: string): Promise<void>;
   /** Run text as a turn addressed to a person. */
   ask?(agent: string, user: string, text: string): Promise<void>;
+  /** The display-only status footer for a finished turn: the model, the turn's tokens, context
+   *  occupancy, and how much of the Claude plan's 5h/7d windows is left. Null for none. */
+  footer?(agent: string, conversation: string, usage: TurnUsage | undefined): Promise<string | null>;
+  /** Remember the turn's usage, so `!status` can report it later without spending a turn. */
+  recordUsage?(conversation: string, usage: TurnUsage): void;
 }
 
 export interface VoiceConfig {
@@ -63,6 +69,17 @@ export interface NoticeInput {
  *  stream. Editing slower than the model produces is the correct trade. */
 const EDIT_INTERVAL_MS = 1200;
 
+/** How often the work log re-renders.
+ *
+ *  Not one second, even though the Teams version counted in seconds: the tick makes TWO Slack calls
+ *  (a message edit and a status set), and at 1s that sits exactly on the per-channel edit limit — a
+ *  429 there would take the answer's own stream down with it, in front of whoever is watching. Two
+ *  and a half seconds still reads as a live clock.
+ *
+ *  It doubles as the delay before the log appears at all, which is deliberate: a turn that answers
+ *  straight from the model in two seconds leaves no trace, and only real work gets narrated. */
+const TICK_MS = 2500;
+
 export function makeActivities(deps: TurnDeps) {
   return {
     async runTurn(input: TurnInput): Promise<void> {
@@ -72,12 +89,15 @@ export function makeActivities(deps: TurnDeps) {
       const { conn, run } = found;
 
       const reply: Reply = conn.reply(input.conversation);
-      // The status line IS the cue — "Nelly is thinking…" under the composer. A placeholder message
-      // posted alongside it is worse than nothing: it flashes "…" and then gets overwritten, which
-      // reads as a glitch. So no message is posted until there is something real to put in it.
+      // The status line IS the immediate cue — "Nelly is thinking…" under the composer. A
+      // placeholder MESSAGE posted alongside it is worse than nothing: it flashes "…" and is then
+      // overwritten, which reads as a glitch. So no message is posted until there is something real
+      // to put in it, and the work log below is a separate note rather than the answer's message.
       await reply.working?.("is thinking").catch(() => {});
 
+      const started = Date.now();
       let answer = "";
+      let usage: TurnUsage | undefined;
       let lastEdit = 0;
       let done = false;
       /** Created on first render, not up front. Empty until then. */
@@ -86,15 +106,46 @@ export function makeActivities(deps: TurnDeps) {
         if (!msgId) msgId = await reply.send(text);
         else await reply.update(msgId, text);
       };
-      // Tool narration (Teams parity). Shown ONLY until the first words of the answer arrive, then
-      // replaced by the answer itself. A turn that greps the second brain for ten seconds otherwise
-      // shows nothing but a placeholder, and silence reads as broken rather than as working.
-      let activity = "";
+
+      // --- the work log ---------------------------------------------------------------------
+      // Teams parity, and the thing that was missing: which tools ran, and how long the agent has
+      // been at it. It lives in its own note above the answer and is driven by a TIMER rather than
+      // by events — a turn that greps the second brain for ten seconds emits one event, and a line
+      // that does not move is indistinguishable from being stuck.
+      const calls: worklog.ToolCall[] = [];
+      let current: worklog.ToolCall | undefined;
+      let noteId = "";
+      let noteText = "";
+      const tick = async (): Promise<void> => {
+        if (done || ctx.cancellationSignal.aborted) return;
+        // Once the answer is streaming, the answer IS the progress. Freezing the log here also
+        // keeps it above the reply: a note posted after the answer's message would read below it.
+        if (answer) return;
+        const elapsed = Date.now() - started;
+        const text = worklog.liveNote(calls, elapsed);
+        if (text !== noteText) {
+          noteText = text;
+          try {
+            noteId = (await reply.note?.(noteId || undefined, text)) ?? "";
+          } catch {
+            /* a dropped work log must never cost a turn */
+          }
+        }
+        await reply.working?.(worklog.statusFor(current, elapsed)).catch(() => {});
+      };
+      const ticker = setInterval(() => void tick(), TICK_MS);
+      /** Remove the log entirely — for an interrupted turn, whose work nobody will see the result
+       *  of, so a trace of it left on screen is only confusing. */
+      const dropLog = (): void => {
+        clearInterval(ticker);
+        if (noteId) void reply.note?.(noteId, null).catch(() => {});
+      };
 
       // Temporal cancels the scope when a new message arrives. Leave the partial visible and say
       // what happened — a reply that silently stops looks like a broken bot.
       ctx.cancelled.catch(() => {
         if (done) return;
+        dropLog();
         void reply.settle?.().catch(() => {});
         // Only if something was already on screen. An interrupted turn that had not yet said
         // anything should leave no trace — the correction is about to be answered instead.
@@ -126,43 +177,60 @@ export function makeActivities(deps: TurnDeps) {
       ].filter(Boolean);
       const preamble = parts.length ? `${parts.join("\n\n")}\n\n` : "";
 
-      for await (const ev of run({ prompt: `${preamble}${input.text}`, systemPromptFile: found.cfg.system_prompt_file })) {
-        if (ctx.cancellationSignal.aborted) return;
-        if (ev.kind === "text" && ev.text) {
-          answer += ev.text;
-          const now = Date.now();
-          if (now - lastEdit >= EDIT_INTERVAL_MS && answer.trim()) {
-            lastEdit = now;
-            await show(answer).catch(() => {});
+      try {
+        for await (const ev of run({ prompt: `${preamble}${input.text}`, systemPromptFile: found.cfg.system_prompt_file })) {
+          if (ctx.cancellationSignal.aborted) return;
+          if (ev.kind === "text" && ev.text) {
+            answer += ev.text;
+            const now = Date.now();
+            if (now - lastEdit >= EDIT_INTERVAL_MS && answer.trim()) {
+              lastEdit = now;
+              await show(answer).catch(() => {});
+            }
+          } else if (ev.kind === "tool") {
+            // Recorded for the work log, and mirrored into the status line straight away so the
+            // cue changes the moment a tool starts rather than on the next tick.
+            current = { tool: ev.tool ?? "working", detail: ev.text };
+            calls.push(current);
+            if (!answer) await tick();
+          } else if (ev.kind === "done") {
+            // The authoritative text. A harness that streams deltas AND sends a final would
+            // otherwise leave whatever the last edit happened to catch; one that only sends a final
+            // would otherwise post nothing at all.
+            if (ev.final) answer = ev.final;
+            // The turn's own tokens — what the status footer and `!status` report.
+            if (ev.usage) usage = ev.usage;
+          } else if (ev.kind === "error" && ev.err) {
+            throw ev.err;
           }
-        } else if (ev.kind === "tool" && !answer) {
-          // Tool narration goes ONLY in the status line, never as a message. Slack renders it there
-          // as the agent's activity; as a message it would be a line the answer then overwrites.
-          activity = `${(ev.tool ?? "working").toLowerCase()}${ev.text ? `: ${ev.text}` : ""}`;
-          const now = Date.now();
-          if (now - lastEdit >= EDIT_INTERVAL_MS) {
-            lastEdit = now;
-            await reply.working?.(`is ${activity}`.slice(0, 100)).catch(() => {});
-          }
-        } else if (ev.kind === "done" && ev.final) {
-          // The authoritative text. A harness that streams deltas AND sends a final would otherwise
-          // leave whatever the last edit happened to catch; one that only sends a final would
-          // otherwise post nothing at all.
-          answer = ev.final;
-        } else if (ev.kind === "error" && ev.err) {
-          throw ev.err;
+          // Heartbeat on real progress, so a wedged model is detected quickly but a slow one is not
+          // killed for being slow.
+          ctx.heartbeat(answer.length);
         }
-        // Heartbeat on real progress, so a wedged model is detected quickly but a slow one is not
-        // killed for being slow.
-        ctx.heartbeat(answer.length);
+      } finally {
+        clearInterval(ticker);
       }
 
       done = true;
+      if (usage) deps.recordUsage?.(input.conversation, usage);
       // Slack leaves "is thinking…" on screen until it is cleared, so an answered turn that
       // forgets this looks permanently busy.
       await reply.settle?.().catch(() => {});
-      if (ctx.cancellationSignal.aborted) return;
-      const final = answer.trim() || "_(no answer)_";
+      if (ctx.cancellationSignal.aborted) {
+        dropLog();
+        return;
+      }
+
+      // Settle the work log into one line of what the turn actually did, or take it down when
+      // there is nothing worth keeping above the answer.
+      if (noteId) {
+        const settled = worklog.settledNote(calls, Date.now() - started);
+        await reply.note?.(noteId, settled).catch(() => {});
+      }
+
+      const footer = await deps.footer?.(input.agent, input.conversation, usage).catch(() => null);
+      const body = answer.trim() || "_(no answer)_";
+      const final = footer ? `${body}\n\n${footer}` : body;
       if (!msgId) msgId = await reply.send(final);
       else await reply.finalize(msgId, final);
     },

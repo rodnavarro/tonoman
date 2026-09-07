@@ -17,8 +17,16 @@ import { Client, Connection } from "@temporalio/client";
 import { NativeConnection, Worker } from "@temporalio/worker";
 import * as path from "node:path";
 import type { Config, AgentConfig } from "../config";
-import type { Connector, TurnEvent } from "../core/contracts";
+import type { Connector, TurnEvent, TurnRunner, TurnUsage } from "../core/contracts";
 import { SlackConnector } from "../connector/slack";
+import * as cmds from "./commands";
+import {
+  parseStatusMode,
+  remoteAccountUsageCached,
+  renderStatus,
+  type StatusMode,
+  type UsageWindow,
+} from "../statusline";
 import { httpAuthOps } from "../authflow";
 import * as gate from "./authgate";
 import * as secondbrain from "./secondbrain";
@@ -67,11 +75,21 @@ async function resolveRef(ref: string | null | undefined): Promise<string> {
   }
 }
 
+/** One wired agent: the roster row, its channel, its harness, and the second-brain note the turn
+ *  is given. The runner is kept alongside `run` because the model knob (`!model`) lives on it. */
+interface Wired {
+  cfg: AgentConfig;
+  conn: Connector;
+  context?: string;
+  runner: TurnRunner;
+  run: (r: TurnRunReq) => AsyncIterable<TurnEvent>;
+}
+
 /** Builds one connector + runner per agent in the roster. An agent whose channel has no connector
  *  is skipped with a reason rather than failing the worker — one bad row must not silence the rest. */
-function wire(cfg: Config): Map<string, { cfg: AgentConfig; conn: Connector; context?: string; run: (r: TurnRunReq) => AsyncIterable<TurnEvent> }> {
+function wire(cfg: Config): Map<string, Wired> {
   const harnesses = defaultHarnesses();
-  const out = new Map<string, { cfg: AgentConfig; conn: Connector; context?: string; run: (r: TurnRunReq) => AsyncIterable<TurnEvent> }>();
+  const out = new Map<string, Wired>();
   for (const a of cfg.agents ?? []) {
     const channel = a.channel ?? (a.slack ? "slack" : a.teams ? "teams" : "telegram");
     if (channel !== "slack") {
@@ -97,6 +115,7 @@ function wire(cfg: Config): Map<string, { cfg: AgentConfig; conn: Connector; con
     out.set(a.name, {
       cfg: a,
       conn,
+      runner,
       run: (r: TurnRunReq) => runner.run({ prompt: r.prompt, systemPromptFile: r.systemPromptFile }),
     });
   }
@@ -196,9 +215,37 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
     console.log(`worker: ${name} voice flow ready (brain at ${dir})`);
   }
 
+  // --- the status bar -------------------------------------------------------------------------
+  // Per-turn tokens and context occupancy come from the harness result; the 5h/7d windows are the
+  // Claude subscription's own account-wide numbers, which only the process HOLDING the credential
+  // can read. In this split that process is the auth sidecar sharing /root/.claude, so we ask it
+  // over loopback (`GET /usage`) rather than reading the credential here. The podman-exec path in
+  // statusline.ts is for the single-machine deployment and has no podman to exec in a pod.
+  const runtimeUrl = process.env.AGENT_RUNTIME_URL ?? "http://127.0.0.1:8080";
+  const runtimeToken = process.env.AGENT_RUNTIME_TOKEN;
+  const windowsFor = (name: string): Promise<UsageWindow[]> =>
+    remoteAccountUsageCached(`agent:${name}`, runtimeUrl, runtimeToken);
+
+  /** The footer mode, per conversation. Process-local and deliberately so: it is a display
+   *  preference for a thread somebody is looking at right now, not a fact about the tenant. */
+  const statusModes = new Map<string, StatusMode>();
+  const defaultMode: StatusMode = parseStatusMode(process.env.TONOMAN_STATUSLINE ?? "") ?? "small";
+  const modeFor = (conversation: string): StatusMode => statusModes.get(conversation) ?? defaultMode;
+  /** The last turn's usage per conversation, so `!status` can report it without spending a turn. */
+  const lastUsage = new Map<string, TurnUsage>();
+
   const deps = {
     agent: (name: string) => wired.get(name),
     voice: (name: string) => voiceCreds.get(name),
+    recordUsage: (conversation: string, u: TurnUsage) => lastUsage.set(conversation, u),
+    footer: async (name: string, conversation: string, u: TurnUsage | undefined): Promise<string | null> => {
+      const mode = modeFor(conversation);
+      if (mode === "none" || !u) return null;
+      // The windows are cached for two minutes, so this is a fetch at most once per window per
+      // agent — an answer must never wait on the usage API to be delivered.
+      const windows = await windowsFor(name).catch(() => [] as UsageWindow[]);
+      return renderStatus(mode, u, wired.get(name)?.runner.getModel?.(), windows, Date.now());
+    },
     say: async (name: string, user: string, text: string) => {
       const conv = await dmFor(name, user);
       if (conv) await wired.get(name)?.conn.reply(conv).send(text);
@@ -216,6 +263,21 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
     },
   };
   const activities = makeActivities(deps);
+
+  // In-channel commands. They read and write the same maps the status footer uses, so what
+  // `!status` reports is exactly what the footer would have shown.
+  const commandDeps: cmds.CommandDeps = {
+    getMode: modeFor,
+    setMode: (conversation, mode) => statusModes.set(conversation, mode),
+    lastUsage: (conversation) => lastUsage.get(conversation),
+    windows: windowsFor,
+    getModel: (name) => wired.get(name)?.runner.getModel?.() ?? wired.get(name)?.cfg.model,
+    // Only offered when the harness actually has the knob — `!model x` on a harness without one
+    // must say so rather than accept the change and silently ignore it.
+    setModel: [...wired.values()].some((w) => w.runner.setModel)
+      ? (name, model) => wired.get(name)?.runner.setModel?.(model)
+      : undefined,
+  };
 
   // The agent asks for its OWN credential, through its own runtime. The login endpoints live in
   // the sidecar sharing this pod's credential volume, so the code goes from a Slack modal to the
@@ -273,6 +335,23 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
     pumps.push(
       (async () => {
         for await (const env of a.conn.receive(signal)) {
+          // Commands are answered HERE, before the durability boundary: `!status` is a read of
+          // state this process already holds, and routing it through a workflow would queue it
+          // behind — or interrupt — the very turn it is asking about. They are also answered
+          // before the auth gate, so `!help` still works on an agent that cannot yet run turns.
+          const cmd = cmds.parse(env.text);
+          if (cmd) {
+            const out = await cmds.run(commandDeps, name, env.conversation, cmd).catch((e) => {
+              console.error(`worker: ${name} command ${cmd.name} failed: ${(e as Error).message}`);
+              return `I couldn't run that — ${String((e as Error)?.message ?? e).slice(0, 150)}`;
+            });
+            // Null means it is not one of ours. An unknown `!word` is far more likely to be
+            // ordinary emphasis than a typo'd command, so it falls through to a real turn.
+            if (out !== null) {
+              await a.conn.reply(env.conversation).send(out).catch(() => {});
+              continue;
+            }
+          }
           // The registry says this agent has no working inference, so there is nothing to run.
           // Ask in the channel instead of spending a turn to discover the same thing — and ask
           // because of a FACT about the agent, not because a file was missing.
