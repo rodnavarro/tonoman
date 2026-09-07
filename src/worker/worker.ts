@@ -31,6 +31,7 @@ import { httpAuthOps } from "../authflow";
 import * as gate from "./authgate";
 import * as secondbrain from "./secondbrain";
 import * as recapFloor from "./recap";
+import { describe as describeVoice, voiceSettings } from "./flowcfg";
 import { serveWake } from "./wake";
 import { promises as fsp } from "node:fs";
 import { defaultHarnesses } from "../gateway";
@@ -228,6 +229,10 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
     const tokenFile = process.env.PLAUD_TOKEN_FILE;
     const groqKey = process.env.GROQ_API_KEY;
     const src = a.cfg.secondbrain?.[0];
+    // Per agent, from the REGISTRY: which channel, which folder, which routes. The environment is
+    // only a fallback for a tenant that has no rows yet — a deployment is the wrong place for
+    // "where do Celine's meetings go".
+    const voice = voiceSettings(a.cfg.flows?.voice, process.env);
     if (!tokenFile || !groqKey || !src) {
       console.log(`worker: ${name} has no voice flow (needs PLAUD_TOKEN_FILE, GROQ_API_KEY and a second-brain source)`);
       continue;
@@ -238,15 +243,14 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
     // Unset means "from today onwards" in the pod's own timezone, which is what switching the
     // feature on is meant to mean.
     const tzOffset = -new Date().getTimezoneOffset();
-    const floorMs = recapFloor.floorFor(process.env.VOICE_SINCE, Date.now(), tzOffset);
+    const floorMs = recapFloor.floorFor(voice.since || undefined, Date.now(), tzOffset);
     const token = await resolveRef(src.secret_ref);
     const pushUrl = token ? src.repo_url.replace("https://", `https://x-access-token:${token}@`) : src.repo_url;
     const dir = path.join(process.env.TONOMAN_STATE_ROOT ?? "/root/.tonoman", "secondbrain", name, src.id);
-    // Per agent. One worker runs every agent the tenant has, and where each announces its recaps
-    // is a separate question — even though today there is one agent and one variable.
-    const notifyChannel = (process.env.VOICE_NOTIFY_CHANNEL ?? "").trim() || undefined;
     voiceCreds.set(name, {
-      notifyChannel,
+      notifyChannel: voice.notifyChannel || undefined,
+      journal: voice.journal,
+      pollSeconds: voice.pollSeconds,
       creds: { tokenFile },
       brainDir: src.subpath ? path.join(dir, src.subpath) : dir,
       pushUrl,
@@ -257,7 +261,8 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
         "Tonoman, Tonoman Cloud, Plaud, Murphy Business Sales, Celine, Rod Navarro, Axiplex, agentic AI, Slack, Temporal.",
     });
     console.log(
-      `worker: ${name} voice flow ready (brain at ${dir}; only recordings from ${new Date(floorMs).toISOString()} onwards)`,
+      `worker: ${name} voice flow ready — ${describeVoice(voice)}; ` +
+        `brain at ${dir}; only recordings from ${new Date(floorMs).toISOString()} onwards`,
     );
   }
 
@@ -500,7 +505,7 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
       await client.workflow.start(plaudPollWorkflow, {
         workflowId: `voice:${name}`,
         taskQueue: o.taskQueue,
-        args: [{ agent: name, notify, everySeconds: Number(process.env.VOICE_POLL_SECONDS ?? 120) }],
+        args: [{ agent: name, notify, everySeconds: voiceCreds.get(name)?.pollSeconds ?? 120 }],
       });
       const ch = voiceCreds.get(name)?.notifyChannel;
       console.log(

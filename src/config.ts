@@ -154,6 +154,13 @@ export interface AgentConfig {
     secret_ref?: string | null;
     read_only?: boolean;
   }[];
+  /** Settings for the FLOWS this agent runs, as the registry holds them: flow → key → value.
+   *
+   *  Flat keys, on purpose. The registry stores rows and knows nothing about what they mean; the
+   *  runtime that owns a flow is the only thing that should have to understand `journal.path` or
+   *  `route.<id>`. That is what keeps adding a meeting category an INSERT rather than a migration
+   *  here and a redeploy there. */
+  flows?: Record<string, Record<string, string>>;
   workspace?: Workspace;
   // --- Service-mode (svc-self-channeled / svc-config-env) ----------------------
   /** Service agent: Tonoman boots + lifecycle-manages a long-lived self-channeled server

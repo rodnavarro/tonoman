@@ -59,6 +59,11 @@ export interface VoiceConfig {
   pushUrl: string;
   groqKey: string;
   vocab: string;
+  /** Where meetings are filed, when this flow classifies them. Absent = the flat `Meetings/`
+   *  layout, which is what a tenant with no folder scheme wants. */
+  journal?: recap.Journal;
+  /** How often the poll looks, from the registry. */
+  pollSeconds?: number;
   /** Epoch ms before which a recording is none of our business. Without it the first poll
    *  backfills the customer's entire Plaud history and announces each one as if it had just
    *  happened. */
@@ -327,7 +332,7 @@ export function makeActivities(deps: TurnDeps) {
       const v = deps.voice?.(input.agent);
       if (!v) return [];
       const all = await recap.listRecordings(v.creds, 20);
-      const fresh = await recap.unpublished(all, v.brainDir, v.floorMs);
+      const fresh = await recap.unpublished(all, v.brainDir, v.floorMs, v.journal);
       return fresh.map((r) => ({
         id: r.id,
         title: r.title,
@@ -360,7 +365,7 @@ export function makeActivities(deps: TurnDeps) {
       // recording was summarised three times because each run of the list re-derived a slightly
       // different summary and so had something to commit. `publish` cannot catch this — a changed
       // summary IS a change.
-      if ((await recap.unpublished([rec], v.brainDir, v.floorMs)).length === 0) {
+      if ((await recap.unpublished([rec], v.brainDir, v.floorMs, v.journal)).length === 0) {
         console.log(`recap: skipping ${rec.title} — already published`);
         return;
       }
@@ -374,11 +379,16 @@ export function makeActivities(deps: TurnDeps) {
       console.log(`recap: ${rec.title} transcribed in ${seconds.toFixed(1)}s, ${text.length} chars`);
 
       ctx.heartbeat("summarising");
-      const summary = await recap.summarize(text, rec.title, v.groqKey);
+      const summary = await recap.summarize(text, rec.title, v.groqKey, v.journal);
 
       ctx.heartbeat("publishing");
-      const published = await recap.publish(v.brainDir, rec, summary, text, v.pushUrl);
-      console.log(`recap: ${rec.title} ${published ? "published" : "already present"} at Meetings/${rec.stamp}.md`);
+      const route = recap.resolveRoute(v.journal, summary.route);
+      const where = recap.pathsFor(v.journal, rec, route);
+      const published = await recap.publish(v.brainDir, rec, summary, text, v.pushUrl, v.journal);
+      console.log(
+        `recap: ${rec.title} ${published ? "published" : "already present"} at ${where.page}` +
+          (route ? ` (route ${route}${summary.route && summary.route !== route ? `, model said "${summary.route}"` : ""})` : ""),
+      );
       if (!published) return; // somebody else got there first; do not announce it twice
 
       // A real turn, so the agent says it in its own words and can be asked follow-ups in the same
@@ -388,7 +398,7 @@ export function makeActivities(deps: TurnDeps) {
         input.agent,
         input.notify,
         `A recording has just finished processing and is filed in the second brain at ` +
-          `Meetings/${rec.stamp}.md: “${rec.title}”. Write a short message telling them it is ready ` +
+          `${where.page}: “${rec.title}”. Write a short message telling them it is ready ` +
           `and giving the three most useful things from it, in your own words, then offer to answer ` +
           `questions about it. The three: ${top.map((h, i) => `(${i + 1}) ${h}`).join(" ")}`,
       );

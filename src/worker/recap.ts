@@ -137,17 +137,51 @@ export function floorFor(since: string | undefined, now: number, tzOffsetMinutes
  *  repository is the record, so "is it published" is a question about the repository. It also means
  *  a recap deleted by hand is reprocessed, which is what somebody deleting it would expect — and
  *  the floor is what keeps that from meaning "reprocess nine days of history". */
-export async function unpublished(recordings: Recording[], brainDir: string, floorMs = 0): Promise<Recording[]> {
+export async function unpublished(
+  recordings: Recording[],
+  brainDir: string,
+  floorMs = 0,
+  journal?: Journal,
+): Promise<Recording[]> {
   const out: Recording[] = [];
   for (const r of recordings) {
     if (r.startTime < floorMs) continue;
-    const exists = await fs
-      .stat(path.join(brainDir, "Meetings", `${r.stamp}.md`))
-      .then(() => true)
-      .catch(() => false);
-    if (!exists) out.push(r);
+    if (!(await isPublished(brainDir, r, journal))) out.push(r);
   }
   return out;
+}
+
+/** Has this recording been filed anywhere yet?
+ *
+ *  With a journal the answer cannot be a single stat: the route is not known until the meeting has
+ *  been summarised, and a person may have MOVED a recap to a different folder afterwards. Both are
+ *  normal, and both must count as published — otherwise re-filing a meeting by hand causes it to be
+ *  transcribed and written again, which is the loop that emptied the transcription quota once
+ *  already. So the check is "does any route hold a page whose name starts with this stamp". */
+async function isPublished(brainDir: string, rec: Recording, journal?: Journal): Promise<boolean> {
+  if (!journal) {
+    return fs
+      .stat(path.join(brainDir, "Meetings", `${rec.stamp}.md`))
+      .then(() => true)
+      .catch(() => false);
+  }
+  const root = path.join(brainDir, journal.path);
+  let dirs: string[];
+  try {
+    dirs = (await fs.readdir(root, { withFileTypes: true })).filter((d) => d.isDirectory()).map((d) => d.name);
+  } catch {
+    return false; // the journal folder does not exist yet; nothing is published
+  }
+  for (const d of dirs) {
+    let names: string[];
+    try {
+      names = await fs.readdir(path.join(root, d));
+    } catch {
+      continue;
+    }
+    if (names.some((n) => n.startsWith(rec.stamp) && n.endsWith(".md"))) return true;
+  }
+  return false;
 }
 
 export interface TranscribeResult {
@@ -267,18 +301,96 @@ export interface Recap {
   highlights: string[];
   decisions: string[];
   followups: string[];
+  /** Which configured route this meeting belongs to. Absent when the flow configures none. */
+  route?: string;
+  /** One line on WHY, so a misfiling is auditable and correctable rather than mysterious. */
+  routeReason?: string;
 }
 
-export async function summarize(transcript: string, title: string, groqKey: string): Promise<Recap> {
+/** Where meetings are filed, as configuration rather than code.
+ *
+ *  A route's `id` IS the folder name, so adding one is adding a folder — a different tenant gets
+ *  `client-meetings` / `listings` / `internal` and nothing here changes. `when` is the sentence the
+ *  model is given to decide by, authored by whoever knows the business.
+ *
+ *  No journal configured at all means the flat `Meetings/` layout, unchanged. */
+export interface Journal {
+  /** Folder inside the brain that holds the routes, e.g. "Meeting-Journals". */
+  path: string;
+  /** Where anything ambiguous goes. A real destination, NOT an error: "I am not sure" is a
+   *  legitimate answer, and forcing a guess is how one client's meeting lands in another's
+   *  folder. */
+  fallback: string;
+  routes: { id: string; when: string }[];
+}
+
+/** PURE: a filename-safe slug from a meeting title, matching the vault's existing convention
+ *  (`2026-07-03-1819-jobs-and-gates-reflect`). Empty when the title yields nothing usable, so the
+ *  caller falls back to the bare stamp rather than writing a file called "-.md". */
+export function slugFor(title: string): string {
+  return (title || "")
+    .normalize("NFKD")
+    .replace(/[̀-ͯ]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .split("-")
+    .slice(0, 8)
+    .join("-")
+    .slice(0, 60);
+}
+
+/** PURE: the route to actually file under.
+ *
+ *  A CLOSED set. The model's answer is accepted only if it names a configured route; anything else
+ *  — a hallucinated folder, a near-miss, an empty string — becomes the fallback. A route invented
+ *  by the model would create a directory nobody ever opens, which is strictly worse than a meeting
+ *  sitting in `unclassified` where somebody will see it. */
+export function resolveRoute(journal: Journal | undefined, proposed: string | undefined): string {
+  if (!journal) return "";
+  const want = (proposed ?? "").trim().toLowerCase();
+  const hit = journal.routes.find((r) => r.id.toLowerCase() === want);
+  return hit ? hit.id : journal.fallback;
+}
+
+/** PURE: where a recording's page and its folder live, given the journal (or the flat default). */
+export function pathsFor(journal: Journal | undefined, rec: Recording, route: string): { page: string; folder: string } {
+  const slug = slugFor(rec.title);
+  const name = slug ? `${rec.stamp}-${slug}` : rec.stamp;
+  if (!journal) return { page: path.join("Meetings", `${rec.stamp}.md`), folder: path.join("Meetings", rec.stamp) };
+  return { page: path.join(journal.path, route, `${name}.md`), folder: path.join(journal.path, route, name) };
+}
+
+export async function summarize(
+  transcript: string,
+  title: string,
+  groqKey: string,
+  journal?: Journal,
+): Promise<Recap> {
   // Checked against /v1/models rather than assumed — the obvious llama name is not on this account.
   const model = process.env.GROQ_TEXT_MODEL || "openai/gpt-oss-120b";
+  // Classification rides THIS call rather than taking one of its own: the transcript is already
+  // here, already paid for, and a second round-trip would double the latency of every recap to
+  // answer a one-word question.
+  const routing = journal
+    ? [
+        `Also decide where this meeting is filed. Choose exactly one "route" from this list:`,
+        journal.routes.map((r) => `"${r.id}" — ${r.when}`).join(" | "),
+        `If none clearly fits, or the transcript does not say enough to be sure, answer "${journal.fallback}".`,
+        `A wrong confident guess is worse than "${journal.fallback}": somebody reviews that folder, and nobody reviews a misfiled meeting.`,
+        `Add "route" (one of the ids above) and "routeReason" (one short sentence) to the JSON.`,
+      ].join(" ")
+    : "";
   const system = [
     "You summarise a recorded business meeting for a searchable knowledge base.",
     "Be specific and factual. Never invent a name, number, decision or commitment.",
     "If something is unclear in the transcript, leave it out rather than guessing.",
     'Reply with STRICT JSON only: {"summary": string, "highlights": string[], "decisions": string[], "followups": string[]}.',
     "summary: 2-4 sentences. highlights: at most 5, each one line. decisions/followups may be empty.",
-  ].join(" ");
+    routing,
+  ]
+    .filter(Boolean)
+    .join(" ");
   const r = await fetch("https://api.groq.com/openai/v1/chat/completions", {
     method: "POST",
     headers: { Authorization: `Bearer ${groqKey}`, "content-type": "application/json" },
@@ -300,11 +412,32 @@ export async function summarize(transcript: string, title: string, groqKey: stri
 const bullets = (xs: string[] | undefined, empty: string): string =>
   xs?.length ? xs.map((x) => `- ${x}`).join("\n") : `_${empty}_`;
 
-/** PURE: the overview page. Separated from writing it so the layout is testable. */
-export function overviewMarkdown(rec: Recording, recap: Recap): string {
-  return `# ${rec.title}
+/** PURE: the overview page. Separated from writing it so the layout is testable.
+ *
+ *  The frontmatter matches the convention already in the vault — `recording_id`, `source`,
+ *  `datetime`, `title`, `route` — rather than inventing a second one alongside it. `route` in
+ *  particular already existed and was always "unclassified"; filling it in is the whole point, and
+ *  keeping it in frontmatter means re-filing a meeting is a `git mv` and one edited line. */
+export function overviewMarkdown(rec: Recording, recap: Recap, folder?: string): string {
+  const when = new Date(rec.startTime).toISOString().replace("T", " ").slice(0, 16);
+  const transcript = folder ? `${path.posix.basename(folder)}/Transcript.md` : `./${rec.stamp}/Transcript.md`;
+  const head = [
+    "---",
+    `recording_id: ${rec.id}`,
+    "source: plaud",
+    `datetime: ${new Date(rec.startTime).toISOString()}`,
+    `duration_min: ${(rec.duration / 60000).toFixed(1)}`,
+    "artifact: overview",
+    `title: ${JSON.stringify(rec.title)}`,
+    ...(recap.route ? [`route: ${recap.route}`] : []),
+    ...(recap.routeReason ? [`route_reason: ${JSON.stringify(recap.routeReason)}`] : []),
+    "---",
+    "",
+  ].join("\n");
 
-**When:** ${new Date(rec.startTime).toISOString().replace("T", " ").slice(0, 16)}
+  return `${head}# ${rec.title}
+
+**When:** ${when}${recap.route ? ` · **Filed under:** ${recap.route}` : ""}
 **Recorded on:** Plaud · **Transcribed by:** Groq (\`whisper-large-v3-turbo\`)
 
 ## Summary
@@ -325,7 +458,7 @@ ${bullets(recap.followups, "none recorded")}
 
 ---
 
-[Full transcript](./${rec.stamp}/Transcript.md)
+[Full transcript](${transcript})
 `;
 }
 
@@ -341,10 +474,13 @@ export async function publish(
   recap: Recap,
   transcript: string,
   pushUrl: string,
+  journal?: Journal,
 ): Promise<boolean> {
-  const dir = path.join(brainDir, "Meetings", rec.stamp);
+  const route = resolveRoute(journal, recap.route);
+  const where = pathsFor(journal, rec, route);
+  const dir = path.join(brainDir, where.folder);
   await fs.mkdir(dir, { recursive: true });
-  await fs.writeFile(path.join(brainDir, "Meetings", `${rec.stamp}.md`), overviewMarkdown(rec, recap), "utf8");
+  await fs.writeFile(path.join(brainDir, where.page), overviewMarkdown(rec, { ...recap, route }, where.folder), "utf8");
   await fs.writeFile(
     path.join(dir, "Transcript.md"),
     `# Transcript — ${rec.title}\n\nTranscribed by Groq \`whisper-large-v3-turbo\` from the Plaud recording.\n\n---\n\n${transcript}\n`,

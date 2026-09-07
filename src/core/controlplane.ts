@@ -62,6 +62,8 @@ export interface RegistryAgent {
   appTokenRef?: string | null;
   allowedUsers?: string[] | null;
   principals?: { kind: string; value: string; label: string }[];
+  /** flow → key → value, straight from `flow_property`. Opaque to the registry by design. */
+  flows?: Record<string, Record<string, string>>;
   tools?: string[];
   secondbrain?: {
     id: string;
@@ -182,6 +184,7 @@ export class RegistryControlPlane implements ControlPlane {
         // spending one to discover there is no credential.
         auth_state: (a.authState as AgentConfig["auth_state"]) ?? "unconfigured",
         principals: a.principals ?? [],
+        flows: a.flows ?? {},
         // Present only when the tool is granted — the registry decides, not the runtime.
         secondbrain: (a.secondbrain ?? []).map((s) => ({
           id: s.id,
