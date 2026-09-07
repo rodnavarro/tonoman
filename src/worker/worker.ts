@@ -466,10 +466,19 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
     // agent's own credential directory, trimmed to its first line — the point is to make "whose
     // subscription is this?" answerable from Slack, which it has never been.
     claudeAccount: async (name) => {
+      // `claude auth status` answers in JSON — { loggedIn, email, subscriptionType, ... } — so the
+      // first line of it is "{". Parsed, not scanned: reading this as text printed a lone brace
+      // into Slack, which told Rod nothing except that something was wrong.
       const ops = authDeps.ops(name);
       const raw = (await ops?.status?.().catch(() => "")) ?? "";
-      const line = raw.split(/\r?\n/).map((l) => l.trim()).filter(Boolean).find((l) => /@|account|email/i.test(l));
-      return (line ?? raw.split(/\r?\n/).find((l) => l.trim()) ?? "").slice(0, 120);
+      try {
+        const j = JSON.parse(raw) as { loggedIn?: boolean; email?: string; subscriptionType?: string };
+        if (!j.loggedIn) return "not signed in";
+        return [j.email, j.subscriptionType && `(${j.subscriptionType})`].filter(Boolean).join(" ") || "signed in";
+      } catch {
+        // A harness that answers in prose rather than JSON still gets to say something.
+        return raw.split(/\r?\n/).find((l) => l.trim())?.slice(0, 120) ?? "";
+      }
     },
     resetSession: (name, conversation) => void resetSession(name, conversation).catch(() => {}),
     plaudConnected: (name) => plaudcli.connected(name),
