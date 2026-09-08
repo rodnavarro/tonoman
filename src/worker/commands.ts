@@ -151,6 +151,9 @@ export interface CommandDeps {
   disconnectPlaud?(agent: string): Promise<string>;
   /** Sign this agent out of its Claude subscription. */
   disconnectClaude?(agent: string): Promise<string>;
+  /** Offer a fresh Claude login in this conversation. Returns "" when the offer IS the message: it
+   *  is posted as blocks, and returning text as well would post the whole thing twice. */
+  connectClaude?(agent: string, conversation: string): Promise<string>;
   /** Finish a connection with the callback URL the person pasted back. */
   finishPlaud?(agent: string, pasted: string): Promise<string>;
   /** Whether this agent already has a Plaud account connected. */
@@ -165,6 +168,7 @@ const HELP = [
   "• `!connect plaud` — connect your Plaud account, so I can pick up your recordings",
   "• `!connect google` / `!connect outlook` — add a calendar, so I know which meeting a recording was",
   "•  …add a name to keep more than one: `!connect google work`",
+  "• `!connect claude` — sign in to the Claude subscription I answer on",
   "• `!disconnect plaud` — forget it again",
   "• `!disconnect claude` — sign out of the Claude subscription I answer on",
   "• `!connections` — what this agent is connected to",
@@ -200,8 +204,20 @@ export function splitConnector(arg: string): { which: string; rest: string } {
   return { which: t.slice(0, i).toLowerCase(), rest: t.slice(i + 1).trim() };
 }
 
-function unknownConnector(which: string): string {
-  return `I don't have a "${which}" connector. Today: \`plaud\`, \`google\`, \`outlook\` or \`claude\`.`;
+/** What `!connect` ACTUALLY dispatches. Declared once, because the version of this that lived only
+ *  inside a sentence disagreed with the code: `!connect claude` was refused with
+ *  `I don't have a "claude" connector. Today: plaud, google, outlook or claude.` - a message that
+ *  contradicts itself in one line, reached by following the instruction the agent had just given.
+ *  The dispatch below is checked against this list, so the two cannot drift apart again without a
+ *  test failing. */
+export const CONNECT_KINDS = ["claude", "plaud", "google", "outlook"] as const;
+
+/** The refusal names what is available HERE - `!code` takes only plaud, `!disconnect` takes two -
+ *  rather than reciting one global list in a context where most of it is wrong. */
+function unknownConnector(which: string, allowed: readonly string[]): string {
+  const q = allowed.map((c) => `\`${c}\``);
+  const list = q.length > 1 ? `${q.slice(0, -1).join(", ")} or ${q[q.length - 1]}` : (q[0] ?? "none");
+  return `I don't have a "${which}" connector here. I can do: ${list}.`;
 }
 
 /** Runs a command. Returns the text to post, or null when the input was not a command we own —
@@ -228,7 +244,7 @@ export async function run(
     case "callback": {
       if (!deps.finishPlaud) return "There is no connection waiting for a code here.";
       const { which, rest } = splitConnector(cmd.arg);
-      if (which && which !== "plaud") return unknownConnector(which);
+      if (which && which !== "plaud") return unknownConnector(which, ["plaud"]);
       if (!rest) return "Paste the whole address from your browser after `!code plaud`, including the part after the `?`.";
       return deps.finishPlaud(agent, rest);
     }
@@ -241,14 +257,23 @@ export async function run(
         if (!deps.disconnectClaude) return "I have no way to sign out of Claude on this deployment.";
         return deps.disconnectClaude(agent);
       }
-      if (which !== "plaud") return unknownConnector(which);
+      if (which !== "plaud") return unknownConnector(which, ["plaud", "claude"]);
       if (!deps.disconnectPlaud) return "I have no way to disconnect an account on this deployment.";
       return deps.disconnectPlaud(agent);
     }
 
     case "connect": {
       const { which, rest } = splitConnector(cmd.arg);
-      if (!which) return "Which one? `!connect plaud`, `!connect google` or `!connect outlook`.";
+      if (!which) return `Which one? ${CONNECT_KINDS.map((c) => `\`!connect ${c}\``).join(", ")}.`;
+      if (!(CONNECT_KINDS as readonly string[]).includes(which)) return unknownConnector(which, CONNECT_KINDS);
+
+      // The subscription this agent ANSWERS on, as opposed to an outside account it reads. Listed
+      // with the others because that is not a distinction a person has any reason to know - and
+      // `!disconnect claude` has always existed, so the missing half read as a broken command.
+      if (which === "claude") {
+        if (!deps.connectClaude) return "I have no way to sign in to Claude on this deployment.";
+        return deps.connectClaude(agent, conversation);
+      }
 
       // The calendar providers. Three-legged, and they land on our OWN callback rather than on a
       // dead page somebody has to copy out of a browser bar — those apps are ours, so we chose the
@@ -272,7 +297,6 @@ export async function run(
       }
 
       if (!deps.connectPlaud) return "I have no way to connect an account on this deployment.";
-      if (which !== "plaud") return unknownConnector(which);
       if (rest.toLowerCase() !== "again" && (await deps.plaudConnected?.(agent).catch(() => false))) {
         // Reconnecting revokes nothing but does replace the tokens, so it is worth one sentence
         // rather than silently doing it to somebody who typed the wrong thing.

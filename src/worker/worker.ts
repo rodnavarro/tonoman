@@ -643,6 +643,27 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
     },
     resetSession: (name, conversation) => void resetSession(name, conversation).catch(() => {}),
     plaudConnected: (name) => plaudcli.connected(name),
+    // `!connect claude`, typed on purpose. The SAME offer the auth gate makes on its own when a
+    // turn finds no credential - one mechanism, not two, so what a person is shown is identical
+    // whether they asked for it or we volunteered it.
+    //
+    // This existed as `!disconnect claude` with no counterpart, which meant the notice told people
+    // to send `!connect claude` and the command then said there was no such connector.
+    connectClaude: async (name, conversation) => {
+      const a = wired.get(name);
+      if (!a) return "I don't know that agent here.";
+      // ask() returns false both when it POSTED a reason and when there was nothing to post, and
+      // those need different answers. The second case is exactly this one, checked here so the
+      // command never ends in silence.
+      if (!authDeps.ops(name)) return "I can't start a Claude login on this deployment.";
+      await gate.ask(authDeps, name, a.cfg.name ?? name, conversation).catch((e) => {
+        console.error(`worker: ${name} connect claude failed: ${(e as Error).message}`);
+        return false;
+      });
+      // The blocks ARE the message; returning text as well would post the whole thing twice, and
+      // ask() has already said why on the paths where it could not offer a login.
+      return "";
+    },
     disconnectClaude: async (name) => {
       // Removing the credential IS the sign-out: the harness reads it from this directory on every
       // turn, so a deleted file means the next message finds no login and the connect gate offers

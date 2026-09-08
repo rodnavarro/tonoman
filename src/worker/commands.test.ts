@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { parse, run, splitConnector, type CommandDeps, undecorate } from "./commands";
+import { parse, run, splitConnector, type CommandDeps, undecorate, CONNECT_KINDS } from "./commands";
 import type { StatusMode } from "../statusline";
 
 describe("parse", () => {
@@ -270,5 +270,46 @@ describe("run — connecting a calendar provider", () => {
     const out = (await run(withOauth(), "sapien", "c", { name: "connect", arg: "" })) ?? "";
     expect(out).toContain("google");
     expect(out).toContain("plaud");
+  });
+});
+
+describe("every connector the agent offers is one it can actually run", () => {
+  // THE bug this guards. `!connect claude` was refused with `I don't have a "claude" connector.
+  // Today: plaud, google, outlook or claude.` — a sentence that lists the thing it is denying,
+  // because the list lived in the message and the dispatch lived in a switch, and nothing made
+  // them agree. It was reached by following the agent's own instruction to send that command.
+  //
+  // So the list is now the source, and this walks it. A connector added to CONNECT_KINDS without a
+  // branch fails here rather than in front of somebody.
+  const deps = {
+    getMode: () => "compact",
+    setMode: () => {},
+    lastUsage: () => undefined,
+    windows: async () => [],
+    getModel: () => undefined,
+    setModel: () => {},
+    connectClaude: async () => "",
+    connectPlaud: async () => "plaud login",
+    beginOauth: async () => ({ url: "https://example.test/auth" }),
+    plaudConnected: async () => false,
+  } as unknown as Parameters<typeof run>[0];
+
+  for (const kind of CONNECT_KINDS) {
+    it(`!connect ${kind} is dispatched, not refused`, async () => {
+      const out = await run(deps, "a", "c", { name: "connect", arg: kind });
+      expect(out).not.toMatch(/don't have a/);
+    });
+  }
+
+  it("still refuses one it really does not have, and names what it does", async () => {
+    const out = await run(deps, "a", "c", { name: "connect", arg: "dropbox" });
+    expect(out).toContain('I don\'t have a "dropbox" connector here');
+    for (const kind of CONNECT_KINDS) expect(out).toContain(kind);
+  });
+
+  it("names only plaud for !code, which is the only one that takes a pasted address", async () => {
+    const out = await run({ ...deps, finishPlaud: async () => "" } as never, "a", "c", { name: "code", arg: "google x" });
+    expect(out).toContain("plaud");
+    expect(out).not.toContain("outlook");
   });
 });
