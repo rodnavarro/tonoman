@@ -15,7 +15,7 @@ import { retryAfterMs, chunkCachePath, clearChunkCache } from "./recap";
 
 const BODY_429 =
   '{"error":{"message":"Rate limit reached for model `whisper-large-v3-turbo` in organization ' +
-  "`org_01m1w01hcwerf96hv9n0rpnw2q` service tier `on_demand` on seconds of audio per day (ASPD): " +
+  "`org_REDACTED` service tier `on_demand` on seconds of audio per day (ASPD): " +
   'Limit 28800, Used 28596, Requested 600. Please try again in 19m48s."}}';
 
 describe("retryAfterMs — the provider already said when", () => {
