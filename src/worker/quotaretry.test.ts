@@ -11,7 +11,7 @@ import { describe, expect, it } from "vitest";
 import { promises as fs } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { retryAfterMs, chunkCachePath, clearChunkCache } from "./recap";
+import { retryAfterMs, chunkCachePath, clearChunkCache, parseProbeSeconds } from "./recap";
 
 const BODY_429 =
   '{"error":{"message":"Rate limit reached for model `whisper-large-v3-turbo` in organization ' +
@@ -96,5 +96,24 @@ describe("clearChunkCache", () => {
     // Publishing a recording that transcribed in one pass still calls this.
     const rec = { id: "never", title: "t", startTime: 0, duration: 0, stamp: "s" };
     await expect(clearChunkCache(path.join(os.tmpdir(), "no-such-dir-here"), rec)).resolves.toBeUndefined();
+  });
+});
+
+describe("parseProbeSeconds — measuring what we actually send", () => {
+  // Everything about this pipeline was reported in megabytes and chunk counts, and the resource we
+  // are rationed on is SECONDS OF AUDIO. When Groq's limiter said 6573 and our arithmetic said
+  // 3600, nothing in the system could say which was right. ffprobe is local and free; there was
+  // never a reason to infer this.
+  it("reads ffprobe's bare duration output", () => {
+    expect(parseProbeSeconds("600.048000\n")).toBeCloseTo(600.048);
+    expect(parseProbeSeconds("  300.5  ")).toBeCloseTo(300.5);
+  });
+
+  it("returns undefined rather than 0 when ffprobe says nothing useful", () => {
+    // A 0 here would be logged as "0s → groq" and quietly misreport a chunk we did send.
+    expect(parseProbeSeconds("")).toBeUndefined();
+    expect(parseProbeSeconds("N/A")).toBeUndefined();
+    expect(parseProbeSeconds("0")).toBeUndefined();
+    expect(parseProbeSeconds("-1")).toBeUndefined();
   });
 });

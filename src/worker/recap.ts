@@ -263,6 +263,28 @@ async function segments(srcPath: string, outDir: string): Promise<string[]> {
   return files.map((f) => path.join(outDir, f));
 }
 
+/** PURE: seconds out of ffprobe's output, or undefined when it did not say. */
+export function parseProbeSeconds(out: string): number | undefined {
+  const n = Number(String(out).trim().split(/\s+/)[0]);
+  return Number.isFinite(n) && n > 0 ? n : undefined;
+}
+
+/** How many seconds of audio a segment actually contains.
+ *
+ *  MEASURED, not assumed. Every figure in this pipeline was derived from megabytes and chunk
+ *  counts — and the one resource we are rationed on is SECONDS OF AUDIO, which nothing logged.
+ *  When Groq's limiter and our own arithmetic disagreed there was no way to tell which was wrong.
+ *  ffprobe is local and costs no quota, so there is no reason to guess. */
+async function probeSeconds(file: string): Promise<number | undefined> {
+  const r = await run("ffprobe", [
+    "-v", "error",
+    "-show_entries", "format=duration",
+    "-of", "default=noprint_wrappers=1:nokey=1",
+    file,
+  ]);
+  return r.code === 0 ? parseProbeSeconds(r.out) : undefined;
+}
+
 /** PURE: how long to wait before asking again, in milliseconds, or undefined when the response
  *  does not say.
  *
@@ -367,7 +389,12 @@ export async function transcribe(
     const src = path.join(work, "source");
     await fs.writeFile(src, audio);
     const parts = await segments(src, work);
-    console.log(`recap: ${rec.title} — ${(audio.length / 1e6).toFixed(1)}MB in ${parts.length} chunk(s)`);
+    const durations = await Promise.all(parts.map(probeSeconds));
+    const totalSecs = durations.reduce((a: number, b) => a + (b ?? 0), 0);
+    console.log(
+      `recap: ${rec.title} — ${(audio.length / 1e6).toFixed(1)}MB in ${parts.length} chunk(s), ` +
+        `${Math.round(totalSecs)}s of audio [${durations.map((d) => (d === undefined ? "?" : Math.round(d))).join(", ")}]`,
+    );
 
     const texts: string[] = [];
     let reused = 0;
@@ -385,6 +412,9 @@ export async function transcribe(
       }
       // Sequential on purpose: the chunks are one conversation, and a rate-limited burst would
       // fail a whole meeting to save a few seconds on one.
+      // Said before the request, not after: when a chunk is REFUSED, this is the only record of
+      // how much audio we asked for, and that is exactly the number the limiter is counting.
+      console.log(`recap: ${rec.title} — chunk ${i + 1}/${parts.length}, ${Math.round(durations[i] ?? 0)}s → groq`);
       const text = await transcribeChunk(file, groqKey, vocab);
       if (at) {
         await fs.mkdir(path.dirname(at), { recursive: true }).catch(() => {});

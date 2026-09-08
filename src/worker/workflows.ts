@@ -183,6 +183,12 @@ export interface PollInput {
    *  trigger` with this set to 1 is how you do that without editing anything. Whatever is left is
    *  still there on the next tick; nothing is skipped, only deferred. */
   maxPerRun?: number;
+  /** Restrict this run to ONE recording, by id or by stamp (`2026-09-08-1422`).
+   *
+   *  For measuring and for repair, not for the schedule. The poll takes the newest first, which is
+   *  the right default and the wrong thing when you want to send a known five minutes of audio at a
+   *  metered API and compare the answer against the provider's dashboard. */
+  only?: string;
 }
 
 /**
@@ -222,7 +228,11 @@ export async function plaudPollWorkflow(input: PollInput): Promise<void> {
     throw e;
   }
 
-  const batch = input.maxPerRun && input.maxPerRun > 0 ? found.slice(0, input.maxPerRun) : found;
+  const picked = input.only ? found.filter((r) => r.id === input.only || r.stamp === input.only) : found;
+  if (input.only && picked.length === 0) {
+    console.log(`recap: ${input.agent} — nothing unpublished matches "${input.only}"; ${found.length} candidate(s)`);
+  }
+  const batch = input.maxPerRun && input.maxPerRun > 0 ? picked.slice(0, input.maxPerRun) : picked;
   if (batch.length < found.length) {
     console.log(`recap: ${input.agent} — taking ${batch.length} of ${found.length}; the rest wait for the next tick`);
   }
