@@ -175,6 +175,14 @@ export interface PollInput {
   /** Kept for compatibility with schedules created before the interval moved to the schedule
    *  itself. Unused: the cadence is the schedule's, which is the point of using one. */
   everySeconds?: number;
+  /** At most this many recordings in one tick. Absent means all of them, which is the right
+   *  default for a flow that has been keeping up.
+   *
+   *  It exists for the BACKLOG. Nine unprocessed meetings is the moment to see one land correctly
+   *  before committing the rest of a daily quota to the other eight — and `temporal schedule
+   *  trigger` with this set to 1 is how you do that without editing anything. Whatever is left is
+   *  still there on the next tick; nothing is skipped, only deferred. */
+  maxPerRun?: number;
 }
 
 /**
@@ -214,7 +222,12 @@ export async function plaudPollWorkflow(input: PollInput): Promise<void> {
     throw e;
   }
 
-  for (const rec of found) {
+  const batch = input.maxPerRun && input.maxPerRun > 0 ? found.slice(0, input.maxPerRun) : found;
+  if (batch.length < found.length) {
+    console.log(`recap: ${input.agent} — taking ${batch.length} of ${found.length}; the rest wait for the next tick`);
+  }
+
+  for (const rec of batch) {
     // Say it landed BEFORE the slow part, so the person knows it was seen.
     await sayVerbatim({
       agent: input.agent,
