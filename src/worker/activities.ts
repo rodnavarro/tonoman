@@ -74,6 +74,10 @@ export interface VoiceConfig {
   pushUrl: string;
   groqKey: string;
   vocab: string;
+  /** Where a half-finished transcription keeps the chunks it already paid for, so a retry resumes.
+   *  On the volume rather than in memory, because the thing being survived is a process that died
+   *  or a quota that will not reset for hours. */
+  chunkCacheDir?: string;
   /** Where meetings are filed, when this flow classifies them. Absent = the flat `Meetings/`
    *  layout, which is what a tenant with no folder scheme wants. */
   journal?: recap.Journal;
@@ -246,8 +250,13 @@ export function makeActivities(deps: TurnDeps) {
       ctx.heartbeat("transcribing");
       // Per chunk, not per recording: a long meeting is many uploads, and a heartbeat only at the
       // start would let Temporal declare a perfectly healthy transcription dead halfway through.
-      const { text, seconds } = await recap.transcribe(v.creds, rec, v.groqKey, v.vocab, (done, total) =>
-        ctx.heartbeat(`transcribing ${done}/${total}`),
+      const { text, seconds } = await recap.transcribe(
+        v.creds,
+        rec,
+        v.groqKey,
+        v.vocab,
+        (done, total) => ctx.heartbeat(`transcribing ${done}/${total}`),
+        v.chunkCacheDir,
       );
       console.log(`recap: ${rec.title} transcribed in ${seconds.toFixed(1)}s, ${text.length} chars`);
 
@@ -292,6 +301,9 @@ export function makeActivities(deps: TurnDeps) {
           (route ? ` (route ${route}${summary.route && summary.route !== route ? `, model said "${summary.route}"` : ""})` : "") +
           (candidates.length ? ` [calendar: ${summary.meeting ? `matched "${summary.meeting}"` : "no match"}]` : ""),
       );
+      // The transcript is in the second brain now, so the saved chunks have nothing left to
+      // protect and become one more copy of a customer's meeting sitting on a volume.
+      if (v.chunkCacheDir) await recap.clearChunkCache(v.chunkCacheDir, rec);
       if (!published) return; // somebody else got there first; do not announce it twice
 
       // A real turn, so the agent says it in its own words and can be asked follow-ups in the same

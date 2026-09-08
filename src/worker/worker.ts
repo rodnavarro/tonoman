@@ -497,6 +497,9 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
       calendarExclude: (voice.calendarExclude ?? []).filter(Boolean),
       calendarPadMinutes: voice.calendarPadMinutes,
       brainDir: src.subpath ? path.join(dir, src.subpath) : dir,
+      // The state volume, not /tmp: a retry that resumes has to survive a pod restart, and /tmp in
+      // a container does not. Per agent, because a recording id is only unique within an account.
+      chunkCacheDir: path.join(process.env.TONOMAN_STATE_ROOT ?? "/root/.tonoman", "chunks", name),
       pushUrl,
       groqKey,
       floorMs,

@@ -150,7 +150,21 @@ const { findNewRecordings, processRecording, sayVerbatim } = proxyActivities<Act
   // Listing is a cheap HTTP call; processing downloads audio and runs two models.
   startToCloseTimeout: "15 minutes",
   heartbeatTimeout: "60 seconds",
-  retry: { maximumAttempts: 2 },
+  retry: {
+    // Enough attempts that a rate limit can actually be WAITED OUT. The transcriber throws with
+    // the provider's OWN delay attached (`nextRetryDelay`), so these attempts are spaced by what
+    // Groq asked for — "try again in 19m48s" — rather than by a backoff we invented and it has no
+    // reason to respect. `maximumAttempts: 2` was the policy this began with, and two attempts
+    // cannot survive a daily quota: the poll simply gave up and the schedule started over two
+    // minutes later, forever.
+    //
+    // The intervals below are for everything ELSE — a transient network fault, a slow segment —
+    // where nobody has told us when to come back.
+    maximumAttempts: 8,
+    initialInterval: "10 seconds",
+    backoffCoefficient: 2,
+    maximumInterval: "10 minutes",
+  },
 });
 
 export interface PollInput {

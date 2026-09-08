@@ -24,6 +24,7 @@ function run(cmd: string, args: string[], opts: { cwd?: string; env?: NodeJS.Pro
   );
 }
 
+import { ApplicationFailure } from "@temporalio/common";
 import * as plaudapi from "./plaudapi";
 import type { CalEvent } from "./calendar";
 
@@ -262,6 +263,26 @@ async function segments(srcPath: string, outDir: string): Promise<string[]> {
   return files.map((f) => path.join(outDir, f));
 }
 
+/** PURE: how long to wait before asking again, in milliseconds, or undefined when the response
+ *  does not say.
+ *
+ *  Two sources because Groq uses both: a `retry-after` header, and — for the daily audio budget —
+ *  only a sentence in the body, `"Please try again in 19m48s"`. Reading just the header would have
+ *  missed the one that actually matters here. Capped at six hours so a malformed or hostile value
+ *  cannot park a meeting until next week. */
+export function retryAfterMs(header: string | null, body: string): number | undefined {
+  const cap = (ms: number): number => Math.min(Math.max(ms, 1_000), 6 * 3_600_000);
+  const h = Number(header);
+  if (Number.isFinite(h) && h > 0) return cap(h * 1000);
+  // "19m48s", "1h2m3s", "45.6s" — the shape Groq writes into the message.
+  const m = /try again in\s+(?:(\d+)h)?(?:(\d+)m)?(?:([\d.]+)s)?/i.exec(body);
+  if (m && (m[1] || m[2] || m[3])) {
+    const ms = (Number(m[1] ?? 0) * 3600 + Number(m[2] ?? 0) * 60 + Number(m[3] ?? 0)) * 1000;
+    if (ms > 0) return cap(ms);
+  }
+  return undefined;
+}
+
 /** One chunk through Groq. Separated so a retry, a log line, or a heartbeat is per chunk. */
 async function transcribeChunk(file: string, groqKey: string, vocab: string): Promise<string> {
   const audio = await fs.readFile(file);
@@ -278,9 +299,46 @@ async function transcribeChunk(file: string, groqKey: string, vocab: string): Pr
     headers: { Authorization: `Bearer ${groqKey}` },
     body: form,
   });
-  if (!r.ok) throw new Error(`groq transcribe: ${r.status} ${(await r.text()).slice(0, 300)}`);
+  if (!r.ok) {
+    const body = (await r.text()).slice(0, 300);
+    const wait = r.status === 429 ? retryAfterMs(r.headers.get("retry-after"), body) : undefined;
+    // A DAILY quota is not a transient fault, and retrying it on the generic policy is what turned
+    // one exhausted budget into 611 attempts. Groq says exactly when it will serve again; hand that
+    // to Temporal as `nextRetryDelay` and the activity simply waits, holding the chunks it has.
+    if (wait !== undefined) {
+      throw ApplicationFailure.create({
+        message: `groq transcribe: ${r.status} ${body}`,
+        type: "GroqRateLimited",
+        nextRetryDelay: wait,
+      });
+    }
+    throw new Error(`groq transcribe: ${r.status} ${body}`);
+  }
   const j = (await r.json()) as { text: string };
   return j.text ?? "";
+}
+
+/** PURE: where one chunk's text is kept between attempts. Keyed by the RECORDING, because that is
+ *  what a retry is retrying, and by chunk INDEX and COUNT together — a different count means the
+ *  audio was segmented differently and index 3 is no longer the same three minutes, so the whole
+ *  set is stale and must not be reused. */
+export function chunkCachePath(cacheDir: string, rec: Recording, index: number, total: number): string {
+  return path.join(cacheDir, rec.id, `of-${total}`, `chunk-${String(index).padStart(3, "0")}.txt`);
+}
+
+/** Text only, never audio. The transcript is going to the second brain anyway, so keeping it for a
+ *  few minutes costs nothing; the AUDIO is the customer's meeting and has no business outliving
+ *  the attempt, which is why the retry re-downloads rather than caching it. */
+async function cachedChunk(file: string): Promise<string | undefined> {
+  return fs.readFile(file, "utf8").catch(() => undefined);
+}
+
+/** Drop a recording's saved chunks. Called once it is published: the transcript is in the second
+ *  brain by then, so keeping a second copy of the customer's meeting on the volume is a liability
+ *  with no remaining purpose. Best effort — a cache that fails to clear costs disk, not
+ *  correctness, and the next attempt would simply reuse it. */
+export async function clearChunkCache(cacheDir: string, rec: Recording): Promise<void> {
+  await fs.rm(path.join(cacheDir, rec.id), { recursive: true, force: true }).catch(() => {});
 }
 
 export async function transcribe(
@@ -289,6 +347,9 @@ export async function transcribe(
   groqKey: string,
   vocab: string,
   onProgress?: (done: number, total: number) => void,
+  /** Where finished chunks are kept, so a retry resumes instead of starting over. Optional: the
+   *  single-machine path passes none and behaves exactly as before. */
+  cacheDir?: string,
 ): Promise<TranscribeResult> {
   const t0 = Date.now();
   // The audio, and ONLY the audio. Plaud will also hand over its own transcript and summary, and
@@ -309,12 +370,31 @@ export async function transcribe(
     console.log(`recap: ${rec.title} — ${(audio.length / 1e6).toFixed(1)}MB in ${parts.length} chunk(s)`);
 
     const texts: string[] = [];
+    let reused = 0;
     for (const [i, file] of parts.entries()) {
+      // RESUME, don't restart. Without this a meeting that failed on chunk 6 of 9 threw away the
+      // five it had already paid for and asked for them again on the next tick — which is how a
+      // handful of meetings consumed a whole day's audio quota: 611 attempts, 4 published.
+      const at = cacheDir ? chunkCachePath(cacheDir, rec, i, parts.length) : undefined;
+      const already = at ? await cachedChunk(at) : undefined;
+      if (already !== undefined) {
+        texts.push(already);
+        reused++;
+        onProgress?.(i + 1, parts.length);
+        continue;
+      }
       // Sequential on purpose: the chunks are one conversation, and a rate-limited burst would
       // fail a whole meeting to save a few seconds on one.
-      texts.push(await transcribeChunk(file, groqKey, vocab));
+      const text = await transcribeChunk(file, groqKey, vocab);
+      if (at) {
+        await fs.mkdir(path.dirname(at), { recursive: true }).catch(() => {});
+        // Written BEFORE the next chunk is attempted, so a failure on chunk i+1 cannot lose chunk i.
+        await fs.writeFile(at, text, "utf8").catch(() => {});
+      }
+      texts.push(text);
       onProgress?.(i + 1, parts.length);
     }
+    if (reused) console.log(`recap: ${rec.title} — reused ${reused}/${parts.length} chunk(s) from a previous attempt`);
     return { text: joinChunks(texts), seconds: (Date.now() - t0) / 1000 };
   } finally {
     await fs.rm(work, { recursive: true, force: true }).catch(() => {});
