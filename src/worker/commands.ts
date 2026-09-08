@@ -154,6 +154,8 @@ export interface CommandDeps {
   /** Offer a fresh Claude login in this conversation. Returns "" when the offer IS the message: it
    *  is posted as blocks, and returning text as well would post the whole thing twice. */
   connectClaude?(agent: string, conversation: string): Promise<string>;
+  /** Offer the calendar dialog. Same contract: "" when the blocks are the message. */
+  connectIcs?(agent: string, conversation: string): Promise<string>;
   /** Finish a connection with the callback URL the person pasted back. */
   finishPlaud?(agent: string, pasted: string): Promise<string>;
   /** Whether this agent already has a Plaud account connected. */
@@ -167,6 +169,7 @@ const HELP = [
   "• `!model` — which model this conversation runs; `!model <name>` to change it here only",
   "• `!connect plaud` — connect your Plaud account, so I can pick up your recordings",
   "• `!connect google` / `!connect outlook` — add a calendar, so I know which meeting a recording was",
+  "• `!connect ics` — add a calendar by its published address, when the account itself is blocked",
   "•  …add a name to keep more than one: `!connect google work`",
   "• `!connect claude` — sign in to the Claude subscription I answer on",
   "• `!disconnect plaud` — forget it again",
@@ -194,6 +197,51 @@ const NEW_NOOP = [
   "That is what `/new` did on Telegram and Teams; in Slack the thread already is it.",
 ].join("\n");
 
+/** PURE: one list of what an agent is connected to, from stores that do not know about each other.
+ *
+ *  THE BUG THIS EXISTS FOR. `!connect plaud` answered "your Plaud account is already connected" and
+ *  `!connections`, one line later, answered "nothing is connected yet". Neither was wrong: the
+ *  first asks the token store, the second listed `connection` rows, and Plaud predates the
+ *  connection model so it has never had a row. A person cannot be expected to know which question
+ *  they asked.
+ *
+ *  THE REGISTRY WINS on any kind it holds. It is the store the connection model is migrating
+ *  towards, so once a kind has a row there, that row is the truth and the legacy check is noise.
+ *  This is what makes the merge a bridge rather than a permanent second source: when Plaud moves,
+ *  its entry here stops being reachable and nothing else changes. */
+export function mergeConnections(registry: readonly ConnectionLine[], legacy: readonly ConnectionLine[]): ConnectionLine[] {
+  const kinds = new Set(registry.map((c) => c.kind));
+  return [...registry, ...legacy.filter((c) => !kinds.has(c.kind))];
+}
+
+/** The credentials that live OUTSIDE the registry, asked of the connectors that own them.
+ *
+ *  Failures are swallowed deliberately: a token store that cannot be read should not turn
+ *  `!connections` into an error page. An absent line reads as "not connected", which is the safer
+ *  of the two wrong answers here — the other one hides the calendars that ARE connected. */
+async function gatherLegacy(deps: CommandDeps, agent: string): Promise<ConnectionLine[]> {
+  const out: ConnectionLine[] = [];
+
+  if (await deps.plaudConnected?.(agent).catch(() => false)) {
+    out.push({ kind: "plaud", alias: "default", label: "Plaud account", status: "connected" });
+  }
+
+  // The Claude subscription belongs here too, and its absence was the other half of the confusion:
+  // an agent is plainly "connected to" the thing it answers on, and `!connections` never said so.
+  const account = await deps.claudeAccount?.(agent).catch(() => "");
+  if (account && !/^not signed in/i.test(account)) {
+    out.push({
+      kind: "claude",
+      alias: "default",
+      label: "Claude subscription",
+      status: "connected",
+      externalAccount: account,
+    });
+  }
+
+  return out;
+}
+
 /** The connector a connection command names, and whatever follows it. A pasted callback address
  *  is one long token, so the split is on the FIRST word only. */
 export function splitConnector(arg: string): { which: string; rest: string } {
@@ -210,7 +258,7 @@ export function splitConnector(arg: string): { which: string; rest: string } {
  *  contradicts itself in one line, reached by following the instruction the agent had just given.
  *  The dispatch below is checked against this list, so the two cannot drift apart again without a
  *  test failing. */
-export const CONNECT_KINDS = ["claude", "plaud", "google", "outlook"] as const;
+export const CONNECT_KINDS = ["claude", "plaud", "google", "outlook", "ics"] as const;
 
 /** The refusal names what is available HERE - `!code` takes only plaud, `!disconnect` takes two -
  *  rather than reciting one global list in a context where most of it is wrong. */
@@ -273,6 +321,14 @@ export async function run(
       if (which === "claude") {
         if (!deps.connectClaude) return "I have no way to sign in to Claude on this deployment.";
         return deps.connectClaude(agent, conversation);
+      }
+
+      // A published calendar address, which has no login at all - only a URL. Collected in a dialog
+      // rather than typed here because the URL IS the credential: anyone holding it reads the
+      // calendar forever, and a pasted link stays in channel history and in workspace exports.
+      if (which === "ics") {
+        if (!deps.connectIcs) return "I can't add a calendar on this deployment.";
+        return deps.connectIcs(agent, conversation);
       }
 
       // The calendar providers. Three-legged, and they land on our OWN callback rather than on a
@@ -354,11 +410,14 @@ export async function run(
 
     case "connections": {
       if (!deps.connections) return "I can't see connections on this deployment.";
-      const list = await deps.connections(agent);
+      // The registry is only ONE of the places a credential lives, and answering from it alone is
+      // how `!connect plaud` came to say "already connected" one line above `!connections` saying
+      // "nothing is connected yet". Both were right about their own store. See mergeConnections.
+      const list = mergeConnections(await deps.connections(agent), await gatherLegacy(deps, agent));
       if (list.length === 0) {
         // Not an error, and worth saying in words. An empty list and a broken lookup look identical
         // if the answer is a blank line.
-        return "Nothing is connected yet. `!connect plaud` to start, or ask me to add a calendar.";
+        return `Nothing is connected yet. Try ${CONNECT_KINDS.map((c) => `\`!connect ${c}\``).join(", ")}.`;
       }
       const lines = list.map((c) => {
         // The NAME first, because that is what a person gave it and what they will use to refer to

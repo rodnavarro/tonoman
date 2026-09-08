@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { parse, run, splitConnector, type CommandDeps, undecorate, CONNECT_KINDS } from "./commands";
+import { parse, run, splitConnector, type CommandDeps, undecorate, CONNECT_KINDS, mergeConnections } from "./commands";
 import type { StatusMode } from "../statusline";
 
 describe("parse", () => {
@@ -311,5 +311,107 @@ describe("every connector the agent offers is one it can actually run", () => {
     const out = await run({ ...deps, finishPlaud: async () => "" } as never, "a", "c", { name: "code", arg: "google x" });
     expect(out).toContain("plaud");
     expect(out).not.toContain("outlook");
+  });
+});
+
+describe("!connections answers from every store, not just the registry", () => {
+  // THE bug: `!connect plaud` said "already connected" and `!connections`, one line later, said
+  // "nothing is connected yet". Neither was wrong - the first asks the token store, the second
+  // listed registry rows, and Plaud has never had one. A person cannot be expected to know which
+  // question they just asked.
+  const base = {
+    getMode: () => "compact",
+    setMode: () => {},
+    lastUsage: () => undefined,
+    windows: async () => [],
+    getModel: () => undefined,
+    setModel: () => {},
+  } as unknown as Parameters<typeof run>[0];
+
+  it("lists a Plaud account that only the token store knows about", async () => {
+    const deps = {
+      ...base,
+      connections: async () => [],
+      plaudConnected: async () => true,
+    } as unknown as Parameters<typeof run>[0];
+    const out = await run(deps, "a", "c", { name: "connections", arg: "" });
+    expect(out).toContain("Plaud account");
+    expect(out).not.toContain("Nothing is connected yet");
+  });
+
+  it("lists the Claude subscription, which an agent is plainly connected to", async () => {
+    const deps = {
+      ...base,
+      connections: async () => [],
+      claudeAccount: async () => "rod@rodnavarro.com (max)",
+    } as unknown as Parameters<typeof run>[0];
+    const out = await run(deps, "a", "c", { name: "connections", arg: "" });
+    expect(out).toContain("Claude subscription");
+    expect(out).toContain("rod@rodnavarro.com (max)");
+  });
+
+  it("says nothing about Claude when the agent is not signed in", async () => {
+    const deps = {
+      ...base,
+      connections: async () => [],
+      claudeAccount: async () => "not signed in",
+    } as unknown as Parameters<typeof run>[0];
+    const out = await run(deps, "a", "c", { name: "connections", arg: "" });
+    expect(out).toContain("Nothing is connected yet");
+  });
+
+  it("shows a calendar and a legacy credential together", async () => {
+    const deps = {
+      ...base,
+      connections: async () => [{ kind: "ics", alias: "foley", label: "Foley Outlook ICS", status: "connected" }],
+      plaudConnected: async () => true,
+    } as unknown as Parameters<typeof run>[0];
+    const out = await run(deps, "a", "c", { name: "connections", arg: "" });
+    expect(out).toContain("Foley Outlook ICS");
+    expect(out).toContain("Plaud account");
+    expect(out).toContain("2 things");
+  });
+
+  it("names the connectors it has when there is nothing to list", async () => {
+    const deps = { ...base, connections: async () => [] } as unknown as Parameters<typeof run>[0];
+    const out = await run(deps, "a", "c", { name: "connections", arg: "" });
+    // The old copy hardcoded "!connect plaud" and pre-dated calendars entirely.
+    for (const kind of ["claude", "plaud", "google", "outlook"]) expect(out).toContain(`!connect ${kind}`);
+  });
+
+  it("does not let a broken token store hide the calendars that DO work", async () => {
+    const deps = {
+      ...base,
+      connections: async () => [{ kind: "ics", alias: "foley", label: "Foley Outlook ICS", status: "connected" }],
+      plaudConnected: async () => {
+        throw new Error("token store unreadable");
+      },
+    } as unknown as Parameters<typeof run>[0];
+    const out = await run(deps, "a", "c", { name: "connections", arg: "" });
+    expect(out).toContain("Foley Outlook ICS");
+  });
+});
+
+describe("mergeConnections", () => {
+  it("lets the registry win on any kind it holds, so the bridge retires itself", async () => {
+    // When Plaud moves onto the connection model its legacy entry stops being reachable and
+    // nothing else has to change. That is what keeps this a bridge rather than a second source.
+    const merged = mergeConnections(
+      [{ kind: "plaud", alias: "default", label: "Plaud (registry)" }],
+      [{ kind: "plaud", alias: "default", label: "Plaud (token store)" }],
+    );
+    expect(merged).toHaveLength(1);
+    expect(merged[0]!.label).toBe("Plaud (registry)");
+  });
+
+  it("keeps every registry row, including two of one kind", async () => {
+    const merged = mergeConnections(
+      [
+        { kind: "google", alias: "work" },
+        { kind: "google", alias: "personal" },
+      ],
+      [{ kind: "plaud", alias: "default" }],
+    );
+    expect(merged.map((c) => `${c.kind}/${c.alias}`)).toEqual(["google/work", "google/personal", "plaud/default"]);
   });
 });

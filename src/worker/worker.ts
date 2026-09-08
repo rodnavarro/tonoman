@@ -27,6 +27,7 @@ import * as claudecode from "../harness/claudecode";
 import * as plaudauth from "./plaudauth";
 import * as tokenstore from "./tokenstore";
 import * as plaudgate from "./plaudgate";
+import * as icsgate from "./icsgate";
 import {
   parseStatusMode,
   remoteAccountUsageCached,
@@ -664,6 +665,14 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
       // ask() has already said why on the paths where it could not offer a login.
       return "";
     },
+    // A published calendar address. The blocks ARE the message; see connectClaude.
+    connectIcs: async (name, conversation) => {
+      const asked = await icsgate.ask(icsDeps, name, conversation).catch((e) => {
+        console.error(`worker: ${name} connect ics failed: ${(e as Error).message}`);
+        return false;
+      });
+      return asked ? "" : "I can't post a dialog in this conversation.";
+    },
     disconnectClaude: async (name) => {
       // Removing the credential IS the sign-out: the harness reads it from this directory on every
       // turn, so a deleted file means the next message finds no login and the connect gate offers
@@ -715,6 +724,63 @@ Record something and I'll pick it up within five minutes - I'll post what I find
     },
   };
 
+  // --- adding a calendar by its published address -------------------------------------------------
+  //
+  // CHECKED BEFORE IT IS STORED. A URL that cannot be read produces a connection row the matcher
+  // silently gets nothing from — "connected" on screen and empty in practice, which is the exact
+  // state every failure this week wore as a disguise. So the feed is fetched and parsed first, and
+  // only a feed that answers is saved.
+  const icsDeps: icsgate.IcsGateDeps = {
+    conn: (name) => wired.get(name)?.conn as SlackConnector | undefined,
+    save: async (name, alias, url) => {
+      const guid = wired.get(name)?.cfg.guid;
+      const baseUrl = process.env.TONOMANCLOUD_API_URL;
+      if (!guid || !baseUrl) return { ok: false, message: "⚠️ This deployment has no registry to store that in." };
+
+      const health = await calendar.checkIcs(url).catch((e) => ({ ok: false as const, problem: (e as Error).message }));
+      if (!health.ok) {
+        return {
+          ok: false,
+          message:
+            `⚠️ I couldn't read that calendar — ${health.problem}
+` +
+            "Nothing has been saved. Check the link is the *ICS* one and that it is published to *Can view all details*.",
+        };
+      }
+
+      const ref = `ics.url:${alias}`;
+      const auth = { authorization: `Bearer ${process.env.TONOMANCLOUD_API_TOKEN ?? ""}`, "content-type": "application/json" };
+      try {
+        // The URL goes into the secret store, sealed, and the connection row only ever names the
+        // ref — the same rule as every other credential. It is the calendar's password.
+        const put = await fetch(`${baseUrl}/v1/system/agents/${guid}/secrets/${encodeURIComponent(ref)}`, {
+          method: "PUT",
+          headers: auth,
+          body: JSON.stringify({ value: url }),
+        });
+        if (!put.ok) return { ok: false, message: `⚠️ I couldn't store that — the registry said HTTP ${put.status}.` };
+
+        const attach = await fetch(
+          `${baseUrl}/v1/system/agents/${guid}/connections/ics/${encodeURIComponent(alias)}`,
+          { method: "PUT", headers: auth, body: JSON.stringify({ secretRef: ref, label: alias }) },
+        );
+        if (!attach.ok) return { ok: false, message: `⚠️ I stored it but couldn't attach it — HTTP ${attach.status}.` };
+      } catch (e) {
+        return { ok: false, message: `⚠️ I couldn't reach the registry — ${(e as Error).message.slice(0, 160)}` };
+      }
+
+      // What it FOUND, not that it succeeded. "Connected" on its own is the claim that has been
+      // wrong all week; a count and the next meeting are checkable by the person reading them.
+      return {
+        ok: true,
+        message:
+          `✅ ${calendar.healthLine(alias, health)}
+` +
+          "It takes effect on my next restart — the calendars are resolved when I start up.",
+      };
+    },
+  };
+
   // The agent asks for its OWN credential, through its own runtime. The login endpoints live in
   // the sidecar sharing this pod's credential volume, so the code goes from a Slack modal to the
   // process that owns the credential and nowhere else — it never transits the control plane.
@@ -757,12 +823,15 @@ Record something and I'll pick it up within five minutes - I'll post what I find
       // Two gates now, and each claims only what it recognises: connecting Claude and connecting
       // Plaud both end in a dialog, so the router asks the Plaud one first and falls through when
       // the interaction is not its own.
-      const mine =
-        it.actionId?.startsWith(plaudgate.PLAUD_CONNECT_ACTION) ||
-        it.callbackId === plaudgate.PLAUD_CONNECT_ACTION;
-      const run = mine
+      // THREE gates now, each claiming only what it recognises, and the auth gate LAST because it
+      // is the one with no namespace of its own — it accepts an undefined callbackId, so anything
+      // routed to it by default would be tried as a Claude authorization code.
+      const claims = (id: string) => it.actionId?.startsWith(id) || it.callbackId === id;
+      const run = claims(plaudgate.PLAUD_CONNECT_ACTION)
         ? plaudgate.handleInteraction(plaudDeps, name, it)
-        : gate.handleInteraction(authDeps, name, it);
+        : claims(icsgate.ICS_CONNECT_ACTION)
+          ? icsgate.handleInteraction(icsDeps, name, it)
+          : gate.handleInteraction(authDeps, name, it);
       void run
         .then((msg) => console.log(`worker: ${name} interaction — ${msg}`))
         .catch((e) => console.error(`worker: ${name} interaction failed: ${(e as Error).message}`));
