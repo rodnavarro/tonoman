@@ -11,7 +11,7 @@ import { describe, expect, it } from "vitest";
 import { promises as fs } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { retryAfterMs, chunkCachePath, clearChunkCache, parseProbeSeconds } from "./recap";
+import { retryAfterMs, chunkCachePath, clearChunkCache, parseProbeSeconds, groqFailure } from "./recap";
 
 const BODY_429 =
   '{"error":{"message":"Rate limit reached for model `whisper-large-v3-turbo` in organization ' +
@@ -115,5 +115,52 @@ describe("parseProbeSeconds — measuring what we actually send", () => {
     expect(parseProbeSeconds("N/A")).toBeUndefined();
     expect(parseProbeSeconds("0")).toBeUndefined();
     expect(parseProbeSeconds("-1")).toBeUndefined();
+  });
+});
+
+describe("groqFailure — too early is not the same as too large", () => {
+  const BODY_413 =
+    '{"error":{"message":"Request too large for model `openai/gpt-oss-120b` in organization ' +
+    "`org_REDACTED` service tier `on_demand` on tokens per minute (TPM): Limit 8000, " +
+    'Requested 9739, please reduce your message size and try again."}}';
+
+  it("makes a 429 retryable, carrying the delay the provider named", () => {
+    const e = groqFailure("transcribe", 429, BODY_429, null) as { type?: string; nextRetryDelay?: unknown; nonRetryable?: boolean };
+    expect(e.type).toBe("GroqRateLimited");
+    expect(e.nextRetryDelay).toBeDefined();
+    expect(e.nonRetryable).not.toBe(true);
+  });
+
+  it("makes a 413 NON-retryable, because the same request will never fit", () => {
+    // Seven attempts were spent on exactly this body — each a full transcription's worth of
+    // orchestration for a foregone conclusion. "Limit 8000, Requested 9739" is a size, not a
+    // schedule; there is no later at which it becomes true.
+    const e = groqFailure("summarize", 413, BODY_413, null) as { type?: string; nonRetryable?: boolean };
+    expect(e.type).toBe("GroqRejected");
+    expect(e.nonRetryable).toBe(true);
+  });
+
+  it("gives up on the errors that describe a broken request rather than a busy server", () => {
+    for (const status of [400, 401, 403, 404]) {
+      const e = groqFailure("transcribe", status, "nope", null) as { nonRetryable?: boolean };
+      expect(e.nonRetryable).toBe(true);
+    }
+  });
+
+  it("keeps a 5xx retryable, because that IS the transient case", () => {
+    const e = groqFailure("transcribe", 503, "upstream unavailable", null) as { nonRetryable?: boolean };
+    expect(e.nonRetryable).not.toBe(true);
+  });
+
+  it("keeps a 429 with no stated delay retryable on the generic backoff", () => {
+    // Retryable, just not on a schedule the provider chose — falling through to nonRetryable here
+    // would abandon a meeting over a rate limit that clears in seconds.
+    const e = groqFailure("transcribe", 429, "slow down", null) as { nonRetryable?: boolean };
+    expect(e.nonRetryable).not.toBe(true);
+  });
+
+  it("names which call failed, since both go to the same provider", () => {
+    expect(String(groqFailure("summarize", 413, BODY_413, null).message)).toContain("groq summarize");
+    expect(String(groqFailure("transcribe", 429, BODY_429, null).message)).toContain("groq transcribe");
   });
 });

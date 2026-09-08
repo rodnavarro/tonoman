@@ -234,33 +234,72 @@ export function joinChunks(parts: string[]): string {
  *
  *  16 kHz mono is Whisper's own working format, so downsampling loses nothing it would have used
  *  and cuts a stereo 48 kHz recording by an order of magnitude before the size cap is even in
- *  question. The segment muxer does the split in the same pass. */
+ *  question.
+ *
+ *  ONE FFMPEG PER PIECE, and NOT `-f segment`, which is what this used to do. The segment muxer
+ *  writes FLAC headers that do not describe the segment: every piece but the last declares an
+ *  unknown length, and the LAST piece declares the length of the WHOLE SOURCE. Measured, on a
+ *  3740-second input cut at 600:
+ *
+ *      part-000..005   122 KB each   ffprobe: N/A
+ *      part-006         35 KB        ffprobe: 3740.014875   <- 140 seconds of audio
+ *
+ *  Groq meters on the DECLARED duration, so the final chunk of every multi-part recording was
+ *  charged as if it were the entire meeting again. A 62-minute recording cost 7340 seconds instead
+ *  of 3720 — the doubling Rod spotted on the usage dashboard, and most of what emptied a day's
+ *  quota. Single-chunk recordings were correct by accident, which is why a five-minute test
+ *  measured perfectly and hid it.
+ *
+ *  Seeking BEFORE `-i` so each cut is still fast, and each output is finalised on its own, so its
+ *  header describes itself:
+ *
+ *      part-000..005   ffprobe: 600.000000
+ *      part-006        ffprobe: 140.014875 */
 async function segments(srcPath: string, outDir: string): Promise<string[]> {
-  const pattern = path.join(outDir, "part-%03d.flac");
-  const r = await run("ffmpeg", [
-    "-nostdin",
-    "-hide_banner",
-    "-loglevel",
-    "error",
-    "-i",
-    srcPath,
-    "-vn",
-    "-ac",
-    "1",
-    "-ar",
-    "16000",
-    "-c:a",
-    "flac",
-    "-f",
-    "segment",
-    "-segment_time",
-    String(SEGMENT_SECONDS),
-    pattern,
-  ]);
-  if (r.code !== 0) throw new Error(`ffmpeg: ${r.out.slice(0, 300)}`);
-  const files = (await fs.readdir(outDir)).filter((f) => f.startsWith("part-")).sort();
-  if (files.length === 0) throw new Error("ffmpeg produced no audio segments");
-  return files.map((f) => path.join(outDir, f));
+  const total = await probeSeconds(srcPath);
+  if (total === undefined) {
+    // Without a duration there is nothing to cut against. Refused rather than guessed: the old
+    // fallback here is exactly the muxer that mis-declares lengths, and a silent return to it
+    // would restore the bug it took a metered API and a usage dashboard to find.
+    throw new Error("ffprobe could not read the recording's duration, so it cannot be split safely");
+  }
+  const out: string[] = [];
+  for (let i = 0, off = 0; off < total; i++, off += SEGMENT_SECONDS) {
+    const file = path.join(outDir, `part-${String(i).padStart(3, "0")}.flac`);
+    const r = await run("ffmpeg", [
+      "-nostdin",
+      "-hide_banner",
+      "-loglevel",
+      "error",
+      // BEFORE -i: ffmpeg seeks the container instead of decoding from the start, so cutting the
+      // ninth piece of a long meeting costs the same as cutting the first.
+      "-ss",
+      String(off),
+      "-t",
+      String(SEGMENT_SECONDS),
+      "-i",
+      srcPath,
+      "-vn",
+      "-ac",
+      "1",
+      "-ar",
+      "16000",
+      "-c:a",
+      "flac",
+      file,
+    ]);
+    if (r.code !== 0) throw new Error(`ffmpeg: ${r.out.slice(0, 300)}`);
+    // A final cut landing exactly on the end produces an empty file; it is not a chunk and must
+    // not become a request.
+    const size = await fs.stat(file).then((st) => st.size).catch(() => 0);
+    if (size === 0) {
+      await fs.rm(file, { force: true }).catch(() => {});
+      break;
+    }
+    out.push(file);
+  }
+  if (out.length === 0) throw new Error("ffmpeg produced no audio segments");
+  return out;
 }
 
 /** PURE: seconds out of ffprobe's output, or undefined when it did not say. */
@@ -305,6 +344,29 @@ export function retryAfterMs(header: string | null, body: string): number | unde
   return undefined;
 }
 
+/** The right KIND of failure for a Groq response, so Temporal retries what can succeed and gives
+ *  up immediately on what cannot.
+ *
+ *  The distinction this exists to make: `429 ... please try again in 19m48s` is a request that came
+ *  too EARLY, and waiting fixes it. `413 ... Limit 8000, Requested 9739` is a request that is too
+ *  LARGE, and no amount of waiting will ever make it fit — it burned seven attempts proving that,
+ *  each one a full transcription's worth of orchestration for a foregone conclusion. */
+export function groqFailure(what: string, status: number, body: string, retryAfter: string | null): Error {
+  const message = `groq ${what}: ${status} ${body}`;
+  if (status === 429) {
+    const wait = retryAfterMs(retryAfter, body);
+    if (wait !== undefined) {
+      return ApplicationFailure.create({ message, type: "GroqRateLimited", nextRetryDelay: wait });
+    }
+  }
+  // Too large, malformed, unauthorised, or a model that does not exist: all of them are the same
+  // request next time, and the same answer.
+  if ([400, 401, 403, 404, 413].includes(status)) {
+    return ApplicationFailure.create({ message, type: "GroqRejected", nonRetryable: true });
+  }
+  return new Error(message);
+}
+
 /** One chunk through Groq. Separated so a retry, a log line, or a heartbeat is per chunk. */
 async function transcribeChunk(file: string, groqKey: string, vocab: string): Promise<string> {
   const audio = await fs.readFile(file);
@@ -322,19 +384,9 @@ async function transcribeChunk(file: string, groqKey: string, vocab: string): Pr
     body: form,
   });
   if (!r.ok) {
-    const body = (await r.text()).slice(0, 300);
-    const wait = r.status === 429 ? retryAfterMs(r.headers.get("retry-after"), body) : undefined;
-    // A DAILY quota is not a transient fault, and retrying it on the generic policy is what turned
-    // one exhausted budget into 611 attempts. Groq says exactly when it will serve again; hand that
-    // to Temporal as `nextRetryDelay` and the activity simply waits, holding the chunks it has.
-    if (wait !== undefined) {
-      throw ApplicationFailure.create({
-        message: `groq transcribe: ${r.status} ${body}`,
-        type: "GroqRateLimited",
-        nextRetryDelay: wait,
-      });
-    }
-    throw new Error(`groq transcribe: ${r.status} ${body}`);
+    // A DAILY quota is not a transient fault. Groq says exactly when it will serve again; handed to
+    // Temporal as `nextRetryDelay`, the activity simply waits, holding the chunks it has.
+    throw groqFailure("transcribe", r.status, (await r.text()).slice(0, 300), r.headers.get("retry-after"));
   }
   const j = (await r.json()) as { text: string };
   return j.text ?? "";
@@ -607,7 +659,7 @@ export async function summarize(
       ],
     }),
   });
-  if (!r.ok) throw new Error(`groq summarize: ${r.status} ${(await r.text()).slice(0, 300)}`);
+  if (!r.ok) throw groqFailure("summarize", r.status, (await r.text()).slice(0, 300), r.headers.get("retry-after"));
   const j = (await r.json()) as { choices: { message: { content: string } }[] };
   return JSON.parse(j.choices[0]!.message.content) as Recap;
 }
