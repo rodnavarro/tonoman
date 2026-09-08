@@ -192,6 +192,10 @@ export async function plaudPollWorkflow(input: PollInput): Promise<void> {
       agent: input.agent,
       user: input.notify,
       text: `⚠️ I can't reach your Plaud account — ${failureReason(e).slice(0, 150)}`,
+      // ONCE AN HOUR, not once a tick. The schedule retries every couple of minutes, which is right
+      // — the credential could come back at any time — but the person can only act on this once,
+      // and thirty identical warnings an hour is how a useful notice becomes noise to be muted.
+      onceMinutes: 60,
     }).catch(() => {});
     throw e;
   }

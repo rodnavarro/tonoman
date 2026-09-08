@@ -7,7 +7,7 @@
 // a customer's second brain before anyone notices.
 
 import { describe, expect, it } from "vitest";
-import { toMs, toRecording, stampFor } from "./plaudapi";
+import { toMs, toRecording, stampFor, envelopeError } from "./plaudapi";
 
 /** Copied verbatim from a real response. */
 const REAL = {
@@ -63,5 +63,42 @@ describe("toRecording — a real row", () => {
   it("uses created_at when start_at is missing", () => {
     const { start_at: _omit, ...noStart } = REAL;
     expect(toRecording(noStart).startTime).toBe(Date.parse("2026-09-07T03:11:13Z"));
+  });
+});
+
+describe("envelopeError — the 200 that was a failure", () => {
+  it("catches the exact body a dead credential returns", () => {
+    // Copied from the live API, not invented. This is what a poll saw every two minutes for hours
+    // while reporting success: HTTP 200, no `data_file_list`, an empty recording list, and a
+    // person waiting for a recap that was never going to come.
+    const r = envelopeError({ status: -419, msg: "workspace token expired" });
+    expect(r).toBeDefined();
+    // The message has to name the ACTION. "workspace token expired" is Plaud's wording and tells
+    // the person nothing they can do about it.
+    expect(r).toContain("!connect plaud");
+    expect(r).toContain("workspace token expired");
+  });
+
+  it("leaves a normal response alone", () => {
+    // The check must be invisible in the healthy case, or it becomes the new silent failure.
+    expect(envelopeError({ data_file_list: [{ id: "1" }] })).toBeUndefined();
+    expect(envelopeError({ status: 0, data_file_list: [] })).toBeUndefined();
+    expect(envelopeError({ status: 200 })).toBeUndefined();
+    expect(envelopeError([])).toBeUndefined();
+    expect(envelopeError(null)).toBeUndefined();
+    expect(envelopeError(undefined)).toBeUndefined();
+  });
+
+  it("reports a negative status it has no wording for, rather than swallowing it", () => {
+    // An unrecognised error is still an error. Returning undefined here would restore exactly the
+    // behaviour this function exists to end.
+    expect(envelopeError({ status: -1 })).toBe("status -1");
+    expect(envelopeError({ status: -3, msg: "rate limited" })).toBe("rate limited");
+  });
+
+  it("treats every wording for a dead credential as one that needs reconnecting", () => {
+    for (const msg of ["workspace token expired", "unauthorized", "invalid token", "not logged in"]) {
+      expect(envelopeError({ status: -1, msg })).toContain("!connect plaud");
+    }
   });
 });

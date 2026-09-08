@@ -26,6 +26,15 @@ export interface PlaudGateDeps {
   complete(agent: string, pasted: string): Promise<{ ok: boolean; problem?: string }>;
   /** Where this agent announces recaps, so the confirmation can say where to look. */
   notifyChannel(agent: string): string | undefined;
+  /** Start this agent's recording poll, now that it has a credential to poll with.
+   *
+   *  Exists because the confirmation below promises "record something and I'll pick it up within a
+   *  couple of minutes", and that promise was false. The voice flow was worked out once at boot, so
+   *  an account connected afterwards was stored, acknowledged — and polled by nothing until the
+   *  process restarted. In the cluster that reads as "connected", then silence until the next deploy.
+   *
+   *  Returns a problem to pass on to the person, or undefined when the poll is running. */
+  onConnected?(agent: string): Promise<string | undefined>;
 }
 
 /** The offer, in the channel: one link to open and one button to come back through. */
@@ -142,19 +151,28 @@ export async function handleInteraction(deps: PlaudGateDeps, agent: string, it: 
     if (!pasted) return "empty address";
 
     const r = await deps.complete(agent, pasted);
+    // BEFORE the confirmation, not after: the next two sentences promise a poll, so the poll has to
+    // exist by the time they are read. A failure here changes what the person is TOLD, rather than
+    // being logged somewhere nobody is looking while they wait for a recap.
+    const caveat = r.ok
+      ? await deps.onConnected?.(agent).catch((e) => `I couldn't start the poll — ${(e as Error).message}`)
+      : undefined;
     if (conversation) {
       const where = deps.notifyChannel(agent);
       await conn
         .reply(conversation)
         .send(
-          r.ok
-            ? "✅ Your Plaud account is connected.\n\nRecord something and I'll pick it up within a couple of minutes — " +
-                `I'll post what I find ${where ? `in <#${where}>` : "here"}.`
-            : `⚠️ That didn't work — ${r.problem ?? "the address wasn't accepted"}.`,
+          !r.ok
+            ? `⚠️ That didn't work — ${r.problem ?? "the address wasn't accepted"}.`
+            : caveat
+              ? `✅ Your Plaud account is connected, but ${caveat}.\n\nNothing will be picked up until that is sorted.`
+              : "✅ Your Plaud account is connected.\n\nRecord something and I'll pick it up within a couple of minutes — " +
+                `I'll post what I find ${where ? `in <#${where}>` : "here"}.`,
         )
         .catch(() => {});
     }
-    return r.ok ? "plaud connected" : `plaud connect failed: ${r.problem ?? "?"}`;
+    if (!r.ok) return `plaud connect failed: ${r.problem ?? "?"}`;
+    return caveat ? `plaud connected but not polling: ${caveat}` : "plaud connected";
   }
 
   return "not mine";

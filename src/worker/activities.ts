@@ -309,11 +309,32 @@ export function makeActivities(deps: TurnDeps) {
 
     /** Say something verbatim to a person, opening a DM if needed. Used for the acknowledgement and
      *  for failures, where spending an LLM turn to relay a known sentence is waste. */
-    async sayVerbatim(input: { agent: string; user: string; text: string }): Promise<void> {
+    async sayVerbatim(input: {
+      agent: string;
+      user: string;
+      text: string;
+      /** Say this at most once in that many minutes. For a notice raised by something that RETRIES:
+       *  a poll on a two-minute schedule reporting a dead credential says it thirty times an hour,
+       *  which is thirty notifications for one fact the person can only act on once. */
+      onceMinutes?: number;
+    }): Promise<void> {
+      if (input.onceMinutes) {
+        // Keyed on the TEXT, not on "this is the poll warning": a DIFFERENT reason must still be
+        // heard. The goal is not to go quiet, it is not to repeat an identical sentence.
+        const key = `${input.agent} :: ${input.text}`;
+        const at = lastSaid.get(key) ?? 0;
+        if (Date.now() - at < input.onceMinutes * 60_000) return;
+        lastSaid.set(key, Date.now());
+      }
       await deps.say?.(input.agent, input.user, input.text);
     },
   };
 }
+
+/** When each distinct notice was last said. In memory deliberately: the worst a restart costs is
+ *  one repeated warning, and the alternative is persisting a fact that stops being true the moment
+ *  somebody reconnects. */
+const lastSaid = new Map<string, number>();
 
 export type Activities = ReturnType<typeof makeActivities>;
 

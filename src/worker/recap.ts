@@ -92,7 +92,11 @@ async function plaudGet<T>(creds: PlaudCreds, p: string, params?: Record<string,
   for (const [k, v] of Object.entries(params ?? {})) url.searchParams.set(k, String(v));
   const r = await fetch(url, { headers: await plaudHeaders(creds) });
   if (!r.ok) throw new Error(`plaud ${p}: ${r.status} ${(await r.text()).slice(0, 200)}`);
-  return (await r.json()) as T;
+  const body = (await r.json()) as T;
+  // The status LINE is not the answer; the envelope is. See envelopeError.
+  const bad = plaudapi.envelopeError(body);
+  if (bad) throw new Error(`plaud ${p}: ${bad}`);
+  return body;
 }
 
 export async function listRecordings(creds: PlaudCreds, limit = 20): Promise<Recording[]> {

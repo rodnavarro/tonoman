@@ -402,7 +402,21 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
   const voiceCreds = new Map<string, VoiceConfig>();
   /** Agents whose voice flow is off, so their schedule can be paused rather than left ticking. */
   const disabledFlows = new Set<string>();
-  for (const [name, a] of wired) {
+  /** Work out one agent's voice configuration and record it, or say plainly why there is none.
+   *
+   *  A FUNCTION, not the body of the boot loop it used to be, because connecting an account is not
+   *  a boot-time event. `!connect plaud` wrote a credential nine hours after this had already run,
+   *  answered "connected", and then nothing polled: the flow had been filed under "waiting for a
+   *  login" at boot and there was no second look until the process restarted. In the cluster that
+   *  reads as a customer connecting their account and hearing nothing until the next deploy.
+   *
+   *  So the connect path calls this too. Idempotent by construction — it only writes the two
+   *  collections above. */
+  async function wireVoice(name: string, a: Wired): Promise<void> {
+    // A recompute, not an accumulation: this runs again when an account is connected, and an
+    // agent that has just stopped being "waiting for a login" must not stay in disabledFlows.
+    voiceCreds.delete(name);
+    disabledFlows.delete(name);
     const groqKey = process.env.GROQ_API_KEY;
     const src = a.cfg.secondbrain?.[0];
     // Per agent, from the REGISTRY: which channel, which folder, which routes. The environment is
@@ -416,7 +430,7 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
       // it fills the schedule list with executions that look like work and reports "off" in one
       // place while ticking in another.
       disabledFlows.add(name);
-      continue;
+      return;
     }
     // Whose Plaud account this agent watches — from the registry, per tenant. An agent with no
     // credential is not misconfigured; it is a tenant whose person has not logged in yet, and
@@ -432,11 +446,11 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
           `${voice.credentialRef ? ` (credential ${voice.credentialRef} is empty or unmounted)` : " (no credential_ref row)"}`,
       );
       disabledFlows.add(name);
-      continue;
+      return;
     }
     if (!groqKey || !src) {
       console.log(`worker: ${name} has no voice flow (needs GROQ_API_KEY and a second-brain source)`);
-      continue;
+      return;
     }
     // How far back the poll may reach. "Not in the second brain" is NOT the same question as
     // "should be transcribed": without a floor the first poll backfills the customer's entire
@@ -504,6 +518,8 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
           : "; no calendars attached"),
     );
   }
+
+  for (const [name, a] of wired) await wireVoice(name, a);
 
   // --- the status bar -------------------------------------------------------------------------
   // Per-turn tokens and context occupancy come from the harness result; the 5h/7d windows are the
@@ -769,14 +785,28 @@ Record something and I'll pick it up within five minutes - I'll post what I find
         return { ok: false, message: `⚠️ I couldn't reach the registry — ${(e as Error).message.slice(0, 160)}` };
       }
 
+      // TAKE EFFECT NOW. This used to end "it takes effect on my next restart", which was honest
+      // about a limitation nobody should have had to live with: connecting a calendar and then
+      // waiting for a deploy is the same "connected, but not really" this whole path exists to
+      // stop. The roster is the worker's cached view, so the new connection is reflected into it
+      // the same way an auth_state change is, and the flow is worked out again.
+      const a = wired.get(name);
+      if (a) {
+        const conns = (a.cfg.connections ??= []);
+        const at = conns.findIndex((c) => c.kind === "ics" && c.alias === alias);
+        const row = { kind: "ics" as const, alias, secret_ref: ref, status: "connected" as const, label: alias };
+        if (at >= 0) conns[at] = { ...conns[at], ...row };
+        else conns.push(row as (typeof conns)[number]);
+        await wireVoice(name, a);
+        const v = voiceCreds.get(name);
+        if (v) await ensureVoiceSchedule(name, v);
+      }
+
       // What it FOUND, not that it succeeded. "Connected" on its own is the claim that has been
       // wrong all week; a count and the next meeting are checkable by the person reading them.
       return {
         ok: true,
-        message:
-          `✅ ${calendar.healthLine(alias, health)}
-` +
-          "It takes effect on my next restart — the calendars are resolved when I start up.",
+        message: `✅ ${calendar.healthLine(alias, health)}`,
       };
     },
   };
@@ -815,6 +845,19 @@ Record something and I'll pick it up within five minutes - I'll post what I find
     begin: async (name) => (await plaudauth.begin(name)).url,
     complete: (name, pasted) => plaudauth.complete(name, pasted),
     notifyChannel: (name) => voiceCreds.get(name)?.notifyChannel,
+    // The half that was missing. Storing the credential was never the end of connecting an account
+    // — the flow has to be worked out again and the schedule created, both of which only happened
+    // at boot.
+    onConnected: async (name) => {
+      const a = wired.get(name);
+      if (!a) return `I don't serve ${name} in this process`;
+      await wireVoice(name, a);
+      const v = voiceCreds.get(name);
+      // wireVoice says WHY in the log; this says it where the person asking can read it.
+      if (!v) return "this agent has no voice flow configured yet, so there is nothing to poll with";
+      await ensureVoiceSchedule(name, v);
+      return undefined;
+    },
   };
 
   // Interactions are wired per connector below, at construction.
@@ -971,13 +1014,16 @@ Record something and I'll pick it up within five minutes - I'll post what I find
     }
   }
 
-  for (const [name, v] of voiceCreds) {
+  /** Create, update or resume one agent's poll schedule. Separated from the loop for the same
+   *  reason as wireVoice: a flow that becomes ready AFTER boot has to get a schedule then, not at
+   *  the next restart. Safe to call repeatedly — "already exists" is the normal answer. */
+  async function ensureVoiceSchedule(name: string, v: VoiceConfig): Promise<void> {
     const recipient = v.notifyUser ?? "";
     if (!recipient && !v.notifyChannel) {
       // Nowhere to send a recap is not a state to run in: the pipeline would transcribe, summarise,
       // commit and then have nobody to tell.
       console.log(`worker: ${name} voice flow not scheduled — nobody to tell (set notify_channel or notify_user)`);
-      continue;
+      return;
     }
     const scheduleId = `voice:${name}`;
     const every: Duration = `${v.pollSeconds ?? 300} seconds`;
@@ -1033,6 +1079,8 @@ Record something and I'll pick it up within five minutes - I'll post what I find
       console.log(`worker: ${name} voice schedule updated — every ${every}`);
     }
   }
+
+  for (const [name, v] of voiceCreds) await ensureVoiceSchedule(name, v);
 
   signal.addEventListener("abort", () => worker.shutdown(), { once: true });
   await Promise.all([serving, ...pumps]);

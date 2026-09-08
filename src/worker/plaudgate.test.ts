@@ -141,3 +141,84 @@ describe("what the person is told", () => {
     expect(said).toContain("expire quickly");
   });
 });
+
+describe("connecting has to START the poll, not just store the credential", () => {
+  // The bug this covers, in full: an account was connected at 11:53, the reply said "record
+  // something and I'll pick it up within a couple of minutes", and nothing polled. The voice flow
+  // was worked out once when the process booted, so a credential that arrived afterwards was
+  // stored, acknowledged, and watched by nobody until a restart. In the cluster: connected, then
+  // silence until the next deploy.
+  const submit = (over = {}) =>
+    handleInteraction(deps(over) as never, "nelly", {
+      kind: "view_submission",
+      userId: "U1",
+      callbackId: PLAUD_CONNECT_ACTION,
+      privateMetadata: JSON.stringify({ agent: "nelly", conversation: "D1" }),
+      values: { url: { value: { value: "?code=abc" } } },
+    } as SlackInteraction);
+
+  it("starts the poll for the agent whose account it is", async () => {
+    const started: string[] = [];
+    const r = await submit({ onConnected: async (a: string) => void started.push(a) });
+    expect(started).toEqual(["nelly"]);
+    expect(r).toBe("plaud connected");
+  });
+
+  it("starts it BEFORE the confirmation, so the promise is true when it is read", async () => {
+    // Order, not merely occurrence: a poll started after the message is a race with the person
+    // walking off to record something.
+    const order: string[] = [];
+    await submit({
+      onConnected: async () => void order.push("poll"),
+      conn: () =>
+        ({
+          call: async () => ({}),
+          reply: () => ({ send: async () => (order.push("said"), "ts") }),
+        }) as never,
+    });
+    expect(order).toEqual(["poll", "said"]);
+  });
+
+  it("does not start a poll for a login that failed", async () => {
+    const started: string[] = [];
+    await submit({
+      complete: async () => ({ ok: false, problem: "the code had already been used" }),
+      onConnected: async (a: string) => void started.push(a),
+    });
+    expect(started).toEqual([]);
+  });
+
+  it("tells the person when the credential landed but the poll did not start", async () => {
+    // The state that used to be invisible. Storing a credential and polling with it are two things,
+    // and a confirmation that covers only the first is how somebody ends up waiting all morning.
+    let said = "";
+    const r = await submit({
+      onConnected: async () => "this agent has no voice flow configured yet",
+      conn: () =>
+        ({ call: async () => ({}), reply: () => ({ send: async (t: string) => ((said = t), "ts") }) }) as never,
+    });
+    expect(said).toContain("no voice flow configured");
+    expect(said).toContain("Nothing will be picked up");
+    expect(said).not.toContain("couple of minutes");
+    expect(r).toContain("not polling");
+  });
+
+  it("survives a poll that throws, and says so rather than promising a recap", async () => {
+    let said = "";
+    await submit({
+      onConnected: async () => {
+        throw new Error("temporal is unreachable");
+      },
+      conn: () =>
+        ({ call: async () => ({}), reply: () => ({ send: async (t: string) => ((said = t), "ts") }) }) as never,
+    });
+    expect(said).toContain("temporal is unreachable");
+    expect(said).not.toContain("couple of minutes");
+  });
+
+  it("still connects when nothing supplies onConnected at all", async () => {
+    // It is optional, and the single-machine deployment does not pass one.
+    expect(await submit()).toBe("plaud connected");
+  });
+});
+

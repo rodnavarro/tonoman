@@ -72,6 +72,34 @@ export async function accessToken(agent: string, root?: string): Promise<string 
   }
 }
 
+/** PURE: the failure Plaud reports INSIDE a 200 response, if there is one.
+ *
+ *  This function exists because of a poll that ran for hours reporting success and picking up
+ *  nothing. Plaud answers an expired credential with **HTTP 200** and a body of
+ *  `{"status":-419,"msg":"workspace token expired"}` — a success status line carrying a failure. So
+ *  `!r.ok` never fired, `data_file_list` was simply absent, `listRecordings` returned an empty
+ *  array, and the activity completed. From the pipeline's point of view there was nothing to do,
+ *  which is indistinguishable from a person who has not recorded anything — and that is the whole
+ *  problem: the one state that needs a person to act is the one state that looks like idle.
+ *
+ *  A NEGATIVE `status` is this API's error convention. Zero and absent both mean fine, so a normal
+ *  response is untouched.
+ *
+ *  Returns the message to raise, or undefined. */
+export function envelopeError(body: unknown): string | undefined {
+  const b = body as { status?: unknown; msg?: unknown } | null;
+  const s = Number((b ?? {}).status);
+  if (!Number.isFinite(s) || s >= 0) return undefined;
+  const msg = String((b ?? {}).msg ?? "").trim() || `status ${s}`;
+  // An expired credential is not a fault to report, it is an action to ask for. Said as the
+  // instruction rather than the API's own wording, because "workspace token expired" tells the
+  // person nothing they can do.
+  if (/expired|unauthor|invalid token|not logged/i.test(msg)) {
+    return `the stored Plaud credential has expired — run !connect plaud to reconnect the account (${msg})`;
+  }
+  return msg;
+}
+
 async function call<T>(agent: string, pathname: string, root?: string): Promise<T> {
   const token = await accessToken(agent, root);
   if (!token) throw new Error("plaud: this agent has no connected account — run !connect");
@@ -82,7 +110,12 @@ async function call<T>(agent: string, pathname: string, root?: string): Promise<
     throw new Error("plaud: the connected account is no longer authorized — run !connect again");
   }
   if (!res.ok) throw new Error(`plaud: ${res.status} ${res.statusText}`);
-  return (await res.json()) as T;
+  const body = (await res.json()) as T;
+  // Checked on this path too, not only on the captured-token one: this is the path every tenant
+  // ends up on, so it is the one that must not go quiet when a credential dies.
+  const bad = envelopeError(body);
+  if (bad) throw new Error(`plaud: ${bad}`);
+  return body;
 }
 
 /** Verified against the live API, not inferred:
