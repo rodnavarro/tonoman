@@ -702,19 +702,34 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
     },
     disconnectPlaud: async (name) => {
       await plaudauth.disconnect(name);
-      // The flow keeps its resolved credential until the worker restarts, so say that rather than
-      // let somebody believe the account is already unhooked when the next poll still reads it.
-      return "Disconnected - I've forgotten your Plaud account and asked Plaud to revoke it. The running flow finishes its current cycle first.";
+      // And STOP POLLING. This used to end "the running flow finishes its current cycle first",
+      // which was a polite way of saying the credential stayed resolved in memory until the next
+      // restart — so a disconnected account kept being read, potentially for days. Re-working the
+      // flow puts the agent back in disabledFlows, and pausing the schedule is what makes that
+      // true rather than merely recorded.
+      const a = wired.get(name);
+      if (a) {
+        await wireVoice(name, a);
+        if (!voiceCreds.has(name)) await pauseVoiceSchedule(name, "the Plaud account was disconnected");
+      }
+      return "Disconnected - I've forgotten your Plaud account and asked Plaud to revoke it. Nothing is polling it any more.";
     },
     finishPlaud: async (name, pasted) => {
       const r = await plaudauth.complete(name, pasted);
       if (!r.ok) return `That didn't work - ${r.problem}.`;
+      // THE SECOND COMPLETION PATH. The dialog is not the only way in — `!connect plaud <code>`
+      // lands here — and a fix applied to one of two doors is not a fix. Starting the poll has to
+      // happen wherever a credential arrives, not wherever it was convenient to add it.
+      const caveat = await plaudDeps.onConnected?.(name).catch((e) => `I couldn't start the poll - ${(e as Error).message}`);
+      if (caveat) return `✅ Your Plaud account is connected, but ${caveat}.
+
+Nothing will be picked up until that is sorted.`;
       const where = voiceCreds.get(name)?.notifyChannel;
       return (
         "✅ Your Plaud account is connected." +
         `
 
-Record something and I'll pick it up within five minutes - I'll post what I find ${where ? `in <#${where}>` : "here"}.`
+Record something and I'll pick it up within a couple of minutes - I'll post what I find ${where ? `in <#${where}>` : "here"}.`
       );
     },
     connectPlaud: async (name, conversation) => {
@@ -1001,18 +1016,21 @@ Record something and I'll pick it up within five minutes - I'll post what I find
   // restarting a pod, and `overlapPolicy: SKIP` is the "do not double-process" guarantee that
   // otherwise has to be written by hand. The loop only made sense if the workflow carried state
   // between ticks, and it never did — what has been published is answered from the git checkout.
-  for (const name of disabledFlows) {
-    // Best effort and idempotent: a flow that was never scheduled has nothing to pause.
+  /** Stop one agent's poll. Best effort and idempotent: a flow that was never scheduled has
+   *  nothing to pause, which is the normal case for a flow that was never on. */
+  async function pauseVoiceSchedule(name: string, why: string): Promise<void> {
     try {
       const h = client.schedule.getHandle(`voice:${name}`);
       if (!(await h.describe()).state.paused) {
-        await h.pause("flow_property enabled=false");
-        console.log(`worker: ${name} voice schedule paused — the flow is switched off`);
+        await h.pause(why);
+        console.log(`worker: ${name} voice schedule paused — ${why}`);
       }
     } catch {
-      /* no schedule under that id, which is the normal case for a flow that was never on */
+      /* no schedule under that id */
     }
   }
+
+  for (const name of disabledFlows) await pauseVoiceSchedule(name, "flow_property enabled=false");
 
   /** Create, update or resume one agent's poll schedule. Separated from the loop for the same
    *  reason as wireVoice: a flow that becomes ready AFTER boot has to get a schedule then, not at
