@@ -55,10 +55,35 @@ export const KNOWN = [
  *  imaginary in practice, which is worse than not having it. */
 const PREFIX = /^!/;
 
+/** PURE: strip the FORMATTING off a line so the command inside it can be seen.
+ *
+ *  Slack delivers markdown source, not rendered text, so a message typed as code arrives as
+ *  "`!connect claude`" — backticks and all — and no command matches it.
+ *
+ *  That is not an exotic way to type it. It is what happens when somebody copies the instruction we
+ *  gave them: notLoggedInNotice() says Send `!connect claude`, and pasting that back is the most
+ *  obedient thing a person can do. We wrote the trap and then failed to open it.
+ *
+ *  Only a whole wrap comes off, never a stray backtick inside an argument, and at most a few layers
+ *  — a copied line can arrive wrapped in both code and bold. */
+export function undecorate(text: string): string {
+  let t = (text ?? "").trim();
+  for (let i = 0; i < 3; i++) {
+    const before = t;
+    t = t
+      .replace(/^```+\s*([\s\S]*?)\s*```+$/, "$1")
+      .replace(/^`([^`]*)`$/, "$1")
+      .replace(/^([*_~])([\s\S]*)\1$/, "$2")
+      .trim();
+    if (t === before) break;
+  }
+  return t;
+}
+
 /** Recognise a command. Returns undefined for ordinary text, which is the common case — so this
  *  runs on every inbound message and must not be clever about it. */
 export function parse(text: string): Command | undefined {
-  const t = (text ?? "").trim();
+  const t = undecorate(text);
   if (!PREFIX.test(t) || !/^![a-z]/i.test(t)) return undefined;
   const m = /^!(\S+)\s*([\s\S]*)$/.exec(t);
   if (!m) return undefined;

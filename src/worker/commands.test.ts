@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { parse, run, splitConnector, type CommandDeps } from "./commands";
+import { parse, run, splitConnector, type CommandDeps, undecorate } from "./commands";
 import type { StatusMode } from "../statusline";
 
 describe("parse", () => {
@@ -22,6 +22,26 @@ describe("parse", () => {
     // second prefix here cannot help with a keystroke this code never sees.
     expect(parse("!connect plaud")).toEqual({ name: "connect", arg: "plaud" });
     expect(parse(".connect plaud")).toBeUndefined();
+  });
+
+  // OBSERVED. The agent's own not-signed-in notice says: Send `!connect claude`. Somebody copied
+  // that line back, Slack delivered the backticks with it, nothing matched, and the message went to
+  // a turn that could not run - so the reply was the same notice again, telling them to do the
+  // thing they had just done. We wrote the instruction; the least we can do is accept it.
+  it("reads a command that arrives wrapped in Slack formatting", () => {
+    expect(parse("`!connect claude`")).toEqual({ name: "connect", arg: "claude" });
+    expect(parse("```!connections```")).toEqual({ name: "connections", arg: "" });
+    expect(parse("*!status*")).toEqual({ name: "status", arg: "" });
+    expect(parse("`*!connect google*`")).toEqual({ name: "connect", arg: "google" });
+  });
+
+  it("takes off a whole wrap only, never punctuation inside the argument", () => {
+    // An argument may legitimately contain a backtick or an underscore, and eating one would
+    // corrupt a URL or an alias silently - worse than not matching at all.
+    expect(parse("!connect ics my_cal")).toEqual({ name: "connect", arg: "ics my_cal" });
+    expect(parse("!connect ics https://x/y?a=`b`")).toEqual({ name: "connect", arg: "ics https://x/y?a=`b`" });
+    expect(undecorate("`not a command`")).toBe("not a command");
+    expect(undecorate("plain text")).toBe("plain text");
   });
 
   it("still ignores ordinary prose that happens to start with punctuation", () => {
