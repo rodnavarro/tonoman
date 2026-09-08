@@ -29,7 +29,7 @@ import type { Activities } from "./activities";
 // built-ins, and `authflow` imports `node:child_process` to drive the harness — importing it here
 // fails the webpack build and the worker never starts, which looks like a hang rather than a bad
 // import. These are pure string functions, which is also what keeps the workflow deterministic.
-import { isNotLoggedInError, notLoggedInNotice } from "../turnfailure";
+import { failureReason, isNotLoggedInError, notLoggedInNotice } from "../turnfailure";
 
 const { runTurn, postNotice } = proxyActivities<Activities>({
   // A turn is a person waiting on an LLM: minutes, not seconds. The heartbeat is what makes a dead
@@ -122,7 +122,11 @@ export async function conversationWorkflow(input: ConversationInput): Promise<vo
       // has nothing to answer on. The gate normally catches it first, from `auth_state`, but that
       // is a snapshot; a credential expiring between roster refreshes leaves the gate open and the
       // turn failing, and the person reads a stack-trace fragment.
-      const why = String((e as Error)?.message ?? e);
+      // failureReason, NOT e.message. An activity that throws arrives here as an ActivityFailure
+      // whose message is the constant "Activity task failed" - the real one is on `cause`. Read
+      // straight, this both printed that constant where the reason belonged AND asked
+      // isNotLoggedInError about it, so no classifier change could ever have taken effect.
+      const why = failureReason(e);
       await postNotice({
         agent: input.agent,
         conversation: input.conversation,
@@ -187,7 +191,7 @@ export async function plaudPollWorkflow(input: PollInput): Promise<void> {
     await sayVerbatim({
       agent: input.agent,
       user: input.notify,
-      text: `⚠️ I can't reach your Plaud account — ${String((e as Error)?.message ?? e).slice(0, 150)}`,
+      text: `⚠️ I can't reach your Plaud account — ${failureReason(e).slice(0, 150)}`,
     }).catch(() => {});
     throw e;
   }
@@ -207,7 +211,7 @@ export async function plaudPollWorkflow(input: PollInput): Promise<void> {
       await sayVerbatim({
         agent: input.agent,
         user: input.notify,
-        text: `⚠️ I couldn't finish processing “${rec.title}” — ${String((e as Error)?.message ?? e).slice(0, 200)}`,
+        text: `⚠️ I couldn't finish processing “${rec.title}” — ${failureReason(e).slice(0, 200)}`,
       }).catch(() => {});
     }
   }

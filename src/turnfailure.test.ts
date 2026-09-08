@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { isNotLoggedInError, notLoggedInNotice } from "./turnfailure";
+import { failureReason, isNotLoggedInError, notLoggedInNotice } from "./turnfailure";
 
 describe("turnfailure — safe to import from a Temporal workflow", () => {
   it("imports NOTHING, which is the entire reason this file exists", () => {
@@ -45,5 +45,39 @@ describe("isNotLoggedInError — the failure that retrying cannot fix", () => {
     const n = notLoggedInNotice();
     expect(n).toContain("!connect claude");
     expect(n.toLowerCase()).not.toContain("try again");
+  });
+});
+
+describe("failureReason - the reason, not Temporal's wrapper", () => {
+  // The shape that actually reached a person: ActivityFailure("Activity task failed") wrapping the
+  // harness's own message. Read as `e.message` this printed the wrapper AND handed the wrapper to
+  // isNotLoggedInError, so the agent said "I hit an error and couldn't finish that - Activity task
+  // failed" for a plainly diagnosable expired subscription.
+  const wrapped = Object.assign(new Error("Activity task failed"), {
+    cause: new Error("Failed to authenticate: OAuth session expired and could not be refreshed"),
+  });
+
+  it("skips the wrapper and returns what the activity said", () => {
+    expect(failureReason(wrapped)).toBe("Failed to authenticate: OAuth session expired and could not be refreshed");
+  });
+
+  it("is what makes the auth classification reachable at all", () => {
+    expect(isNotLoggedInError("Activity task failed")).toBe(false); // the bug, stated
+    expect(isNotLoggedInError(failureReason(wrapped))).toBe(true); // the fix
+  });
+
+  it("keeps a real message that arrives unwrapped", () => {
+    expect(failureReason(new Error("second brain push rejected"))).toBe("second brain push rejected");
+  });
+
+  it("falls back to the wrapper rather than to nothing, when there is no cause", () => {
+    // Worse is acceptable; blanker is not - an empty reason reads as the agent having no idea.
+    expect(failureReason(new Error("Activity task failed"))).toBe("Activity task failed");
+  });
+
+  it("survives a cause cycle", () => {
+    const a: { message: string; cause?: unknown } = { message: "Activity task failed" };
+    a.cause = a;
+    expect(failureReason(a)).toBe("Activity task failed");
   });
 });

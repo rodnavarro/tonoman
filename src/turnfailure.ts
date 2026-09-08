@@ -45,3 +45,37 @@ export function notLoggedInNotice(): string {
     "Send `!connect claude` and I'll walk you through it."
   );
 }
+
+/** Temporal's own wrapper messages. An activity that throws reaches the workflow as an
+ *  `ActivityFailure` whose message is the constant "Activity task failed"; what the activity
+ *  actually said is on `cause`. These carry no information about the failure at all. */
+const WRAPPERS = /^(activity task failed|workflow execution failed|activity task cancelled)$/i;
+
+/** PURE: the real reason, dug out of a Temporal failure chain.
+ *
+ *  This is the bug behind the bug. `String(e.message)` on an ActivityFailure is ALWAYS
+ *  "Activity task failed" — so a person read "⚠️ I hit an error and couldn't finish that —
+ *  Activity task failed", and, worse, `isNotLoggedInError` was being asked about that constant
+ *  rather than about the harness's message. No pattern could ever have matched it. Widening the
+ *  classifier looked like a fix and changed nothing, because the string it was judging was never
+ *  the string that mattered.
+ *
+ *  The rendered text was the evidence all along: "Activity task failed" IS the wrapper's message,
+ *  printed where the reason was meant to go.
+ *
+ *  Returns the outermost message that isn't a wrapper, so a real error at any depth wins, and
+ *  falls back to the original rather than to an empty string — an unrecognised shape should read
+ *  worse, never blanker. */
+export function failureReason(e: unknown): string {
+  const seen = new Set<unknown>();
+  let node: unknown = e;
+  let fallback = "";
+  for (let depth = 0; node && depth < 8 && !seen.has(node); depth++) {
+    seen.add(node);
+    const msg = String((node as { message?: unknown })?.message ?? "").trim();
+    if (msg && !fallback) fallback = msg;
+    if (msg && !WRAPPERS.test(msg)) return msg;
+    node = (node as { cause?: unknown })?.cause;
+  }
+  return fallback || String(e ?? "unknown error");
+}
