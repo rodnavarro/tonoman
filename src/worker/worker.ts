@@ -448,7 +448,16 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
           console.error(`worker: ${name} second-brain sync failed: ${(e as Error).message}`);
           return [] as { dir: string; label: string }[];
         });
-      a.context = secondbrain.contextNote(ready, a.cfg.timezone ?? "UTC");
+      a.context = secondbrain.contextNote(
+        ready,
+        a.cfg.timezone ?? "UTC",
+        (a.cfg.connections ?? []).map((c) => ({
+          kind: c.kind,
+          alias: c.alias,
+          label: c.label,
+          status: c.status,
+        })),
+      );
     }
   };
 

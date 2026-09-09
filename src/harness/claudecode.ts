@@ -77,7 +77,13 @@ export interface RunnerOptions {
    *  a self-hosted roster with one login; a multi-tenant pool passes one per agent. */
   configHome?: string;
   extraArgs?: string[]; // MUST NOT include --bare or --resume
-  settingSources?: string; // default "user" (discovers the preset skill, A2)
+  settingSources?: string;
+  /** Let the account's own MCP configuration through — claude.ai connectors included.
+   *
+   *  Off by default and it should stay off for anything serving a tenant: those connectors belong
+   *  to the account holding the credential, not to the customer. Present so a single-tenant or
+   *  developer deployment can opt back in deliberately rather than by forgetting. */
+  allowAmbientMcp?: boolean; // default "user" (discovers the preset skill, A2)
   // Ephemeral mode (gw-command-btw): instead of `podman exec <container>`, run a throwaway
   // `podman run --rm --volumes-from <caller>` sandbox from the harness image and tear it
   // down after the turn. Inherits the caller's mounts (shared credential, identity, skills).
@@ -159,6 +165,25 @@ export class Runner implements TurnRunner {
       "--setting-sources",
       this.o.settingSources ?? "user",
       "--dangerously-skip-permissions",
+      // NO MCP SERVER THIS AGENT WAS NOT EXPLICITLY GIVEN.
+      //
+      // `--setting-sources user` reads the account's own configuration, and on a claude.ai
+      // subscription that includes its CONNECTORS — Google Calendar, Gmail, Microsoft 365. They
+      // arrive as tools, so an agent serving a customer silently gains tools bound to whichever
+      // account holds its credential. That is one person's account answering on another's behalf,
+      // which is the single thing this platform exists to make impossible.
+      //
+      // It also made capability nondeterministic: the same agent reported 22 tools on one turn and
+      // 33 on the next, so what it could do changed between messages for reasons nothing recorded.
+      //
+      // And it produced a confidently wrong answer. Asked about calendars, the agent said Google
+      // Calendar "needs to be authorized via claude.ai connector settings" — true of the connector
+      // it could see, and nothing to do with the three Google calendars the TENANT had connected.
+      //
+      // `--strict-mcp-config` with no `--mcp-config` means none. A tenant that genuinely needs an
+      // MCP server gets it passed here, from the registry, per agent — which is the only way it can
+      // belong to the tenant rather than to whoever logged in.
+      ...(this.o.allowAmbientMcp ? [] : ["--strict-mcp-config"]),
     ];
     // Drop tools this agent never uses, so their schemas leave the context floor (claude-code-only).
     if (this.o.disallowedTools && this.o.disallowedTools.length) {

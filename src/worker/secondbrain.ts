@@ -120,7 +120,19 @@ export function redact(text: string, token: string): string {
 
 /** The note prepended to a turn so the agent knows what it can read and where. Without it the
  *  files are present but the model has no reason to look. */
-export function contextNote(ready: { dir: string; label: string }[], timezone = ""): string {
+/** One of the tenant's outside accounts, as the agent should understand it. */
+export interface ConnectionNote {
+  kind: string;
+  alias: string;
+  label?: string | null;
+  status?: string | null;
+}
+
+export function contextNote(
+  ready: { dir: string; label: string }[],
+  timezone = "",
+  connections: ConnectionNote[] = [],
+): string {
   if (ready.length === 0) return "";
   const lines = ready.map((r) => `- ${r.label}: ${r.dir}`).join("\n");
   // WHAT TIME IT IS FOR THIS PERSON. A recap page carries a UTC instant and a local rendering, and
@@ -135,10 +147,42 @@ export function contextNote(ready: { dir: string; label: string }[], timezone = 
           "ALWAYS answer in their local time, and name the zone whenever a time could be mistaken.",
         ].join("\n")
       : "";
+  // WHOSE ACCOUNTS ARE WHOSE.
+  //
+  // Without this the agent answers from its own tool inventory, which is a different thing wearing
+  // the same words. Asked about calendars it said Google Calendar "needs to be authorized via
+  // claude.ai connector settings" — true of a connector it could see, and nothing whatever to do
+  // with the three Google calendars the TENANT had connected. It could not have known: nothing here
+  // told it, so the only calendar-shaped thing in view was the wrong one.
+  //
+  // Kept even now that the harness runs with `--strict-mcp-config` and those connectors are gone.
+  // Belt and braces is not the reason: the agent still needs to be able to say WHICH connection is
+  // missing when it cannot do something, and "no calendar is connected" and "I have no calendar
+  // tool" are different sentences to the person reading them.
+  const accounts = connections.length
+    ? [
+        "",
+        "This person's connected accounts, as the platform holds them:",
+        ...connections.map(
+          (c) =>
+            `- ${c.kind}/${c.alias}${c.label ? ` (${c.label})` : ""}` +
+            `${c.status && c.status !== "connected" ? ` — ${c.status}, not usable yet` : ""}`,
+        ),
+        "These are the only accounts that are theirs. If something needs an account that is not",
+        "listed, say so and name the connection required, rather than pointing them at settings",
+        "somewhere else.",
+      ].join("\n")
+    : [
+        "",
+        "This person has no outside accounts connected to the platform yet. If something needs one,",
+        "say so and name the connection required.",
+      ].join("\n");
+
   return [
     "Your second brain is checked out on this machine and is the memory of the business:",
     lines,
     clock,
+    accounts,
     "",
     "Search it with Grep and read pages with Read before answering anything about meetings, people,",
     "deals or decisions. If the answer is not in there, say so plainly rather than guessing — a wrong",
