@@ -1019,6 +1019,13 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
   // restarting a pod, and `overlapPolicy: SKIP` is the "do not double-process" guarantee that
   // otherwise has to be written by hand. The loop only made sense if the workflow carried state
   // between ticks, and it never did — what has been published is answered from the git checkout.
+  /** The note this worker writes when it pauses a schedule BECAUSE THE REGISTRY SAYS SO. It is
+   *  what tells our own pause apart from a person's, and the difference is not cosmetic: resuming
+   *  on `enabled=true` is correct, and resuming a pause somebody made by hand is a restart quietly
+   *  undoing an operator's decision. That is how a paused backlog re-enabled itself and published
+   *  recaps nobody had approved. */
+  const DISABLED_NOTE = "flow_property enabled=false";
+
   /** Stop one agent's poll. Best effort and idempotent: a flow that was never scheduled has
    *  nothing to pause, which is the normal case for a flow that was never on. */
   async function pauseVoiceSchedule(name: string, why: string): Promise<void> {
@@ -1033,7 +1040,7 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
     }
   }
 
-  for (const name of disabledFlows) await pauseVoiceSchedule(name, "flow_property enabled=false");
+  for (const name of disabledFlows) await pauseVoiceSchedule(name, DISABLED_NOTE);
 
   /** Create, update or resume one agent's poll schedule. Separated from the loop for the same
    *  reason as wireVoice: a flow that becomes ready AFTER boot has to get a schedule then, not at
@@ -1090,12 +1097,24 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
         spec: { intervals: [{ every }] },
         action,
       }));
-      // And UNPAUSE it. Turning the flow off pauses the schedule, so leaving this out makes the
-      // switch work in one direction only: a row set back to enabled=true would look on in the
-      // registry and in the boot log while the schedule sat paused and nothing ever ran.
-      if ((await h.describe()).state.paused) {
-        await h.unpause("flow_property enabled=true");
-        console.log(`worker: ${name} voice schedule resumed`);
+      // And UNPAUSE it — but ONLY the pause this worker wrote. Turning the flow off pauses the
+      // schedule, so skipping this entirely would make the switch work in one direction only: a row
+      // set back to enabled=true would look on in the registry and in the boot log while the
+      // schedule sat paused and nothing ever ran.
+      //
+      // Unpausing UNCONDITIONALLY is the other half of the same mistake, and it is the one that
+      // actually cost something: every restart resumed a schedule a person had paused on purpose,
+      // so a backlog held back for inspection drained itself the next time the pod came up.
+      const state = (await h.describe()).state;
+      if (state.paused) {
+        if (state.note === DISABLED_NOTE) {
+          await h.unpause("flow_property enabled=true");
+          console.log(`worker: ${name} voice schedule resumed`);
+        } else {
+          console.log(
+            `worker: ${name} voice schedule LEFT PAUSED — ${state.note || "paused outside the registry"}`,
+          );
+        }
       }
       console.log(`worker: ${name} voice schedule updated — every ${every}`);
     }
