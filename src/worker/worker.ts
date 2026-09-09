@@ -611,6 +611,9 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
       pushUrl,
       transcribe,
       summarize,
+      // From the registry, per tenant. The roster already carries it, so this is not a second
+      // round trip that can be stale on its own.
+      mission: a.cfg.mission ?? "",
       floorMs,
       vocab:
         process.env.GROQ_PROMPT ??

@@ -457,6 +457,25 @@ export interface Recap {
   /** Why that entry and not another. The Overview shows it beside every candidate considered,
    *  because "why is this filed under the wrong meeting" is otherwise unanswerable. */
   meetingReason?: string;
+  /** Whether this meeting moved the tenant's mission forward, did nothing for it, or COST the
+   *  attention it needed. One of ALIGNMENTS, or absent when there is no mission to judge against. */
+  alignment?: string;
+  /** One line on why. The verdict without the reason is a score, and nobody trusts a score. */
+  alignmentReason?: string;
+}
+
+/** The only verdicts. A closed set, exactly like `route`, and for the same reason: a free-text
+ *  judgement cannot be counted, filtered, or checked for the failure mode below. */
+export const ALIGNMENTS = ["advances", "neutral", "detracts"] as const;
+
+/** PURE: the model's answer, or NOTHING.
+ *
+ *  Unrecognised maps to "" and NOT to "neutral", which is the whole point. A fabricated neutral is a
+ *  judgement nobody made, rendered on the page in the same typeface as one somebody did — and it
+ *  would be indistinguishable from a real verdict forever after. Absent is honest; invented is not. */
+export function resolveAlignment(proposed: string | undefined): string {
+  const v = (proposed ?? "").trim().toLowerCase();
+  return (ALIGNMENTS as readonly string[]).includes(v) ? v : "";
 }
 
 /** Where meetings are filed, as configuration rather than code.
@@ -602,6 +621,10 @@ export async function summarize(
   providers: Provider[],
   journal?: Journal,
   candidates: CalEvent[] = [],
+  /** What the tenant is trying to do. Empty means this recap does not judge. */
+  mission = "",
+  /** Names the transcriber is known to mishear. Passed UNCONDITIONALLY — see below. */
+  vocab = "",
 ): Promise<Recap> {
   // Classification rides THIS call rather than taking one of its own: the transcript is already
   // here, already paid for, and a second round-trip would double the latency of every recap to
@@ -636,6 +659,37 @@ export async function summarize(
         'Also add "meetingReason": one short sentence naming what in the transcript decided it.',
       ].join(" ")
     : "";
+  // Whether this meeting was worth the attention it took. Rides the same call as routing and
+  // calendaring, for the same reason: the transcript is already here and already paid for.
+  //
+  // THE FAILURE MODE THIS PROMPT IS WRITTEN AGAINST is a field that only ever reports how a meeting
+  // helped. That version looks exactly like a working one — every recap has an alignment, every
+  // alignment is positive, and the section is quietly worthless. So "detracts" is sanctioned out
+  // loud, with examples, and flattery is forbidden by name.
+  const aligning = mission
+    ? [
+        `The person whose meeting this is describes what they are trying to do as: "${mission}".`,
+        "Treat that as a statement about ATTENTION, not about topics. It does not mean meetings on other subjects are unimportant; it means their attention is the scarce resource, and the question is whether this meeting bought progress or spent the capacity to make progress.",
+        `Add "alignment" to the JSON, exactly one of: ${ALIGNMENTS.join(" | ")}.`,
+        '"detracts" is a normal and expected answer. Use it when the meeting reached no decision, re-answered a question already settled, or covered something that belonged in a message — however pleasant or productive it felt.',
+        '"neutral" is for a meeting that neither moved this forward nor cost anything worth naming.',
+        'Also add "alignmentReason": ONE short sentence naming what in the transcript decided it.',
+        "Do not flatter. Do not look for a way to connect the meeting to the goal. If the honest answer is that this was an hour that bought nothing, say so.",
+      ].join(" ")
+    : "";
+  // Vocabulary correction, UNCONDITIONALLY. The chunk cache records text with no note of which
+  // provider produced it, and one transcript can mix a vocabulary-biased chunk with an unbiased one
+  // across retries — so "was this transcript biased?" has no answer by construction. Asking every
+  // time costs nothing and is the only version that is always right.
+  //
+  // LIMIT, stated: this corrects the RECAP. Transcript.md still says "plot".
+  const spelling = vocab
+    ? [
+        `The transcriber mishears these names: ${vocab}.`,
+        "Where the transcript clearly means one of them, use the correct spelling in your answer.",
+        "Spelling only — never change what was said or what it meant.",
+      ].join(" ")
+    : "";
   const system = [
     "You summarise a recorded business meeting for a searchable knowledge base.",
     "Be specific and factual. Never invent a name, number, decision or commitment.",
@@ -644,6 +698,8 @@ export async function summarize(
     "summary: 2-4 sentences. highlights: at most 5, each one line. decisions/followups may be empty.",
     routing,
     calendaring,
+    aligning,
+    spelling,
   ]
     .filter(Boolean)
     .join(" ");
@@ -662,7 +718,11 @@ export async function summarize(
     },
     { log: (line) => console.log(line) },
   );
-  return parseRecapJson(served.value);
+  const out = parseRecapJson(served.value);
+  // A verdict outside the closed set is DROPPED, not coerced. See `resolveAlignment`.
+  out.alignment = resolveAlignment(out.alignment);
+  if (!out.alignment) out.alignmentReason = undefined;
+  return out;
 }
 
 const bullets = (xs: string[] | undefined, empty: string): string =>
@@ -683,6 +743,28 @@ const span = (a: number, b: number): string => {
  *  what the model saw turns that into something a person can correct in one glance.
  *
  *  Empty string when no calendar is connected, so the page is exactly what it is today. */
+/** PURE: the verdict, or nothing at all.
+ *
+ *  Omitted entirely when there is no mission or the model gave no usable answer. An "Alignment:
+ *  unknown" heading on every page would train the reader to skip the section, which costs more than
+ *  the section is worth. */
+export function alignmentSection(recap: Recap): string {
+  if (!recap.alignment) return "";
+  const said: Record<string, string> = {
+    advances: "Advances the mission",
+    neutral: "Neutral for the mission",
+    detracts: "Cost attention the mission needed",
+  };
+  const reason = recap.alignmentReason ? `
+
+${recap.alignmentReason}` : "";
+  return `
+## Alignment
+
+**${said[recap.alignment] ?? recap.alignment}**${reason}
+`;
+}
+
 export function calendarSection(recap: Recap, candidates: CalEvent[]): string {
   if (!candidates.length) return "";
   const chosen = (recap.meeting ?? "").trim().toLowerCase();
@@ -748,6 +830,10 @@ export function overviewMarkdown(
     // In frontmatter so the series is queryable from the vault — "every API Team Standup" is the
     // question a knowledge base exists to answer, and it cannot be asked of prose.
     ...(recap.meeting ? [`meeting: ${JSON.stringify(recap.meeting)}`] : []),
+    // In frontmatter for the same reason `route` is: "which meetings detracted this month" should
+    // be a query over the vault, not a person re-reading thirty pages to find out.
+    ...(recap.alignment ? [`alignment: ${recap.alignment}`] : []),
+    ...(recap.alignmentReason ? [`alignment_reason: ${JSON.stringify(recap.alignmentReason)}`] : []),
     "---",
     "",
   ].join("\n");
@@ -772,7 +858,7 @@ ${bullets(recap.decisions, "none recorded")}
 ## Follow-ups
 
 ${bullets(recap.followups, "none recorded")}
-${calendarSection(recap, candidates)}
+${alignmentSection(recap)}${calendarSection(recap, candidates)}
 ---
 
 [Full transcript](${transcript})

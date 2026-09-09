@@ -161,6 +161,13 @@ export interface AgentConfig {
    *  `route.<id>`. That is what keeps adding a meeting category an INSERT rather than a migration
    *  here and a redeploy there. */
   flows?: Record<string, Record<string, string>>;
+  /** What the TENANT is trying to do, in their own words — one row, shared by every agent the
+   *  tenant has. Every recap is measured against it.
+   *
+   *  A lens on ATTENTION, not a topic filter: it exists so a recap can say a meeting cost the
+   *  scarce thing rather than only ever reporting how it helped. Empty is ordinary — every tenant
+   *  is in that state until somebody writes one — and means the recap simply does not judge. */
+  mission?: string;
   /** Outside accounts this agent may use, from the registry (§8). Identified by `(kind, alias)`:
    *  the KIND is what the platform knows how to talk to, the ALIAS is which one of them this is.
    *  That is what lets a tenant attach a work calendar and a personal one without either becoming

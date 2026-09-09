@@ -117,6 +117,10 @@ export interface VoiceConfig {
    *  the transcription tier's 8000-token context cannot summarise a 62-minute meeting at any
    *  price, and that is a fact about the summariser, not about the audio. */
   summarize: inference.Provider[];
+  /** What the TENANT is trying to do — one sentence, from the registry, shared by every agent the
+   *  tenant has. Empty means this flow does not judge, which is the ordinary state until somebody
+   *  writes one. */
+  mission?: string;
   vocab: string;
   /** Where a half-finished transcription keeps the chunks it already paid for, so a retry resumes.
    *  On the volume rather than in memory, because the thing being survived is a process that died
@@ -334,7 +338,7 @@ export function makeActivities(deps: TurnDeps) {
       ctx.heartbeat("summarising");
       const summary = await beating(
         () => "summarising",
-        () => recap.summarize(text, rec.title, v.summarize, v.journal, candidates),
+        () => recap.summarize(text, rec.title, v.summarize, v.journal, candidates, v.mission, v.vocab),
       );
       // The model may only claim a meeting it was shown. Anything else is no match — a
       // hallucinated meeting name looks entirely correct and files the recap into a series it does

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { budgetTranscript, calendarSection, floorFor, isTimestampTitle, joinChunks, overviewMarkdown, parseRecapJson, pathsFor, redact, resolveMeeting, slugFor, stampFor, titleFor, transcribedBy } from "./recap";
+import { alignmentSection, budgetTranscript, calendarSection, floorFor, isTimestampTitle, joinChunks, overviewMarkdown, parseRecapJson, pathsFor, redact, resolveMeeting, slugFor, resolveAlignment, stampFor, titleFor, transcribedBy } from "./recap";
 
 describe("stampFor", () => {
   it("is stable, sortable and unique per minute, so re-processing lands on the same path", () => {
@@ -292,5 +292,51 @@ describe("parseRecapJson — a fenced answer must not discard a paid-for transcr
 
   it("still fails loudly when there is no JSON at all", () => {
     expect(() => parseRecapJson("I could not summarise this.")).toThrow(/did not return JSON/);
+  });
+});
+
+describe("resolveAlignment — a verdict nobody reached must not appear as one", () => {
+  it.each(["advances", "neutral", "detracts"])("accepts %s", (v) => {
+    expect(resolveAlignment(v)).toBe(v);
+  });
+
+  it("is forgiving about case and whitespace, which is all a model varies", () => {
+    expect(resolveAlignment("  Detracts ")).toBe("detracts");
+  });
+
+  it("maps anything unrecognised to NOTHING — never to neutral", () => {
+    // This is the whole point. Coercing to "neutral" would render a judgement nobody made, in the
+    // same typeface as one somebody did, and it would be indistinguishable forever after.
+    expect(resolveAlignment("somewhat aligned")).toBe("");
+    expect(resolveAlignment("positive")).toBe("");
+    expect(resolveAlignment(undefined)).toBe("");
+    expect(resolveAlignment("")).toBe("");
+  });
+});
+
+describe("alignmentSection — the page says it, or says nothing", () => {
+  const base = { summary: "s", highlights: [], decisions: [], followups: [] };
+
+  it("is omitted entirely when there is no verdict", () => {
+    // An "unknown" heading on every page trains the reader to skip the section.
+    expect(alignmentSection(base)).toBe("");
+  });
+
+  it("says plainly that a meeting COST attention", () => {
+    const out = alignmentSection({ ...base, alignment: "detracts", alignmentReason: "No decision was reached." });
+    expect(out).toContain("## Alignment");
+    expect(out).toContain("Cost attention");
+    expect(out).toContain("No decision was reached.");
+  });
+
+  it("renders a verdict without a reason rather than dropping it", () => {
+    expect(alignmentSection({ ...base, alignment: "advances" })).toContain("Advances the mission");
+  });
+
+  it("puts the verdict in frontmatter, so the vault can be asked which meetings detracted", () => {
+    const rec = { id: "r1", title: "Standup", stamp: "2026-09-08-1422", startTime: Date.UTC(2026, 8, 8, 14, 22), duration: 329_000 };
+    const page = overviewMarkdown(rec, { ...base, alignment: "detracts", alignmentReason: "Nothing was decided." }, undefined, [], ["groq"]);
+    expect(page).toContain("alignment: detracts");
+    expect(page).toContain("alignment_reason: ");
   });
 });
