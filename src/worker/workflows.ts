@@ -25,11 +25,13 @@ import {
   setHandler,
 } from "@temporalio/workflow";
 import type { Activities } from "./activities";
+import { declaredOut, validateSteps, type Bag, type Step } from "./skill";
 // From `turnfailure`, NOT from `authflow`. A workflow is bundled into a sandbox with no Node
 // built-ins, and `authflow` imports `node:child_process` to drive the harness — importing it here
 // fails the webpack build and the worker never starts, which looks like a hang rather than a bad
 // import. These are pure string functions, which is also what keeps the workflow deterministic.
 import { failureReason, isNotLoggedInError, notLoggedInNotice } from "../turnfailure";
+import { ApplicationFailure } from "@temporalio/common";
 
 const { runTurn, postNotice } = proxyActivities<Activities>({
   // A turn is a person waiting on an LLM: minutes, not seconds. The heartbeat is what makes a dead
@@ -255,5 +257,100 @@ export async function plaudPollWorkflow(input: PollInput): Promise<void> {
         text: `⚠️ I couldn't finish processing “${rec.title}” — ${failureReason(e).slice(0, 200)}`,
       }).catch(() => {});
     }
+  }
+}
+
+
+// --- the skill interpreter ----------------------------------------------------------------------
+
+const { runStep, openSkillRun, closeSkillRun } = proxyActivities<Activities>({
+  // A step is whatever the verb behind it is: `mission get` is one query, `transcript get`
+  // downloads audio and runs a model on it. Sized for the slowest, because the alternative is a
+  // per-verb table in the workflow — which would put the runtime's knowledge of its own tools back
+  // into code the tenant cannot see.
+  startToCloseTimeout: "60 minutes",
+  heartbeatTimeout: "60 seconds",
+  retry: {
+    maximumAttempts: 8,
+    initialInterval: "10 seconds",
+    backoffCoefficient: 2,
+    maximumInterval: "10 minutes",
+  },
+});
+
+export interface RunSkillInput {
+  agent: string;
+  /** Which skill, by name — resolved to its steps on the roster the worker already holds. */
+  skill: string;
+  /** The one item this run is for. Every run operates on exactly ONE item; the fan-out lives in the
+   *  trigger, which is what removes the loop from the step language. */
+  itemKey: string;
+  /** The steps, and the version they came from, pinned by the caller. Passed IN rather than read
+   *  here so that an edit to a live skill cannot change what an in-flight run is doing halfway
+   *  through — the run's history would otherwise describe something that never happened. */
+  steps: Step[];
+  version: number;
+  notify?: string;
+}
+
+/**
+ * ONE generic workflow, for every skill there will ever be.
+ *
+ * This is the whole argument of the layer in one function: there is no new engine. Retries, backoff,
+ * durability, per-run history and the Temporal UI all come for free from Temporal, and every one of
+ * them was missing from the hand-written pipeline on 2026-09-08.
+ *
+ * The steps are FLAT and executed in order, because the one construct that would have forced a real
+ * DSL — "for each recording" — is hoisted into the trigger instead.
+ */
+export async function runSkillWorkflow(input: RunSkillInput): Promise<void> {
+  // Checked ONCE, before anything runs. A skill that names an input nothing produces is a broken
+  // definition, and it must fail as one at the start rather than at step five with three side
+  // effects already committed.
+  const problems = validateSteps(input.steps);
+  if (problems.length) {
+    throw ApplicationFailure.create({
+      message: `skill ${input.skill} is not runnable: ${problems.join("; ")}`,
+      type: "BadSkill",
+      nonRetryable: true,
+    });
+  }
+
+  // The durable record whose absence produced 611 attempts for 4 published recaps. Opened BEFORE
+  // the first step, so "being worked on" is a state that exists at all — which it never was.
+  await openSkillRun({ agent: input.agent, skill: input.skill, itemKey: input.itemKey, version: input.version });
+
+  const bag: Bag = {};
+  try {
+    for (const step of input.steps) {
+      const result = await runStep({
+        agent: input.agent,
+        skill: input.skill,
+        itemKey: input.itemKey,
+        notify: input.notify ?? "",
+        step,
+        // Only what the step DECLARED. Computed in the activity from the step and the bag, so the
+        // workflow never has to know what a verb means.
+        bag,
+      });
+      const out = declaredOut(step);
+      // A step that files nothing ran for its effect — `say` is the case, and it is not a gap.
+      if (out) bag[out] = result;
+      // A step may end the run without failing it: a recording nothing can hear is not a meeting to
+      // file, and it is not an error either.
+      if (result !== null && typeof result === "object" && (result as { $stop?: boolean }).$stop) break;
+    }
+    await closeSkillRun({ agent: input.agent, skill: input.skill, itemKey: input.itemKey, status: "done" });
+  } catch (e) {
+    // Recorded, then rethrown. Temporal owns the retry; this table owns the ANSWER to "is this
+    // failing, or has nobody looked at it yet" — which nothing could answer before.
+    await closeSkillRun({
+      agent: input.agent,
+      skill: input.skill,
+      itemKey: input.itemKey,
+      status: "failed",
+      error: failureReason(e).slice(0, 500),
+    }).catch(() => {});
+    throw e;
   }
 }

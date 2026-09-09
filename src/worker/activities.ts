@@ -11,10 +11,13 @@
 // leaves that partial visible and labelled rather than vanishing.
 
 import { Context } from "@temporalio/activity";
+import { promises as fs } from "node:fs";
+import * as path from "node:path";
 import type { Connector, Reply, TurnEvent, TurnUsage } from "../core/contracts";
 import type { AgentConfig } from "../config";
 import * as recap from "./recap";
 import * as inference from "./inference";
+import * as skill from "./skill";
 import * as calendar from "./calendar";
 import * as worklog from "./worklog";
 import { randomMysticVerb } from "../core/mystic";
@@ -27,6 +30,15 @@ export interface TurnDeps {
   voice?(name: string): VoiceConfig | undefined;
   /** Say something verbatim to a person, opening a DM if needed. */
   say?(agent: string, user: string, text: string): Promise<void>;
+  /** The durable record of one item of one skill: opened before the first step, closed either way.
+   *
+   *  Behind a hook rather than a direct database call for the same reason everything else here is:
+   *  the worker holds no connection string. It asks the registry, over the same system-token API it
+   *  already uses for the roster. */
+  skillRun?: {
+    open(agent: string, skill: string, itemKey: string, version: number): Promise<void>;
+    close(agent: string, skill: string, itemKey: string, status: "done" | "failed", error?: string): Promise<void>;
+  };
   /** Run text as a turn addressed to a person. */
   ask?(agent: string, user: string, text: string): Promise<void>;
   /** The display-only status footer for a finished turn: the model, the turn's tokens, context
@@ -54,6 +66,63 @@ export interface TurnDeps {
   /** Abandon this conversation's session and hand back a fresh one. The resume-miss repair, and
    *  what `!new` does. */
   resetSession?(agent: string, conversation: string): Promise<{ id: string; isNew: boolean }>;
+}
+
+/** PURE: the text of a transcript value, whichever shape it arrived in. */
+function transcriptText(v: unknown): string {
+  if (typeof v === "string") return v;
+  const t = (v as { text?: unknown } | null)?.text;
+  return typeof t === "string" ? t : "";
+}
+
+/** PURE: who transcribed it, for the page to state. Empty when the value predates provenance or
+ *  every chunk came from a cache that records none — which `transcribedBy` then says out loud
+ *  rather than guessing at. */
+function transcribedByOf(v: unknown): string[] {
+  const by = (v as { by?: unknown } | null)?.by;
+  return Array.isArray(by) ? (by as string[]) : [];
+}
+
+/** LARGE VALUES TRAVEL BY REFERENCE.
+ *
+ *  A 42,000-character transcript through workflow state runs into Temporal's payload limits —
+ *  warned past 256KB, refused past 2MB — and an eighty-eight-minute meeting is 55,000 characters
+ *  before anything else is in the bag. Inlining works perfectly on a five-minute recording and
+ *  breaks on a long one, which is the kind of thing that must be settled rather than discovered.
+ *
+ *  So a big value is written beside the chunk cache and the bag carries a pointer. Small ones stay
+ *  inline, because a pointer to eleven characters is just a slower eleven characters. */
+async function maybeRef(value: string, v: VoiceConfig, name: string): Promise<unknown> {
+  if (!skill.tooBigToInline(value) || !v.chunkCacheDir) return value;
+  const at = path.join(v.chunkCacheDir, "refs", `${name}.txt`);
+  await fs.mkdir(path.dirname(at), { recursive: true });
+  await fs.writeFile(at, value, "utf8");
+  return { $ref: at, bytes: value.length } satisfies skill.Ref;
+}
+
+/** The other half: a step is handed VALUES, never pointers. Resolving here rather than in the
+ *  workflow is what keeps the workflow free of a filesystem it is not allowed to touch. */
+async function resolveRefs(seen: skill.Bag, _v: VoiceConfig): Promise<skill.Bag> {
+  // A reference that cannot be read is a REAL failure, not an empty string: the alternative is
+  // summarising a meeting from nothing and publishing the result as if it were the meeting.
+  const one = async (value: unknown): Promise<unknown> => {
+    if (skill.isRef(value)) return await fs.readFile(value.$ref, "utf8");
+    // ONE level of nesting, so a value can carry its own provenance — `{ text, by }` is the honest
+    // shape for a transcript, since WHO transcribed it is a fact about that text and travels with
+    // it. Not arbitrary depth: a general graph walk would be a serialisation format, and this
+    // language deliberately does not have one.
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+      const inner: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+        inner[k] = skill.isRef(v) ? await fs.readFile(v.$ref, "utf8") : v;
+      }
+      return inner;
+    }
+    return value;
+  };
+  const out: skill.Bag = {};
+  for (const [k, value] of Object.entries(seen)) out[k] = await one(value);
+  return out;
 }
 
 /** Keep an activity's heartbeat alive on a TIMER while `work` runs.
@@ -404,6 +473,187 @@ export function makeActivities(deps: TurnDeps) {
           `and giving the three most useful things from it, in your own words, then offer to answer ` +
           `questions about it. The three: ${top.map((h, i) => `(${i + 1}) ${h}`).join(" ")}`,
       );
+    },
+
+    /** Open — or re-open — the durable record for one item of one skill.
+     *
+     *  This is the record whose absence produced 611 attempts for 4 published recaps. "Not published
+     *  yet" and "failing every two minutes for ten hours" were the same state, because the only
+     *  durable fact was whether a file existed in a git checkout — a check that can answer "is it
+     *  done" and can never answer "is it being worked on, or failing". */
+    async openSkillRun(input: { agent: string; skill: string; itemKey: string; version: number }): Promise<void> {
+      await deps.skillRun?.open(input.agent, input.skill, input.itemKey, input.version);
+    },
+
+    /** Close it, either way. The FAILED case is the one that matters: it is what makes "this
+     *  recording has been failing all day" something a person can see without reading a log. */
+    async closeSkillRun(input: {
+      agent: string;
+      skill: string;
+      itemKey: string;
+      status: "done" | "failed";
+      error?: string;
+    }): Promise<void> {
+      await deps.skillRun?.close(input.agent, input.skill, input.itemKey, input.status, input.error);
+    },
+
+    /** ONE STEP of a skill, whichever kind it is.
+     *
+     *  THE REGISTRY IS HERE, in the worker, and a `tool` step names a verb in it rather than a
+     *  command line. A step that shelled out to a CLI would need a tenant credential inside the
+     *  agent's shell — and the agent is a language model with a shell. Today the worker resolves
+     *  credentials and hands the harness RESULTS, never secrets; keeping that is worth more than the
+     *  reuse. A CLI becomes a thin shell over this same registry the day something outside the
+     *  worker genuinely needs to invoke a step.
+     *
+     *  The workflow driving this knows nothing about what any verb means, which is exactly what lets
+     *  a tenant reorder or drop steps without a deploy. */
+    async runStep(input: {
+      agent: string;
+      skill: string;
+      itemKey: string;
+      notify: string;
+      step: skill.Step;
+      bag: skill.Bag;
+    }): Promise<unknown> {
+      const ctx = Context.current();
+      const v = deps.voice?.(input.agent);
+      if (!v) throw new Error(`no voice configuration for ${input.agent}`);
+      const step = input.step;
+      // A step sees what it DECLARED, not the whole bag. Resolved on this side rather than in the
+      // workflow so a large value can travel through workflow state as a reference and be read back
+      // here, where a filesystem exists.
+      const seen = await resolveRefs(skill.visibleTo(step, input.bag), v);
+
+      const recording = async (): Promise<recap.Recording> => {
+        const all = await recap.listRecordings(v.creds, 50);
+        const found = all.find((r) => r.id === input.itemKey || r.stamp === input.itemKey);
+        if (!found) throw new Error(`recording ${input.itemKey} is no longer listed`);
+        return found;
+      };
+
+      if (skill.isInfer(step)) {
+        // INFERENCE PRODUCES VALUES; CODE DECIDES WHAT HAPPENS TO THEM. The row names WHICH prompt;
+        // the runtime owns its text. The answer is checked against the declared schema, because a
+        // response that does not conform has to fail the step — that is the difference between a
+        // value and a claim.
+        if (step.infer.prompt !== "recap-vs-mission") {
+          throw new Error(`unknown prompt "${step.infer.prompt}" — a skill names a prompt, it does not carry one`);
+        }
+        if (step.infer.schema !== "Recap") throw new Error(`unknown schema "${step.infer.schema}"`);
+        const transcript = transcriptText(seen.transcript);
+        if (!transcript.trim()) return { $stop: true, why: "nothing was transcribed" };
+        const r = await recording();
+        const answer = await beating(
+          () => "summarising",
+          () =>
+            recap.summarize(
+              transcript,
+              r.title,
+              v.summarize,
+              v.journal,
+              (seen.candidates as calendar.CalEvent[]) ?? [],
+              String(seen.mission ?? ""),
+              v.vocab,
+            ),
+        );
+        if (typeof answer?.summary !== "string") throw new Error("the model's answer did not match the Recap schema");
+        return answer;
+      }
+
+      switch (step.tool) {
+        case "transcript get": {
+          const r = await recording();
+          let note = "transcribing";
+          const { text, by } = await beating(
+            () => note,
+            () =>
+              recap.transcribe(
+                v.creds,
+                r,
+                v.transcribe,
+                v.vocab,
+                (done, total) => {
+                  note = `transcribing ${done}/${total}`;
+                  ctx.heartbeat(note);
+                },
+                v.chunkCacheDir,
+              ),
+          );
+          // A recording nothing can hear is not a meeting to file — and it is not an error either.
+          if (!text.trim()) return { $stop: true, why: "every provider transcribed silence" };
+          // `by` travels WITH the text rather than beside it. Who transcribed a transcript is a
+          // fact about that transcript, and the page states it — so splitting them would need a
+          // second `out` and would let a recap claim a provider that served a different run.
+          return { text: await maybeRef(text, v, `${r.id}-transcript`), by };
+        }
+        case "calendar candidates": {
+          // Empty when nothing is connected, which is NOT a failure. This is what `optional` means
+          // in the definition, and the calendars are the case that proves the distinction is real.
+          if (!v.calendars?.length) return [];
+          const r = await recording();
+          const w = calendar.windowFor(r.startTime, r.startTime + r.duration, v.calendarPadMinutes);
+          return await calendar.gather(v.calendars, w.from, w.to, {
+            exclude: v.calendarExclude,
+            log: (m) => console.log(m),
+          });
+        }
+        // No account argument, deliberately: the credential IS the tenant, so an agent cannot ask for
+        // anybody else's. Empty is a normal state — no mission, no alignment line, still a recap.
+        case "mission get":
+          return v.mission ?? "";
+        case "brain publish": {
+          const r = await recording();
+          const summary = seen.recap as recap.Recap | undefined;
+          if (!summary?.summary) throw new Error("brain publish was given no recap to publish");
+          const transcript = transcriptText(seen.transcript);
+          const candidates = (seen.candidates as calendar.CalEvent[]) ?? [];
+          // The model may only claim a meeting it was SHOWN. A hallucinated meeting name looks
+          // entirely correct and files the recap into a series it does not belong to.
+          summary.meeting = recap.resolveMeeting(candidates, summary.meeting)?.summary ?? "";
+          const route = recap.resolveRoute(v.journal, summary.route);
+          const where = recap.pathsFor(v.journal, r, route, summary.highlights?.[0] ?? summary.summary);
+          // ONE tool that writes, commits AND pushes, reporting the outcome of all three. Splitting
+          // them would create a state where the agent believes it published and the remote has
+          // nothing — the same class of failure as trusting the model to call the step at all.
+          const published = await recap.publish(
+            v.brainDir,
+            r,
+            summary,
+            transcript,
+            v.pushUrl,
+            v.journal,
+            candidates,
+            transcribedByOf(seen.transcript),
+          );
+          if (v.chunkCacheDir) await recap.clearChunkCache(v.chunkCacheDir, r);
+          console.log(`skill: ${r.title} ${published ? "published" : "already present"} at ${where.page}`);
+          return { published, page: where.page };
+        }
+        case "say": {
+          const done = seen.published as { published?: boolean; page?: string } | undefined;
+          // Nothing new to announce is not a failure — somebody else got there first, and saying it
+          // twice is worse than not saying it.
+          if (!done?.published) return null;
+          const summary = seen.recap as recap.Recap | undefined;
+          const top = (summary?.highlights ?? []).slice(0, 3);
+          const r = await recording();
+          await deps.ask?.(
+            input.agent,
+            input.notify,
+            `A recording has just finished processing and is filed in the second brain at ` +
+              `${done.page}: "${r.title}". Write a short message telling them it is ready ` +
+              `and giving the three most useful things from it, in your own words, then offer to answer ` +
+              `questions about it. The three: ${top.map((h, i) => `(${i + 1}) ${h}`).join(" ")}`,
+          );
+          return null;
+        }
+        default:
+          // A verb nothing implements is a BROKEN DEFINITION, not a step to skip. Skipping would
+          // publish a recap with a piece silently missing, which is the failure mode this whole
+          // layer exists to stop.
+          throw new Error(`unknown tool "${step.tool}" — the runtime has no verb by that name`);
+      }
     },
 
     /** Say something verbatim to a person, opening a DM if needed. Used for the acknowledgement and
