@@ -139,6 +139,39 @@ export async function listRecordings(creds: PlaudCreds, limit = 20): Promise<Rec
  *  `since` is an explicit ISO date when the operator sets one. Absent that the floor is the start
  *  of the day the worker booted, in the operator's timezone — "from today onwards", which is what
  *  somebody switching the feature on means by it. */
+/** PURE: minutes EAST of UTC for a zone at a given instant.
+ *
+ *  Derived from the zone rather than stored, because a stored offset is wrong twice a year and the
+ *  floor is a wall-clock question — "recordings from today onwards" means the tenant's today, and
+ *  their today starts an hour earlier after the clocks change.
+ *
+ *  Computed by formatting the instant in the zone and in UTC and subtracting, which is the only way
+ *  to get this out of the platform without a timezone library. Falls back to 0 (UTC) on a zone Node
+ *  does not know, so a typo in a settings field costs correct times, never a crash. */
+export function offsetMinutesFor(timezone: string, at: number): number {
+  if (!timezone || timezone === "UTC") return 0;
+  try {
+    const read = (tz: string): number => {
+      const p = new Intl.DateTimeFormat("en-US", {
+        timeZone: tz,
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hour12: false,
+      }).formatToParts(new Date(at));
+      const v = (t: string): number => Number(p.find((x) => x.type === t)?.value ?? 0);
+      const hour = v("hour") === 24 ? 0 : v("hour");
+      return Date.UTC(v("year"), v("month") - 1, v("day"), hour, v("minute"), v("second"));
+    };
+    return Math.round((read(timezone) - read("UTC")) / 60_000);
+  } catch {
+    return 0;
+  }
+}
+
 export function floorFor(since: string | undefined, now: number, tzOffsetMinutes = 0): number {
   if (since) {
     // A bare `YYYY-MM-DD` means local midnight, so it takes the offset. A full instant already
@@ -736,8 +769,10 @@ const bullets = (xs: string[] | undefined, empty: string): string =>
 
 /** PURE: `14:00–14:30` in UTC, for the candidate list. Short because the date is already at the
  *  top of the page, and the only question the reader has here is which slot. */
-const span = (a: number, b: number): string => {
-  const hm = (t: number): string => new Date(t).toISOString().slice(11, 16);
+const span = (a: number, b: number, timezone = "UTC"): string => {
+  // Same rule as the header: a candidate list showing 16:00–16:30 beside a meeting the reader
+  // remembers at noon is worse than no times at all.
+  const hm = (t: number): string => localWhen(t, timezone).slice(11, 16);
   return `${hm(a)}–${hm(b)}`;
 };
 
@@ -771,7 +806,7 @@ ${recap.alignmentReason}` : "";
 `;
 }
 
-export function calendarSection(recap: Recap, candidates: CalEvent[]): string {
+export function calendarSection(recap: Recap, candidates: CalEvent[], timezone = "UTC"): string {
   if (!candidates.length) return "";
   const chosen = (recap.meeting ?? "").trim().toLowerCase();
   const lines = candidates.map((c) => {
@@ -799,6 +834,41 @@ ${lines.join("\n")}
  *  `datetime`, `title`, `route` — rather than inventing a second one alongside it. `route` in
  *  particular already existed and was always "unclassified"; filling it in is the whole point, and
  *  keeping it in frontmatter means re-filing a meeting is a `git mv` and one edited line. */
+/** PURE: a wall-clock time in the TENANT's timezone, as `2026-09-09 12:10 EDT`.
+ *
+ *  Every time on a recap used to be UTC with nothing saying so, which is the part that made it
+ *  wrong rather than merely inconvenient: a 12:10 Eastern interview read as 16:10, and an agent
+ *  asked how many meetings there had been that day answered confidently and four hours out.
+ *
+ *  An IANA NAME, never an offset, because an offset is wrong twice a year. The zone abbreviation is
+ *  printed alongside so the reader can tell a local time from a UTC one at a glance — an unlabelled
+ *  timestamp is exactly how this went unnoticed.
+ *
+ *  Falls back to UTC on a zone Node does not recognise, rather than throwing: a typo in a settings
+ *  field must not take down a recap. */
+export function localWhen(ms: number, timezone = "UTC"): string {
+  const zone = timezone || "UTC";
+  try {
+    const parts = new Intl.DateTimeFormat("en-CA", {
+      timeZone: zone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+      timeZoneName: "short",
+    }).formatToParts(new Date(ms));
+    const at = (t: string): string => parts.find((x) => x.type === t)?.value ?? "";
+    // `hour` can come back as "24" for midnight in some ICU builds; normalise so a reader never
+    // sees a time that does not exist on a clock.
+    const hour = at("hour") === "24" ? "00" : at("hour");
+    return `${at("year")}-${at("month")}-${at("day")} ${hour}:${at("minute")} ${at("timeZoneName")}`;
+  } catch {
+    return `${new Date(ms).toISOString().replace("T", " ").slice(0, 16)} UTC`;
+  }
+}
+
 /** PURE: who actually transcribed this recording, for the page to state.
  *
  *  It used to be the literal string "Groq (whisper-large-v3-turbo)", written once and true only
@@ -820,14 +890,19 @@ export function overviewMarkdown(
   folder?: string,
   candidates: CalEvent[] = [],
   by: string[] = [],
+  timezone = "UTC",
 ): string {
-  const when = new Date(rec.startTime).toISOString().replace("T", " ").slice(0, 16);
+  const when = localWhen(rec.startTime, timezone);
   const transcript = folder ? `${path.posix.basename(folder)}/Transcript.md` : `./${rec.stamp}/Transcript.md`;
   const head = [
     "---",
     `recording_id: ${rec.id}`,
     "source: plaud",
+    // The INSTANT, unchanged and still UTC — that is what an instant is, and every existing page
+    // has it. `local_time` is the same moment as the tenant reads a clock, so a vault query can ask
+    // "what did I do on Tuesday" and mean the tenant's Tuesday.
     `datetime: ${new Date(rec.startTime).toISOString()}`,
+    `local_time: ${JSON.stringify(localWhen(rec.startTime, timezone))}`,
     `duration_min: ${(rec.duration / 60000).toFixed(1)}`,
     "artifact: overview",
     `title: ${JSON.stringify(rec.title)}`,
@@ -864,7 +939,7 @@ ${bullets(recap.decisions, "none recorded")}
 ## Follow-ups
 
 ${bullets(recap.followups, "none recorded")}
-${alignmentSection(recap)}${calendarSection(recap, candidates)}
+${alignmentSection(recap)}${calendarSection(recap, candidates, timezone)}
 ---
 
 [Full transcript](${transcript})
@@ -886,6 +961,7 @@ export async function publish(
   journal?: Journal,
   candidates: CalEvent[] = [],
   by: string[] = [],
+  timezone = "UTC",
 ): Promise<boolean> {
   const route = resolveRoute(journal, recap.route);
   const where = pathsFor(journal, rec, route, recap.highlights?.[0] ?? recap.summary);
@@ -893,7 +969,7 @@ export async function publish(
   await fs.mkdir(dir, { recursive: true });
   await fs.writeFile(
     path.join(brainDir, where.page),
-    overviewMarkdown(rec, { ...recap, route }, where.folder, candidates, by),
+    overviewMarkdown(rec, { ...recap, route }, where.folder, candidates, by, timezone),
     "utf8",
   );
   await fs.writeFile(

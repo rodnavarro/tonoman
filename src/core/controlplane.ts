@@ -66,6 +66,8 @@ export interface RegistryAgent {
   flows?: Record<string, Record<string, string>>;
   /** What the TENANT is trying to do. One sentence, shared by every agent the tenant has. */
   mission?: string;
+  /** The tenant's display timezone, IANA. */
+  timezone?: string;
   tools?: string[];
   secondbrain?: {
     id: string;
@@ -207,6 +209,9 @@ export class RegistryControlPlane implements ControlPlane {
         // recap simply came out with no Alignment section, which looks exactly like a model
         // declining to judge.
         mission: a.mission ?? "",
+        // Mapped here too, and this is the field that taught the lesson: `mission` was added to the
+        // registry, the roster and the voice flow, and dropped in this whitelist in between.
+        timezone: a.timezone ?? "UTC",
         // Present only when the tool is granted — the registry decides, not the runtime.
         secondbrain: (a.secondbrain ?? []).map((s) => ({
           id: s.id,

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { alignmentSection, budgetTranscript, calendarSection, floorFor, isTimestampTitle, joinChunks, overviewMarkdown, parseRecapJson, pathsFor, redact, resolveMeeting, slugFor, resolveAlignment, stampFor, titleFor, transcribedBy } from "./recap";
+import { alignmentSection, budgetTranscript, calendarSection, localWhen, offsetMinutesFor, floorFor, isTimestampTitle, joinChunks, overviewMarkdown, parseRecapJson, pathsFor, redact, resolveMeeting, slugFor, resolveAlignment, stampFor, titleFor, transcribedBy } from "./recap";
 
 describe("stampFor", () => {
   it("is stable, sortable and unique per minute, so re-processing lands on the same path", () => {
@@ -338,5 +338,55 @@ describe("alignmentSection — the page says it, or says nothing", () => {
     const page = overviewMarkdown(rec, { ...base, alignment: "detracts", alignmentReason: "Nothing was decided." }, undefined, [], ["groq"]);
     expect(page).toContain("alignment: detracts");
     expect(page).toContain("alignment_reason: ");
+  });
+});
+
+describe("localWhen — a time the reader recognises, labelled so they can tell", () => {
+  // 2026-09-09T16:10:22Z is the David interview: 12:10 in New York, and the page said 16:10.
+  const david = Date.UTC(2026, 8, 9, 16, 10, 22);
+
+  it("renders the tenant's wall clock, not UTC", () => {
+    expect(localWhen(david, "America/New_York")).toMatch(/^2026-09-09 12:10 /);
+  });
+
+  it("NAMES the zone, because an unlabelled timestamp is how this went unnoticed for a day", () => {
+    expect(localWhen(david, "America/New_York")).toMatch(/EDT|EST|GMT-4/);
+    expect(localWhen(david, "UTC")).toMatch(/UTC|GMT/);
+  });
+
+  it("follows daylight saving, which is why the setting is a NAME and not an offset", () => {
+    // Same zone, six months apart: an offset stored once would be wrong for half the year.
+    const summer = localWhen(Date.UTC(2026, 6, 1, 16, 0), "America/New_York");
+    const winter = localWhen(Date.UTC(2026, 0, 1, 16, 0), "America/New_York");
+    expect(summer.slice(11, 16)).toBe("12:00");
+    expect(winter.slice(11, 16)).toBe("11:00");
+  });
+
+  it("crosses a date boundary correctly, where a naive offset would print the wrong DAY", () => {
+    // 01:30 UTC on the 10th is still the evening of the 9th in New York.
+    expect(localWhen(Date.UTC(2026, 8, 10, 1, 30), "America/New_York")).toMatch(/^2026-09-09 21:30/);
+  });
+
+  it("falls back to UTC on a zone it does not know, rather than failing a recap", () => {
+    // A typo in a settings field must cost correct times, never a published meeting.
+    expect(localWhen(david, "Mars/Olympus")).toMatch(/^2026-09-09 16:10 UTC$/);
+    expect(localWhen(david, "")).toMatch(/16:10/);
+  });
+});
+
+describe("offsetMinutesFor — the floor is the TENANT's today", () => {
+  it("reads minutes east of UTC from the zone name", () => {
+    expect(offsetMinutesFor("America/New_York", Date.UTC(2026, 6, 1))).toBe(-240);
+    expect(offsetMinutesFor("America/New_York", Date.UTC(2026, 0, 1))).toBe(-300);
+    expect(offsetMinutesFor("UTC", Date.now())).toBe(0);
+  });
+
+  it("handles a zone east of UTC and a half-hour one", () => {
+    expect(offsetMinutesFor("Europe/Madrid", Date.UTC(2026, 6, 1))).toBe(120);
+    expect(offsetMinutesFor("Asia/Kolkata", Date.UTC(2026, 6, 1))).toBe(330);
+  });
+
+  it("is 0 for a zone it does not know, so a bad setting does not shift the floor wildly", () => {
+    expect(offsetMinutesFor("Nowhere/Special", Date.now())).toBe(0);
   });
 });

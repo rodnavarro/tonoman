@@ -168,6 +168,9 @@ export interface AgentConfig {
    *  scarce thing rather than only ever reporting how it helped. Empty is ordinary — every tenant
    *  is in that state until somebody writes one — and means the recap simply does not judge. */
   mission?: string;
+  /** IANA timezone for DISPLAY, from the tenant. "America/New_York", never an offset. Empty or
+   *  "UTC" means render in UTC, which is what every recap did before this existed. */
+  timezone?: string;
   /** Outside accounts this agent may use, from the registry (§8). Identified by `(kind, alias)`:
    *  the KIND is what the platform knows how to talk to, the ALIAS is which one of them this is.
    *  That is what lets a tenant attach a work calendar and a personal one without either becoming

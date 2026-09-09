@@ -448,7 +448,7 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
           console.error(`worker: ${name} second-brain sync failed: ${(e as Error).message}`);
           return [] as { dir: string; label: string }[];
         });
-      a.context = secondbrain.contextNote(ready);
+      a.context = secondbrain.contextNote(ready, a.cfg.timezone ?? "UTC");
     }
   };
 
@@ -566,7 +566,11 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
     // Plaud history and announces each old meeting in Slack as if it had just happened.
     // Unset means "from today onwards" in the pod's own timezone, which is what switching the
     // feature on is meant to mean.
-    const tzOffset = -new Date().getTimezoneOffset();
+    // THE TENANT'S timezone, not the pod's. `-new Date().getTimezoneOffset()` read the worker's own
+    // clock, so one pod's timezone silently decided what "from today onwards" meant for every
+    // tenant on it — a deployment-wide default standing in for a customer's fact, which is exactly
+    // the pattern this product exists to delete.
+    const tzOffset = recapFloor.offsetMinutesFor(a.cfg.timezone ?? "UTC", Date.now());
     const floorMs = recapFloor.floorFor(voice.since || undefined, Date.now(), tzOffset);
     // Calendars this agent has been granted. `(kind, alias)` is the identity: the KIND is what
     // the platform knows how to read, the ALIAS is which one of them this is — so a work calendar
@@ -615,6 +619,7 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
       // From the registry, per tenant. The roster already carries it, so this is not a second
       // round trip that can be stale on its own.
       mission: a.cfg.mission ?? "",
+      timezone: a.cfg.timezone ?? "UTC",
       floorMs,
       vocab:
         process.env.GROQ_PROMPT ??

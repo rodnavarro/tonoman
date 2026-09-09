@@ -120,12 +120,25 @@ export function redact(text: string, token: string): string {
 
 /** The note prepended to a turn so the agent knows what it can read and where. Without it the
  *  files are present but the model has no reason to look. */
-export function contextNote(ready: { dir: string; label: string }[]): string {
+export function contextNote(ready: { dir: string; label: string }[], timezone = ""): string {
   if (ready.length === 0) return "";
   const lines = ready.map((r) => `- ${r.label}: ${r.dir}`).join("\n");
+  // WHAT TIME IT IS FOR THIS PERSON. A recap page carries a UTC instant and a local rendering, and
+  // without being told which is which the agent reads whichever it finds first — asked how many
+  // meetings there had been that day, it answered in UTC, four hours out, and sounded certain.
+  const clock =
+    timezone && timezone !== "UTC"
+      ? [
+          "",
+          `This person is in ${timezone}. A recap page carries "datetime" (a UTC instant) and`,
+          '"local_time" (the same moment on their clock). The filename stamp is UTC.',
+          "ALWAYS answer in their local time, and name the zone whenever a time could be mistaken.",
+        ].join("\n")
+      : "";
   return [
     "Your second brain is checked out on this machine and is the memory of the business:",
     lines,
+    clock,
     "",
     "Search it with Grep and read pages with Read before answering anything about meetings, people,",
     "deals or decisions. If the answer is not in there, say so plainly rather than guessing — a wrong",

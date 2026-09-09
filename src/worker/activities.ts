@@ -190,6 +190,9 @@ export interface VoiceConfig {
    *  tenant has. Empty means this flow does not judge, which is the ordinary state until somebody
    *  writes one. */
   mission?: string;
+  /** The tenant's display timezone, IANA. Used for rendering only — matching is epoch milliseconds
+   *  and the filename stamp stays UTC. */
+  timezone?: string;
   vocab: string;
   /** Where a half-finished transcription keeps the chunks it already paid for, so a retry resumes.
    *  On the volume rather than in memory, because the thing being survived is a process that died
@@ -451,7 +454,7 @@ export function makeActivities(deps: TurnDeps) {
         route,
         summary.meeting || summary.highlights?.[0] || summary.summary,
       );
-      const published = await recap.publish(v.brainDir, rec, summary, text, v.pushUrl, v.journal, candidates, by);
+      const published = await recap.publish(v.brainDir, rec, summary, text, v.pushUrl, v.journal, candidates, by, v.timezone);
       console.log(
         `recap: ${rec.title} ${published ? "published" : "already present"} at ${where.page}` +
           (route ? ` (route ${route}${summary.route && summary.route !== route ? `, model said "${summary.route}"` : ""})` : "") +
@@ -625,6 +628,7 @@ export function makeActivities(deps: TurnDeps) {
             v.journal,
             candidates,
             transcribedByOf(seen.transcript),
+            v.timezone,
           );
           if (v.chunkCacheDir) await recap.clearChunkCache(v.chunkCacheDir, r);
           console.log(`skill: ${r.title} ${published ? "published" : "already present"} at ${where.page}`);
