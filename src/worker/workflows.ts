@@ -37,7 +37,11 @@ const { runTurn, postNotice } = proxyActivities<Activities>({
   // A turn is a person waiting on an LLM: minutes, not seconds. The heartbeat is what makes a dead
   // worker detectable in seconds anyway, so the long timeout costs nothing in responsiveness.
   startToCloseTimeout: "20 minutes",
-  heartbeatTimeout: "30 seconds",
+  // 60s, with the activity keeping itself alive on a 15s timer. 30 seconds was a gap the model
+  // could exceed just by THINKING after a large tool result, which killed real turns. The margin
+  // matters because a big synchronous parse can briefly block the timer too — and a blocked event
+  // loop is exactly what this timeout should still catch.
+  heartbeatTimeout: "60 seconds",
   // A turn is not idempotent — it posts to a channel and spends money. One attempt, then surface it.
   retry: { maximumAttempts: 1 },
 });

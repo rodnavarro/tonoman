@@ -891,7 +891,21 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
 
     try {
       try {
-        await consume();
+        // KEPT ALIVE ON A TIMER while the model thinks.
+        //
+        // The stream heartbeats on every event, which reads like enough and is not: between events
+        // there IS no event, and a model that has just been handed a 79,000-character transcript
+        // reasons for well over the heartbeat timeout before emitting its next token. Temporal then
+        // declares a perfectly healthy turn dead, and the person is told their question failed.
+        //
+        // That happened on a real question about a 112-minute meeting: two tool calls, a large Read,
+        // and the activity timed out sixty seconds in — with 38 of its 40 turns unused, so it looked
+        // like a model problem rather than a liveness one.
+        //
+        // Same fix as `transcribe` and `summarize`, and the same lesson: the heartbeat's job is to
+        // detect a dead WORKER, not to police how long thinking takes. The stream events still
+        // report real progress on top of this.
+        await beating(() => `thinking (${answer.length} chars so far)`, consume);
       } catch (e) {
         // A session that cannot be resumed is a lost memory, not a failed turn.
         //
