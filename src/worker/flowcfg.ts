@@ -126,6 +126,8 @@ export interface ProviderSpec {
    *  server accepts the field and ignores it, which is a real difference in proper nouns. */
   biases: boolean;
   timeoutMs?: number;
+  /** Most transcript this provider may be sent in one request, in characters. See Provider. */
+  maxChars?: number;
 }
 
 /**
@@ -169,6 +171,7 @@ export function providerSpecs(props: Record<string, string> = {}, job = "transcr
       // vocabulary hints on the one that does.
       biases: (g.biases ?? "true").toLowerCase() !== "false",
       timeoutMs: g.timeout_seconds ? num(g.timeout_seconds, 0) * 1000 || undefined : undefined,
+      maxChars: g.max_chars ? num(g.max_chars, 0) || undefined : undefined,
     }))
     .filter((p) => p.url && p.model);
 }

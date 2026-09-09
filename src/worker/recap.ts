@@ -13,7 +13,7 @@ import { promises as fs } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { chatWith, transcribeWith, type Provider } from "./inference";
+import { budgetFor, chatWith, transcribeWith, type Provider } from "./inference";
 
 // MOVED, not changed. Deciding what a provider's refusal means belongs with the providers; these
 // two are re-exported because every existing caller and test names them here, and a move that
@@ -713,7 +713,7 @@ export async function summarize(
       response_format: { type: "json_object" },
       messages: [
         { role: "system", content: system },
-        { role: "user", content: `Meeting: ${title}\n\nTranscript:\n${budgetTranscript(transcript)}` },
+        { role: "user", content: `Meeting: ${title}\n\nTranscript:\n${budgetTranscript(transcript, budgetFor(providers))}` },
       ],
     },
     { log: (line) => console.log(line) },

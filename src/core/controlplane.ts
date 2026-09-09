@@ -64,6 +64,8 @@ export interface RegistryAgent {
   principals?: { kind: string; value: string; label: string }[];
   /** flow → key → value, straight from `flow_property`. Opaque to the registry by design. */
   flows?: Record<string, Record<string, string>>;
+  /** What the TENANT is trying to do. One sentence, shared by every agent the tenant has. */
+  mission?: string;
   tools?: string[];
   secondbrain?: {
     id: string;
@@ -199,6 +201,12 @@ export class RegistryControlPlane implements ControlPlane {
         auth_state: (a.authState as AgentConfig["auth_state"]) ?? "unconfigured",
         principals: a.principals ?? [],
         flows: a.flows ?? {},
+        // Mapped EXPLICITLY, like everything else here. This mapping is a whitelist by design — the
+        // runtime takes only what it understands — and the cost of that is real: a field added to
+        // the roster and to the worker, but not to this list, is silently dropped in between. The
+        // recap simply came out with no Alignment section, which looks exactly like a model
+        // declining to judge.
+        mission: a.mission ?? "",
         // Present only when the tool is granted — the registry decides, not the runtime.
         secondbrain: (a.secondbrain ?? []).map((s) => ({
           id: s.id,

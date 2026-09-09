@@ -30,6 +30,15 @@ export interface Provider {
   /** Absent for a server that wants no auth. ABSENT, not empty: see `authHeaders`. */
   apiKey?: string;
   timeoutMs?: number;
+  /** The most transcript this provider can be sent in one request, in characters.
+   *
+   *  A FACT ABOUT THE PROVIDER, not about meetings, which is why it lives on the row. Groq's free
+   *  tier meters 8000 tokens per minute and applies it per request, so a 62-minute meeting — about
+   *  15000 tokens — is refused with a 413 no retry can fix. A gateway onto a 200k-context model has
+   *  no such limit and eliding anything for it would be a self-inflicted loss of the transcript.
+   *
+   *  Absent means "no known limit". */
+  maxChars?: number;
   /** Whether this provider biases its vocabulary from `prompt`. Groq does; faster-whisper's
    *  OpenAI-compatible server accepts the field and ignores it. Recorded because it changes what the
    *  transcript will contain, not because it changes what we send. */
@@ -142,6 +151,16 @@ export function chooseFailure(what: string, attempts: Attempt[]): Error {
   }
   // Everyone refused permanently. NOW it is worth stopping — this is yesterday's 413 lesson, kept.
   return ApplicationFailure.create({ message, type: "Rejected", nonRetryable: true });
+}
+
+/** PURE: how much transcript is safe to send to THIS list of providers.
+ *
+ *  The MINIMUM of what any of them allows, not the first one's. The request is built once and then
+ *  offered to each provider in turn, so a body sized for a roomy gateway would be refused by the
+ *  smaller provider behind it — and the fall-through would fail exactly when it was needed. */
+export function budgetFor(providers: Provider[], fallback = 200_000): number {
+  const limits = providers.map((p) => p.maxChars).filter((n): n is number => typeof n === "number" && n > 0);
+  return limits.length ? Math.min(...limits) : fallback;
 }
 
 /** OMITTED, not empty. `Authorization: Bearer undefined` is a string a server will happily reject as

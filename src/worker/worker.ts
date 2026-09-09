@@ -118,6 +118,7 @@ async function providersFrom(specs: flowcfg.ProviderSpec[], who: string): Promis
       model: sp.model,
       apiKey: apiKey || undefined,
       timeoutMs: sp.timeoutMs,
+      maxChars: sp.maxChars,
       biasesWithPrompt: sp.biases,
     });
   }

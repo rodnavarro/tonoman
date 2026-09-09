@@ -121,3 +121,37 @@ describe("controlPlaneFrom", () => {
     expect(p.name()).toContain("http://api");
   });
 });
+
+describe("the roster mapping is a WHITELIST, and that cuts both ways", () => {
+  // Every field the runtime uses is copied across by name here. That is the right shape — the
+  // runtime takes only what it understands — but the cost is real and was paid once: `mission` was
+  // added to the registry, to the roster response and to the voice flow, and dropped silently in
+  // between. The recap came out with no Alignment section, which is indistinguishable from a model
+  // that declined to judge. These assert the carriage itself.
+
+  const withTokens = async () => {
+    await putSecret("acme-slack", "SLACK_BOT_TOKEN", "b");
+    await putSecret("acme-slack", "SLACK_APP_TOKEN", "a");
+  };
+
+  it("carries the tenant's mission through to the agent config", async () => {
+    await withTokens();
+    const cfg = await plane([{ ...base, mission: "Grow Axiplex to 20k/month. The constraint is my attention." }]).roster();
+    expect(cfg.agents[0]!.mission).toBe("Grow Axiplex to 20k/month. The constraint is my attention.");
+  });
+
+  it("is an empty string, never undefined, for a tenant that has written none", async () => {
+    await withTokens();
+    // The voice flow tests this to decide whether to judge at all, and "" and undefined would be
+    // two spellings of the same state for it to disagree about.
+    const cfg = await plane([base]).roster();
+    expect(cfg.agents[0]!.mission).toBe("");
+  });
+
+  it("carries flow settings through, which is how the voice flow is configured at all", async () => {
+    await withTokens();
+    const flows = { voice: { "route.axiplex-meetings": "Rod's own company", "transcribe.1.model": "whisper-1" } };
+    const cfg = await plane([{ ...base, flows }]).roster();
+    expect(cfg.agents[0]!.flows).toEqual(flows);
+  });
+});
