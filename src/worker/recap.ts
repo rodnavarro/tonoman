@@ -13,6 +13,13 @@ import { promises as fs } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
+import { chatWith, transcribeWith, type Provider } from "./inference";
+
+// MOVED, not changed. Deciding what a provider's refusal means belongs with the providers; these
+// two are re-exported because every existing caller and test names them here, and a move that
+// rewrites call sites is a move that hides whether the behaviour moved too.
+export { groqFailure, retryAfterMs } from "./inference";
+
 /** Run a command and collect its output. Never throws: the caller decides what a non-zero exit
  *  means, which differs — a failed `git commit` means "nothing to commit", a failed ffmpeg means
  *  the recording is unusable. */
@@ -208,6 +215,10 @@ async function isPublished(brainDir: string, rec: Recording, journal?: Journal):
 export interface TranscribeResult {
   text: string;
   seconds: number;
+  /** Which providers actually served, in the order they first did. Recorded because the recap page
+   *  states who transcribed it, and a hardcoded "Groq" became a lie the moment a second provider
+   *  existed. Empty when every chunk came from the cache — see `transcribedBy`. */
+  by: string[];
 }
 
 /** How long each piece of audio sent to Groq is.
@@ -324,73 +335,7 @@ async function probeSeconds(file: string): Promise<number | undefined> {
   return r.code === 0 ? parseProbeSeconds(r.out) : undefined;
 }
 
-/** PURE: how long to wait before asking again, in milliseconds, or undefined when the response
- *  does not say.
- *
- *  Two sources because Groq uses both: a `retry-after` header, and — for the daily audio budget —
- *  only a sentence in the body, `"Please try again in 19m48s"`. Reading just the header would have
- *  missed the one that actually matters here. Capped at six hours so a malformed or hostile value
- *  cannot park a meeting until next week. */
-export function retryAfterMs(header: string | null, body: string): number | undefined {
-  const cap = (ms: number): number => Math.min(Math.max(ms, 1_000), 6 * 3_600_000);
-  const h = Number(header);
-  if (Number.isFinite(h) && h > 0) return cap(h * 1000);
-  // "19m48s", "1h2m3s", "45.6s" — the shape Groq writes into the message.
-  const m = /try again in\s+(?:(\d+)h)?(?:(\d+)m)?(?:([\d.]+)s)?/i.exec(body);
-  if (m && (m[1] || m[2] || m[3])) {
-    const ms = (Number(m[1] ?? 0) * 3600 + Number(m[2] ?? 0) * 60 + Number(m[3] ?? 0)) * 1000;
-    if (ms > 0) return cap(ms);
-  }
-  return undefined;
-}
 
-/** The right KIND of failure for a Groq response, so Temporal retries what can succeed and gives
- *  up immediately on what cannot.
- *
- *  The distinction this exists to make: `429 ... please try again in 19m48s` is a request that came
- *  too EARLY, and waiting fixes it. `413 ... Limit 8000, Requested 9739` is a request that is too
- *  LARGE, and no amount of waiting will ever make it fit — it burned seven attempts proving that,
- *  each one a full transcription's worth of orchestration for a foregone conclusion. */
-export function groqFailure(what: string, status: number, body: string, retryAfter: string | null): Error {
-  const message = `groq ${what}: ${status} ${body}`;
-  if (status === 429) {
-    const wait = retryAfterMs(retryAfter, body);
-    if (wait !== undefined) {
-      return ApplicationFailure.create({ message, type: "GroqRateLimited", nextRetryDelay: wait });
-    }
-  }
-  // Too large, malformed, unauthorised, or a model that does not exist: all of them are the same
-  // request next time, and the same answer.
-  if ([400, 401, 403, 404, 413].includes(status)) {
-    return ApplicationFailure.create({ message, type: "GroqRejected", nonRetryable: true });
-  }
-  return new Error(message);
-}
-
-/** One chunk through Groq. Separated so a retry, a log line, or a heartbeat is per chunk. */
-async function transcribeChunk(file: string, groqKey: string, vocab: string): Promise<string> {
-  const audio = await fs.readFile(file);
-  const form = new FormData();
-  form.append("file", new Blob([audio], { type: "audio/flac" }), path.basename(file));
-  form.append("model", process.env.GROQ_MODEL || "whisper-large-v3-turbo");
-  form.append("response_format", "verbose_json");
-  // Vocabulary bias. Without it the transcriber hears "Plaud" as "plot" and "Tonoman" as
-  // "tournament" — the exact words somebody later searches the second brain for.
-  form.append("prompt", vocab);
-
-  const r = await fetch("https://api.groq.com/openai/v1/audio/transcriptions", {
-    method: "POST",
-    headers: { Authorization: `Bearer ${groqKey}` },
-    body: form,
-  });
-  if (!r.ok) {
-    // A DAILY quota is not a transient fault. Groq says exactly when it will serve again; handed to
-    // Temporal as `nextRetryDelay`, the activity simply waits, holding the chunks it has.
-    throw groqFailure("transcribe", r.status, (await r.text()).slice(0, 300), r.headers.get("retry-after"));
-  }
-  const j = (await r.json()) as { text: string };
-  return j.text ?? "";
-}
 
 /** PURE: where one chunk's text is kept between attempts. Keyed by the RECORDING, because that is
  *  what a retry is retrying, and by chunk INDEX and COUNT together — a different count means the
@@ -418,7 +363,7 @@ export async function clearChunkCache(cacheDir: string, rec: Recording): Promise
 export async function transcribe(
   creds: PlaudCreds,
   rec: Recording,
-  groqKey: string,
+  providers: Provider[],
   vocab: string,
   onProgress?: (done: number, total: number) => void,
   /** Where finished chunks are kept, so a retry resumes instead of starting over. Optional: the
@@ -450,6 +395,11 @@ export async function transcribe(
 
     const texts: string[] = [];
     let reused = 0;
+    const by: string[] = [];
+    // A provider that is DEAD AT THE TRANSPORT — nothing listening, DNS gone, the container stopped —
+    // is skipped for the rest of this recording rather than waited on once per chunk. Scoped to the
+    // recording, not the process: a server that comes back is asked again on the next one.
+    let dead: string[] = [];
     for (const [i, file] of parts.entries()) {
       // RESUME, don't restart. Without this a meeting that failed on chunk 6 of 9 threw away the
       // five it had already paid for and asked for them again on the next tick — which is how a
@@ -467,7 +417,16 @@ export async function transcribe(
       // Said before the request, not after: when a chunk is REFUSED, this is the only record of
       // how much audio we asked for, and that is exactly the number the limiter is counting.
       console.log(`recap: ${rec.title} — chunk ${i + 1}/${parts.length}, ${Math.round(durations[i] ?? 0)}s → groq`);
-      const text = await transcribeChunk(file, groqKey, vocab);
+      // An empty list after filtering means every provider looked dead, which is far more likely to
+      // be this machine's network than all of them being down — so ask everyone again rather than
+      // fail a meeting on the strength of one blip.
+      const live = providers.filter((x) => !dead.includes(x.name));
+      const served = await transcribeWith(live.length ? live : providers, file, vocab, {
+        onDead: (n) => { dead = [...dead, n]; },
+        log: (line) => console.log(line),
+      });
+      const text = served.value;
+      if (!by.includes(served.provider.name)) by.push(served.provider.name);
       if (at) {
         await fs.mkdir(path.dirname(at), { recursive: true }).catch(() => {});
         // Written BEFORE the next chunk is attempted, so a failure on chunk i+1 cannot lose chunk i.
@@ -477,7 +436,7 @@ export async function transcribe(
       onProgress?.(i + 1, parts.length);
     }
     if (reused) console.log(`recap: ${rec.title} — reused ${reused}/${parts.length} chunk(s) from a previous attempt`);
-    return { text: joinChunks(texts), seconds: (Date.now() - t0) / 1000 };
+    return { text: joinChunks(texts), seconds: (Date.now() - t0) / 1000, by };
   } finally {
     await fs.rm(work, { recursive: true, force: true }).catch(() => {});
   }
@@ -593,15 +552,57 @@ export function pathsFor(
   };
 }
 
+/** PURE: how much transcript the summariser is given, and WHICH part of it.
+ *
+ *  `transcript.slice(0, 40000)` was head-only truncation, and the end of a meeting is exactly where
+ *  the decisions and the follow-ups are — so a long meeting silently lost the part those fields are
+ *  extracted from, and still produced a confident-looking recap. It never protected the context
+ *  limit either: the 413 that killed a 62-minute recording said `Requested 9739` with that cap
+ *  already in place, because 40000 characters sits far ABOVE an 8000-token ceiling.
+ *
+ *  So: keep both ends, and say out loud that the middle is gone. The default is high enough that a
+ *  three-hour meeting is never cut — this is a stop against a pathological bill, not a
+ *  summarisation strategy. The real answer to a small ceiling is a summariser with room, and that
+ *  is a provider row. */
+export function budgetTranscript(text: string, max = 200_000): string {
+  if (text.length <= max) return text;
+  const head = Math.floor(max * 0.6);
+  const tail = max - head;
+  const omitted = text.length - max;
+  return `${text.slice(0, head)}\n\n[... ${omitted} characters of the middle of this transcript are omitted ...]\n\n${text.slice(-tail)}`;
+}
+
+/** PURE: the model's JSON, however it chose to wrap it.
+ *
+ *  `response_format: json_object` is an OpenAI feature a gateway may honour, emulate, or drop
+ *  silently, and the same model that obeys it on one provider fences its answer in a code block on
+ *  another. A bare `JSON.parse` throws there — discarding a transcription already paid for, over
+ *  punctuation. */
+export function parseRecapJson(raw: string): Recap {
+  const text = raw.trim();
+  const shapes = [text];
+  const fenced = /```(?:json)?([^`]*)```/i.exec(text);
+  if (fenced?.[1]) shapes.push(fenced[1].trim());
+  const open = text.indexOf("{");
+  const close = text.lastIndexOf("}");
+  if (open >= 0 && close > open) shapes.push(text.slice(open, close + 1));
+  for (const shape of shapes) {
+    try {
+      return JSON.parse(shape) as Recap;
+    } catch {
+      /* try the next shape */
+    }
+  }
+  throw new Error(`summarize: the model did not return JSON — ${text.slice(0, 200)}`);
+}
+
 export async function summarize(
   transcript: string,
   title: string,
-  groqKey: string,
+  providers: Provider[],
   journal?: Journal,
   candidates: CalEvent[] = [],
 ): Promise<Recap> {
-  // Checked against /v1/models rather than assumed — the obvious llama name is not on this account.
-  const model = process.env.GROQ_TEXT_MODEL || "openai/gpt-oss-120b";
   // Classification rides THIS call rather than taking one of its own: the transcript is already
   // here, already paid for, and a second round-trip would double the latency of every recap to
   // answer a one-word question.
@@ -646,22 +647,22 @@ export async function summarize(
   ]
     .filter(Boolean)
     .join(" ");
-  const r = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-    method: "POST",
-    headers: { Authorization: `Bearer ${groqKey}`, "content-type": "application/json" },
-    body: JSON.stringify({
-      model,
+  // The MODEL comes from the provider row, so which model summarises is a tenant's configuration
+  // rather than this file's opinion — and pointing it at a gateway with room is what removes the
+  // 413 that made a 62-minute meeting unsummarisable at any price.
+  const served = await chatWith(
+    providers,
+    {
       temperature: 0.2,
       response_format: { type: "json_object" },
       messages: [
         { role: "system", content: system },
-        { role: "user", content: `Meeting: ${title}\n\nTranscript:\n${transcript.slice(0, 40000)}` },
+        { role: "user", content: `Meeting: ${title}\n\nTranscript:\n${budgetTranscript(transcript)}` },
       ],
-    }),
-  });
-  if (!r.ok) throw groqFailure("summarize", r.status, (await r.text()).slice(0, 300), r.headers.get("retry-after"));
-  const j = (await r.json()) as { choices: { message: { content: string } }[] };
-  return JSON.parse(j.choices[0]!.message.content) as Recap;
+    },
+    { log: (line) => console.log(line) },
+  );
+  return parseRecapJson(served.value);
 }
 
 const bullets = (xs: string[] | undefined, empty: string): string =>
@@ -710,11 +711,27 @@ ${lines.join("\n")}
  *  `datetime`, `title`, `route` — rather than inventing a second one alongside it. `route` in
  *  particular already existed and was always "unclassified"; filling it in is the whole point, and
  *  keeping it in frontmatter means re-filing a meeting is a `git mv` and one edited line. */
+/** PURE: who actually transcribed this recording, for the page to state.
+ *
+ *  It used to be the literal string "Groq (whisper-large-v3-turbo)", written once and true only
+ *  while there was exactly one provider. The moment a second one existed that line was a claim
+ *  nobody checked, on a page a person reads to decide whether to trust the transcript — and no test
+ *  guarded it, because a hardcoded string always matches itself.
+ *
+ *  Empty means every chunk came from a previous attempt's cache, and the cache records no provider.
+ *  That is said plainly rather than guessed at: an honest "not recorded" is worth more here than a
+ *  confident name that might be wrong. */
+export function transcribedBy(by: string[] = []): string {
+  if (by.length === 0) return "a previous attempt (provider not recorded)";
+  return by.join(" + ");
+}
+
 export function overviewMarkdown(
   rec: Recording,
   recap: Recap,
   folder?: string,
   candidates: CalEvent[] = [],
+  by: string[] = [],
 ): string {
   const when = new Date(rec.startTime).toISOString().replace("T", " ").slice(0, 16);
   const transcript = folder ? `${path.posix.basename(folder)}/Transcript.md` : `./${rec.stamp}/Transcript.md`;
@@ -738,7 +755,7 @@ export function overviewMarkdown(
   return `${head}# ${rec.title}
 
 **When:** ${when}${recap.route ? ` · **Filed under:** ${recap.route}` : ""}
-**Recorded on:** Plaud · **Transcribed by:** Groq (\`whisper-large-v3-turbo\`)
+**Recorded on:** Plaud · **Transcribed by:** ${transcribedBy(by)}
 
 ## Summary
 
@@ -776,6 +793,7 @@ export async function publish(
   pushUrl: string,
   journal?: Journal,
   candidates: CalEvent[] = [],
+  by: string[] = [],
 ): Promise<boolean> {
   const route = resolveRoute(journal, recap.route);
   const where = pathsFor(journal, rec, route, recap.highlights?.[0] ?? recap.summary);
@@ -783,12 +801,12 @@ export async function publish(
   await fs.mkdir(dir, { recursive: true });
   await fs.writeFile(
     path.join(brainDir, where.page),
-    overviewMarkdown(rec, { ...recap, route }, where.folder, candidates),
+    overviewMarkdown(rec, { ...recap, route }, where.folder, candidates, by),
     "utf8",
   );
   await fs.writeFile(
     path.join(dir, "Transcript.md"),
-    `# Transcript — ${rec.title}\n\nTranscribed by Groq \`whisper-large-v3-turbo\` from the Plaud recording.\n\n---\n\n${transcript}\n`,
+    `# Transcript — ${rec.title}\n\nTranscribed by ${transcribedBy(by)} from the Plaud recording.\n\n---\n\n${transcript}\n`,
     "utf8",
   );
 

@@ -14,6 +14,7 @@ import { Context } from "@temporalio/activity";
 import type { Connector, Reply, TurnEvent, TurnUsage } from "../core/contracts";
 import type { AgentConfig } from "../config";
 import * as recap from "./recap";
+import * as inference from "./inference";
 import * as calendar from "./calendar";
 import * as worklog from "./worklog";
 import { randomMysticVerb } from "../core/mystic";
@@ -55,6 +56,42 @@ export interface TurnDeps {
   resetSession?(agent: string, conversation: string): Promise<{ id: string; isNew: boolean }>;
 }
 
+/** Keep an activity's heartbeat alive on a TIMER while `work` runs.
+ *
+ *  WHY A TIMER AND NOT MORE CALLS. `heartbeatTimeout` is how long Temporal waits before declaring
+ *  an activity dead, and the only heartbeats during a transcription fired BETWEEN chunks — so the
+ *  real gap was the wall time of ONE 600-second chunk. That made a liveness timeout into an
+ *  accidental throughput limit: a slower provider, or one busy machine, and a perfectly healthy
+ *  transcription is killed and started again from the beginning.
+ *
+ *  It mattered less while a single fast cloud provider bounded the gap. It stops being an
+ *  abstraction the moment any local server is in the list, because the gap becomes a property of
+ *  somebody's hardware. With this, progress reporting and liveness go back to being separate
+ *  things: `onProgress` still says how far along we are, and the heartbeat says the worker is
+ *  alive — which is the only question the timeout was ever asking.
+ *
+ *  `note()` is read at each tick rather than captured, so the heartbeat carries the CURRENT step
+ *  and a stalled activity says which chunk it stalled on. */
+async function beating<T>(note: () => string, work: () => Promise<T>): Promise<T> {
+  const ctx = Context.current();
+  const timer = setInterval(() => {
+    // Never let the keep-alive be what fails the activity: outside an activity context, or once
+    // cancellation has begun, heartbeating throws and the real work is still fine.
+    try {
+      ctx.heartbeat(note());
+    } catch {
+      /* the work below is what matters */
+    }
+  }, 15_000);
+  // `unref` so a pending timer can never hold the worker process open at shutdown.
+  timer.unref?.();
+  try {
+    return await work();
+  } finally {
+    clearInterval(timer);
+  }
+}
+
 export interface VoiceConfig {
   /** Where this agent's recaps are announced: a Slack channel id.
    *
@@ -72,7 +109,14 @@ export interface VoiceConfig {
   brainDir: string;
   /** Push URL carrying the credential — used for one command, never left on disk. */
   pushUrl: string;
-  groqKey: string;
+  /** Who transcribes, in order of preference. A LIST because one key was three separate
+   *  impossibilities: no tenant could bring its own transcription, a rotated key killed every
+   *  meeting while a working spare sat unused, and there was nowhere to put a local server. */
+  transcribe: inference.Provider[];
+  /** Who summarises. A SEPARATE list, because it is a different job with a different constraint:
+   *  the transcription tier's 8000-token context cannot summarise a 62-minute meeting at any
+   *  price, and that is a fact about the summariser, not about the audio. */
+  summarize: inference.Provider[];
   vocab: string;
   /** Where a half-finished transcription keeps the chunks it already paid for, so a retry resumes.
    *  On the volume rather than in memory, because the thing being survived is a process that died
@@ -250,15 +294,26 @@ export function makeActivities(deps: TurnDeps) {
       ctx.heartbeat("transcribing");
       // Per chunk, not per recording: a long meeting is many uploads, and a heartbeat only at the
       // start would let Temporal declare a perfectly healthy transcription dead halfway through.
-      const { text, seconds } = await recap.transcribe(
-        v.creds,
-        rec,
-        v.groqKey,
-        v.vocab,
-        (done, total) => ctx.heartbeat(`transcribing ${done}/${total}`),
-        v.chunkCacheDir,
+      let note = "transcribing";
+      const { text, seconds, by } = await beating(
+        () => note,
+        () =>
+          recap.transcribe(
+            v.creds,
+            rec,
+            v.transcribe,
+            v.vocab,
+            (done, total) => {
+              note = `transcribing ${done}/${total}`;
+              ctx.heartbeat(note);
+            },
+            v.chunkCacheDir,
+          ),
       );
-      console.log(`recap: ${rec.title} transcribed in ${seconds.toFixed(1)}s, ${text.length} chars`);
+      console.log(
+        `recap: ${rec.title} transcribed in ${seconds.toFixed(1)}s, ${text.length} chars` +
+          (by.length ? ` by ${by.join(" + ")}` : " (every chunk came from a previous attempt)"),
+      );
 
       // What was on the calendar around this recording. Gathered BEFORE summarising because the
       // candidates ride that same call — content decides which meeting this was, and it can only
@@ -277,7 +332,10 @@ export function makeActivities(deps: TurnDeps) {
       }
 
       ctx.heartbeat("summarising");
-      const summary = await recap.summarize(text, rec.title, v.groqKey, v.journal, candidates);
+      const summary = await beating(
+        () => "summarising",
+        () => recap.summarize(text, rec.title, v.summarize, v.journal, candidates),
+      );
       // The model may only claim a meeting it was shown. Anything else is no match — a
       // hallucinated meeting name looks entirely correct and files the recap into a series it does
       // not belong to.
@@ -295,7 +353,7 @@ export function makeActivities(deps: TurnDeps) {
         route,
         summary.meeting || summary.highlights?.[0] || summary.summary,
       );
-      const published = await recap.publish(v.brainDir, rec, summary, text, v.pushUrl, v.journal, candidates);
+      const published = await recap.publish(v.brainDir, rec, summary, text, v.pushUrl, v.journal, candidates, by);
       console.log(
         `recap: ${rec.title} ${published ? "published" : "already present"} at ${where.page}` +
           (route ? ` (route ${route}${summary.route && summary.route !== route ? `, model said "${summary.route}"` : ""})` : "") +

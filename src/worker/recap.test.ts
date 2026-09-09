@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { calendarSection, floorFor, isTimestampTitle, joinChunks, overviewMarkdown, pathsFor, redact, resolveMeeting, slugFor, stampFor, titleFor } from "./recap";
+import { budgetTranscript, calendarSection, floorFor, isTimestampTitle, joinChunks, overviewMarkdown, parseRecapJson, pathsFor, redact, resolveMeeting, slugFor, stampFor, titleFor, transcribedBy } from "./recap";
 
 describe("stampFor", () => {
   it("is stable, sortable and unique per minute, so re-processing lands on the same path", () => {
@@ -229,5 +229,68 @@ describe("pathsFor — a matched meeting names the file", () => {
     expect(pathsFor(j, rec, "foley", "API Team Standup").page).toBe(
       "MJ/foley/2026-09-07-0310-api-team-standup.md",
     );
+  });
+});
+
+describe("transcribedBy — the page must not claim a provider that did not serve", () => {
+  it("names the provider that actually transcribed", () => {
+    expect(transcribedBy(["groq"])).toBe("groq");
+  });
+
+  it("names BOTH when a recording fell through mid-way", () => {
+    // A meeting whose first chunks went to a local server and whose rest went to Groq was
+    // transcribed by two different models. Saying only the first is the more comfortable lie.
+    expect(transcribedBy(["local-whisper", "groq"])).toBe("local-whisper + groq");
+  });
+
+  it("says 'not recorded' rather than guessing, when every chunk came from the cache", () => {
+    expect(transcribedBy([])).toMatch(/not recorded/);
+  });
+
+  it("puts whatever it says onto the page, instead of a hardcoded name", () => {
+    const rec = { id: "r1", title: "Standup", stamp: "2026-09-08-1422", startTime: Date.UTC(2026, 8, 8, 14, 22), duration: 329_000 };
+    const page = overviewMarkdown(rec, { summary: "s", highlights: [], decisions: [], followups: [] }, undefined, [], ["local-whisper"]);
+    expect(page).toContain("**Transcribed by:** local-whisper");
+    expect(page).not.toContain("whisper-large-v3-turbo");
+  });
+});
+
+describe("budgetTranscript — keep the END, where the decisions are", () => {
+  it("leaves a normal meeting completely untouched", () => {
+    // A three-hour meeting is ~120k characters, so in practice nothing is ever cut.
+    const t = "x".repeat(1000);
+    expect(budgetTranscript(t)).toBe(t);
+  });
+
+  it("keeps BOTH ends when it must cut, because head-only truncation lost the follow-ups", () => {
+    const t = "START" + "x".repeat(5000) + "END";
+    const out = budgetTranscript(t, 100);
+    expect(out.startsWith("START")).toBe(true);
+    expect(out.endsWith("END")).toBe(true);
+  });
+
+  it("says out loud that the middle is gone, so nobody reads it as a complete transcript", () => {
+    expect(budgetTranscript("x".repeat(5000), 100)).toMatch(/omitted/);
+  });
+});
+
+describe("parseRecapJson — a fenced answer must not discard a paid-for transcription", () => {
+  const recap = { summary: "s", highlights: [], decisions: [], followups: [] };
+
+  it("reads plain JSON", () => {
+    expect(parseRecapJson(JSON.stringify(recap)).summary).toBe("s");
+  });
+
+  it("reads JSON a gateway wrapped in a code fence", () => {
+    // `response_format: json_object` is an OpenAI feature a gateway may honour, emulate, or drop.
+    expect(parseRecapJson("```json\n" + JSON.stringify(recap) + "\n```").summary).toBe("s");
+  });
+
+  it("reads JSON with a sentence in front of it", () => {
+    expect(parseRecapJson("Here you go: " + JSON.stringify(recap)).summary).toBe("s");
+  });
+
+  it("still fails loudly when there is no JSON at all", () => {
+    expect(() => parseRecapJson("I could not summarise this.")).toThrow(/did not return JSON/);
   });
 });

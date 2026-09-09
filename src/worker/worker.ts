@@ -40,6 +40,8 @@ import * as gate from "./authgate";
 import * as secondbrain from "./secondbrain";
 import * as recapFloor from "./recap";
 import { describe as describeVoice, voiceSettings } from "./flowcfg";
+import * as flowcfg from "./flowcfg";
+import * as inference from "./inference";
 import * as calendar from "./calendar";
 import { serveWake } from "./wake";
 import { promises as fsp } from "node:fs";
@@ -91,6 +93,93 @@ async function resolveRef(ref: string | null | undefined): Promise<string> {
   } catch {
     return "";
   }
+}
+
+const GROQ_V1 = "https://api.groq.com/openai/v1";
+const trimSlash = (u: string): string => u.replace(/[/]+$/, "");
+
+/** The registry's provider rows, with each key ref resolved. The ONLY place a ref becomes a
+ *  credential, which is what lets `providerSpecs` stay pure.
+ *
+ *  A row whose `key_ref` is named but resolves to nothing is DROPPED, not sent unauthenticated. An
+ *  unmounted secret is a deployment fault, and turning it into a 401 from Groq spends an attempt to
+ *  produce a message that blames the wrong thing. */
+async function providersFrom(specs: flowcfg.ProviderSpec[], who: string): Promise<inference.Provider[]> {
+  const out: inference.Provider[] = [];
+  for (const sp of specs) {
+    const apiKey = sp.keyRef ? await resolveRef(sp.keyRef) : "";
+    if (sp.keyRef && !apiKey) {
+      console.log(`worker: ${who} provider ${sp.name} skipped — ${sp.keyRef} is empty or unmounted`);
+      continue;
+    }
+    out.push({
+      name: sp.name,
+      baseUrl: sp.url,
+      model: sp.model,
+      apiKey: apiKey || undefined,
+      timeoutMs: sp.timeoutMs,
+      biasesWithPrompt: sp.biases,
+    });
+  }
+  return out;
+}
+
+/** What a tenant with no provider rows gets. GROQ, AND GROQ ONLY.
+ *
+ *  This is the line where a product differs from one person's setup. A local server at
+ *  `host.containers.internal:8181` is meaningful on exactly one laptop, resolves nowhere in a
+ *  cluster, and would be somebody else's meetings going to a machine they have never heard of — so
+ *  it is included only when a deployment explicitly names one, and a tenant that wants it puts it
+ *  in its own rows. */
+function envTranscribe(env: NodeJS.ProcessEnv): inference.Provider[] {
+  const model = env.GROQ_MODEL || "whisper-large-v3-turbo";
+  const out: inference.Provider[] = [];
+  // A SECOND key is not redundancy for its own sake: a rotated or exhausted first key otherwise
+  // kills every meeting while a working key sits unused in the same deployment.
+  for (const [name, apiKey] of [
+    ["groq", env.GROQ_API_KEY],
+    ["groq-2", env.GROQ_API_KEY_2],
+  ] as const) {
+    if (apiKey) out.push({ name, baseUrl: GROQ_V1, model, apiKey, biasesWithPrompt: true });
+  }
+  if (env.WHISPER_LOCAL_URL) {
+    out.push({
+      name: env.WHISPER_LOCAL_NAME || "local-whisper",
+      baseUrl: trimSlash(env.WHISPER_LOCAL_URL),
+      model: env.WHISPER_LOCAL_MODEL || "whisper-1",
+      // faster-whisper's OpenAI-compatible server accepts `prompt` and ignores it. Saying so here is
+      // what stops the recap page claiming a vocabulary-corrected transcript it never got.
+      biasesWithPrompt: false,
+    });
+  }
+  return out;
+}
+
+/** Who summarises. A SEPARATE list from transcription, because the constraint is different: the
+ *  transcription tier's 8000-token context cannot summarise a 62-minute meeting at any price, and
+ *  that is the 413 that made yesterday's longest recordings impossible rather than slow.
+ *
+ *  Groq stays BEHIND whatever is configured, so a deployment that sets nothing keeps working
+ *  exactly as it did. */
+function envSummarize(env: NodeJS.ProcessEnv): inference.Provider[] {
+  const out: inference.Provider[] = [];
+  if (env.SUMMARY_BASE_URL && env.SUMMARY_MODEL) {
+    out.push({
+      name: env.SUMMARY_NAME || "summary",
+      baseUrl: trimSlash(env.SUMMARY_BASE_URL),
+      model: env.SUMMARY_MODEL,
+      apiKey: env.SUMMARY_API_KEY || undefined,
+    });
+  }
+  if (env.GROQ_API_KEY) {
+    out.push({
+      name: "groq",
+      baseUrl: GROQ_V1,
+      model: env.GROQ_TEXT_MODEL || "openai/gpt-oss-120b",
+      apiKey: env.GROQ_API_KEY,
+    });
+  }
+  return out;
 }
 
 /**
@@ -417,7 +506,6 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
     // agent that has just stopped being "waiting for a login" must not stay in disabledFlows.
     voiceCreds.delete(name);
     disabledFlows.delete(name);
-    const groqKey = process.env.GROQ_API_KEY;
     const src = a.cfg.secondbrain?.[0];
     // Per agent, from the REGISTRY: which channel, which folder, which routes. The environment is
     // only a fallback for a tenant that has no rows yet — a deployment is the wrong place for
@@ -448,10 +536,30 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
       disabledFlows.add(name);
       return;
     }
-    if (!groqKey || !src) {
-      console.log(`worker: ${name} has no voice flow (needs GROQ_API_KEY and a second-brain source)`);
+    // WHO transcribes and WHO summarises, per tenant. Registry rows win outright; the environment
+    // is the fallback for a tenant that has no rows yet. That order is the whole point: a
+    // deployment stops being where "which model hears my meetings" lives.
+    const rows = a.cfg.flows?.voice ?? {};
+    const rowTranscribe = flowcfg.providerSpecs(rows, "transcribe");
+    const rowSummarize = flowcfg.providerSpecs(rows, "summarize");
+    const transcribe = rowTranscribe.length
+      ? await providersFrom(rowTranscribe, name)
+      : envTranscribe(process.env);
+    const summarize = rowSummarize.length ? await providersFrom(rowSummarize, name) : envSummarize(process.env);
+    if (transcribe.length === 0 || !src) {
+      console.log(
+        `worker: ${name} has no voice flow (needs a transcription provider — transcribe.* rows or GROQ_API_KEY — and a second-brain source)`,
+      );
       return;
     }
+    if (summarize.length === 0) {
+      console.log(`worker: ${name} has no voice flow (needs a summariser — summarize.* rows or GROQ_API_KEY)`);
+      return;
+    }
+    console.log(
+      `worker: ${name} voice inference — transcribe ${transcribe.map((x) => x.name).join(" → ")}` +
+        `, summarize ${summarize.map((x) => x.name).join(" → ")}`,
+    );
     // How far back the poll may reach. "Not in the second brain" is NOT the same question as
     // "should be transcribed": without a floor the first poll backfills the customer's entire
     // Plaud history and announces each old meeting in Slack as if it had just happened.
@@ -501,7 +609,8 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
       // a container does not. Per agent, because a recording id is only unique within an account.
       chunkCacheDir: path.join(process.env.TONOMAN_STATE_ROOT ?? "/root/.tonoman", "chunks", name),
       pushUrl,
-      groqKey,
+      transcribe,
+      summarize,
       floorMs,
       vocab:
         process.env.GROQ_PROMPT ??

@@ -110,6 +110,69 @@ export function voiceSettings(props: Record<string, string> = {}, env: NodeJS.Pr
   };
 }
 
+/** One inference provider as the registry holds it — the key still a REF, never the key itself.
+ *
+ *  That separation is the point: `flowcfg` stays pure and testable because it never reads a secret,
+ *  and the one place that can turn a ref into a credential is the worker. A pure function that
+ *  quietly needed the filesystem would be neither. */
+export interface ProviderSpec {
+  /** For the log and the recap's provenance line. Defaults to the row index if nobody named it. */
+  name: string;
+  /** The OpenAI-compatible root, the part before `/audio/transcriptions`. */
+  url: string;
+  model: string;
+  keyRef: string;
+  /** Whether this provider biases its vocabulary from `prompt`. Groq does; a local faster-whisper
+   *  server accepts the field and ignores it, which is a real difference in proper nouns. */
+  biases: boolean;
+  timeoutMs?: number;
+}
+
+/**
+ * A tenant's providers for one job, in the order it wants them tried.
+ *
+ * Rows are `<job>.<n>.<field>`, so adding a fallback is an INSERT and reordering is an UPDATE:
+ *
+ *   transcribe.1.url    https://api.groq.com/openai/v1
+ *   transcribe.1.model  whisper-large-v3-turbo
+ *   transcribe.1.key_ref  recap-secrets:GROQ_API_KEY
+ *   transcribe.2.url    http://host.containers.internal:8181/v1
+ *
+ * SORTED NUMERICALLY, which is not fussiness: `localeCompare` puts "10" before "2", so a customer
+ * who added a tenth provider would find their order silently rearranged — and the symptom is a bill
+ * from the wrong provider, not an error.
+ *
+ * A row group with no `url` or no `model` is DROPPED rather than defaulted. Guessing an endpoint
+ * for a half-written row means sending a customer's meeting somewhere they did not name.
+ */
+export function providerSpecs(props: Record<string, string> = {}, job = "transcribe"): ProviderSpec[] {
+  const groups = new Map<number, Record<string, string>>();
+  for (const [k, v] of Object.entries(props)) {
+    // Split rather than match. A regex built from a template literal is one missed backslash away
+    // from `\d` meaning the letter d, and it would parse nothing while looking entirely correct.
+    const parts = k.split(".");
+    if (parts.length !== 3 || parts[0] !== job || !v.trim()) continue;
+    const n = Number(parts[1]);
+    if (!Number.isInteger(n)) continue;
+    const g = groups.get(n) ?? {};
+    g[parts[2]!] = v.trim();
+    groups.set(n, g);
+  }
+  return [...groups.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([n, g]) => ({
+      name: g.name ?? `${job}-${n}`,
+      url: (g.url ?? "").replace(/[/]+$/, ""),
+      model: g.model ?? "",
+      keyRef: g.key_ref ?? "",
+      // Default TRUE: every hosted provider does, and assuming it does not would silently drop the
+      // vocabulary hints on the one that does.
+      biases: (g.biases ?? "true").toLowerCase() !== "false",
+      timeoutMs: g.timeout_seconds ? num(g.timeout_seconds, 0) * 1000 || undefined : undefined,
+    }))
+    .filter((p) => p.url && p.model);
+}
+
 /** A one-line summary for the boot log. What is configured is worth saying out loud: a flow that
  *  silently files everything under `unclassified` looks identical to one that is working. */
 export function describe(v: VoiceSettings): string {
