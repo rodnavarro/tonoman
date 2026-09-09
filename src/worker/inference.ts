@@ -228,13 +228,28 @@ export async function transcribeWith(
         continue;
       }
       const j = (await r.json()) as { text?: string };
+      const text = j.text ?? "";
+      // NOTHING IS NOT AN ANSWER — not from ONE provider, anyway. A 200 carrying an empty
+      // transcript is a success by every measure the HTTP layer has, and it is how a provider fails
+      // most quietly: the recording is "transcribed", the recap is written, and the page says the
+      // meeting contained nothing. Observed for real — `large-v3` returns nothing on near-silent
+      // audio while Groq hallucinates "Thank you" forty times over the same 13 minutes.
+      //
+      // So an empty answer costs that provider its turn and the next one is asked. If EVERY
+      // provider hears nothing, that is evidence rather than a fault, and the caller is told so
+      // below rather than being handed an exception.
+      if (!text.trim() && i < providers.length - 1) {
+        attempts.push({ provider: p.name, kind: "server", message: `${p.name} transcribe: 200 but no speech transcribed` });
+        opts.log?.(`inference: ${p.name} returned an empty transcript for ${path.basename(file)} — asking ${providers[i + 1]!.name}`);
+        continue;
+      }
       // SAID OUT LOUD when it was not the first choice. A fallback that never announces itself hides
       // a dead GPU while the paid provider quietly picks up the bill — the failure still "works",
       // which is why it can run for a month unnoticed.
       if (i > 0) {
         opts.log?.(`inference: transcribe fell through to ${p.name} — ${attempts.map((a) => a.message).join(" | ")}`);
       }
-      return { value: j.text ?? "", provider: p };
+      return { value: text, provider: p };
     } catch (e) {
       const why = timedOut(e) ? `no response in ${Math.round(wait / 1000)}s` : ((e as Error).message ?? "transport error");
       attempts.push({ provider: p.name, kind: "transport", message: `${p.name} transcribe: ${why}` });

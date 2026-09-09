@@ -319,6 +319,31 @@ export function makeActivities(deps: TurnDeps) {
           (by.length ? ` by ${by.join(" + ")}` : " (every chunk came from a previous attempt)"),
       );
 
+      // A RECORDING WITH NO SPEECH IN IT IS NOT A MEETING TO FILE.
+      //
+      // Summarising nothing does not fail — it produces a confident page explaining that the
+      // meeting contained no substantive discussion, filed under `unclassified`, indistinguishable
+      // from a real recap of a bad meeting. That is worse than no page at all: it is a knowledge
+      // base entry asserting something about an hour of somebody's life, derived from silence.
+      //
+      // Left UNPUBLISHED on purpose, so it is picked up again if a provider that can hear it is
+      // added later — `unpublished()` answers from the checkout, so nothing is written and nothing
+      // is forgotten.
+      if (!text.trim()) {
+        console.log(`recap: ${rec.title} — every provider transcribed silence; not publishing`);
+        // Said verbatim rather than through a turn: the sentence is already known, and the person
+        // was told two minutes ago that this recording was being processed. Silence here would read
+        // as the pipeline having lost it.
+        await deps
+          .say?.(
+            input.agent,
+            input.notify,
+            `I couldn't get any speech out of “${rec.title}” — every transcriber returned nothing, so I've left it unprocessed rather than file a recap made out of silence.`,
+          )
+          .catch(() => {});
+        return;
+      }
+
       // What was on the calendar around this recording. Gathered BEFORE summarising because the
       // candidates ride that same call — content decides which meeting this was, and it can only
       // decide between things it has been shown.

@@ -415,13 +415,19 @@ export async function transcribe(
       // Sequential on purpose: the chunks are one conversation, and a rate-limited burst would
       // fail a whole meeting to save a few seconds on one.
       // Said before the request, not after: when a chunk is REFUSED, this is the only record of
-      // how much audio we asked for, and that is exactly the number the limiter is counting.
-      console.log(`recap: ${rec.title} — chunk ${i + 1}/${parts.length}, ${Math.round(durations[i] ?? 0)}s → groq`);
       // An empty list after filtering means every provider looked dead, which is far more likely to
       // be this machine's network than all of them being down — so ask everyone again rather than
       // fail a meeting on the strength of one blip.
       const live = providers.filter((x) => !dead.includes(x.name));
-      const served = await transcribeWith(live.length ? live : providers, file, vocab, {
+      const asking = live.length ? live : providers;
+      // Said BEFORE the request, not after: when a chunk is REFUSED this is the only record of how
+      // much audio we asked for, and that is exactly the number the limiter is counting. It names
+      // the ORDER rather than one provider, because which one answers is not known until one does —
+      // this line said "groq" unconditionally, which stopped being true the day a second existed.
+      console.log(
+        `recap: ${rec.title} — chunk ${i + 1}/${parts.length}, ${Math.round(durations[i] ?? 0)}s → ${asking.map((x) => x.name).join(" → ")}`,
+      );
+      const served = await transcribeWith(asking, file, vocab, {
         onDead: (n) => { dead = [...dead, n]; },
         log: (line) => console.log(line),
       });

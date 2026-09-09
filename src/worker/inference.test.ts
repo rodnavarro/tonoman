@@ -233,6 +233,25 @@ describe("transcribeWith — asking each provider in turn", () => {
     expect(served.provider.name).toBe("groq");
   });
 
+  it("treats an EMPTY transcript as a non-answer and asks the next provider", async () => {
+    // A 200 carrying no text is a success by every measure the HTTP layer has, and it is how a
+    // provider fails most quietly: the recording is "transcribed", a recap is written, and the page
+    // reports that the meeting contained nothing.
+    vi.stubGlobal("fetch", async (url: string) => (url.startsWith("https://mute") ? ok("") : ok("real words")));
+    const served = await transcribeWith([P("mute"), P("groq")], await withAudio(), "");
+    expect(served.value).toBe("real words");
+    expect(served.provider.name).toBe("groq");
+  });
+
+  it("accepts silence once EVERY provider has heard it — nothing is a real answer", async () => {
+    // Observed for real: large-v3 returns nothing on near-silent audio while Groq hallucinates
+    // "Thank you" forty times. When they all hear nothing, that is evidence, not a fault, and
+    // throwing here would retry a recording that is genuinely silent until Temporal gave up.
+    vi.stubGlobal("fetch", async () => ok("   "));
+    const served = await transcribeWith([P("a"), P("b")], await withAudio(), "");
+    expect(served.value.trim()).toBe("");
+  });
+
   it("throws with EVERY provider's answer once none of them served", async () => {
     vi.stubGlobal("fetch", async () => bad(500, "upstream is unwell"));
     await expect(transcribeWith([P("local"), P("groq")], await withAudio(), "")).rejects.toThrow(/local.*groq/s);
