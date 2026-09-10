@@ -90,6 +90,10 @@ export interface AgentConfig {
    *  tenant (`axiplex-sapien`) to key one worker's many agents. Renaming an agent changes this, and
    *  the worker carries it into the agent's context so a rename reaches how it introduces itself. */
   displayName?: string;
+  /** The tenant slug this agent belongs to (`axiplex`, `murphy`). Carried so the worker can render
+   *  a readable label — `${tenant}-${displayName}` — in logs and match TONOMAN_AGENTS, now that
+   *  `name` is the stable guid rather than the tenant-prefixed display name. */
+  tenant?: string;
   role?: string;
   harness?: string;
   container: string;

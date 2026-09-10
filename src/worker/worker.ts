@@ -260,8 +260,9 @@ interface Wired {
  *  what makes "run the one I am changing locally, leave the customer's on the cluster" safe rather
  *  than a coin flip.
  *
- *  Names are the ROSTER names — `axiplex-sapien`, `murphy-nelly` — because that is what the logs
- *  say and what somebody will copy. */
+ *  Names are the tenant-prefixed display names — `axiplex-sapien`, `murphy-nelly` — because that is
+ *  what the logs say and what somebody will copy. `wire()` also matches an agent's guid and its bare
+ *  display name, so the guid a boot log prints works here too. */
 export function agentsAllowed(names: string | undefined): Set<string> {
   return new Set(
     (names ?? "")
@@ -275,28 +276,37 @@ function wire(cfg: Config, only: Set<string> = new Set()): Map<string, Wired> {
   const harnesses = defaultHarnesses();
   const out = new Map<string, Wired>();
   for (const a of cfg.agents ?? []) {
-    if (only.size > 0 && !only.has(a.name.toLowerCase())) {
+    // `a.name` is now the stable guid (registry roster). What a person reads in a log or types into
+    // TONOMAN_AGENTS is the tenant-prefixed display name, so every human-facing line uses `label`
+    // while the machine keys off `a.name`. Falls back to the name for a file roster with no tenant.
+    const label = a.tenant ? `${a.tenant}-${a.displayName ?? a.name}` : (a.displayName ?? a.name);
+    if (
+      only.size > 0 &&
+      !only.has(a.name.toLowerCase()) &&
+      !only.has(label.toLowerCase()) &&
+      !only.has((a.displayName ?? "").toLowerCase())
+    ) {
       // Said out loud rather than skipped quietly: "why is my agent not answering" is otherwise
       // answered only by remembering an environment variable somebody set days ago.
-      console.log(`worker: not serving ${a.name} — TONOMAN_AGENTS does not list it`);
+      console.log(`worker: not serving ${label} — TONOMAN_AGENTS does not list it`);
       continue;
     }
     const channel = a.channel ?? (a.slack ? "slack" : a.teams ? "teams" : "telegram");
     if (channel !== "slack") {
-      console.error(`worker: skipping ${a.name} — channel "${channel}" has no worker connector yet`);
+      console.error(`worker: skipping ${label} — channel "${channel}" has no worker connector yet`);
       continue;
     }
     const appToken = a.slack?.app_token || process.env.SLACK_APP_TOKEN || "";
     const botToken = a.slack?.bot_token || process.env.SLACK_BOT_TOKEN || "";
     if (!appToken || !botToken) {
-      console.error(`worker: skipping ${a.name} — missing ${!botToken ? "bot" : "app"} token`);
+      console.error(`worker: skipping ${label} — missing ${!botToken ? "bot" : "app"} token`);
       continue;
     }
     const conn = new SlackConnector({ appToken, botToken, allowedUsers: a.slack?.allowed_users });
 
     const spec = harnesses.lookup(a.harness ?? "claude-code");
     if (!spec?.newRunner) {
-      console.error(`worker: skipping ${a.name} — harness "${a.harness}" cannot run turns`);
+      console.error(`worker: skipping ${label} — harness "${a.harness}" cannot run turns`);
       continue;
     }
     // No container: the pod is the sandbox (an agent is a row, not a container).
@@ -1104,6 +1114,12 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
   });
   const serving = worker.run();
   console.log(`worker: serving ${o.taskQueue} on ${o.address}/${o.namespace} — ${wired.size} agent(s)`);
+  // The map from the guid keys (what every other log line and workflow id now carries) back to the
+  // names a person recognises. Printed once, so a `f89e0934-…` anywhere below can be read.
+  for (const [key, a] of wired) {
+    const label = a.cfg.tenant ? `${a.cfg.tenant}-${a.cfg.displayName ?? key}` : (a.cfg.displayName ?? key);
+    if (key !== label) console.log(`worker:   ${label} = ${key}`);
+  }
 
   // Ingress: each connector yields envelopes; each becomes a signal. The connector does nothing
   // else — the durability boundary starts at signalWithStart.

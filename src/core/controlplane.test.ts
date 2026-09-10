@@ -51,12 +51,17 @@ describe("RegistryControlPlane", () => {
     expect(cfg.agents[0]!.slack).toMatchObject({ bot_token: "xoxb-real", app_token: "xapp-real" });
   });
 
-  it("namespaces the agent by tenant, so two tenants may both name an agent the same", async () => {
+  it("keys the agent by its stable guid, not the mutable tenant-name — a rename never re-keys it", async () => {
     await putSecret("acme-slack", "SLACK_BOT_TOKEN", "b");
     await putSecret("acme-slack", "SLACK_APP_TOKEN", "a");
     const cfg = await plane([base]).roster();
-    expect(cfg.agents[0]!.name).toBe("acme-nova");
+    // `name` is the guid — what the worker keys the wired map, the sessions, the credential dir and
+    // the Temporal inputs off, so renaming the agent (which changes only `displayName`) moves none
+    // of it. The tenant-prefixed name a person reads lives on as displayName + tenant.
+    expect(cfg.agents[0]!.name).toBe("g1");
     expect(cfg.agents[0]!.guid).toBe("g1");
+    expect(cfg.agents[0]!.displayName).toBe("nova");
+    expect(cfg.agents[0]!.tenant).toBe("acme");
   });
 
   it("skips ONE agent with an unresolvable credential rather than failing the whole roster", async () => {
@@ -72,7 +77,9 @@ describe("RegistryControlPlane", () => {
     };
     // `base` points at a secret that was never written.
     const cfg = await plane([base, good]).roster();
-    expect(cfg.agents.map((a) => a.name)).toEqual(["globex-scout"]);
+    // The survivor, keyed by its guid; `base` was dropped for its unresolvable credential.
+    expect(cfg.agents.map((a) => a.name)).toEqual(["g2"]);
+    expect(cfg.agents.map((a) => `${a.tenant}-${a.displayName}`)).toEqual(["globex-scout"]);
   });
 
   it("refuses a ref that tries to climb out of the secrets mount", async () => {

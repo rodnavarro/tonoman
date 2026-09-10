@@ -185,12 +185,18 @@ export class RegistryControlPlane implements ControlPlane {
 
     const agents: AgentConfig[] = [];
     for (const a of body.agents) {
-      // Namespaced by tenant, because two tenants may both call an agent "nelly" and the roster is
-      // flat. The guid stays the identity everywhere it matters.
-      const localName = `${a.tenant}-${a.name}`;
+      // The agent's STABLE identity is its guid, and that is now what keys the worker end to end —
+      // the `wired` map, the Temporal workflow inputs, the session store, the on-disk credential and
+      // identity dirs. It was `${a.tenant}-${a.name}`, which changed the moment somebody renamed the
+      // agent: the rename re-keyed everything and orphaned the login on disk. The guid never moves,
+      // so a rename is now invisible to the worker's plumbing and reaches only how the agent calls
+      // itself (displayName). The tenant-prefixed name lives on as `label`, for logs and the
+      // TONOMAN_AGENTS filter, where a human — not the machine — is the reader.
+      const label = `${a.tenant}-${a.name}`;
+      const localName = a.guid || label;
 
       if (a.channel !== "slack") {
-        console.error(`registry: skipping ${localName} — channel "${a.channel}" is not wired here yet`);
+        console.error(`registry: skipping ${label} — channel "${a.channel}" is not wired here yet`);
         continue;
       }
       const [botToken, appToken] = await Promise.all([
@@ -200,7 +206,7 @@ export class RegistryControlPlane implements ControlPlane {
       if (!botToken || !appToken) {
         // One agent's missing credential must not take the whole gateway down with it.
         console.error(
-          `registry: skipping ${localName} — could not resolve ${!botToken ? "bot" : "app"} token ` +
+          `registry: skipping ${label} — could not resolve ${!botToken ? "bot" : "app"} token ` +
             `(looked under ${this.secretsDir})`,
         );
         continue;
@@ -212,9 +218,12 @@ export class RegistryControlPlane implements ControlPlane {
         guid: a.guid,
         name: localName,
         // The tenant's own name for the agent, unprefixed — what it calls itself. `name` above is
-        // prefixed to key one worker's agents; this is the one a person set and can rename, and the
-        // same whitelist hazard applies: added at both ends, dropped here, it would vanish.
+        // now the guid; this is the one a person set and can rename, and the same whitelist hazard
+        // applies: added at both ends, dropped here, it would vanish.
         displayName: a.name,
+        // The tenant slug, carried so the worker can render the readable `${tenant}-${displayName}`
+        // label in logs and match TONOMAN_AGENTS — the human-facing name that `name` used to be.
+        tenant: a.tenant,
         // Empty on purpose: no per-agent container, because the pod is the sandbox. The harness
         // reads this to choose local-exec over `podman exec`.
         container: "",
