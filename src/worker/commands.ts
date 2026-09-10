@@ -55,6 +55,25 @@ export const KNOWN = [
  *  imaginary in practice, which is worse than not having it. */
 const PREFIX = /^!/;
 
+/** Turn a marketing model name into the CLI alias the harness understands.
+ *
+ *  The Hub labels the models "Claude Opus 5", "Claude Sonnet 5", "Claude Haiku 4.5", so a person in
+ *  Slack reasonably types `!model opus-5` (or "Opus 5", "opus5") — and the Claude CLI knows `opus`,
+ *  not `opus-5`, so that guess used to strand the whole conversation on a model that does not exist,
+ *  reported only as a cryptic "unrecognized_model" on the next turn. So a generation-suffixed family
+ *  name collapses to its alias here. A full `claude-…` id, a Bedrock profile, or anything that is not
+ *  one of the three families passes through UNCHANGED — the harness still owns the real list, and an
+ *  advanced or unknown name still surfaces the harness's own error rather than a guess at it. */
+export function canonicalModel(raw: string): string {
+  const s = raw.trim();
+  const low = s.toLowerCase().replace(/\s+/g, "");
+  for (const alias of ["opus", "sonnet", "haiku"]) {
+    // `opus`, `opus5`, `opus-5`, `opus.4.8` → `opus`; a bare family name matches too.
+    if (low === alias || new RegExp(`^${alias}[._-]?\\d`).test(low)) return alias;
+  }
+  return s;
+}
+
 /** PURE: strip the FORMATTING off a line so the command inside it can be seen.
  *
  *  Slack delivers markdown source, not rendered text, so a message typed as code arrives as
@@ -401,11 +420,14 @@ export async function run(
         deps.setModel(agent, conversation, undefined);
         return "🧠 Back to the default model from the next message.";
       }
-      deps.setModel(agent, conversation, cmd.arg);
-      // Deliberately not validated here: the harness owns the list of valid names, and an invalid
-      // one surfaces on the next turn as the harness's own error rather than as our guess at it.
-      // Scoped to THIS conversation — it does not move anybody else's model.
-      return `🧠 Model set to *${cmd.arg}* for this conversation — from the next message.`;
+      // Marketing name → CLI alias, so `!model opus-5` (a reasonable read of the Hub's "Claude Opus
+      // 5") means `opus` rather than a model that does not exist. A full `claude-…` id or an unknown
+      // name still passes through and surfaces the harness's own error — the harness owns the real
+      // list; this only rescues the family names a person actually types. Scoped to THIS conversation.
+      const model = canonicalModel(cmd.arg);
+      deps.setModel(agent, conversation, model);
+      const note = model !== cmd.arg.trim() ? ` (\`${cmd.arg.trim()}\` → \`${model}\`)` : "";
+      return `🧠 Model set to *${model}* for this conversation${note} — from the next message.`;
     }
 
     case "connections": {

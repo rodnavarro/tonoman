@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { parse, run, splitConnector, type CommandDeps, undecorate, CONNECT_KINDS, mergeConnections } from "./commands";
+import { parse, run, splitConnector, type CommandDeps, undecorate, CONNECT_KINDS, mergeConnections, canonicalModel } from "./commands";
 import type { StatusMode } from "../statusline";
 
 describe("parse", () => {
@@ -413,5 +413,41 @@ describe("mergeConnections", () => {
       [{ kind: "plaud", alias: "default" }],
     );
     expect(merged.map((c) => `${c.kind}/${c.alias}`)).toEqual(["google/work", "google/personal", "plaud/default"]);
+  });
+});
+
+describe("canonicalModel", () => {
+  it("collapses a marketing name to the CLI alias — the opus-5 footgun", () => {
+    // The exact string a person typed off the Hub's "Claude Opus 5" label, which the CLI rejects.
+    expect(canonicalModel("opus-5")).toBe("opus");
+    expect(canonicalModel("Opus 5")).toBe("opus");
+    expect(canonicalModel("opus5")).toBe("opus");
+    expect(canonicalModel("sonnet-5")).toBe("sonnet");
+    expect(canonicalModel("haiku 4.5")).toBe("haiku");
+  });
+
+  it("leaves the bare aliases alone", () => {
+    for (const a of ["opus", "sonnet", "haiku"]) expect(canonicalModel(a)).toBe(a);
+  });
+
+  it("passes a full claude- id and anything unknown through unchanged — the harness owns the list", () => {
+    expect(canonicalModel("claude-opus-5")).toBe("claude-opus-5");
+    expect(canonicalModel("us.anthropic.claude-sonnet-4-6")).toBe("us.anthropic.claude-sonnet-4-6");
+    expect(canonicalModel("banana")).toBe("banana");
+  });
+});
+
+describe("run — !model normalises the marketing name", () => {
+  const base = (over: Partial<CommandDeps> = {}): CommandDeps => ({
+    status: async () => "",
+    setModel: () => {},
+    getModel: () => "sonnet",
+    ...over,
+  });
+  it("sets opus, not opus-5, and says so", async () => {
+    const setModel = vi.fn();
+    const out = await run(base({ setModel }), "sapien", "t", { name: "model", arg: "opus-5" });
+    expect(setModel).toHaveBeenCalledWith("sapien", "t", "opus");
+    expect(out).toContain("opus");
   });
 });
