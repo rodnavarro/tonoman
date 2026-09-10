@@ -229,7 +229,15 @@ async function runWorker(cfgPath: string, env: string | undefined): Promise<void
   const stop = () => ac.abort();
   process.on("SIGINT", stop);
   process.on("SIGTERM", stop);
-  await tworker.run(cfg, tworker.workerOptionsFrom(process.env), ac.signal);
+  // How the worker re-fetches the roster to reach a running agent with a Hub edit — the same control
+  // plane and env overrides as the boot load, minus the boot log line (reload logs only what it
+  // actually changes). Quiet on an unchanged roster, which is the common case.
+  const reloadRoster = async (): Promise<Config> => {
+    const c = await controlPlaneFrom(process.env, cfgPath).roster();
+    applyEnv(c, env);
+    return c;
+  };
+  await tworker.run(cfg, tworker.workerOptionsFrom(process.env), ac.signal, reloadRoster);
 }
 
 async function runUp(cfgPath: string, env: string | undefined): Promise<void> {

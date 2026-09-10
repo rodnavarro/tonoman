@@ -49,6 +49,7 @@ import { defaultHarnesses } from "../gateway";
 import { makeActivities, type TurnRunReq, type VoiceConfig } from "./activities";
 import type { Step } from "./skill";
 import { conversationWorkflow, messageSignal, plaudPollWorkflow, type Inbound, type PollInput } from "./workflows";
+import { planReload } from "./reload";
 
 export interface WorkerOptions {
   address: string;
@@ -244,6 +245,17 @@ interface Wired {
   context?: string;
   runner: TurnRunner;
   run: (r: TurnRunReq) => AsyncIterable<TurnEvent>;
+  /** Stops THIS agent's ingress pump on its own, chained to the worker-wide signal so shutdown still
+   *  stops everything. Live reload aborts it to retire a removed agent's connector without touching
+   *  any other; undefined until the pump is started. */
+  abort?: AbortController;
+}
+
+/** The human-facing name for an agent whose stable key (`cfg.name`) is now a guid: the tenant-
+ *  prefixed display name a person reads in a log or types into TONOMAN_AGENTS. Falls back to the
+ *  bare name for a file roster with no tenant. */
+function agentLabel(a: AgentConfig): string {
+  return a.tenant ? `${a.tenant}-${a.displayName ?? a.name}` : (a.displayName ?? a.name);
 }
 
 /** Builds one connector + runner per agent in the roster. An agent whose channel has no connector
@@ -272,14 +284,79 @@ export function agentsAllowed(names: string | undefined): Set<string> {
   );
 }
 
+/** Build a new runner for one agent. Split out because live reload rebuilds a runner in place — when
+ *  `max_turns` or the runtime `url` changes, both of which the harness bakes in at construction — while
+ *  keeping the agent's connector, so no socket reconnects. */
+function newRunnerFor(a: AgentConfig, harnesses: ReturnType<typeof defaultHarnesses>): TurnRunner | null {
+  const spec = harnesses.lookup(a.harness ?? "claude-code");
+  if (!spec?.newRunner) return null;
+  // No container: the pod is the sandbox (an agent is a row, not a container).
+  //
+  // And because the pod is the sandbox, the tools it hands the model are the security boundary.
+  // This pod holds the operator's Claude subscription credential, so a shell here can read the
+  // account behind it — which is exactly what happened: asked who it was talking to, the agent
+  // ran Bash, found the operator's email in the runtime, and told a customer about it. An agent
+  // that answers from meetings and notes has no use for a shell anyway.
+  return spec.newRunner({
+    agent: a.name,
+    container: a.container,
+    model: a.model,
+    maxTurns: a.max_turns,
+    url: a.url,
+    disallowedTools: disallowedTools(),
+  });
+}
+
+/** Wrap a runner in the `run` closure the ingress uses — the model comes per turn (`!model`), so a
+ *  reload that changes only the default model never has to touch the runner. */
+function runClosure(runner: TurnRunner): Wired["run"] {
+  return (r: TurnRunReq, signal?: AbortSignal) =>
+    runner.run(
+      {
+        prompt: r.prompt,
+        systemPromptFile: r.systemPromptFile,
+        model: r.model,
+        sessionId: r.sessionId,
+        sessionNew: r.sessionNew,
+      },
+      signal,
+    );
+}
+
+/** Build the connector + runner for ONE agent, or return null with a logged reason. Shared by the
+ *  boot wiring and by live reload (which wires a newly-added or structurally-changed agent), so the
+ *  skip rules — channel, tokens, harness — are decided in exactly one place. The `only` filter is
+ *  NOT here: it is a boot-time concern of `wire()`, and reload applies it separately. */
+function wireOne(a: AgentConfig, harnesses: ReturnType<typeof defaultHarnesses>): Wired | null {
+  const label = agentLabel(a);
+  const channel = a.channel ?? (a.slack ? "slack" : a.teams ? "teams" : "telegram");
+  if (channel !== "slack") {
+    console.error(`worker: skipping ${label} — channel "${channel}" has no worker connector yet`);
+    return null;
+  }
+  const appToken = a.slack?.app_token || process.env.SLACK_APP_TOKEN || "";
+  const botToken = a.slack?.bot_token || process.env.SLACK_BOT_TOKEN || "";
+  if (!appToken || !botToken) {
+    console.error(`worker: skipping ${label} — missing ${!botToken ? "bot" : "app"} token`);
+    return null;
+  }
+  const conn = new SlackConnector({ appToken, botToken, allowedUsers: a.slack?.allowed_users });
+
+  const runner = newRunnerFor(a, harnesses);
+  if (!runner) {
+    console.error(`worker: skipping ${label} — harness "${a.harness}" cannot run turns`);
+    return null;
+  }
+  return { cfg: a, conn, runner, run: runClosure(runner) };
+}
+
 function wire(cfg: Config, only: Set<string> = new Set()): Map<string, Wired> {
   const harnesses = defaultHarnesses();
   const out = new Map<string, Wired>();
   for (const a of cfg.agents ?? []) {
     // `a.name` is now the stable guid (registry roster). What a person reads in a log or types into
-    // TONOMAN_AGENTS is the tenant-prefixed display name, so every human-facing line uses `label`
-    // while the machine keys off `a.name`. Falls back to the name for a file roster with no tenant.
-    const label = a.tenant ? `${a.tenant}-${a.displayName ?? a.name}` : (a.displayName ?? a.name);
+    // TONOMAN_AGENTS is the tenant-prefixed display name (`label`) while the machine keys off `a.name`.
+    const label = agentLabel(a);
     if (
       only.size > 0 &&
       !only.has(a.name.toLowerCase()) &&
@@ -291,56 +368,8 @@ function wire(cfg: Config, only: Set<string> = new Set()): Map<string, Wired> {
       console.log(`worker: not serving ${label} — TONOMAN_AGENTS does not list it`);
       continue;
     }
-    const channel = a.channel ?? (a.slack ? "slack" : a.teams ? "teams" : "telegram");
-    if (channel !== "slack") {
-      console.error(`worker: skipping ${label} — channel "${channel}" has no worker connector yet`);
-      continue;
-    }
-    const appToken = a.slack?.app_token || process.env.SLACK_APP_TOKEN || "";
-    const botToken = a.slack?.bot_token || process.env.SLACK_BOT_TOKEN || "";
-    if (!appToken || !botToken) {
-      console.error(`worker: skipping ${label} — missing ${!botToken ? "bot" : "app"} token`);
-      continue;
-    }
-    const conn = new SlackConnector({ appToken, botToken, allowedUsers: a.slack?.allowed_users });
-
-    const spec = harnesses.lookup(a.harness ?? "claude-code");
-    if (!spec?.newRunner) {
-      console.error(`worker: skipping ${label} — harness "${a.harness}" cannot run turns`);
-      continue;
-    }
-    // No container: the pod is the sandbox (an agent is a row, not a container).
-    //
-    // And because the pod is the sandbox, the tools it hands the model are the security boundary.
-    // This pod holds the operator's Claude subscription credential, so a shell here can read the
-    // account behind it — which is exactly what happened: asked who it was talking to, the agent
-    // ran Bash, found the operator's email in the runtime, and told a customer about it. An agent
-    // that answers from meetings and notes has no use for a shell anyway.
-    const runner = spec.newRunner({
-      agent: a.name,
-      container: a.container,
-      model: a.model,
-      maxTurns: a.max_turns,
-      url: a.url,
-      disallowedTools: disallowedTools(),
-    });
-
-    out.set(a.name, {
-      cfg: a,
-      conn,
-      runner,
-      run: (r: TurnRunReq, signal?: AbortSignal) =>
-        runner.run(
-          {
-            prompt: r.prompt,
-            systemPromptFile: r.systemPromptFile,
-            model: r.model,
-            sessionId: r.sessionId,
-            sessionNew: r.sessionNew,
-          },
-          signal,
-        ),
-    });
+    const w = wireOne(a, harnesses);
+    if (w) out.set(a.name, w);
   }
   return out;
 }
@@ -405,7 +434,15 @@ export function sessionStore(
   };
 }
 
-export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): Promise<void> {
+export async function run(
+  cfg: Config,
+  o: WorkerOptions,
+  signal: AbortSignal,
+  /** Re-fetch the roster from the same control plane the boot used, applying the same env overrides.
+   *  Provided by the CLI; when absent (a test, or a caller that opts out) the worker serves the boot
+   *  roster forever, exactly as it did before live reload. */
+  reloadRoster?: () => Promise<Config>,
+): Promise<void> {
   const only = agentsAllowed(process.env.TONOMAN_AGENTS);
   if (only.size > 0) {
     console.log(`worker: serving only ${[...only].join(", ")} (TONOMAN_AGENTS)`);
@@ -479,14 +516,18 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
   // fired again into a checkout git was still building and the two processes collided on
   // `.git/shallow.lock` — reported as "failed to sync" for a repository that was in fact fine.
   // Skipping a tick is free; the next one is a minute away.
-  let syncing = false;
+  // One background mutation of `wired` at a time. syncAll clones checkouts and reads `a.cfg`; reload
+  // (below) swaps `a.cfg` and rebuilds runners. Sharing one flag keeps a reload from swapping config
+  // out from under a clone mid-iteration, and keeps two clones off the same `.git/shallow.lock` (the
+  // collision that first taught the guard). A skipped tick is free; the next is a minute away.
+  let busy = false;
   const syncTimer = setInterval(() => {
-    if (syncing) return;
-    syncing = true;
+    if (busy) return;
+    busy = true;
     void syncAll()
       .catch(() => {})
       .finally(() => {
-        syncing = false;
+        busy = false;
       });
   }, syncEvery);
   signal.addEventListener("abort", () => clearInterval(syncTimer), { once: true });
@@ -1123,64 +1164,193 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
 
   // Ingress: each connector yields envelopes; each becomes a signal. The connector does nothing
   // else — the durability boundary starts at signalWithStart.
+  //
+  // One pump per agent, each on its OWN abort chained to the worker signal, so live reload can retire
+  // one agent's connector without disturbing another's. Extracted from the boot loop for the same
+  // reason wireOne was: reload starts a pump for a newly-added or rebuilt agent, and the ingress
+  // logic must be identical whether it is boot or reload that starts it.
   const pumps: Promise<void>[] = [];
-  for (const [name, a] of wired) {
-    pumps.push(
-      (async () => {
-        for await (const env of a.conn.receive(signal)) {
-          // Commands are answered HERE, before the durability boundary: `!status` is a read of
-          // state this process already holds, and routing it through a workflow would queue it
-          // behind — or interrupt — the very turn it is asking about. They are also answered
-          // before the auth gate, so `!help` still works on an agent that cannot yet run turns.
-          const cmd = cmds.parse(env.text);
-          if (cmd) {
-            const out = await cmds.run(commandDeps, name, env.conversation, cmd).catch((e) => {
-              console.error(`worker: ${name} command ${cmd.name} failed: ${(e as Error).message}`);
-              return `I couldn't run that — ${String((e as Error)?.message ?? e).slice(0, 150)}`;
-            });
-            // Null means it is not one of ours. An unknown `!word` is far more likely to be
-            // ordinary emphasis than a typo'd command, so it falls through to a real turn.
-            if (out !== null) {
-              // An EMPTY string means the command already said its piece another way - `!connect
-              // plaud` posts Block Kit buttons itself. Sending "" on top would post a blank
-              // message under them.
-              if (out !== "") await a.conn.reply(env.conversation).send(out).catch(() => {});
-              continue;
-            }
-          }
-          // The registry says this agent has no working inference, so there is nothing to run.
-          // Ask in the channel instead of spending a turn to discover the same thing — and ask
-          // because of a FACT about the agent, not because a file was missing.
-          if (a.cfg.auth_state && a.cfg.auth_state !== "ok") {
-            const asked = await gate.ask(authDeps, name, a.cfg.name ?? name, env.conversation).catch((e) => {
-              console.error(`worker: auth prompt failed for ${name}: ${(e as Error).message}`);
-              return false;
-            });
-            if (asked) console.log(`worker: ${name} asked for an inference login (auth_state=${a.cfg.auth_state})`);
+  const startPump = (name: string, a: Wired): Promise<void> => {
+    const ac = new AbortController();
+    signal.addEventListener("abort", () => ac.abort(), { once: true });
+    a.abort = ac;
+    const pump = (async () => {
+      for await (const env of a.conn.receive(ac.signal)) {
+        // Commands are answered HERE, before the durability boundary: `!status` is a read of
+        // state this process already holds, and routing it through a workflow would queue it
+        // behind — or interrupt — the very turn it is asking about. They are also answered
+        // before the auth gate, so `!help` still works on an agent that cannot yet run turns.
+        const cmd = cmds.parse(env.text);
+        if (cmd) {
+          const out = await cmds.run(commandDeps, name, env.conversation, cmd).catch((e) => {
+            console.error(`worker: ${name} command ${cmd.name} failed: ${(e as Error).message}`);
+            return `I couldn't run that — ${String((e as Error)?.message ?? e).slice(0, 150)}`;
+          });
+          // Null means it is not one of ours. An unknown `!word` is far more likely to be
+          // ordinary emphasis than a typo'd command, so it falls through to a real turn.
+          if (out !== null) {
+            // An EMPTY string means the command already said its piece another way - `!connect
+            // plaud` posts Block Kit buttons itself. Sending "" on top would post a blank
+            // message under them.
+            if (out !== "") await a.conn.reply(env.conversation).send(out).catch(() => {});
             continue;
           }
-          const first: Inbound = { text: env.text, user: env.user, ts: String(Date.now()) };
-          try {
-            // One call whether or not the conversation is already running. Temporal serializes
-            // signals per workflow id, so ordering is free and two people typing at once cannot
-            // interleave two turns.
-            // `first` is deliberately NOT in args. signalWithStart on a workflow that does not yet
-            // exist does BOTH things: it starts the workflow with `args` and delivers the signal.
-            // Passing the message in both places queued it twice and answered every first message
-            // of a conversation twice — observed, not theorised. The signal is the only carrier.
-            await client.workflow.signalWithStart(conversationWorkflow, {
-              workflowId: `${name}:${env.channel}:${env.conversation}`,
-              taskQueue: o.taskQueue,
-              args: [{ agent: name, conversation: env.conversation, channel: env.channel }],
-              signal: messageSignal,
-              signalArgs: [first],
-            });
-          } catch (e) {
-            console.error(`worker: signal failed for ${env.conversation}: ${(e as Error).message}`);
-          }
         }
-      })(),
-    );
+        // The registry says this agent has no working inference, so there is nothing to run.
+        // Ask in the channel instead of spending a turn to discover the same thing — and ask
+        // because of a FACT about the agent, not because a file was missing.
+        if (a.cfg.auth_state && a.cfg.auth_state !== "ok") {
+          const asked = await gate.ask(authDeps, name, a.cfg.name ?? name, env.conversation).catch((e) => {
+            console.error(`worker: auth prompt failed for ${name}: ${(e as Error).message}`);
+            return false;
+          });
+          if (asked) console.log(`worker: ${name} asked for an inference login (auth_state=${a.cfg.auth_state})`);
+          continue;
+        }
+        const first: Inbound = { text: env.text, user: env.user, ts: String(Date.now()) };
+        try {
+          // One call whether or not the conversation is already running. Temporal serializes
+          // signals per workflow id, so ordering is free and two people typing at once cannot
+          // interleave two turns.
+          // `first` is deliberately NOT in args. signalWithStart on a workflow that does not yet
+          // exist does BOTH things: it starts the workflow with `args` and delivers the signal.
+          // Passing the message in both places queued it twice and answered every first message
+          // of a conversation twice — observed, not theorised. The signal is the only carrier.
+          await client.workflow.signalWithStart(conversationWorkflow, {
+            workflowId: `${name}:${env.channel}:${env.conversation}`,
+            taskQueue: o.taskQueue,
+            args: [{ agent: name, conversation: env.conversation, channel: env.channel }],
+            signal: messageSignal,
+            signalArgs: [first],
+          });
+        } catch (e) {
+          console.error(`worker: signal failed for ${env.conversation}: ${(e as Error).message}`);
+        }
+      }
+    })();
+    return pump;
+  };
+  for (const [name, a] of wired) pumps.push(startPump(name, a));
+
+  // Live roster reload (A11, hot-reload). The worker used to read the roster once and never again,
+  // so a Hub edit — a new default model, a granted skill, a rename — reached the running agent only
+  // on a restart. On a timer it re-fetches the roster and applies the DIFFERENCE: an unchanged agent
+  // is left strictly alone (no socket touched), a config change is swapped in for the next turn, and
+  // only a change to a connector's own inputs reconnects anything.
+  const reloadEvery = Number(process.env.ROSTER_RELOAD_SECONDS ?? 30) * 1000;
+  if (reloadRoster && reloadEvery > 0) {
+    const harnesses = defaultHarnesses();
+    const doReload = async (): Promise<void> => {
+      const next = await reloadRoster();
+      const nextAgents = next.agents ?? [];
+      // A roster that came back empty while we are serving agents is an upstream failure, never an
+      // instruction to tear the fleet down. Keep what we have and wait for the next tick.
+      if (nextAgents.length === 0 && wired.size > 0) {
+        console.error("worker: roster reload returned 0 agents — keeping current wiring");
+        return;
+      }
+      // Compare like with like: `wired` holds only servable agents, so filter the incoming roster by
+      // the same TONOMAN_AGENTS allowlist wire() applies at boot before diffing.
+      const servable = nextAgents.filter((a) => {
+        if (only.size === 0) return true;
+        const label = agentLabel(a);
+        return (
+          only.has(a.name.toLowerCase()) ||
+          only.has(label.toLowerCase()) ||
+          only.has((a.displayName ?? "").toLowerCase())
+        );
+      });
+      const current = [...wired.values()].map((w) => w.cfg);
+      const plan = planReload(current, servable);
+      // Losing more than half the fleet in one tick is degradation upstream (a partial roster, a
+      // flaky join), not a mass delete somebody asked for. Refuse it and log loudly.
+      if (wired.size > 1 && plan.removed.length > wired.size / 2 && servable.length < current.length) {
+        console.error(
+          `worker: roster reload would remove ${plan.removed.length}/${wired.size} agents — ` +
+            `ignoring as likely upstream degradation`,
+        );
+        return;
+      }
+      if (plan.added.length === 0 && plan.removed.length === 0 && plan.updated.length === 0) return;
+
+      const byKey = new Map(servable.map((a) => [a.name, a] as const));
+
+      // Removed: stop its pump (its own abort), pause its poll, drop it. A turn in flight dies with
+      // the connector — the same as a restart, and acceptable for a disabled or deleted agent.
+      for (const key of plan.removed) {
+        const a = wired.get(key);
+        if (!a) continue;
+        a.abort?.abort();
+        await pauseVoiceSchedule(key, "agent left the roster").catch(() => {});
+        wired.delete(key);
+        console.log(`worker: reload — retired ${agentLabel(a.cfg)} (${key})`);
+      }
+
+      // Added: wire it, start its pump, wire its voice. A newly created agent appears here the reload
+      // after its Slack setup completes — the roster lists only enabled, channel-bound agents.
+      for (const key of plan.added) {
+        const cfg2 = byKey.get(key);
+        if (!cfg2) continue;
+        const w = wireOne(cfg2, harnesses);
+        if (!w) continue; // wireOne logged why (channel, tokens, harness)
+        wired.set(key, w);
+        pumps.push(startPump(key, w));
+        await wireVoice(key, w).catch((e) => console.error(`worker: reload — wireVoice ${key} failed: ${(e as Error).message}`));
+        console.log(`worker: reload — added ${agentLabel(cfg2)} (${key})`);
+      }
+
+      // Updated: swap the config in place so the next turn reads it (the model per turn; the persona
+      // through the identity file the roster fetch just rewrote). Rebuild the runner if a baked-in
+      // field changed (max_turns / url), keeping the connector so no socket reconnects. Rebuild the
+      // whole entry only if a connector input changed (harness / token / channel / allowed-users).
+      for (const d of plan.updated) {
+        const cfg2 = byKey.get(d.key);
+        const a = wired.get(d.key);
+        if (!cfg2 || !a) continue;
+        if (d.rebuildConn) {
+          a.abort?.abort();
+          const w = wireOne(cfg2, harnesses);
+          if (!w) {
+            wired.delete(d.key);
+            continue;
+          }
+          wired.set(d.key, w);
+          pumps.push(startPump(d.key, w));
+          console.log(`worker: reload — reconnected ${agentLabel(cfg2)} (${d.key})`);
+        } else {
+          a.cfg = cfg2;
+          if (d.rebuildRunner) {
+            const runner = newRunnerFor(cfg2, harnesses);
+            if (runner) {
+              a.runner = runner;
+              a.run = runClosure(runner);
+            }
+          }
+          console.log(`worker: reload — updated ${agentLabel(cfg2)} (${d.key})${d.rebuildRunner ? " — new runner" : ""}`);
+        }
+        // Re-derive the voice flow from the new config — idempotent (ensureVoiceSchedule updates in
+        // place), and how a newly granted skill or a changed cadence reaches the poll.
+        const w = wired.get(d.key);
+        if (w) await wireVoice(d.key, w).catch((e) => console.error(`worker: reload — wireVoice ${d.key} failed: ${(e as Error).message}`));
+      }
+
+      // Refresh checkouts and context notes against the swapped configs. We hold `busy`, so syncAll's
+      // own timer is not also running; call its body directly.
+      await syncAll().catch(() => {});
+    };
+
+    let reloadTimer: ReturnType<typeof setInterval> | undefined;
+    reloadTimer = setInterval(() => {
+      if (busy) return;
+      busy = true;
+      void doReload()
+        .catch((e) => console.error(`worker: roster reload failed — ${(e as Error).message}`))
+        .finally(() => {
+          busy = false;
+        });
+    }, reloadEvery);
+    signal.addEventListener("abort", () => clearInterval(reloadTimer), { once: true });
+    console.log(`worker: roster reload every ${reloadEvery / 1000}s`);
   }
 
   // gw-wake: a system can start the conversation. This is what lets the voice flow say "I've got
