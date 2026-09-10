@@ -155,3 +155,78 @@ describe("the roster mapping is a WHITELIST, and that cuts both ways", () => {
     expect(cfg.agents[0]!.flows).toEqual(flows);
   });
 });
+
+describe("RegistryControlPlane — a connection flattens to its shared account, and carries every account", () => {
+  const withCreds = async (): Promise<void> => {
+    await putSecret("acme-slack", "SLACK_BOT_TOKEN", "b");
+    await putSecret("acme-slack", "SLACK_APP_TOKEN", "a");
+  };
+
+  it("flattens the SHARED account (accountId null) into the flat fields the calendar loop and contextNote read", async () => {
+    // The drift bug this guards: the account fields moved to their own table server-side, and if the
+    // roster map drops the shared account the worker gets a connection with no secret_ref and the
+    // calendar silently becomes "no calendar" — exactly the class of failure `mission`/`skills` hit.
+    await withCreds();
+    const agent: RegistryAgent = {
+      ...base,
+      connections: [
+        {
+          id: "c1",
+          kind: "ics",
+          alias: "foley",
+          label: "Foley Outlook ICS",
+          scope: "shared",
+          accounts: [
+            { accountId: null, externalAccount: "foley@acme.com", secretRef: "ics.url:foley", status: "connected", expiresAt: null },
+          ],
+        },
+      ],
+    };
+    const cfg = await plane([agent]).roster();
+    const c = cfg.agents[0]!.connections![0]!;
+    expect(c.secret_ref).toBe("ics.url:foley");
+    expect(c.status).toBe("connected");
+    expect(c.external_account).toBe("foley@acme.com");
+    expect(c.scope).toBe("shared");
+    expect(c.accounts).toHaveLength(1);
+  });
+
+  it("prefers the shared account over a member's for the flat slot, and passes every account through", async () => {
+    await withCreds();
+    const agent: RegistryAgent = {
+      ...base,
+      connections: [
+        {
+          id: "c2",
+          kind: "plaud",
+          alias: "default",
+          scope: "per_person",
+          accounts: [
+            { accountId: "acc-celine", secretRef: "plaud.tokens:celine", status: "connected" },
+            { accountId: null, secretRef: "plaud.tokens:shared", status: "connected" },
+          ],
+        },
+      ],
+    };
+    const cfg = await plane([agent]).roster();
+    const c = cfg.agents[0]!.connections![0]!;
+    expect(c.secret_ref).toBe("plaud.tokens:shared");
+    expect(c.scope).toBe("per_person");
+    expect((c.accounts ?? []).map((a) => a.secret_ref).sort()).toEqual(["plaud.tokens:celine", "plaud.tokens:shared"]);
+    expect((c.accounts ?? []).map((a) => a.account_id)).toContain("acc-celine");
+  });
+
+  it("keeps a per-person connection with no accounts yet — an empty accounts list, no secret", async () => {
+    // A skill someone must still connect for is a real, nameable state; it must not vanish for want
+    // of a credential.
+    await withCreds();
+    const agent: RegistryAgent = {
+      ...base,
+      connections: [{ id: "c3", kind: "plaud", alias: "default", scope: "per_person", accounts: [] }],
+    };
+    const cfg = await plane([agent]).roster();
+    const c = cfg.agents[0]!.connections![0]!;
+    expect(c.secret_ref).toBeUndefined();
+    expect(c.accounts).toEqual([]);
+  });
+});

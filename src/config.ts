@@ -197,10 +197,27 @@ export interface AgentConfig {
     kind: string;
     alias: string;
     label?: string;
+    // The flat account fields carry the SHARED account (the whole-tenant one), which is every
+    // connection today. They keep the existing consumers — the calendar loop, contextNote, the
+    // `!connect` roster patch — working unchanged now that a connection's accounts live in their
+    // own table server-side.
     external_account?: string;
     secret_ref?: string;
     status?: string;
     expires_at?: string;
+    // 'shared' | 'per_person'. Present so the per-member voice flow can tell "one account for
+    // everyone" from "each member brings their own" without re-deriving it.
+    scope?: string;
+    // Every account implementing this connection. For a shared connection there is one, with
+    // account_id null (and it is also flattened above). For a per-person connection there is one
+    // per member — which the per-member voice flow iterates.
+    accounts?: {
+      account_id?: string | null;
+      external_account?: string;
+      secret_ref?: string;
+      status?: string;
+      expires_at?: string;
+    }[];
   }[];
   workspace?: Workspace;
   // --- Service-mode (svc-self-channeled / svc-config-env) ----------------------

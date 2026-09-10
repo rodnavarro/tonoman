@@ -101,10 +101,18 @@ export interface RegistryAgent {
     kind: string;
     alias: string;
     label?: string | null;
-    externalAccount?: string | null;
-    secretRef?: string | null;
-    status?: string;
-    expiresAt?: string | null;
+    /** 'shared' (one account for the whole tenant) or 'per_person' (each member's own). */
+    scope?: string;
+    /** The accounts implementing this connection. A shared connection has one, with `accountId`
+     *  null; a per-person one has an account per member. The secret material never travels — only
+     *  the `secretRef` into the gateway's mounted secret tree. */
+    accounts?: {
+      accountId?: string | null;
+      externalAccount?: string | null;
+      secretRef?: string | null;
+      status?: string | null;
+      expiresAt?: string | null;
+    }[];
   }[];
 }
 
@@ -250,16 +258,34 @@ export class RegistryControlPlane implements ControlPlane {
           secret_ref: s.secretRef,
           read_only: s.readOnly,
         })),
-        connections: (a.connections ?? []).map((c) => ({
-          id: c.id,
-          kind: c.kind,
-          alias: c.alias,
-          label: c.label ?? undefined,
-          external_account: c.externalAccount ?? undefined,
-          secret_ref: c.secretRef ?? undefined,
-          status: c.status,
-          expires_at: c.expiresAt ?? undefined,
-        })),
+        // A connection is a definition; its accounts arrive in `accounts`. The FLAT fields below
+        // carry the SHARED account (the one every member uses, `accountId` null), which is every
+        // connection today — so the calendar loop, contextNote and the `!connect` roster patch keep
+        // reading `secret_ref`/`status` unchanged. `scope` and the full `accounts` ride along for
+        // the per-member voice flow. Same whitelist hazard as everything else here: an account field
+        // added to the roster and dropped in this map vanishes with no error.
+        connections: (a.connections ?? []).map((c) => {
+          const accounts = c.accounts ?? [];
+          const shared = accounts.find((x) => (x.accountId ?? null) === null) ?? accounts[0];
+          return {
+            id: c.id,
+            kind: c.kind,
+            alias: c.alias,
+            label: c.label ?? undefined,
+            external_account: shared?.externalAccount ?? undefined,
+            secret_ref: shared?.secretRef ?? undefined,
+            status: shared?.status ?? undefined,
+            expires_at: shared?.expiresAt ?? undefined,
+            scope: c.scope,
+            accounts: accounts.map((x) => ({
+              account_id: x.accountId ?? null,
+              external_account: x.externalAccount ?? undefined,
+              secret_ref: x.secretRef ?? undefined,
+              status: x.status ?? undefined,
+              expires_at: x.expiresAt ?? undefined,
+            })),
+          };
+        }),
         channel: "slack",
         slack: {
           team_id: a.teamId,
