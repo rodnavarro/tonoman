@@ -1264,6 +1264,14 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
       const plan = planReload(current, servable);
       // Losing more than half the fleet in one tick is degradation upstream (a partial roster, a
       // flaky join), not a mass delete somebody asked for. Refuse it and log loudly.
+      //
+      // DELIBERATELY off for a single-agent worker (`wired.size > 1`): with one agent, "more than
+      // half" is the agent itself, and there is no majority to compare it against. The empty-roster
+      // guard above still catches `agents: []`, but a roster that comes back non-empty yet without
+      // this one agent (its channel join momentarily invisible) WOULD retire it here. Acceptable
+      // today — Sapien and Nelly make two — and the reload after the hiccup wires it straight back.
+      // A single-agent self-hosted worker that wants belt-and-braces should pin ROSTER_RELOAD_SECONDS
+      // higher or disable reload.
       if (wired.size > 1 && plan.removed.length > wired.size / 2 && servable.length < current.length) {
         console.error(
           `worker: roster reload would remove ${plan.removed.length}/${wired.size} agents — ` +
