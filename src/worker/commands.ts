@@ -55,21 +55,32 @@ export const KNOWN = [
  *  imaginary in practice, which is worse than not having it. */
 const PREFIX = /^!/;
 
-/** Turn a marketing model name into the CLI alias the harness understands.
+/** Turn a marketing model name into the exact name the Claude CLI understands.
  *
- *  The Hub labels the models "Claude Opus 5", "Claude Sonnet 5", "Claude Haiku 4.5", so a person in
- *  Slack reasonably types `!model opus-5` (or "Opus 5", "opus5") — and the Claude CLI knows `opus`,
- *  not `opus-5`, so that guess used to strand the whole conversation on a model that does not exist,
- *  reported only as a cryptic "unrecognized_model" on the next turn. So a generation-suffixed family
- *  name collapses to its alias here. A full `claude-…` id, a Bedrock profile, or anything that is not
- *  one of the three families passes through UNCHANGED — the harness still owns the real list, and an
- *  advanced or unknown name still surfaces the harness's own error rather than a guess at it. */
+ *  Three shapes, and only these are rewritten:
+ *
+ *   - a BARE family — `opus`, `sonnet`, `haiku` — is the CLI's own alias, the LATEST of that family.
+ *     It is kept as-is, because that is the future-proof value: when a new generation ships, `opus`
+ *     follows it and a pinned id does not (see the roster's stored default).
+ *
+ *   - a family WITH a version — `opus-5`, "Opus 5", `opus5`, `opus 4.8` — names a SPECIFIC model,
+ *     which the CLI spells `claude-<family>-<version>` (`claude-opus-5`, `claude-opus-4-8`). This is
+ *     the case that used to strand a conversation: the CLI knows `opus` and `claude-opus-5`, never
+ *     `opus-5`, so the reasonable read of the Hub's "Claude Opus 5" label failed cryptically on the
+ *     next turn. It now becomes the specific id, and — the point of doing this precisely — `opus-4-8`
+ *     becomes `claude-opus-4-8` rather than silently collapsing to the latest opus.
+ *
+ *  Everything else — a full `claude-…` id a person pasted, a Bedrock profile, an unknown string —
+ *  passes through UNTOUCHED. The harness owns the real list, so an id it does not know still surfaces
+ *  its own error rather than a guess at it, and a deliberate pin is never mangled. */
 export function canonicalModel(raw: string): string {
   const s = raw.trim();
-  const low = s.toLowerCase().replace(/\s+/g, "");
-  for (const alias of ["opus", "sonnet", "haiku"]) {
-    // `opus`, `opus5`, `opus-5`, `opus.4.8` → `opus`; a bare family name matches too.
-    if (low === alias || new RegExp(`^${alias}[._-]?\\d`).test(low)) return alias;
+  const low = s.toLowerCase();
+  if (/^(opus|sonnet|haiku)$/.test(low)) return low; // the CLI alias — the latest of that family
+  const m = low.match(/^(opus|sonnet|haiku)[\s._-]*(\d[\d._-]*\d|\d)$/);
+  if (m) {
+    const version = m[2].replace(/[._]/g, '-').replace(/-+/g, '-');
+    return `claude-${m[1]}-${version}`; // a specific model: claude-opus-5, claude-opus-4-8
   }
   return s;
 }
