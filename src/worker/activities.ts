@@ -216,6 +216,19 @@ export interface VoiceConfig {
   calendarExclude?: string[];
   /** How far either side of a recording to look. Generous by default; see calendar.ts. */
   calendarPadMinutes?: number;
+  /** WHICH runtime processes a recording: the hardcoded pipeline, or the generic skill interpreter.
+   *
+   *  A reversible switch, from `flow_property runner`, default `hardcoded` so nothing changes until a
+   *  tenant is deliberately armed onto the skill runner. `skill` only takes effect when `skill` below
+   *  is also present — a skill runner with no skill would be a flow that does nothing, so it falls
+   *  back rather than fails. Reverting is the row flipped back plus a worker restart, the same shape
+   *  as every other boot-resolved setting (§15.20). */
+  runner?: "skill" | "hardcoded";
+  /** The granted voice skill (its steps, pinned to the version they came from), populated from the
+   *  roster the worker already holds. Present only when the agent has a plaud-poll skill granted and
+   *  enabled. This is what the trigger hands to `runSkillWorkflow` so an edit to a live skill cannot
+   *  change what an in-flight run is doing. */
+  skill?: { name: string; steps: skill.Step[]; version: number };
 }
 
 export interface TurnRunReq {
@@ -321,6 +334,24 @@ export function makeActivities(deps: TurnDeps) {
     },
 
     // --- the voice flow -------------------------------------------------------------------------
+
+    /** Which runtime this agent's poll should use for each recording, and — when it is the skill
+     *  interpreter — the skill to run.
+     *
+     *  Read by the poll trigger at the start of a tick rather than baked into the schedule, so the
+     *  choice comes from the worker's live view of the agent (which itself is boot-resolved from the
+     *  registry, §15.20) rather than from arguments frozen when the schedule was first created. Falls
+     *  back to `hardcoded` whenever the skill runner is asked for but no skill is granted — a runner
+     *  with nothing to run is a flow that silently does nothing, which is the failure this avoids. */
+    async voicePlan(input: { agent: string }): Promise<{
+      runner: "skill" | "hardcoded";
+      skill?: { name: string; steps: skill.Step[]; version: number };
+    }> {
+      const v = deps.voice?.(input.agent);
+      if (!v) return { runner: "hardcoded" };
+      if (v.runner === "skill" && v.skill) return { runner: "skill", skill: v.skill };
+      return { runner: "hardcoded" };
+    },
 
     /** Which finished recordings have not been published yet. Cheap and safe to retry. */
     async findNewRecordings(input: { agent: string }): Promise<

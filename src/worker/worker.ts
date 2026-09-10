@@ -47,6 +47,7 @@ import { serveWake } from "./wake";
 import { promises as fsp } from "node:fs";
 import { defaultHarnesses } from "../gateway";
 import { makeActivities, type TurnRunReq, type VoiceConfig } from "./activities";
+import type { Step } from "./skill";
 import { conversationWorkflow, messageSignal, plaudPollWorkflow, type Inbound, type PollInput } from "./workflows";
 
 export interface WorkerOptions {
@@ -606,6 +607,13 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
     const token = await resolveRef(src.secret_ref);
     const pushUrl = token ? src.repo_url.replace("https://", `https://x-access-token:${token}@`) : src.repo_url;
     const dir = path.join(process.env.TONOMAN_STATE_ROOT ?? "/root/.tonoman", "secondbrain", name, src.id);
+    // The granted skill that drives the voice flow, if any — the one whose trigger polls Plaud. The
+    // steps and version are pinned here, off the roster, so a run started tonight keeps interpreting
+    // the definition it began with even if the row is edited under it. Absent = this agent has no
+    // voice skill granted, and `runner: skill` will fall back to hardcoded rather than do nothing.
+    const voiceSkill = (a.cfg.skills ?? []).find(
+      (s) => (s.trigger as { poll?: unknown } | undefined)?.poll === "plaud",
+    );
     voiceCreds.set(name, {
       notifyChannel: voice.notifyChannel || undefined,
       notifyUser: voice.notifyUser || undefined,
@@ -629,6 +637,12 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
       // round trip that can be stale on its own.
       mission: a.cfg.mission ?? "",
       timezone: a.cfg.timezone ?? "UTC",
+      // Which runtime, and the skill to run when it is the interpreter. Default hardcoded (from
+      // flowcfg), so the proven pipeline stays in charge until a tenant is deliberately armed.
+      runner: voice.runner,
+      skill: voiceSkill
+        ? { name: voiceSkill.name, steps: voiceSkill.steps as Step[], version: voiceSkill.version }
+        : undefined,
       floorMs,
       vocab:
         process.env.GROQ_PROMPT ??
@@ -717,6 +731,58 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
         signal: messageSignal,
         signalArgs: [{ text, user, ts: String(Date.now()) }],
       });
+    },
+    // The durable record of one item of one skill, over the same system-token API the worker uses
+    // for everything else — the worker holds no database connection string.
+    //
+    // BEST-EFFORT, ALWAYS. This row is observability: it is what answers "is this failing, or has
+    // nobody looked at it". A registry that is briefly unreachable must never be the reason a
+    // recording is not processed, so every failure here is logged and swallowed — the run proceeds,
+    // the row is simply missing. Dedup does not depend on it (the git checkout still answers "already
+    // published"); this makes a failing run visible, which nothing did before.
+    skillRun: {
+      open: async (name: string, skillName: string, itemKey: string, version: number) => {
+        const baseUrl = process.env.TONOMANCLOUD_API_URL;
+        const guid = wired.get(name)?.cfg.guid;
+        if (!baseUrl || !guid) return; // a file roster has no registry to record into
+        try {
+          const r = await fetch(`${baseUrl}/v1/system/agents/${guid}/skill-runs`, {
+            method: "POST",
+            headers: {
+              authorization: `Bearer ${process.env.TONOMANCLOUD_API_TOKEN ?? ""}`,
+              "content-type": "application/json",
+            },
+            body: JSON.stringify({ skill: skillName, itemKey, version }),
+          });
+          if (!r.ok) console.error(`worker: ${name} skill_run open ${skillName}/${itemKey} → ${r.status}`);
+        } catch (e) {
+          console.error(`worker: ${name} skill_run open ${skillName}/${itemKey} failed: ${String(e)}`);
+        }
+      },
+      close: async (
+        name: string,
+        skillName: string,
+        itemKey: string,
+        status: "done" | "failed",
+        error?: string,
+      ) => {
+        const baseUrl = process.env.TONOMANCLOUD_API_URL;
+        const guid = wired.get(name)?.cfg.guid;
+        if (!baseUrl || !guid) return;
+        try {
+          const r = await fetch(`${baseUrl}/v1/system/agents/${guid}/skill-runs`, {
+            method: "PATCH",
+            headers: {
+              authorization: `Bearer ${process.env.TONOMANCLOUD_API_TOKEN ?? ""}`,
+              "content-type": "application/json",
+            },
+            body: JSON.stringify({ skill: skillName, itemKey, status, error }),
+          });
+          if (!r.ok) console.error(`worker: ${name} skill_run close ${skillName}/${itemKey} → ${r.status}`);
+        } catch (e) {
+          console.error(`worker: ${name} skill_run close ${skillName}/${itemKey} failed: ${String(e)}`);
+        }
+      },
     },
   };
   const activities = makeActivities(deps);

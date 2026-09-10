@@ -171,6 +171,18 @@ export interface AgentConfig {
   /** IANA timezone for DISPLAY, from the tenant. "America/New_York", never an offset. Empty or
    *  "UTC" means render in UTC, which is what every recap did before this existed. */
   timezone?: string;
+  /** Skills GRANTED and enabled for this agent, from the registry — the catalogue row plus the
+   *  attachment's parameters. `steps` and `version` are what a run is pinned to, so an edit to a live
+   *  skill cannot change what an in-flight run is doing. `trigger` says how a skill is invoked
+   *  (`{poll: "plaud"}` for the voice pipeline); the worker reads it to decide which grant, if any,
+   *  drives the voice flow. Opaque jsonb from the registry, typed where consumed. */
+  skills?: {
+    name: string;
+    steps: unknown;
+    version: number;
+    trigger?: Record<string, unknown>;
+    config?: Record<string, unknown>;
+  }[];
   /** Outside accounts this agent may use, from the registry (§8). Identified by `(kind, alias)`:
    *  the KIND is what the platform knows how to talk to, the ALIAS is which one of them this is.
    *  That is what lets a tenant attach a work calendar and a personal one without either becoming

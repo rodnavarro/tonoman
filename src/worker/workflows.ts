@@ -21,8 +21,10 @@ import {
   continueAsNew,
   defineSignal,
   isCancellation,
+  ParentClosePolicy,
   proxyActivities,
   setHandler,
+  startChild,
 } from "@temporalio/workflow";
 import type { Activities } from "./activities";
 import { declaredOut, validateSteps, type Bag, type Step } from "./skill";
@@ -31,7 +33,7 @@ import { declaredOut, validateSteps, type Bag, type Step } from "./skill";
 // fails the webpack build and the worker never starts, which looks like a hang rather than a bad
 // import. These are pure string functions, which is also what keeps the workflow deterministic.
 import { failureReason, isNotLoggedInError, notLoggedInNotice } from "../turnfailure";
-import { ApplicationFailure } from "@temporalio/common";
+import { ApplicationFailure, WorkflowExecutionAlreadyStartedError } from "@temporalio/common";
 
 const { runTurn, postNotice } = proxyActivities<Activities>({
   // A turn is a person waiting on an LLM: minutes, not seconds. The heartbeat is what makes a dead
@@ -152,7 +154,7 @@ export async function conversationWorkflow(input: ConversationInput): Promise<vo
 
 // --- the voice flow -----------------------------------------------------------------------------
 
-const { findNewRecordings, processRecording, sayVerbatim } = proxyActivities<Activities>({
+const { voicePlan, findNewRecordings, processRecording, sayVerbatim } = proxyActivities<Activities>({
   // Listing is a cheap HTTP call; processing downloads audio and runs two models.
   startToCloseTimeout: "15 minutes",
   heartbeatTimeout: "60 seconds",
@@ -216,6 +218,12 @@ export interface PollInput {
  * So this is now what one tick does, and nothing else.
  */
 export async function plaudPollWorkflow(input: PollInput): Promise<void> {
+  // WHICH RUNTIME, read once per tick. `hardcoded` is the proven pipeline; `skill` hands each
+  // recording to the generic interpreter. The poll's job — find what is new, say it landed, dedup —
+  // is identical either way; only what processes a recording changes, which is what makes arming and
+  // reverting a single registry row rather than a different schedule.
+  const plan = await voicePlan({ agent: input.agent });
+
   let found: { id: string; title: string; stamp: string; minutes: number }[] = [];
   try {
     found = await findNewRecordings({ agent: input.agent });
@@ -244,12 +252,49 @@ export async function plaudPollWorkflow(input: PollInput): Promise<void> {
   }
 
   for (const rec of batch) {
-    // Say it landed BEFORE the slow part, so the person knows it was seen.
+    // Say it landed BEFORE the slow part, so the person knows it was seen. Identical on both paths:
+    // the ack is a fact about the poll, not about which runtime files the recap.
     await sayVerbatim({
       agent: input.agent,
       user: input.notify,
       text: `I've got a new recording — “${rec.title}”, ${rec.minutes} minute${rec.minutes === 1 ? "" : "s"}. Processing it now; I'll send the highlights shortly.`,
     }).catch(() => {});
+
+    if (plan.runner === "skill" && plan.skill) {
+      // Hand this ONE recording to the generic interpreter, as an independent CHILD workflow. Child,
+      // not inline, for two reasons: a 112-minute meeting must not hold the poll tick open (and with
+      // overlap SKIP, block the next one), and each run wants to be its own retryable, inspectable
+      // execution in the Temporal UI — which is the visibility whose absence produced 611 attempts.
+      //
+      // ABANDON so the run OUTLIVES the poll tick that started it. Deterministic workflowId IS the
+      // dedup: a re-tick that lands while this recording is still being processed is rejected here
+      // rather than starting a second run of the same meeting.
+      try {
+        await startChild(runSkillWorkflow, {
+          workflowId: `skill:${input.agent}:${rec.id}`,
+          args: [
+            {
+              agent: input.agent,
+              skill: plan.skill.name,
+              itemKey: rec.id,
+              steps: plan.skill.steps,
+              version: plan.skill.version,
+              notify: input.notify,
+            },
+          ],
+          parentClosePolicy: ParentClosePolicy.ABANDON,
+        });
+      } catch (e) {
+        // Already running under this id: the previous tick's run for this recording has not finished.
+        // That is the dedup working, not an error — leave it to finish.
+        if (e instanceof WorkflowExecutionAlreadyStartedError) {
+          console.log(`recap: ${input.agent} — “${rec.title}” already has a skill run in flight; leaving it`);
+        } else {
+          throw e;
+        }
+      }
+      continue;
+    }
 
     try {
       await processRecording({ agent: input.agent, notify: input.notify, id: rec.id });
@@ -355,6 +400,17 @@ export async function runSkillWorkflow(input: RunSkillInput): Promise<void> {
       status: "failed",
       error: failureReason(e).slice(0, 500),
     }).catch(() => {});
+    // Parity with the hardcoded path's per-recording failure notice. The trigger already told the
+    // person "processing it now; highlights shortly", so a silent failure here leaves them waiting on
+    // a recap that is never coming — the precise silent failure this whole layer exists to end.
+    // Best-effort and once: the child does not retry, so this fires exactly when the run gives up.
+    if (input.notify) {
+      await sayVerbatim({
+        agent: input.agent,
+        user: input.notify,
+        text: `⚠️ I couldn't finish processing a recording — ${failureReason(e).slice(0, 200)}`,
+      }).catch(() => {});
+    }
     throw e;
   }
 }

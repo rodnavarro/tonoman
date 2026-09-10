@@ -69,6 +69,19 @@ export interface RegistryAgent {
   /** The tenant's display timezone, IANA. */
   timezone?: string;
   tools?: string[];
+  /** Skills GRANTED and enabled for this agent — the catalogue row (steps, version, trigger) plus
+   *  the per-agent attachment's `config`. The registry has already filtered to enabled grants; the
+   *  worker reads `trigger` to find which one, if any, drives the voice flow. */
+  skills?: {
+    id: string;
+    name: string;
+    description?: string | null;
+    requires?: unknown;
+    trigger?: Record<string, unknown>;
+    steps: unknown;
+    version: number;
+    config?: Record<string, unknown>;
+  }[];
   secondbrain?: {
     id: string;
     label: string;
@@ -212,6 +225,16 @@ export class RegistryControlPlane implements ControlPlane {
         // Mapped here too, and this is the field that taught the lesson: `mission` was added to the
         // registry, the roster and the voice flow, and dropped in this whitelist in between.
         timezone: a.timezone ?? "UTC",
+        // Same whitelist, same hazard: the voice flow reads `skills` to find the plaud-poll grant, so
+        // a skill that arrives on the roster but is dropped here would leave the interpreter with
+        // nothing to run and the flow silently falling back to hardcoded.
+        skills: (a.skills ?? []).map((s) => ({
+          name: s.name,
+          steps: s.steps,
+          version: s.version,
+          trigger: s.trigger,
+          config: s.config,
+        })),
         // Present only when the tool is granted — the registry decides, not the runtime.
         secondbrain: (a.secondbrain ?? []).map((s) => ({
           id: s.id,

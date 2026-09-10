@@ -171,3 +171,22 @@ describe("voiceSettings — calendars", () => {
     expect(Object.keys(voiceSettings({ "calendar.tz": "America/New_York" }))).not.toContain("calendarTz");
   });
 });
+
+describe("voiceSettings — the runner switch", () => {
+  it("defaults to the proven hardcoded pipeline when nothing is set", () => {
+    // A working pipeline must never change runtime because of a missing row.
+    expect(voiceSettings({}).runner).toBe("hardcoded");
+  });
+
+  it("arms the skill interpreter only on an explicit 'skill'", () => {
+    expect(voiceSettings({ runner: "skill" }).runner).toBe("skill");
+    expect(voiceSettings({ runner: "SKILL" }).runner).toBe("skill");
+  });
+
+  it("treats anything else — a typo included — as hardcoded, never as armed", () => {
+    // The dangerous direction is silently arming; a mistyped value must fall to the safe side.
+    expect(voiceSettings({ runner: "skil" }).runner).toBe("hardcoded");
+    expect(voiceSettings({ runner: "hardcoded" }).runner).toBe("hardcoded");
+    expect(voiceSettings({ runner: "" }).runner).toBe("hardcoded");
+  });
+});

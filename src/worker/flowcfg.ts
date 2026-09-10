@@ -42,6 +42,10 @@ export interface VoiceSettings {
   /** How far either side of a recording to look for events. Generous by default: people start
    *  recording after a meeting begins, and this only gathers candidates — the content decides. */
   calendarPadMinutes?: number;
+  /** Which runtime processes a recording: `hardcoded` (the proven pipeline) or `skill` (the generic
+   *  interpreter). Default `hardcoded`, so arming a tenant onto the skill runner is a deliberate row
+   *  and a typo can never move a working pipeline onto an unproven path. */
+  runner: "skill" | "hardcoded";
 }
 
 const num = (v: string | undefined, fallback: number): number => {
@@ -106,6 +110,9 @@ export function voiceSettings(props: Record<string, string> = {}, env: NodeJS.Pr
     credentialRef: p("credential_ref") ?? "",
     pollSeconds: num(p("poll_seconds") ?? env.VOICE_POLL_SECONDS, 300),
     since: p("since") ?? (env.VOICE_SINCE ?? "").trim(),
+    // Default hardcoded: only an explicit "skill" arms the interpreter, for the same reason `enabled`
+    // defaults on — a working pipeline must never change runtime because of a missing or mistyped row.
+    runner: (p("runner") ?? "hardcoded").toLowerCase() === "skill" ? "skill" : "hardcoded",
     journal,
   };
 }
