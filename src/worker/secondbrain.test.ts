@@ -70,3 +70,29 @@ describe("contextNote — whose accounts are whose, and what time it is", () => 
     expect(contextNote([], "America/New_York", [{ kind: "google", alias: "work" }])).toBe("");
   });
 });
+
+describe("contextNote — the agent's current name is live, not baked in the prose", () => {
+  const ready = [{ dir: "/d/1", label: "Murphy second brain" }];
+
+  it("states the name and declares it authoritative over the instructions", () => {
+    const note = contextNote(ready, "", [], "Roxane");
+    expect(note).toContain("Your name is Roxane");
+    expect(note).toMatch(/authoritative/);
+    expect(note).toMatch(/out of date/);
+  });
+
+  it("puts the name FIRST, ahead of the second brain — a name question must not fall through to it", () => {
+    const note = contextNote(ready, "", [], "Roxane");
+    expect(note.indexOf("Your name is Roxane")).toBeLessThan(note.indexOf("second brain"));
+  });
+
+  it("injects the name even with NO second brain — the case the old early-return swallowed", () => {
+    // This is the whole point: rename an agent with no brain and it still introduces itself anew.
+    const note = contextNote([], "America/New_York", [], "Roxane");
+    expect(note).toContain("Your name is Roxane");
+  });
+
+  it("says nothing about a name when none is given, so the prose still governs", () => {
+    expect(contextNote(ready, "", [])).not.toContain("Your name is");
+  });
+});

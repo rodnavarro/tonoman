@@ -85,6 +85,11 @@ export interface Workspace {
 export interface AgentConfig {
   guid?: string;
   name: string;
+  /** The name the TENANT gave this agent, as the registry holds it — what it should call itself and
+   *  how people refer to it. Distinct from `name`, which the registry control plane prefixes with the
+   *  tenant (`axiplex-sapien`) to key one worker's many agents. Renaming an agent changes this, and
+   *  the worker carries it into the agent's context so a rename reaches how it introduces itself. */
+  displayName?: string;
   role?: string;
   harness?: string;
   container: string;

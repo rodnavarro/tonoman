@@ -203,6 +203,10 @@ export class RegistryControlPlane implements ControlPlane {
       agents.push({
         guid: a.guid,
         name: localName,
+        // The tenant's own name for the agent, unprefixed — what it calls itself. `name` above is
+        // prefixed to key one worker's agents; this is the one a person set and can rename, and the
+        // same whitelist hazard applies: added at both ends, dropped here, it would vanish.
+        displayName: a.name,
         // Empty on purpose: no per-agent container, because the pod is the sandbox. The harness
         // reads this to choose local-exec over `podman exec`.
         container: "",

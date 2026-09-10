@@ -458,6 +458,7 @@ export async function run(cfg: Config, o: WorkerOptions, signal: AbortSignal): P
           label: c.label,
           status: c.status,
         })),
+        a.cfg.displayName ?? "",
       );
     }
   };

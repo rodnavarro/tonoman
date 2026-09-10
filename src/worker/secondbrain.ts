@@ -132,8 +132,22 @@ export function contextNote(
   ready: { dir: string; label: string }[],
   timezone = "",
   connections: ConnectionNote[] = [],
+  name = "",
 ): string {
-  if (ready.length === 0) return "";
+  // WHO THE AGENT CURRENTLY IS. The name lives in the registry and can be changed from the Hub; the
+  // identity/instructions prose is written once and goes stale the moment it is. So the live name is
+  // stated here and declared authoritative over the prose — rename an agent and it introduces itself
+  // anew on the next roster reload, without anyone editing the instructions to match. Stated first,
+  // and present even with no second brain, because "what is your name" must never fall through to
+  // whatever a prompt happened to say months ago.
+  const naming = name
+    ? [
+        `Your name is ${name}. This is your current name on the platform and is authoritative: if`,
+        `the instructions below call you by a different name, it is out of date — introduce yourself`,
+        `and refer to yourself as ${name}.`,
+      ].join("\n")
+    : "";
+  if (ready.length === 0) return naming;
   const lines = ready.map((r) => `- ${r.label}: ${r.dir}`).join("\n");
   // WHAT TIME IT IS FOR THIS PERSON. A recap page carries a UTC instant and a local rendering, and
   // without being told which is which the agent reads whichever it finds first — asked how many
@@ -179,6 +193,8 @@ export function contextNote(
       ].join("\n");
 
   return [
+    naming,
+    naming ? "" : undefined,
     "Your second brain is checked out on this machine and is the memory of the business:",
     lines,
     clock,
@@ -187,5 +203,7 @@ export function contextNote(
     "Search it with Grep and read pages with Read before answering anything about meetings, people,",
     "deals or decisions. If the answer is not in there, say so plainly rather than guessing — a wrong",
     "recollection about a real client conversation is worse than no recollection.",
-  ].join("\n");
+  ]
+    .filter((l) => l !== undefined)
+    .join("\n");
 }
