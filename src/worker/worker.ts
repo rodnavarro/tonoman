@@ -1220,11 +1220,19 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
    *  recaps nobody had approved. */
   const DISABLED_NOTE = "flow_property enabled=false";
 
+  /** The voice schedule's id, keyed by the agent's STABLE guid rather than its (mutable) name.
+   *  Renaming an agent must not re-key its schedule: the old one would be left polling in parallel
+   *  with the new — the double-process this whole flow guards against, in a rename's costume. Falls
+   *  back to the name for a file roster, which has no guid. */
+  function voiceScheduleId(name: string): string {
+    return `voice:${wired.get(name)?.cfg.guid ?? name}`;
+  }
+
   /** Stop one agent's poll. Best effort and idempotent: a flow that was never scheduled has
    *  nothing to pause, which is the normal case for a flow that was never on. */
   async function pauseVoiceSchedule(name: string, why: string): Promise<void> {
     try {
-      const h = client.schedule.getHandle(`voice:${name}`);
+      const h = client.schedule.getHandle(voiceScheduleId(name));
       if (!(await h.describe()).state.paused) {
         await h.pause(why);
         console.log(`worker: ${name} voice schedule paused — ${why}`);
@@ -1247,7 +1255,7 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
       console.log(`worker: ${name} voice flow not scheduled — nobody to tell (set notify_channel or notify_user)`);
       return;
     }
-    const scheduleId = `voice:${name}`;
+    const scheduleId = voiceScheduleId(name);
     const every: Duration = `${v.pollSeconds ?? 300} seconds`;
     const action = {
       type: "startWorkflow" as const,
@@ -1255,6 +1263,18 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
       taskQueue: o.taskQueue,
       args: [{ agent: name, notify: recipient ?? "" }] as [PollInput],
     };
+
+    // One-time migration off the old NAME-keyed id. An earlier build scheduled `voice:<tenant>-<name>`;
+    // left in place it keeps polling alongside the new guid-keyed schedule — the double-process this
+    // change exists to prevent. Delete it when the id has actually moved (guid rosters only).
+    if (scheduleId !== `voice:${name}`) {
+      try {
+        await client.schedule.getHandle(`voice:${name}`).delete();
+        console.log(`worker: ${name} removed the legacy name-keyed voice schedule (now ${scheduleId})`);
+      } catch {
+        /* no legacy schedule under the old id, which is the normal case after the first migration */
+      }
+    }
 
     // The loop's execution, if this pod is the one replacing it. Left running it would poll in
     // parallel with the schedule and announce everything twice — the double-answer bug in a
