@@ -1237,6 +1237,12 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
   // on a restart. On a timer it re-fetches the roster and applies the DIFFERENCE: an unchanged agent
   // is left strictly alone (no socket touched), a config change is swapped in for the next turn, and
   // only a change to a connector's own inputs reconnects anything.
+  // Run a reload now if one is not already in flight, sharing the `busy` guard with syncAll and the
+  // reload timer. Assigned only when reload is enabled; the wake endpoint calls it so a Hub write can
+  // reach the running agent in about a second instead of at the next poll tick. Undefined (a no-op
+  // through the wake 404) when reload is off.
+  let triggerReload: (() => void) | undefined;
+
   const reloadEvery = Number(process.env.ROSTER_RELOAD_SECONDS ?? 30) * 1000;
   if (reloadRoster && reloadEvery > 0) {
     const harnesses = defaultHarnesses();
@@ -1347,8 +1353,10 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
       await syncAll().catch(() => {});
     };
 
-    let reloadTimer: ReturnType<typeof setInterval> | undefined;
-    reloadTimer = setInterval(() => {
+    // One reconcile at a time, whether it was the timer or a poke that asked for it. A poke while a
+    // reload is already running is dropped rather than queued — the running one will pick up a write
+    // that landed a moment ago anyway, and two back-to-back reconciles would only fight over `busy`.
+    triggerReload = () => {
       if (busy) return;
       busy = true;
       void doReload()
@@ -1356,9 +1364,11 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
         .finally(() => {
           busy = false;
         });
-    }, reloadEvery);
+    };
+
+    const reloadTimer = setInterval(() => triggerReload!(), reloadEvery);
     signal.addEventListener("abort", () => clearInterval(reloadTimer), { once: true });
-    console.log(`worker: roster reload every ${reloadEvery / 1000}s`);
+    console.log(`worker: roster reload every ${reloadEvery / 1000}s (and on demand via /api/reload)`);
   }
 
   // gw-wake: a system can start the conversation. This is what lets the voice flow say "I've got
@@ -1370,6 +1380,9 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
       token: wakeToken,
       deps: {
         has: (name) => wired.has(name),
+        // Present only when reload is enabled; the wake endpoint answers 404 otherwise, so the API
+        // learns "reload off" rather than silently believing a poke landed.
+        reload: triggerReload,
         dmFor,
         say: async (name, conversation, text) => {
           await wired.get(name)?.conn.reply(conversation).send(text);

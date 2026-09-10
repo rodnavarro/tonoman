@@ -34,3 +34,61 @@ describe("parseWake", () => {
     expect(parseWake("nope").ok).toBe(false);
   });
 });
+
+import { serveWake, type WakeDeps } from "./wake";
+
+/** A wake deps stub — records reload calls, and answers `has` for one agent. */
+function stubDeps(over: Partial<WakeDeps> = {}): WakeDeps & { reloads: number } {
+  const state = { reloads: 0 };
+  return Object.assign(state, {
+    has: () => true,
+    dmFor: async () => "C1",
+    say: async () => {},
+    ask: async () => {},
+    reload: () => {
+      state.reloads += 1;
+    },
+    ...over,
+  });
+}
+
+describe("serveWake — POST /api/reload", () => {
+  const PORT = 39817;
+  const TOKEN = "t0k";
+  const base = `http://127.0.0.1:${PORT}`;
+
+  it("pokes a reload when authorised, and reports whether reload is enabled", async () => {
+    const ac = new AbortController();
+    const deps = stubDeps();
+    expect(serveWake({ port: PORT, token: TOKEN, deps }, ac.signal)).toBe(true);
+    // A moment for listen().
+    await new Promise((r) => setTimeout(r, 50));
+    try {
+      // No token → 401, and reload NOT called.
+      const un = await fetch(`${base}/api/reload`, { method: "POST" });
+      expect(un.status).toBe(401);
+      // Authorised → 202, reload called exactly once.
+      const ok = await fetch(`${base}/api/reload`, { method: "POST", headers: { authorization: `Bearer ${TOKEN}` } });
+      expect(ok.status).toBe(202);
+      expect(deps.reloads).toBe(1);
+    } finally {
+      ac.abort();
+    }
+  });
+
+  it("answers 404 when the worker has reload disabled — 'not supported', not 'not authorised'", async () => {
+    const ac = new AbortController();
+    const deps = stubDeps({ reload: undefined });
+    serveWake({ port: PORT + 1, token: TOKEN, deps }, ac.signal);
+    await new Promise((r) => setTimeout(r, 50));
+    try {
+      const r = await fetch(`http://127.0.0.1:${PORT + 1}/api/reload`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${TOKEN}` },
+      });
+      expect(r.status).toBe(404);
+    } finally {
+      ac.abort();
+    }
+  });
+});

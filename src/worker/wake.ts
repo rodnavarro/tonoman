@@ -45,6 +45,11 @@ export interface WakeDeps {
   ask(agent: string, conversation: string, text: string, user?: string): Promise<void>;
   /** Whether this agent exists in the roster. */
   has(agent: string): boolean;
+  /** Re-fetch the roster and apply the difference NOW, instead of waiting for the next poll tick.
+   *  Optional: a worker with reload disabled (no reloadRoster, or ROSTER_RELOAD_SECONDS=0) does not
+   *  offer it, and `POST /api/reload` answers 404 there. The Hub's API pokes this after a write so an
+   *  edit reaches the running agent in about a second rather than up to a poll interval later. */
+  reload?(): void;
 }
 
 /** PURE: validate a wake body, returning the request or the reason it is not one. Unit-tested —
@@ -78,11 +83,22 @@ export function serveWake(o: WakeServerOptions, signal: AbortSignal): boolean {
       res.end(`${JSON.stringify(body)}\n`);
     };
 
-    if (req.method !== "POST" || (req.url ?? "").split("?")[0] !== "/api/wake") {
+    const route = (req.url ?? "").split("?")[0];
+    if (req.method !== "POST" || (route !== "/api/wake" && route !== "/api/reload")) {
       return send(404, { error: "not found" });
     }
     if (req.headers.authorization !== `Bearer ${o.token}`) {
       return send(401, { error: "unauthorized" });
+    }
+
+    // Reload NOW, on demand — the Hub's API pokes this after a write so an edit reaches the running
+    // agent in about a second. Bodyless and idempotent: it re-fetches the whole roster and applies
+    // the diff, exactly what the poll timer does, so a double poke is a no-op. 404 when the worker
+    // has reload disabled, so the API can tell "not supported" from "not authorised".
+    if (route === "/api/reload") {
+      if (!o.deps.reload) return send(404, { error: "reload is not enabled on this worker" });
+      o.deps.reload();
+      return send(202, { accepted: true });
     }
 
     let raw = "";
