@@ -224,7 +224,7 @@ export async function plaudPollWorkflow(input: PollInput): Promise<void> {
   // reverting a single registry row rather than a different schedule.
   const plan = await voicePlan({ agent: input.agent });
 
-  let found: { id: string; title: string; stamp: string; minutes: number }[] = [];
+  let found: { id: string; title: string; stamp: string; minutes: number; user?: string; notify?: string }[] = [];
   try {
     found = await findNewRecordings({ agent: input.agent });
   } catch (e) {
@@ -252,11 +252,15 @@ export async function plaudPollWorkflow(input: PollInput): Promise<void> {
   }
 
   for (const rec of batch) {
+    // Who hears about THIS recording: the member whose account it came from, when the poll fanned
+    // out over per-member accounts, else the poll's own `notify`. For every tenant that has not gone
+    // per-person `rec.notify` is undefined, so this is `input.notify` exactly as before.
+    const notify = rec.notify || input.notify;
     // Say it landed BEFORE the slow part, so the person knows it was seen. Identical on both paths:
     // the ack is a fact about the poll, not about which runtime files the recap.
     await sayVerbatim({
       agent: input.agent,
-      user: input.notify,
+      user: notify,
       text: `I've got a new recording — “${rec.title}”, ${rec.minutes} minute${rec.minutes === 1 ? "" : "s"}. Processing it now; I'll send the highlights shortly.`,
     }).catch(() => {});
 
@@ -271,7 +275,11 @@ export async function plaudPollWorkflow(input: PollInput): Promise<void> {
       // rather than starting a second run of the same meeting.
       try {
         await startChild(runSkillWorkflow, {
-          workflowId: `skill:${input.agent}:${rec.id}`,
+          // A recording id is only unique within an account, so a per-member run keys its id on the
+          // member too — else two members' recordings sharing an id would dedup against each other.
+          // The shared account (no user) keeps the original id, so an in-flight run across a deploy
+          // is still recognised.
+          workflowId: rec.user ? `skill:${input.agent}:${rec.user}:${rec.id}` : `skill:${input.agent}:${rec.id}`,
           args: [
             {
               agent: input.agent,
@@ -279,7 +287,8 @@ export async function plaudPollWorkflow(input: PollInput): Promise<void> {
               itemKey: rec.id,
               steps: plan.skill.steps,
               version: plan.skill.version,
-              notify: input.notify,
+              notify,
+              user: rec.user,
             },
           ],
           parentClosePolicy: ParentClosePolicy.ABANDON,
@@ -297,12 +306,12 @@ export async function plaudPollWorkflow(input: PollInput): Promise<void> {
     }
 
     try {
-      await processRecording({ agent: input.agent, notify: input.notify, id: rec.id });
+      await processRecording({ agent: input.agent, notify, id: rec.id, user: rec.user });
     } catch (e) {
       // One recording failing must not abandon the rest of the batch.
       await sayVerbatim({
         agent: input.agent,
-        user: input.notify,
+        user: notify,
         text: `⚠️ I couldn't finish processing “${rec.title}” — ${failureReason(e).slice(0, 200)}`,
       }).catch(() => {});
     }
@@ -340,6 +349,9 @@ export interface RunSkillInput {
   steps: Step[];
   version: number;
   notify?: string;
+  /** The member whose Plaud account this recording came from, when the poll fanned out per-person.
+   *  Carried so the interpreter can attribute the run; undefined for the shared account. */
+  user?: string;
 }
 
 /**

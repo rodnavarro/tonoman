@@ -162,6 +162,25 @@ async function beating<T>(note: () => string, work: () => Promise<T>): Promise<T
   }
 }
 
+/** One Plaud account feeding an agent's voice flow.
+ *
+ *  An agent watches ONE account today — the tenant's shared login — and still does for every tenant
+ *  that has not gone per-person. A per-person tenant watches one account per member, so the poll
+ *  fans out over these and attributes each recording to the member whose account it came from. */
+export interface VoiceAccount {
+  /** The member this account belongs to — a Slack user id — or undefined for the tenant's one
+   *  shared account (every agent before per-person, and still Sapien's). */
+  user?: string;
+  /** How to read this account's recordings. */
+  creds: recap.PlaudCreds;
+  /** Who a recap from this account is announced to, when set. The shared account leaves this unset
+   *  so the poll's own `notify` is used, exactly as before. */
+  notifyUser?: string;
+  /** Earliest recording this account may reach — a member's own connect time, so somebody who joins
+   *  today does not backfill the tenant's whole history. Falls back to the agent floor. */
+  floorMs?: number;
+}
+
 export interface VoiceConfig {
   /** Where this agent's recaps are announced: a Slack channel id.
    *
@@ -230,6 +249,28 @@ export interface VoiceConfig {
    *  enabled. This is what the trigger hands to `runSkillWorkflow` so an edit to a live skill cannot
    *  change what an in-flight run is doing. */
   skill?: { name: string; steps: skill.Step[]; version: number };
+  /** Per-member Plaud accounts, when this agent's Plaud connection is per-person. Undefined or empty
+   *  is the ordinary state: the poll reads the single shared `creds` exactly as it always has. */
+  accounts?: VoiceAccount[];
+}
+
+/** The accounts this agent's poll iterates.
+ *
+ *  The invariant that keeps every existing tenant byte-identical: with no per-member accounts this
+ *  is exactly the one shared account the flow always had — same `creds`, same floor — so
+ *  `findNewRecordings`/`processRecording` make the same calls they made before per-person existed. */
+export function accountsOf(v: VoiceConfig): VoiceAccount[] {
+  return v.accounts && v.accounts.length
+    ? v.accounts
+    : [{ user: undefined, creds: v.creds, notifyUser: undefined, floorMs: v.floorMs }];
+}
+
+/** The account a recording belongs to — the member whose account it came from, else the shared one.
+ *  `accountFor(v, undefined)` returns the shared account, which is why an un-tagged recording reads
+ *  `v.creds` exactly as before. */
+export function accountFor(v: VoiceConfig, user?: string): VoiceAccount {
+  const all = accountsOf(v);
+  return all.find((a) => a.user === user) ?? all[0];
 }
 
 export interface TurnRunReq {
@@ -359,18 +400,29 @@ export function makeActivities(deps: TurnDeps) {
 
     /** Which finished recordings have not been published yet. Cheap and safe to retry. */
     async findNewRecordings(input: { agent: string }): Promise<
-      { id: string; title: string; stamp: string; minutes: number }[]
+      { id: string; title: string; stamp: string; minutes: number; user?: string; notify?: string }[]
     > {
       const v = deps.voice?.(input.agent);
       if (!v) return [];
-      const all = await recap.listRecordings(v.creds, 20);
-      const fresh = await recap.unpublished(all, v.brainDir, v.floorMs, v.journal);
-      return fresh.map((r) => ({
-        id: r.id,
-        title: r.title,
-        stamp: r.stamp,
-        minutes: Math.max(1, Math.round(r.duration / 60000)),
-      }));
+      const out: { id: string; title: string; stamp: string; minutes: number; user?: string; notify?: string }[] = [];
+      // One account for every tenant that has not gone per-person, so this loop runs once and makes
+      // the same two calls the flow always made. With per-member accounts it runs per account, and
+      // each recording is tagged with the member it belongs to so the poll can attribute and route it.
+      for (const acct of accountsOf(v)) {
+        const all = await recap.listRecordings(acct.creds, 20);
+        const fresh = await recap.unpublished(all, v.brainDir, acct.floorMs ?? v.floorMs, v.journal);
+        for (const r of fresh) {
+          out.push({
+            id: r.id,
+            title: r.title,
+            stamp: r.stamp,
+            minutes: Math.max(1, Math.round(r.duration / 60000)),
+            user: acct.user,
+            notify: acct.notifyUser,
+          });
+        }
+      }
+      return out;
     },
 
     /** Download, transcribe, summarise, publish, push — then ask the agent to say what it found.
@@ -378,18 +430,30 @@ export function makeActivities(deps: TurnDeps) {
      *  Everything up to the push is idempotent by path: re-running lands on the same folder and
      *  commits nothing. The notification is last, so a failure anywhere before it means the person
      *  is told about a failure rather than promised a recap that does not exist. */
-    async processRecording(input: { agent: string; notify: string; id: string }): Promise<void> {
+    async processRecording(input: { agent: string; notify: string; id: string; user?: string }): Promise<void> {
       const ctx = Context.current();
       const v = deps.voice?.(input.agent);
       if (!v) throw new Error(`no voice configuration for ${input.agent}`);
 
-      const all = await recap.listRecordings(v.creds, 50);
+      // Which account this recording came from — the member's own when per-person, else the one
+      // shared account. `accountFor(v, undefined)` returns the shared account and reads `v.creds`
+      // exactly as before, so every tenant that has not gone per-person is unchanged here.
+      const acct = accountFor(v, input.user);
+      const creds = acct.creds;
+      const floorMs = acct.floorMs ?? v.floorMs;
+      // Recording ids are only unique WITHIN an account, so a per-member run keeps its cached chunks
+      // in a subdir keyed by the member — else two members' recordings sharing an id would fight over
+      // one cache. The shared account (no user) keeps the original path unchanged.
+      const chunkCacheDir =
+        input.user && v.chunkCacheDir ? path.join(v.chunkCacheDir, encodeURIComponent(input.user)) : v.chunkCacheDir;
+
+      const all = await recap.listRecordings(creds, 50);
       const rec = all.find((r) => r.id === input.id);
       if (!rec) throw new Error(`recording ${input.id} is no longer listed`);
       // Checked again here, not only at selection: a workflow run that queued a list of recordings
       // before the floor existed would otherwise keep working through it across a redeploy, which
       // is the difference between "fixed" and "fixed for the next poll".
-      if (rec.startTime < v.floorMs) {
+      if (rec.startTime < floorMs) {
         console.log(`recap: skipping ${rec.title} — before the floor`);
         return;
       }
@@ -397,7 +461,7 @@ export function makeActivities(deps: TurnDeps) {
       // recording was summarised three times because each run of the list re-derived a slightly
       // different summary and so had something to commit. `publish` cannot catch this — a changed
       // summary IS a change.
-      if ((await recap.unpublished([rec], v.brainDir, v.floorMs, v.journal)).length === 0) {
+      if ((await recap.unpublished([rec], v.brainDir, floorMs, v.journal)).length === 0) {
         console.log(`recap: skipping ${rec.title} — already published`);
         return;
       }
@@ -410,7 +474,7 @@ export function makeActivities(deps: TurnDeps) {
         () => note,
         () =>
           recap.transcribe(
-            v.creds,
+            creds,
             rec,
             v.transcribe,
             v.vocab,
@@ -418,7 +482,7 @@ export function makeActivities(deps: TurnDeps) {
               note = `transcribing ${done}/${total}`;
               ctx.heartbeat(note);
             },
-            v.chunkCacheDir,
+            chunkCacheDir,
           ),
       );
       console.log(
@@ -497,7 +561,7 @@ export function makeActivities(deps: TurnDeps) {
       );
       // The transcript is in the second brain now, so the saved chunks have nothing left to
       // protect and become one more copy of a customer's meeting sitting on a volume.
-      if (v.chunkCacheDir) await recap.clearChunkCache(v.chunkCacheDir, rec);
+      if (chunkCacheDir) await recap.clearChunkCache(chunkCacheDir, rec);
       if (!published) return; // somebody else got there first; do not announce it twice
 
       // A real turn, so the agent says it in its own words and can be asked follow-ups in the same

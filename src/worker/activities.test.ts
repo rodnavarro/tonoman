@@ -1,5 +1,6 @@
-import { describe, expect, it } from "vitest";
-import { makeActivities, type TurnDeps, type VoiceConfig } from "./activities";
+import { describe, expect, it, vi } from "vitest";
+import { makeActivities, accountsOf, accountFor, type TurnDeps, type VoiceConfig } from "./activities";
+import * as recap from "./recap";
 import type { Step } from "./skill";
 
 /** The voice plan is the one decision the poll trigger reads each tick: which runtime, and — when it
@@ -39,5 +40,97 @@ describe("voicePlan — which runtime, and the skill to run", () => {
       runner: "skill",
       skill: { name: "meeting-recap", steps: STEPS, version: 3 },
     });
+  });
+});
+
+/** Per-person Plaud (Step 2). The whole safety argument is one property: a tenant with no per-member
+ *  accounts must read ONE account — the shared login — exactly as it did before per-person existed.
+ *  `accountsOf`/`accountFor` are where that invariant lives, so they are tested directly and without
+ *  a network. */
+function voiceCfg(over: Partial<VoiceConfig>): VoiceConfig {
+  return {
+    creds: { tokenJson: "shared-token" },
+    brainDir: "/brain",
+    pushUrl: "",
+    transcribe: [],
+    summarize: [],
+    vocab: "",
+    floorMs: 1000,
+    ...over,
+  } as VoiceConfig;
+}
+
+describe("accountsOf / accountFor — the shared account is the identity case", () => {
+  it("accountsOf returns the single shared account when there are none, carrying v.creds and v.floorMs", () => {
+    const v = voiceCfg({ floorMs: 4242 });
+    expect(accountsOf(v)).toEqual([{ user: undefined, creds: v.creds, notifyUser: undefined, floorMs: 4242 }]);
+  });
+
+  it("accountsOf returns the per-member accounts verbatim when present", () => {
+    const accounts = [{ user: "U_A", creds: { tokenJson: "a" }, notifyUser: "U_A", floorMs: 5 }];
+    expect(accountsOf(voiceCfg({ accounts }))).toBe(accounts);
+  });
+
+  it("accountFor(undefined) returns the shared account, so an un-tagged recording reads v.creds", () => {
+    const v = voiceCfg({});
+    expect(accountFor(v, undefined).creds).toBe(v.creds);
+  });
+
+  it("accountFor picks the member's own account, and falls back to the first for an unknown member", () => {
+    const v = voiceCfg({
+      accounts: [
+        { user: "U_A", creds: { tokenJson: "a" } },
+        { user: "U_B", creds: { tokenJson: "b" } },
+      ],
+    });
+    expect(accountFor(v, "U_B").creds).toEqual({ tokenJson: "b" });
+    expect(accountFor(v, "U_X").creds).toEqual({ tokenJson: "a" });
+  });
+});
+
+describe("findNewRecordings — the shared account makes the same calls as before", () => {
+  const R = (id: string, stamp: string) => ({ id, title: id.toUpperCase(), stamp, startTime: 2000, duration: 600000 });
+
+  it("with no per-member accounts, lists ONCE from the shared creds and dedups against the agent floor", async () => {
+    const list = vi.spyOn(recap, "listRecordings").mockResolvedValue([]);
+    const unpub = vi.spyOn(recap, "unpublished").mockResolvedValue([]);
+    try {
+      const v = voiceCfg({ journal: undefined });
+      const acts = makeActivities({ agent: () => undefined, voice: () => v });
+      const found = await acts.findNewRecordings({ agent: "sapien" });
+      expect(found).toEqual([]);
+      expect(list).toHaveBeenCalledTimes(1);
+      expect(list).toHaveBeenCalledWith(v.creds, 20);
+      expect(unpub).toHaveBeenCalledTimes(1);
+      expect(unpub).toHaveBeenCalledWith([], v.brainDir, v.floorMs, v.journal);
+    } finally {
+      list.mockRestore();
+      unpub.mockRestore();
+    }
+  });
+
+  it("fans out per member and tags each recording with its member and notify", async () => {
+    const list = vi
+      .spyOn(recap, "listRecordings")
+      .mockImplementation(async (creds) => (creds.tokenJson === "tokA" ? [R("a1", "2026-01-01-1000")] : [R("b1", "2026-01-02-1000")]));
+    const unpub = vi.spyOn(recap, "unpublished").mockImplementation(async (recs) => recs as recap.Recording[]);
+    try {
+      const v = voiceCfg({
+        accounts: [
+          { user: "U_A", creds: { tokenJson: "tokA" }, notifyUser: "U_A", floorMs: 500 },
+          { user: "U_B", creds: { tokenJson: "tokB" }, notifyUser: "U_B", floorMs: 500 },
+        ],
+      });
+      const acts = makeActivities({ agent: () => undefined, voice: () => v });
+      const found = await acts.findNewRecordings({ agent: "murphy" });
+      expect(list).toHaveBeenCalledTimes(2);
+      expect(found).toEqual([
+        { id: "a1", title: "A1", stamp: "2026-01-01-1000", minutes: 10, user: "U_A", notify: "U_A" },
+        { id: "b1", title: "B1", stamp: "2026-01-02-1000", minutes: 10, user: "U_B", notify: "U_B" },
+      ]);
+    } finally {
+      list.mockRestore();
+      unpub.mockRestore();
+    }
   });
 });
