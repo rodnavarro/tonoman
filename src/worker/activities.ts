@@ -303,6 +303,8 @@ export interface TurnRunReq {
   /** WHO is speaking (the connector's sender id). Carried so the run closure can pick the speaker's
    *  own credential when the agent runs inference per person; ignored for a shared-inference agent. */
   user?: string;
+  /** Paths to attached files on the shared mount, passed through to the harness. */
+  mediaPaths?: string[];
 }
 
 export interface TurnInput {
@@ -311,6 +313,9 @@ export interface TurnInput {
   channel: string;
   text: string;
   user: string;
+  /** Paths to files attached to the message, on the shared volume. The model is told to read them;
+   *  absent for an ordinary message, so the prompt is unchanged. */
+  mediaPaths?: string[];
   /** The previous turn was steered away mid-answer, so say so rather than pretending continuity. */
   afterInterruption?: boolean;
 }
@@ -972,12 +977,21 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
     // no session on disk to resume — is repaired below rather than left to fail forever.
     let session = await deps.claimSession?.(input.agent, input.conversation);
 
+    // Files the person attached, named for the model to open with its Read tool (images and PDFs it
+    // reads; a text file it reads; an audio file it can see and name but not transcribe here). Mirrors
+    // the gateway's media convention so there is one shape, not two. Empty for an ordinary message.
+    const media = input.mediaPaths ?? [];
+    const mediaNote = media.length
+      ? `\n\nAttached file(s) on the shared mount — read them:\n${media.map((p) => `- ${p}`).join("\n")}`
+      : "";
+
     const consume = async (): Promise<void> => {
       for await (const ev of run(
         {
-          prompt: `${preamble}${input.text}`,
+          prompt: `${preamble}${input.text}${mediaNote}`,
           systemPromptFile: found.cfg.system_prompt_file,
           model: deps.modelFor?.(input.agent, input.conversation),
+          mediaPaths: media.length ? media : undefined,
           sessionId: session?.id,
           sessionNew: session?.isNew,
           // WHO is speaking — the run closure turns this into the speaker's own credential when the

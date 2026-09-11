@@ -14,6 +14,9 @@
 //   2. Slack rotates the socket every ~10-60 minutes and warns first (`disconnect`). We treat that
 //      as ordinary, not an error: reconnect and keep yielding from the same iterator.
 
+import { promises as fs } from "node:fs";
+import * as path from "node:path";
+import { randomUUID } from "node:crypto";
 import { toMrkdwn } from "./mrkdwn";
 import type { Connector, Envelope, Reply } from "../core/contracts";
 
@@ -26,6 +29,13 @@ export interface SlackOptions {
   allowedUsers?: string[];
   apiBase?: string; // default https://slack.com/api
   fetchImpl?: typeof fetch; // injectable for tests; defaults to global fetch
+  /** Where inbound attachments are downloaded so the turn can read them. The agent's directory on
+   *  the shared state volume; absent = attachments are ignored (the text turn still runs). Needs the
+   *  app's `files:read` scope — without it the download 403s and is logged, never silent. */
+  mediaDir?: string;
+  /** The path `mediaDir` appears at to the process that runs `claude`. Same as `mediaDir` when the
+   *  runtime shares this pod's filesystem (the local-exec case); a mount path when it does not. */
+  mediaMount?: string;
   /** injectable WebSocket ctor for tests; defaults to the global (Node >= 22). */
   socketImpl?: typeof WebSocket;
   /** Block Kit interactions: button clicks and modal submissions.
@@ -63,6 +73,17 @@ interface SocketEnvelope {
   reason?: string;
 }
 
+interface SlackFile {
+  id?: string;
+  name?: string;
+  mimetype?: string;
+  size?: number;
+  /** The authenticated download URL (`url_private_download`), or the inline one. Fetched with the
+   *  bot token — a private file is not public, so the token IS the access. */
+  url_private_download?: string;
+  url_private?: string;
+}
+
 interface SlackEvent {
   type: string; // "app_mention" | "message"
   subtype?: string; // "message_changed", "bot_message", … — all ignored
@@ -74,6 +95,42 @@ interface SlackEvent {
   ts?: string;
   thread_ts?: string;
   event_ts?: string;
+  /** Files attached to THIS message. Only present on a message the agent was addressed in, so this
+   *  never picks up a `file_shared` event for something dropped elsewhere in the workspace. */
+  files?: SlackFile[];
+}
+
+/** Files larger than this are skipped rather than pulled onto the volume — a multi-hundred-MB
+ *  recording attached to a message is not something to download on a whim. Receipts and photos are
+ *  comfortably under it. */
+const MAX_MEDIA_BYTES = 25 * 1024 * 1024;
+
+/** Extensions trusted from the file's name when the magic bytes are unrecognised — text and audio,
+ *  which have no single signature. `claude`'s Read keys on the extension to know how to open it. */
+const TRUSTED_EXT = new Set([
+  ".txt", ".md", ".csv", ".json", ".log", ".xml", ".yaml", ".yml",
+  ".m4a", ".mp3", ".wav", ".ogg", ".opus", ".aac", ".flac",
+]);
+
+/** PURE: the file's real extension from its MAGIC BYTES (authoritative), else a trusted name
+ *  extension, else `.bin`. Covers the image/PDF set `claude` can read AND audio, which it cannot
+ *  transcribe but should still see named correctly rather than as an opaque `.bin`. */
+export function sniffMedia(buf: Buffer, name?: string): string {
+  const b = (i: number): number => (i < buf.length ? buf[i]! : -1);
+  const ascii = (off: number, s: string): boolean => buf.toString("latin1", off, off + s.length) === s;
+  if (b(0) === 0xff && b(1) === 0xd8 && b(2) === 0xff) return ".jpg";
+  if (b(0) === 0x89 && ascii(1, "PNG")) return ".png";
+  if (ascii(0, "GIF8")) return ".gif";
+  if (ascii(0, "RIFF") && ascii(8, "WEBP")) return ".webp";
+  if (ascii(0, "RIFF") && ascii(8, "WAVE")) return ".wav";
+  if (ascii(0, "%PDF")) return ".pdf";
+  if (ascii(0, "ID3") || (b(0) === 0xff && (b(1) & 0xe0) === 0xe0)) return ".mp3";
+  if (ascii(4, "ftyp")) {
+    if (ascii(8, "heic") || ascii(8, "heix") || ascii(8, "mif1") || ascii(8, "heif")) return ".heic";
+    if (ascii(8, "M4A") || ascii(8, "mp4") || ascii(8, "isom")) return ".m4a";
+  }
+  const ext = path.extname(name || "").toLowerCase();
+  return TRUSTED_EXT.has(ext) ? ext : ".bin";
 }
 
 export class SlackConnector implements Connector {
@@ -208,8 +265,14 @@ export class SlackConnector implements Connector {
         }
 
         if (frame.type !== "events_api" || !frame.payload?.event) return;
-        const env = this.normalize(frame.payload.event, frame.payload.team_id ?? "");
-        if (env) push(env);
+        // The ack already went out above, so downloading attachments here (async) cannot cause a
+        // redelivery. Errors are handled inside normalize; a rejected promise would only mean no
+        // envelope, never a crash of the socket handler.
+        void this.normalize(frame.payload.event, frame.payload.team_id ?? "")
+          .then((env) => {
+            if (env) push(env);
+          })
+          .catch((e) => console.error(`slack: normalize failed: ${(e as Error).message}`));
       };
 
       try {
@@ -267,7 +330,7 @@ export class SlackConnector implements Connector {
    *  We answer exactly two things: an `app_mention` (someone said @nelly), and a `message` in a
    *  DM. Everything else — channel chatter we were not addressed in, edits, joins, our own
    *  posts — is dropped here rather than in the router. */
-  private normalize(e: SlackEvent, teamID: string): Envelope | null {
+  private async normalize(e: SlackEvent, teamID: string): Promise<Envelope | null> {
     if (e.type !== "app_mention" && !(e.type === "message" && e.channel_type === "im")) return null;
     // A subtype means it is not a plain human message: message_changed, message_deleted,
     // channel_join, bot_message. None of them are something to answer.
@@ -315,8 +378,60 @@ export class SlackConnector implements Connector {
       conversation: conversationKey(teamID, e.channel, e.thread_ts),
       user: e.user,
       text: stripMention(e.text ?? ""),
-      mediaPaths: [],
+      // Files attached to the message, downloaded so the turn can read them. Empty for an ordinary
+      // message, which is every message today — so nothing about a text turn changes.
+      mediaPaths: await this.downloadFiles(e.files ?? []),
     };
+  }
+
+  /** Download the files attached to a message into `mediaDir`, returning the paths the turn will
+   *  hand the model. Best-effort per file: a failed download is logged and skipped (NEVER silent —
+   *  a swallowed download is the "agent says it sees nothing" bug), and the text turn still runs. */
+  private async downloadFiles(files: SlackFile[]): Promise<string[]> {
+    if (!files.length || !this.o.mediaDir) return [];
+    await this.cleanMedia().catch(() => {});
+    const out: string[] = [];
+    for (const f of files) {
+      const url = f.url_private_download || f.url_private;
+      if (!url) continue;
+      if (typeof f.size === "number" && f.size > MAX_MEDIA_BYTES) {
+        console.error(`slack: attachment "${f.name ?? f.id}" is ${f.size} bytes, over the ${MAX_MEDIA_BYTES} cap — skipping`);
+        continue;
+      }
+      try {
+        // `url_private*` is authenticated: the bot token IS the access, and the app needs the
+        // `files:read` scope. Without it Slack answers 403 — logged here, not swallowed.
+        const resp = await this.fetch(url, { headers: { authorization: `Bearer ${this.o.botToken}` } });
+        if (!resp.ok) throw new Error(`http ${resp.status}`);
+        const buf = Buffer.from(await resp.arrayBuffer());
+        const ext = sniffMedia(buf, f.name);
+        await fs.mkdir(this.o.mediaDir, { recursive: true });
+        const file = `${randomUUID()}${ext}`;
+        await fs.writeFile(path.join(this.o.mediaDir, file), buf);
+        out.push(this.o.mediaMount ? `${this.o.mediaMount}/${file}` : path.join(this.o.mediaDir, file));
+      } catch (err) {
+        console.error(`slack: attachment download failed (${f.mimetype ?? "?"}): ${(err as Error).message}`);
+      }
+    }
+    return out;
+  }
+
+  /** Remove downloaded attachments older than a day, so a volume does not accumulate every receipt
+   *  anyone ever sent. Best-effort: a turn is never held up or failed over cleanup. */
+  private async cleanMedia(): Promise<void> {
+    if (!this.o.mediaDir) return;
+    const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+    let entries: string[];
+    try {
+      entries = await fs.readdir(this.o.mediaDir);
+    } catch {
+      return;
+    }
+    for (const name of entries) {
+      const p = path.join(this.o.mediaDir, name);
+      const st = await fs.stat(p).catch(() => undefined);
+      if (st && st.isFile() && st.mtimeMs < cutoff) await fs.rm(p, { force: true }).catch(() => {});
+    }
   }
 }
 

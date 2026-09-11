@@ -323,6 +323,7 @@ function runClosure(runner: TurnRunner, cfg: AgentConfig): Wired["run"] {
         prompt: r.prompt,
         systemPromptFile: r.systemPromptFile,
         model: r.model,
+        mediaPaths: r.mediaPaths,
         sessionId: r.sessionId,
         sessionNew: r.sessionNew,
         configHome:
@@ -351,7 +352,17 @@ function wireOne(a: AgentConfig, harnesses: ReturnType<typeof defaultHarnesses>)
     console.error(`worker: skipping ${label} — missing ${!botToken ? "bot" : "app"} token`);
     return null;
   }
-  const conn = new SlackConnector({ appToken, botToken, allowedUsers: a.slack?.allowed_users });
+  // Where this agent's inbound attachments land, on the shared state volume so the process that runs
+  // `claude` (this same pod, local-exec) can read them. Per agent, so one tenant's receipts are never
+  // in another's directory — the same rule as every other per-agent path here.
+  const mediaDir = path.join(process.env.TONOMAN_STATE_ROOT ?? "/root/.tonoman", "media", a.name);
+  const conn = new SlackConnector({
+    appToken,
+    botToken,
+    allowedUsers: a.slack?.allowed_users,
+    mediaDir,
+    mediaMount: mediaDir,
+  });
 
   const runner = newRunnerFor(a, harnesses);
   if (!runner) {
@@ -1298,7 +1309,12 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
           if (asked) console.log(`worker: ${name} asked for an inference login (auth_state=${a.cfg.auth_state})`);
           continue;
         }
-        const first: Inbound = { text: env.text, user: env.user, ts: String(Date.now()) };
+        const first: Inbound = {
+          text: env.text,
+          user: env.user,
+          ts: String(Date.now()),
+          ...(env.mediaPaths.length ? { mediaPaths: env.mediaPaths } : {}),
+        };
         try {
           // One call whether or not the conversation is already running. Temporal serializes
           // signals per workflow id, so ordering is free and two people typing at once cannot

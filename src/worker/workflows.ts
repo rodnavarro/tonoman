@@ -52,6 +52,9 @@ export interface Inbound {
   text: string;
   user: string;
   ts: string;
+  /** Paths to files attached to the message, on the shared volume for the turn to read. Absent for
+   *  an ordinary message — every message today — so the turn is unchanged. */
+  mediaPaths?: string[];
 }
 
 export interface ConversationInput {
@@ -111,6 +114,7 @@ export async function conversationWorkflow(input: ConversationInput): Promise<vo
           channel: input.channel,
           text: m.text,
           user: m.user,
+          mediaPaths: m.mediaPaths,
           afterInterruption: interrupted,
         });
         interrupted = false;
