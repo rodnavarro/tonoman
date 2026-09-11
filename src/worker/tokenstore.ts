@@ -33,11 +33,31 @@ export interface TokenSet {
 }
 
 export interface TokenStore {
-  load(agent: string): Promise<TokenSet | undefined>;
-  save(agent: string, tokens: TokenSet): Promise<void>;
-  clear(agent: string): Promise<void>;
+  /** A Plaud account belongs to a PERSON — two teammates on one agent have two of them — so every
+   *  method takes an optional `user`: absent for the agent's one shared token (every account before
+   *  per-person existed, and still Sapien's), present for a member's own. The user does not travel
+   *  as part of the agent string; each store maps it to where that person's tokens live — a nested
+   *  home on the volume, a scoped ref in the registry — which is what keeps one member's account
+   *  from ever reading, or overwriting, another's. */
+  load(agent: string, user?: string): Promise<TokenSet | undefined>;
+  save(agent: string, tokens: TokenSet, user?: string): Promise<void>;
+  clear(agent: string, user?: string): Promise<void>;
   /** For `!status`, and for saying which of these two is in use without inferring it. */
   readonly where: string;
+}
+
+// --- Whose account -------------------------------------------------------------------------------
+
+/** The registry ref for a person's own Plaud tokens, under the agent. The user id is part of the
+ *  REF, not the row shape — scope lives in the ref, same as `plaud.tokens:<name>` always could. */
+export function plaudRefFor(base: string, user?: string): string {
+  return user ? `${base}:${user}` : base;
+}
+
+/** The user id back out of a per-person ref (`plaud.tokens:<user>`), for the roster side. */
+export function userFromPlaudRef(ref: string | undefined, base = "plaud.tokens"): string | undefined {
+  if (!ref || !ref.startsWith(`${base}:`)) return undefined;
+  return ref.slice(base.length + 1) || undefined;
 }
 
 // --- The volume ----------------------------------------------------------------------------------
@@ -45,22 +65,26 @@ export interface TokenStore {
 /** The CLI's own file. Still the fallback, and still what a single-tenant self-hosted install
  *  wants: no registry to talk to, no network call in the poll path. */
 export function fileStore(root?: string): TokenStore {
-  const at = (agent: string): string => path.join(homeFor(agent, root), ".plaud", "tokens.json");
+  // The per-member home is nested UNDER the agent's, so a member's tokens live at
+  // `<agent home>/users/<user>/.plaud/tokens.json` and the shared account keeps the exact original
+  // path — `homeFor(agent, undefined, root)` is the old `homeFor(agent, root)`.
+  const at = (agent: string, user?: string): string =>
+    path.join(homeFor(agent, user, root), ".plaud", "tokens.json");
   return {
     where: "the volume",
-    async load(agent) {
+    async load(agent, user) {
       try {
-        return JSON.parse(await fsp.readFile(at(agent), "utf8")) as TokenSet;
+        return JSON.parse(await fsp.readFile(at(agent, user), "utf8")) as TokenSet;
       } catch {
         return undefined;
       }
     },
-    async save(agent, tokens) {
-      await fsp.mkdir(path.dirname(at(agent)), { recursive: true });
-      await fsp.writeFile(at(agent), JSON.stringify(tokens, null, 2), "utf8");
+    async save(agent, tokens, user) {
+      await fsp.mkdir(path.dirname(at(agent, user)), { recursive: true });
+      await fsp.writeFile(at(agent, user), JSON.stringify(tokens, null, 2), "utf8");
     },
-    async clear(agent) {
-      await fsp.rm(at(agent), { force: true }).catch(() => {});
+    async clear(agent, user) {
+      await fsp.rm(at(agent, user), { force: true }).catch(() => {});
     },
   };
 }
@@ -92,16 +116,22 @@ export function cloudStore(o: CloudOptions): TokenStore {
   const ref = o.ref ?? "plaud.tokens";
   const f = o.fetchImpl ?? globalThis.fetch;
 
-  const url = (agent: string): string | undefined => {
+  // A member's own tokens are a scoped ref UNDER the tenant's — `plaud.tokens:<user>` — so scope
+  // lives in the ref, not in a second row shape, and the shared account keeps the bare `plaud.tokens`
+  // ref unchanged (`plaudRefFor(ref, undefined) === ref`).
+  const refFor = (user?: string): string => plaudRefFor(ref, user);
+  const url = (agent: string, user?: string): string | undefined => {
     const guid = o.guidOf(agent);
-    return guid ? `${o.baseUrl}/v1/system/agents/${guid}/secrets/${encodeURIComponent(ref)}` : undefined;
+    return guid
+      ? `${o.baseUrl}/v1/system/agents/${guid}/secrets/${encodeURIComponent(refFor(user))}`
+      : undefined;
   };
   const auth = { authorization: `Bearer ${o.token}` };
 
   return {
     where: "Tonoman Cloud, encrypted",
-    async load(agent) {
-      const u = url(agent);
+    async load(agent, user) {
+      const u = url(agent, user);
       if (!u) return undefined;
       const r = await f(u, { headers: auth }).catch(() => undefined);
       // 404 is "not connected", which is the ordinary state of a tenant who has not connected.
@@ -110,18 +140,18 @@ export function cloudStore(o: CloudOptions): TokenStore {
         // Anything else — a 500 from a failed decrypt, a 503 from a missing key — must NOT read as
         // "not connected". A caller that took it that way would offer to reconnect an account that
         // is connected, and the reconnect would overwrite a row we simply could not read.
-        throw new Error(`secrets: ${r.status} reading ${ref}`);
+        throw new Error(`secrets: ${r.status} reading ${refFor(user)}`);
       }
       const body = (await r.json()) as { value?: string };
       if (!body.value) return undefined;
       try {
         return JSON.parse(body.value) as TokenSet;
       } catch {
-        throw new Error(`secrets: ${ref} is not JSON`);
+        throw new Error(`secrets: ${refFor(user)} is not JSON`);
       }
     },
-    async save(agent, tokens) {
-      const u = url(agent);
+    async save(agent, tokens, user) {
+      const u = url(agent, user);
       if (!u) throw new Error(`secrets: ${agent} has no registry guid, so its tokens have nowhere to go`);
       const r = await f(u, {
         method: "PUT",
@@ -129,10 +159,10 @@ export function cloudStore(o: CloudOptions): TokenStore {
         // In the body, never the path: a credential in a URL ends up in access logs at both ends.
         body: JSON.stringify({ value: JSON.stringify(tokens) }),
       });
-      if (!r.ok) throw new Error(`secrets: ${r.status} storing ${ref}`);
+      if (!r.ok) throw new Error(`secrets: ${r.status} storing ${refFor(user)}`);
     },
-    async clear(agent) {
-      const u = url(agent);
+    async clear(agent, user) {
+      const u = url(agent, user);
       if (!u) return;
       await f(u, { method: "DELETE", headers: auth }).catch(() => {});
     },

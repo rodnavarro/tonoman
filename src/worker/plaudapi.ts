@@ -35,8 +35,8 @@ const RENEW_BEFORE_MS = 10 * 60 * 1000;
 
 /** The access token for this agent, refreshed if it is close to expiring. Undefined means the
  *  tenant has not connected an account, which is a state and not a failure. */
-export async function accessToken(agent: string, root?: string): Promise<string | undefined> {
-  const t = await storeFor(root).load(agent);
+export async function accessToken(agent: string, user?: string, root?: string): Promise<string | undefined> {
+  const t = await storeFor(root).load(agent, user);
   if (!t?.access_token) return undefined;
 
   const expMs = typeof t.expires_at === "number" ? (t.expires_at > 1e12 ? t.expires_at : t.expires_at * 1000) : 0;
@@ -65,7 +65,7 @@ export async function accessToken(agent: string, root?: string): Promise<string 
     if (!next.access_token) return t.access_token;
     // Written back wherever the store keeps them. A refresh that renewed the token but failed to
     // persist it would renew again on every poll, and burn the refresh token's rotation budget.
-    await storeFor(root).save(agent, stamp({ ...t, ...next }));
+    await storeFor(root).save(agent, stamp({ ...t, ...next }), user);
     return next.access_token;
   } catch {
     return t.access_token;
@@ -100,8 +100,8 @@ export function envelopeError(body: unknown): string | undefined {
   return msg;
 }
 
-async function call<T>(agent: string, pathname: string, root?: string): Promise<T> {
-  const token = await accessToken(agent, root);
+async function call<T>(agent: string, pathname: string, user?: string, root?: string): Promise<T> {
+  const token = await accessToken(agent, user, root);
   if (!token) throw new Error("plaud: this agent has no connected account — run !connect");
   const res = await fetch(`${API_BASE}${pathname}`, {
     headers: { authorization: `Bearer ${token}`, accept: "application/json" },
@@ -170,18 +170,18 @@ export function toRecording(f: ApiFile): Recording {
 }
 
 /** The recent recordings on this agent's connected account, newest first. */
-export async function list(agent: string, pageSize = 20, root?: string): Promise<Recording[]> {
+export async function list(agent: string, pageSize = 20, user?: string, root?: string): Promise<Recording[]> {
   // The API refuses a page smaller than ten, and says so with a 422 that names the constraint.
   const size = Math.max(10, Math.min(100, pageSize));
-  const body = await call<{ data?: ApiFile[] }>(agent, `/open/third-party/files/?page=1&page_size=${size}`, root);
+  const body = await call<{ data?: ApiFile[] }>(agent, `/open/third-party/files/?page=1&page_size=${size}`, user, root);
   return (body.data ?? []).map(toRecording).sort((a, b) => b.startTime - a.startTime);
 }
 
 /** A time-limited download URL for one recording's audio. Signed on demand and short-lived, so it
  *  is fetched at the moment of use and never stored. */
-export async function audioUrl(agent: string, id: string, root?: string): Promise<string> {
+export async function audioUrl(agent: string, id: string, user?: string, root?: string): Promise<string> {
   // The detail response is the file itself, with no envelope around it.
-  const f = await call<ApiFile>(agent, `/open/third-party/files/${encodeURIComponent(id)}`, root);
+  const f = await call<ApiFile>(agent, `/open/third-party/files/${encodeURIComponent(id)}`, user, root);
   if (!f.presigned_url) {
     // Their own client distinguishes these two, and so should we: a recording that has not
     // finished syncing will have a URL shortly, and one that never had audio never will.
@@ -196,6 +196,6 @@ export async function audioUrl(agent: string, id: string, root?: string): Promis
 }
 
 /** Whether this agent has a usable connected account, without making a request. */
-export async function connected(agent: string, root?: string): Promise<boolean> {
-  return Boolean((await storeFor(root).load(agent))?.access_token);
+export async function connected(agent: string, user?: string, root?: string): Promise<boolean> {
+  return Boolean((await storeFor(root).load(agent, user))?.access_token);
 }

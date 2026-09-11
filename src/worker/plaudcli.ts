@@ -17,8 +17,11 @@ import * as path from "node:path";
 
 /** Where one agent's Plaud tokens live. Per agent, on the volume — the same rule as every other
  *  credential here: whose account this is, is a fact about the tenant. */
-export function homeFor(agent: string, root?: string): string {
-  return path.join(root ?? process.env.TONOMAN_STATE_ROOT ?? "/root/.tonoman", "plaud", encodeURIComponent(agent));
+export function homeFor(agent: string, user?: string, root?: string): string {
+  const base = path.join(root ?? process.env.TONOMAN_STATE_ROOT ?? "/root/.tonoman", "plaud", encodeURIComponent(agent));
+  // A member's home is nested under the agent's; the shared account (no user) keeps the exact path
+  // it always had, so nothing on the volume moves for a tenant that has not gone per-person.
+  return user ? path.join(base, "users", encodeURIComponent(user)) : base;
 }
 
 /** The first URL the CLI prints. It offers to open a browser and, failing that, tells the person
@@ -45,6 +48,8 @@ export interface Started {
 
 export interface RunOpts {
   agent: string;
+  /** The member connecting their own account, when per-person; absent for the shared account. */
+  user?: string;
   root?: string;
   /** Overridable so tests do not need the real CLI on PATH. */
   bin?: string;
@@ -65,7 +70,7 @@ export interface RunOpts {
  *  connect replaces the first — which is the bug we just finished removing from the old
  *  credential, and it would be a shame to reintroduce it here. */
 export async function startLogin(o: RunOpts): Promise<Started> {
-  const home = homeFor(o.agent, o.root);
+  const home = homeFor(o.agent, o.user, o.root);
   await fsp.mkdir(home, { recursive: true });
 
   // The CLI opens a browser and only PRINTS the URL when opening fails:
@@ -171,7 +176,7 @@ export async function completeLogin(pasted: string): Promise<boolean> {
  *  A store that THROWS is not "no": a 500 from a failed decrypt means there is a credential we
  *  could not read, and answering false would offer to reconnect an account that is connected —
  *  and then overwrite it. Undefined is no, an error is an error. */
-export async function connected(agent: string, root?: string): Promise<boolean> {
+export async function connected(agent: string, user?: string, root?: string): Promise<boolean> {
   const { storeFor } = await import("./tokenstore");
-  return Boolean(await storeFor(root).load(agent));
+  return Boolean(await storeFor(root).load(agent, user));
 }

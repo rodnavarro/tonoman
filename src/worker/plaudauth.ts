@@ -43,12 +43,12 @@ export interface Pending {
 /** Where a half-finished login waits. On the volume, not in memory: connecting is two messages
  *  with a person's attention span in between, and a pod that restarts mid-login should not
  *  silently make their pasted code meaningless. */
-function pendingPath(agent: string, root?: string): string {
-  return path.join(homeFor(agent, root), "pending-login.json");
+function pendingPath(agent: string, user?: string, root?: string): string {
+  return path.join(homeFor(agent, user, root), "pending-login.json");
 }
 
 /** Begin a login: the URL to put in front of the person, and the secret that finishes it. */
-export async function begin(agent: string, root?: string): Promise<Pending> {
+export async function begin(agent: string, user?: string, root?: string): Promise<Pending> {
   const verifier = randomBytes(32).toString("base64url");
   const challenge = createHash("sha256").update(verifier).digest("base64url");
   const state = randomBytes(16).toString("base64url");
@@ -62,8 +62,8 @@ export async function begin(agent: string, root?: string): Promise<Pending> {
   }).toString()}`;
 
   const p: Pending = { url, verifier, state };
-  await fsp.mkdir(homeFor(agent, root), { recursive: true });
-  await fsp.writeFile(pendingPath(agent, root), JSON.stringify(p), "utf8");
+  await fsp.mkdir(homeFor(agent, user, root), { recursive: true });
+  await fsp.writeFile(pendingPath(agent, user, root), JSON.stringify(p), "utf8");
   return p;
 }
 
@@ -87,13 +87,13 @@ export interface Finished {
  *  Local first, and revocation best-effort. If the network call fails we have still stopped reading
  *  the account, which is the part the person asked for; a disconnect that refuses because a remote
  *  call failed leaves them connected to something they just said to drop. */
-export async function disconnect(agent: string, root?: string): Promise<void> {
+export async function disconnect(agent: string, user?: string, root?: string): Promise<void> {
   const token = await storeFor(root)
-    .load(agent)
+    .load(agent, user)
     .then((t) => t?.access_token)
     .catch(() => undefined);
-  await storeFor(root).clear(agent);
-  await fsp.rm(pendingPath(agent, root), { force: true }).catch(() => {});
+  await storeFor(root).clear(agent, user);
+  await fsp.rm(pendingPath(agent, user, root), { force: true }).catch(() => {});
   if (!token) return;
   await fetch(`${API_BASE}/open/third-party/users/current/revoke`, {
     method: "POST",
@@ -102,13 +102,13 @@ export async function disconnect(agent: string, root?: string): Promise<void> {
 }
 
 /** Finish a login with the pasted callback, and store the tokens where the poll reads them. */
-export async function complete(agent: string, pasted: string, root?: string): Promise<Finished> {
+export async function complete(agent: string, pasted: string, user?: string, root?: string): Promise<Finished> {
   const { code, state } = codeFrom(pasted);
   if (!code) return { ok: false, problem: "that address has no `code=` in it — paste the whole thing" };
 
   let pending: Pending | undefined;
   try {
-    pending = JSON.parse(await fsp.readFile(pendingPath(agent, root), "utf8")) as Pending;
+    pending = JSON.parse(await fsp.readFile(pendingPath(agent, user, root), "utf8")) as Pending;
   } catch {
     return { ok: false, problem: "I don't have a sign-in waiting — start again with `!connect plaud`" };
   }
@@ -154,11 +154,11 @@ export async function complete(agent: string, pasted: string, root?: string): Pr
   // Storing is allowed to fail loudly. Reporting a connection that was not persisted is worse
   // than reporting a failure: the person believes they are done, and nothing ever polls.
   try {
-    await storeFor(root).save(agent, stamp(granted));
+    await storeFor(root).save(agent, stamp(granted), user);
   } catch (e) {
     return { ok: false, problem: `I signed in but couldn't store the credential — ${(e as Error).message}` };
   }
   // The pending secret has done its job; leaving it lying about serves nobody.
-  await fsp.rm(pendingPath(agent, root), { force: true }).catch(() => {});
+  await fsp.rm(pendingPath(agent, user, root), { force: true }).catch(() => {});
   return { ok: true };
 }

@@ -50,6 +50,10 @@ export interface PlaudCreds {
    *  in one step would have meant no working pipeline at all while it was tried. The bearer path
    *  goes when the second tenant has connected. */
   cliAgent?: string;
+  /** When set, the recordings come from ONE member's own connected account rather than the agent's
+   *  shared one — the poll fanned out per person. Passed through to the token store so a member's
+   *  tokens are read from their own scope; absent for the shared account. */
+  cliUser?: string;
 }
 
 export interface Recording {
@@ -108,7 +112,7 @@ async function plaudGet<T>(creds: PlaudCreds, p: string, params?: Record<string,
 }
 
 export async function listRecordings(creds: PlaudCreds, limit = 20): Promise<Recording[]> {
-  if (creds.cliAgent) return plaudapi.list(creds.cliAgent, limit);
+  if (creds.cliAgent) return plaudapi.list(creds.cliAgent, limit, creds.cliUser);
   const j = await plaudGet<{ data_file_list?: Record<string, unknown>[] }>(creds, "/file/simple/web", {
     skip: 0,
     limit,
@@ -408,7 +412,7 @@ export async function transcribe(
   // taking them would put the quality of every recap in somebody else's model, tuned for somebody
   // else's purpose, with our vocabulary hints discarded. ffmpeg and Groq stay.
   const tempUrl = creds.cliAgent
-    ? await plaudapi.audioUrl(creds.cliAgent, rec.id)
+    ? await plaudapi.audioUrl(creds.cliAgent, rec.id, creds.cliUser)
     : (await plaudGet<{ temp_url: string }>(creds, `/file/temp-url/${rec.id}`)).temp_url;
   const audio = Buffer.from(await (await fetch(tempUrl)).arrayBuffer());
 

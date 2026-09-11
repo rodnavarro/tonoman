@@ -13,7 +13,18 @@ import { afterEach, describe, expect, it } from "vitest";
 import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { chooseStore, cloudStore, fileStore, resetStore, stamp, storeFor, tokens, useStore } from "./tokenstore";
+import {
+  chooseStore,
+  cloudStore,
+  fileStore,
+  plaudRefFor,
+  resetStore,
+  stamp,
+  storeFor,
+  tokens,
+  useStore,
+  userFromPlaudRef,
+} from "./tokenstore";
 
 afterEach(() => resetStore());
 
@@ -52,6 +63,25 @@ describe("the volume", () => {
     await s.clear("nelly");
     expect(await s.load("nelly")).toBeUndefined();
   });
+
+  it("keeps a member's own account out of the shared one and out of another member's", async () => {
+    // Per-person: two teammates on one agent have two accounts, and neither is the shared one. A
+    // member's tokens must never be read or overwritten by the shared account or by another member —
+    // that is the whole safety property of going per-person.
+    const root = await tmp();
+    const s = fileStore(root);
+    await s.save("murphy", { access_token: "shared" });
+    await s.save("murphy", { access_token: "celine" }, "U_CELINE");
+    await s.save("murphy", { access_token: "rod" }, "U_ROD");
+    expect((await s.load("murphy"))?.access_token).toBe("shared");
+    expect((await s.load("murphy", "U_CELINE"))?.access_token).toBe("celine");
+    expect((await s.load("murphy", "U_ROD"))?.access_token).toBe("rod");
+    // Clearing one member touches neither the shared account nor the other member.
+    await s.clear("murphy", "U_CELINE");
+    expect(await s.load("murphy", "U_CELINE")).toBeUndefined();
+    expect((await s.load("murphy"))?.access_token).toBe("shared");
+    expect((await s.load("murphy", "U_ROD"))?.access_token).toBe("rod");
+  });
 });
 
 describe("Tonoman Cloud", () => {
@@ -77,6 +107,18 @@ describe("Tonoman Cloud", () => {
     let url = "";
     const s = deps((async (u: string) => ((url = u), ok({ value: "{}" }))) as unknown as typeof fetch);
     await s.load("nelly");
+    expect(url).toBe("http://api/v1/system/agents/guid-1/secrets/plaud.tokens");
+  });
+
+  it("scopes a member's own secret in the REF, leaving the shared ref untouched", async () => {
+    // Per-person lives in the ref, not a second row shape: the shared account is `plaud.tokens`
+    // exactly as before, a member's own is `plaud.tokens:<user>` (URL-encoded), so one member can
+    // never address another's, and no schema changes.
+    let url = "";
+    const s = deps((async (u: string) => ((url = u), ok({ value: "{}" }))) as unknown as typeof fetch);
+    await s.load("murphy", "U_CELINE");
+    expect(url).toBe(`http://api/v1/system/agents/guid-1/secrets/${encodeURIComponent("plaud.tokens:U_CELINE")}`);
+    await s.load("murphy");
     expect(url).toBe("http://api/v1/system/agents/guid-1/secrets/plaud.tokens");
   });
 
@@ -183,5 +225,19 @@ describe("stamp", () => {
 
   it("leaves a token set with no lifetime alone rather than inventing one", () => {
     expect(stamp({ access_token: "a" }).expires_at).toBeUndefined();
+  });
+});
+
+describe("plaudRefFor / userFromPlaudRef — scope lives in the ref", () => {
+  it("appends the user to the base ref, and leaves the shared ref bare", () => {
+    expect(plaudRefFor("plaud.tokens", "U_CELINE")).toBe("plaud.tokens:U_CELINE");
+    expect(plaudRefFor("plaud.tokens", undefined)).toBe("plaud.tokens");
+  });
+
+  it("round-trips the user back out of a scoped ref, and yields undefined for the shared one", () => {
+    expect(userFromPlaudRef("plaud.tokens:U_CELINE")).toBe("U_CELINE");
+    expect(userFromPlaudRef("plaud.tokens")).toBeUndefined();
+    expect(userFromPlaudRef(undefined)).toBeUndefined();
+    expect(userFromPlaudRef("something.else:U_X")).toBeUndefined();
   });
 });
