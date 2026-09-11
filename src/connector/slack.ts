@@ -404,6 +404,41 @@ export function stripMention(text: string): string {
   return text.replace(/<@[UWB][A-Z0-9]*>/g, " ").replace(/\s+/g, " ").trim();
 }
 
+/** Slack caps one message's text. A streamed answer that grows past the cap used to freeze at the
+ *  last edit that fit — the model produced the whole thing and the person saw it cut mid-sentence.
+ *  So a long final answer is split into follow-on messages in the same thread instead. 3900, not
+ *  4000: the split runs on the CONVERTED mrkdwn, and there is no reason to sit on the exact edge. */
+export const SLACK_MSG_LIMIT = 3900;
+
+/** PURE: split text into pieces no longer than `limit`, cutting at the last paragraph break before
+ *  the cap, else the last line break, else a hard cut. A code fence left open by a cut is closed at
+ *  the end of its piece and reopened at the start of the next, so no piece renders as broken
+ *  markdown. Text within the cap returns as a single piece — the common case, unchanged. */
+export function splitForSlack(text: string, limit = SLACK_MSG_LIMIT): string[] {
+  if (text.length <= limit) return [text];
+  const pieces: string[] = [];
+  let rest = text;
+  while (rest.length > limit) {
+    let cut = rest.lastIndexOf("\n\n", limit);
+    if (cut <= 0) cut = rest.lastIndexOf("\n", limit);
+    if (cut <= 0) cut = limit; // a single unbroken run longer than the cap — cut it hard
+    pieces.push(rest.slice(0, cut));
+    rest = rest.slice(cut).replace(/^\n+/, ""); // the boundary newlines belong to neither piece
+  }
+  if (rest) pieces.push(rest);
+  // Carry an unbalanced ``` fence across the boundary so neither piece renders as broken code.
+  // `open` is the true fence state entering a piece; `odd` is whether the piece's OWN fences flip it.
+  let open = false;
+  return pieces.map((p) => {
+    const odd = ((p.match(/```/g) || []).length % 2) === 1;
+    let out = open ? "```\n" + p : p; // a block left open by the previous piece: reopen it here
+    const nowOpen = open !== odd;
+    if (nowOpen) out = out + "\n```"; // this piece leaves a block open: close it at its own end
+    open = nowOpen;
+    return out;
+  });
+}
+
 class SlackReply implements Reply {
   private readonly target: { team: string; channel: string; threadTs?: string };
 
@@ -417,11 +452,26 @@ class SlackReply implements Reply {
   }
 
   async send(text: string): Promise<string> {
+    // Slack speaks mrkdwn, not markdown. Converting here rather than at each call site means every
+    // outbound path — answers, notices, the work log — is translated exactly once.
+    //
+    // Splits, for the ONE case that reaches send() with a whole long answer: a turn that delivered
+    // everything in a final event with no streamed deltas, so `oneTurn` posts fresh rather than
+    // editing. A streaming partial arrives here too but is small (the first ~second of output), so
+    // it is one message and is superseded by the next update exactly as before.
+    const pieces = splitForSlack(toMrkdwn(text) || "…");
+    let first = "";
+    for (let i = 0; i < pieces.length; i++) {
+      const ts = await this.postRaw(pieces[i]!);
+      if (i === 0) first = ts;
+    }
+    return first;
+  }
+
+  private async postRaw(mrkdwn: string): Promise<string> {
     const res = await this.c.call<{ ts?: string }>("chat.postMessage", {
       channel: this.target.channel,
-      // Slack speaks mrkdwn, not markdown. Converting here rather than at each call site means
-      // every outbound path — answers, notices, the work log — is translated exactly once.
-      text: toMrkdwn(text) || "…",
+      text: mrkdwn || "…",
       // Stay in the thread we were addressed in; a top-level mention answers top-level.
       ...(this.target.threadTs ? { thread_ts: this.target.threadTs } : {}),
       unfurl_links: false,
@@ -434,8 +484,15 @@ class SlackReply implements Reply {
     await this.edit(msgID, text);
   }
 
+  /** The FINAL answer, which unlike an intermediate update is not superseded by anything — so it
+   *  must actually land. A long answer is split across follow-on messages in the same thread rather
+   *  than frozen at the last chunk that fit (the bug where the model wrote the whole thing and the
+   *  person saw it cut mid-sentence). `msgID` empty = nothing streamed, so post the first piece fresh. */
   async finalize(msgID: string, text: string): Promise<void> {
-    await this.edit(msgID, text);
+    const pieces = splitForSlack(toMrkdwn(text) || "…");
+    if (msgID) await this.editFinal(msgID, pieces[0]!);
+    else await this.postRaw(pieces[0]!);
+    for (let i = 1; i < pieces.length; i++) await this.postRaw(pieces[i]!);
   }
 
   private async edit(msgID: string, text: string): Promise<void> {
@@ -444,9 +501,29 @@ class SlackReply implements Reply {
       await this.c.call("chat.update", { channel: this.target.channel, ts: msgID, text: toMrkdwn(text) || "…" });
     } catch (e) {
       // Slack rejects an edit that changes nothing, and rate-limits a fast stream. Neither is
-      // worth failing a turn over — the next update carries the same text forward.
+      // worth failing a turn over — the next update carries the same text forward. This is ONLY for
+      // intermediate updates; the final answer goes through editFinal, which must not vanish.
       const m = (e as Error).message;
       if (/msg_too_long|ratelimited|edit_window_closed/.test(m)) return;
+      throw e;
+    }
+  }
+
+  /** Edit for the FINAL piece: unlike `edit`, a rate-limited final is retried once rather than
+   *  dropped (dropping it is exactly how a complete answer ended up frozen at a partial), and a
+   *  genuine `msg_too_long` is surfaced rather than swallowed — a piece is ≤ the cap, so it means a
+   *  real bug, not a superseded edit. */
+  private async editFinal(msgID: string, mrkdwn: string): Promise<void> {
+    try {
+      await this.c.call("chat.update", { channel: this.target.channel, ts: msgID, text: mrkdwn || "…" });
+    } catch (e) {
+      const m = (e as Error).message;
+      if (/ratelimited/.test(m)) {
+        await new Promise((r) => setTimeout(r, 1200));
+        await this.c.call("chat.update", { channel: this.target.channel, ts: msgID, text: mrkdwn || "…" }).catch(() => {});
+        return;
+      }
+      if (/edit_window_closed/.test(m)) return; // the message is too old to edit; nothing to do
       throw e;
     }
   }

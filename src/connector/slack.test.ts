@@ -1,5 +1,39 @@
 import { describe, it, expect } from "vitest";
-import { SlackConnector, stripMention, conversationKey, parseConversation } from "./slack";
+import { SlackConnector, stripMention, conversationKey, parseConversation, splitForSlack, SLACK_MSG_LIMIT } from "./slack";
+
+describe("splitForSlack — a long answer becomes follow-on messages, never a cut one", () => {
+  it("leaves a short answer as a single piece, unchanged", () => {
+    expect(splitForSlack("hello")).toEqual(["hello"]);
+    const justUnder = "x".repeat(SLACK_MSG_LIMIT);
+    expect(splitForSlack(justUnder)).toEqual([justUnder]);
+  });
+
+  it("splits a long answer into pieces that are each within the cap", () => {
+    const para = "A paragraph that is reasonably long. ".repeat(30).trim(); // ~1100 chars
+    const text = Array.from({ length: 8 }, (_, i) => `## Section ${i}\n\n${para}`).join("\n\n"); // ~9k chars
+    const pieces = splitForSlack(text);
+    expect(pieces.length).toBeGreaterThan(1);
+    for (const p of pieces) expect(p.length).toBeLessThanOrEqual(SLACK_MSG_LIMIT);
+    // Nothing is lost: the words survive in order (boundary whitespace aside).
+    expect(pieces.join("\n\n").replace(/\s+/g, " ").trim()).toBe(text.replace(/\s+/g, " ").trim());
+  });
+
+  it("hard-cuts a single unbroken run longer than the cap rather than looping", () => {
+    const pieces = splitForSlack("y".repeat(SLACK_MSG_LIMIT * 2 + 50));
+    expect(pieces.length).toBe(3);
+    for (const p of pieces) expect(p.length).toBeLessThanOrEqual(SLACK_MSG_LIMIT);
+  });
+
+  it("never leaves a code fence open across a boundary", () => {
+    // A fenced block straddling the cap would render as broken code in the first piece.
+    const code = "```\n" + "console.log('x');\n".repeat(300) + "```"; // one big fence, >cap
+    const pieces = splitForSlack("intro\n\n" + code + "\n\noutro");
+    expect(pieces.length).toBeGreaterThan(1);
+    for (const p of pieces) {
+      expect((p.match(/```/g) || []).length % 2).toBe(0); // balanced in every piece
+    }
+  });
+});
 
 describe("stripMention", () => {
   it("drops the leading bot mention and normalizes whitespace", () => {
