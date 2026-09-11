@@ -51,7 +51,8 @@ export interface TurnDeps {
    *  Per CONVERSATION. The harness's own model knob is per process, so one worker serving two
    *  people meant `!model opus` in one thread silently moved everybody else too — which is what
    *  happened the first time two users shared this worker. */
-  modelFor?(conversation: string): string | undefined;
+  /** The model for a turn: the conversation's `!model` choice, else the agent's CURRENT default. */
+  modelFor?(agent: string, conversation: string): string | undefined;
   /** The harness session this conversation continues in, MARKED AS IN USE by the act of asking.
    *
    *  Without one, every message is a fresh `claude` run: the agent answers a question perfectly and
@@ -888,7 +889,7 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
         {
           prompt: `${preamble}${input.text}`,
           systemPromptFile: found.cfg.system_prompt_file,
-          model: deps.modelFor?.(input.conversation),
+          model: deps.modelFor?.(input.agent, input.conversation),
           sessionId: session?.id,
           sessionNew: session?.isNew,
           // WHO is speaking — the run closure turns this into the speaker's own credential when the

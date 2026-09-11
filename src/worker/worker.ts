@@ -769,7 +769,12 @@ export async function run(
     agent: (name: string) => wired.get(name),
     voice: (name: string) => voiceCreds.get(name),
     recordUsage: (conversation: string, u: TurnUsage) => lastUsage.set(conversation, u),
-    modelFor: (conversation: string) => models.get(conversation),
+    // The conversation's own `!model` choice, else the agent's CURRENT default from the roster.
+    // The fall-through is load-bearing: the runner also holds a model, but that one was baked in
+    // at wire time, and a reload that changes only the default model is a plain cfg swap (no runner
+    // rebuild) on the promise that the model is read per turn. Without this a Hub edit to "opus"
+    // saved, reloaded, and every new conversation still opened on the old default.
+    modelFor: (agent: string, conversation: string) => models.get(conversation) ?? wired.get(agent)?.cfg.model,
     claimSession,
     resetSession,
     footer: async (name: string, conversation: string, u: TurnUsage | undefined): Promise<string | null> => {
