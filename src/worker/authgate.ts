@@ -18,8 +18,9 @@ import { firstInputValue } from "../connector/slack";
 export const CONNECT_ACTION = "tonoman_connect_inference";
 
 export interface AuthGateDeps {
-  /** Start the harness's own login and return the OAuth URL. */
-  ops(agent: string): AuthOps | undefined;
+  /** Start the harness's own login and return the OAuth URL. `user` names the person's own login
+   *  dir when the agent runs inference per person; omitted for a shared-inference agent. */
+  ops(agent: string, user?: string): AuthOps | undefined;
   conn(agent: string): SlackConnector | undefined;
   /** Report the OUTCOME back to the registry, so the next turn is not gated. */
   setAuthState(agent: string, state: "ok" | "error"): Promise<void>;
@@ -99,8 +100,14 @@ export function codeModal(agent: string, conversation: string): Record<string, u
 
 /** Ask, in the channel. Returns false when the login could not even be started, so the caller can
  *  say something rather than leaving the person watching nothing. */
-export async function ask(deps: AuthGateDeps, agent: string, agentLabel: string, conversation: string): Promise<boolean> {
-  const ops = deps.ops(agent);
+export async function ask(
+  deps: AuthGateDeps,
+  agent: string,
+  agentLabel: string,
+  conversation: string,
+  user?: string,
+): Promise<boolean> {
+  const ops = deps.ops(agent, user);
   const conn = deps.conn(agent);
   if (!ops || !conn) return false;
   let url: string;

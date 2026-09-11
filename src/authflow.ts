@@ -187,7 +187,7 @@ export function transportFailure(e: unknown, base: string): string {
  * credential store, so it runs the PTY dance itself (same reason /usage lives agent-side).
  * We send only the CODE, never a command: the login argv comes from the agent's harness spec,
  * so this can never become a remote-exec primitive. */
-export function httpAuthOps(baseUrl: string, token?: string, agent?: string): AuthOps {
+export function httpAuthOps(baseUrl: string, token?: string, agent?: string, user?: string): AuthOps {
   const base = baseUrl.replace(/\/$/, "");
   const headers: Record<string, string> = { "content-type": "application/json" };
   if (token) headers["authorization"] = `Bearer ${token}`;
@@ -225,8 +225,13 @@ export function httpAuthOps(baseUrl: string, token?: string, agent?: string): Au
   // credential went to the shared home anyway. The endpoint reported success, because the login
   // HAD succeeded; it just belonged to the wrong agent. Both are sent now: the query is what is
   // read, the body costs nothing and keeps the two halves honest if the handler ever changes.
-  const q = agent ? `?agent=${encodeURIComponent(agent)}` : "";
-  const who = agent ? { agent } : {};
+  // `user` rides alongside `agent` — the per-person login dir when the agent runs inference per
+  // person. Same query-string rule and the same reason: the runtime reads it off the URL.
+  const params = new URLSearchParams();
+  if (agent) params.set("agent", agent);
+  if (user) params.set("user", user);
+  const q = params.toString() ? `?${params.toString()}` : "";
+  const who = { ...(agent ? { agent } : {}), ...(user ? { user } : {}) };
 
   return {
     async startHeadless(): Promise<string> {
@@ -235,9 +240,9 @@ export function httpAuthOps(baseUrl: string, token?: string, agent?: string): Au
       if (!url) throw new Error("auth: the agent runtime started a login but produced no URL");
       return url;
     },
-    /** What the harness reports for THIS agent: which account, which plan. */
+    /** What the harness reports for THIS agent (and person, if per-user): which account, which plan. */
     async status(): Promise<string> {
-      const r = await call(`/auth/status${agent ? `?agent=${encodeURIComponent(agent)}` : ""}`);
+      const r = await call(`/auth/status${q}`);
       return String(r.status ?? "");
     },
     async submitCode(code: string): Promise<{ ok: boolean; status: string; loginTail: string }> {

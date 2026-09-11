@@ -902,11 +902,13 @@ export async function run(
     // Which Claude account this agent is signed in as. Straight from `claude auth status` in the
     // agent's own credential directory, trimmed to its first line — the point is to make "whose
     // subscription is this?" answerable from Slack, which it has never been.
-    claudeAccount: async (name) => {
+    claudeAccount: async (name, user) => {
       // `claude auth status` answers in JSON — { loggedIn, email, subscriptionType, ... } — so the
       // first line of it is "{". Parsed, not scanned: reading this as text printed a lone brace
       // into Slack, which told Rod nothing except that something was wrong.
-      const ops = authDeps.ops(name);
+      // Per-person agent: report the SPEAKER's own login; shared: the agent's one login (user ignored).
+      const u = wired.get(name)?.cfg.inference_mode === "per_user" ? user : undefined;
+      const ops = authDeps.ops(name, u);
       const raw = (await ops?.status?.().catch(() => "")) ?? "";
       try {
         const j = JSON.parse(raw) as { loggedIn?: boolean; email?: string; subscriptionType?: string };
@@ -925,14 +927,17 @@ export async function run(
     //
     // This existed as `!disconnect claude` with no counterpart, which meant the notice told people
     // to send `!connect claude` and the command then said there was no such connector.
-    connectClaude: async (name, conversation) => {
+    connectClaude: async (name, conversation, user) => {
       const a = wired.get(name);
       if (!a) return "I don't know that agent here.";
       // ask() returns false both when it POSTED a reason and when there was nothing to post, and
       // those need different answers. The second case is exactly this one, checked here so the
       // command never ends in silence.
       if (!authDeps.ops(name)) return "I can't start a Claude login on this deployment.";
-      await gate.ask(authDeps, name, a.cfg.name ?? name, conversation).catch((e) => {
+      // Per-person agent: sign in the SPEAKER's own subscription (their own credential dir); shared:
+      // the agent's one login, and the user is ignored — same offer either way.
+      const u = a.cfg.inference_mode === "per_user" ? user : undefined;
+      await gate.ask(authDeps, name, a.cfg.name ?? name, conversation, u).catch((e) => {
         console.error(`worker: ${name} connect claude failed: ${(e as Error).message}`);
         return false;
       });
@@ -948,15 +953,19 @@ export async function run(
       });
       return asked ? "" : "I can't post a dialog in this conversation.";
     },
-    disconnectClaude: async (name) => {
+    disconnectClaude: async (name, user) => {
       // Removing the credential IS the sign-out: the harness reads it from this directory on every
       // turn, so a deleted file means the next message finds no login and the connect gate offers
-      // one. Only THIS agent's directory, so signing Nelly out never touches Sapien.
-      const dir = claudecode.configHomeFor(name);
-      await fsp.rm(path.join(dir, ".credentials.json"), { force: true }).catch(() => {});
+      // one. Only THIS agent's directory, so signing Nelly out never touches Sapien — and on a
+      // per-person agent only the SPEAKER's own dir, so one teammate signing out never touches
+      // another's.
       const a = wired.get(name);
-      // So the gate offers a login on the very next message rather than after a restart.
-      if (a) a.cfg.auth_state = "unconfigured";
+      const u = a?.cfg.inference_mode === "per_user" ? user : undefined;
+      const dir = claudecode.configHomeFor(name, u);
+      await fsp.rm(path.join(dir, ".credentials.json"), { force: true }).catch(() => {});
+      // So the gate offers a login on the very next message rather than after a restart. On a
+      // per-person agent the gate is per-speaker (a file check), so there is no shared flag to flip.
+      if (a && a.cfg.inference_mode !== "per_user") a.cfg.auth_state = "unconfigured";
       return "🔓 Signed out of Claude. Send me anything and I'll offer you a fresh login.";
     },
     disconnectPlaud: async (name) => {
@@ -1092,7 +1101,10 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
   const authDeps: gate.AuthGateDeps = {
     // Named, so the login lands in THIS agent's credential directory. Without the name every
     // agent in the pool shares one Claude subscription and the last person to sign in owns them.
-    ops: (name) => (wired.has(name) ? httpAuthOps(authBase, process.env.AGENT_RUNTIME_TOKEN, name) : undefined),
+    // `user`, when the caller passes it (a per-person agent), lands the login in the speaker's own
+    // dir under the agent — so two teammates on one agent sign into their own subscriptions.
+    ops: (name, user) =>
+      wired.has(name) ? httpAuthOps(authBase, process.env.AGENT_RUNTIME_TOKEN, name, user) : undefined,
     conn: (name) => wired.get(name)?.conn as SlackConnector | undefined,
     setAuthState: async (name, state) => {
       const a = wired.get(name);
@@ -1193,7 +1205,7 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
         // before the auth gate, so `!help` still works on an agent that cannot yet run turns.
         const cmd = cmds.parse(env.text);
         if (cmd) {
-          const out = await cmds.run(commandDeps, name, env.conversation, cmd).catch((e) => {
+          const out = await cmds.run(commandDeps, name, env.conversation, cmd, env.user).catch((e) => {
             console.error(`worker: ${name} command ${cmd.name} failed: ${(e as Error).message}`);
             return `I couldn't run that — ${String((e as Error)?.message ?? e).slice(0, 150)}`;
           });
@@ -1207,10 +1219,26 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
             continue;
           }
         }
-        // The registry says this agent has no working inference, so there is nothing to run.
-        // Ask in the channel instead of spending a turn to discover the same thing — and ask
-        // because of a FACT about the agent, not because a file was missing.
-        if (a.cfg.auth_state && a.cfg.auth_state !== "ok") {
+        // Whether inference is ready is a different question per mode. A SHARED agent's login is a
+        // FACT the registry tracks (auth_state), so ask in the channel rather than spend a turn to
+        // discover the same thing. A PER-PERSON agent's is per-speaker — has THIS person signed in
+        // their own subscription yet — which only their credential dir can answer, so here (and only
+        // here) a file check is the right gate: it is a fact about a person, not a probe standing in
+        // for the registry's word about the agent.
+        if (a.cfg.inference_mode === "per_user") {
+          const credFile = path.join(claudecode.configHomeFor(name, env.user), ".credentials.json");
+          const hasOwn = await fsp.access(credFile).then(() => true).catch(() => false);
+          if (!hasOwn) {
+            const asked = await gate
+              .ask(authDeps, name, a.cfg.name ?? name, env.conversation, env.user)
+              .catch((e) => {
+                console.error(`worker: auth prompt failed for ${name}: ${(e as Error).message}`);
+                return false;
+              });
+            if (asked) console.log(`worker: ${name} asked ${env.user} to connect their own Claude (per_user)`);
+            continue;
+          }
+        } else if (a.cfg.auth_state && a.cfg.auth_state !== "ok") {
           const asked = await gate.ask(authDeps, name, a.cfg.name ?? name, env.conversation).catch((e) => {
             console.error(`worker: auth prompt failed for ${name}: ${(e as Error).message}`);
             return false;

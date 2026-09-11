@@ -165,7 +165,7 @@ export interface CommandDeps {
    *  Worth a line in `!status` because it is otherwise unknowable from the outside: two agents
    *  answering identically may be spending two different people's subscriptions, or the same one
    *  twice, and nothing in a reply distinguishes those. */
-  claudeAccount?(agent: string): Promise<string>;
+  claudeAccount?(agent: string, user?: string): Promise<string>;
   /** Which model THIS conversation runs. Scoped to the conversation, never to the process: one
    *  worker serves every thread in the tenant, so a process-wide knob meant one person's `!model`
    *  changed the model under everybody else mid-conversation. */
@@ -179,11 +179,13 @@ export interface CommandDeps {
   connectPlaud?(agent: string, conversation: string): Promise<string>;
   /** Forget this agent's Plaud account and revoke it upstream. */
   disconnectPlaud?(agent: string): Promise<string>;
-  /** Sign this agent out of its Claude subscription. */
-  disconnectClaude?(agent: string): Promise<string>;
+  /** Sign this agent out of its Claude subscription — the speaker's own when `user` is set and the
+   *  agent runs inference per person. */
+  disconnectClaude?(agent: string, user?: string): Promise<string>;
   /** Offer a fresh Claude login in this conversation. Returns "" when the offer IS the message: it
-   *  is posted as blocks, and returning text as well would post the whole thing twice. */
-  connectClaude?(agent: string, conversation: string): Promise<string>;
+   *  is posted as blocks, and returning text as well would post the whole thing twice. `user` signs
+   *  in the speaker's own subscription for a per-person agent. */
+  connectClaude?(agent: string, conversation: string, user?: string): Promise<string>;
   /** Offer the calendar dialog. Same contract: "" when the blocks are the message. */
   connectIcs?(agent: string, conversation: string): Promise<string>;
   /** Finish a connection with the callback URL the person pasted back. */
@@ -249,7 +251,7 @@ export function mergeConnections(registry: readonly ConnectionLine[], legacy: re
  *  Failures are swallowed deliberately: a token store that cannot be read should not turn
  *  `!connections` into an error page. An absent line reads as "not connected", which is the safer
  *  of the two wrong answers here — the other one hides the calendars that ARE connected. */
-async function gatherLegacy(deps: CommandDeps, agent: string): Promise<ConnectionLine[]> {
+async function gatherLegacy(deps: CommandDeps, agent: string, user?: string): Promise<ConnectionLine[]> {
   const out: ConnectionLine[] = [];
 
   if (await deps.plaudConnected?.(agent).catch(() => false)) {
@@ -258,7 +260,8 @@ async function gatherLegacy(deps: CommandDeps, agent: string): Promise<Connectio
 
   // The Claude subscription belongs here too, and its absence was the other half of the confusion:
   // an agent is plainly "connected to" the thing it answers on, and `!connections` never said so.
-  const account = await deps.claudeAccount?.(agent).catch(() => "");
+  // On a per-person agent this is the SPEAKER's own subscription.
+  const account = await deps.claudeAccount?.(agent, user).catch(() => "");
   if (account && !/^not signed in/i.test(account)) {
     out.push({
       kind: "claude",
@@ -305,6 +308,9 @@ export async function run(
   agent: string,
   conversation: string,
   cmd: Command,
+  /** WHO typed it — threaded to the Claude connect/disconnect/status commands so a per-person
+   *  agent signs in (and reports) the speaker's own subscription. Ignored by a shared agent. */
+  user?: string,
   now: number = Date.now(),
 ): Promise<string | null> {
   switch (cmd.name) {
@@ -333,7 +339,7 @@ export async function run(
       if (!which) return "Which one? `!disconnect plaud` or `!disconnect claude`.";
       if (which === "claude") {
         if (!deps.disconnectClaude) return "I have no way to sign out of Claude on this deployment.";
-        return deps.disconnectClaude(agent);
+        return deps.disconnectClaude(agent, user);
       }
       if (which !== "plaud") return unknownConnector(which, ["plaud", "claude"]);
       if (!deps.disconnectPlaud) return "I have no way to disconnect an account on this deployment.";
@@ -350,7 +356,7 @@ export async function run(
       // `!disconnect claude` has always existed, so the missing half read as a broken command.
       if (which === "claude") {
         if (!deps.connectClaude) return "I have no way to sign in to Claude on this deployment.";
-        return deps.connectClaude(agent, conversation);
+        return deps.connectClaude(agent, conversation, user);
       }
 
       // A published calendar address, which has no login at all - only a URL. Collected in a dialog
@@ -399,7 +405,7 @@ export async function run(
     case "status":
     case "usage": {
       const windows = await deps.windows(agent).catch(() => [] as UsageWindow[]);
-      const account = (await deps.claudeAccount?.(agent).catch(() => "")) ?? "";
+      const account = (await deps.claudeAccount?.(agent, user).catch(() => "")) ?? "";
       const who = account ? `🔑 Claude account: ${account}` : "";
       const u = deps.lastUsage(conversation);
       // Account headroom is always answerable; per-turn numbers only after a turn has run here.
@@ -446,7 +452,7 @@ export async function run(
       // The registry is only ONE of the places a credential lives, and answering from it alone is
       // how `!connect plaud` came to say "already connected" one line above `!connections` saying
       // "nothing is connected yet". Both were right about their own store. See mergeConnections.
-      const list = mergeConnections(await deps.connections(agent), await gatherLegacy(deps, agent));
+      const list = mergeConnections(await deps.connections(agent), await gatherLegacy(deps, agent, user));
       if (list.length === 0) {
         // Not an error, and worth saying in words. An empty list and a broken lookup look identical
         // if the answer is a blank line.

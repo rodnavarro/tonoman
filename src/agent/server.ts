@@ -299,7 +299,7 @@ const DEFAULT_AUTH_LOG = path.join(os.tmpdir(), "tonoman-auth.log");
 const DEFAULT_PTY = (cmd: string, log: string): string[] => ["script", "-qfc", cmd, log];
 /** The login in flight, and WHOSE it is - the follow-up code must be judged against the same
  *  agent that started it, not against whatever the second request happens to say. */
-let pendingLogin: { child: import("node:child_process").ChildProcess; agent?: string } | null = null;
+let pendingLogin: { child: import("node:child_process").ChildProcess; agent?: string; user?: string } | null = null;
 
 /** The credential's (mtime, size) — the OUTCOME signal for a login. 0/0 when absent. */
 async function credStamp(credFile: string): Promise<[number, number]> {
@@ -326,9 +326,20 @@ function agentOf(req: http.IncomingMessage, body?: Record<string, unknown>): str
   return (q || b || undefined) ?? undefined;
 }
 
-/** Where this agent's login writes, and where its credential is checked. */
-function credFileFor(opts: RuntimeOptions, agent: string | undefined): string {
-  if (agent) return `${claudecode.configHomeFor(agent)}/.credentials.json`;
+/** WHICH PERSON's login under the agent, from `?user=` or the JSON body — set only when the agent
+ *  runs inference per person, so each teammate signs into their own credential dir. `configHomeFor`
+ *  sanitises it the same way as the agent name, since it too decides a filesystem path from the wire.
+ *  Absent = the agent's one shared login, which is every agent today. */
+function userOf(req: http.IncomingMessage, body?: Record<string, unknown>): string | undefined {
+  const q = new URL(req.url ?? "/", "http://x").searchParams.get("user");
+  const b = typeof body?.user === "string" ? body.user : undefined;
+  return (q || b || undefined) ?? undefined;
+}
+
+/** Where this agent's login writes, and where its credential is checked — the person's own dir when
+ *  `user` is set, else the agent's shared one. */
+function credFileFor(opts: RuntimeOptions, agent: string | undefined, user?: string): string {
+  if (agent) return `${claudecode.configHomeFor(agent, user)}/.credentials.json`;
   return opts.credFile ?? activeSpec().credFile ?? `${claudecode.CONFIG_HOME}/.credentials.json`;
 }
 
@@ -360,11 +371,12 @@ async function handleAuthLogin(req: http.IncomingMessage, res: http.ServerRespon
   // subscription an agent ends up running on. Without it every login in the pool lands in one
   // directory and the last person to sign in owns every agent.
   const who = agentOf(req);
+  const user = userOf(req);
   const child = spawn(argv[0], argv.slice(1), {
     stdio: ["pipe", "ignore", "ignore"],
-    env: who ? { ...process.env, CLAUDE_CONFIG_DIR: claudecode.configHomeFor(who) } : process.env,
+    env: who ? { ...process.env, CLAUDE_CONFIG_DIR: claudecode.configHomeFor(who, user) } : process.env,
   });
-  pendingLogin = { child, agent: who };
+  pendingLogin = { child, agent: who, user };
   child.on("error", () => {
     if (pendingLogin?.child === child) pendingLogin = null;
   });
@@ -424,7 +436,7 @@ async function handleAuthCode(req: http.IncomingMessage, res: http.ServerRespons
   // another's login.
   // Falls back to the agent named on THIS request only when the pending login recorded none —
   // an older client that sent it one way and not the other should still be judged per agent.
-  const credFile = credFileFor(opts, pendingLogin?.agent ?? agentOf(req));
+  const credFile = credFileFor(opts, pendingLogin?.agent ?? agentOf(req), pendingLogin?.user ?? userOf(req));
   const before = await credStamp(credFile);
 
   pendingLogin.child.stdin?.write(`${code}\n`);
@@ -437,12 +449,13 @@ async function handleAuthCode(req: http.IncomingMessage, res: http.ServerRespons
   // which is exactly what it did: the credential file had changed, and the status check was
   // looking somewhere else entirely.
   const codeAgent = pendingLogin?.agent ?? agentOf(req);
+  const codeUser = pendingLogin?.user ?? userOf(req);
   const status = statusArgs.length
     ? (
         await run(
           statusArgs[0],
           statusArgs.slice(1),
-          codeAgent ? { CLAUDE_CONFIG_DIR: claudecode.configHomeFor(codeAgent) } : undefined,
+          codeAgent ? { CLAUDE_CONFIG_DIR: claudecode.configHomeFor(codeAgent, codeUser) } : undefined,
         )
       ).trim()
     : "";
@@ -469,7 +482,8 @@ async function handleAuthStatus(req: http.IncomingMessage, res: http.ServerRespo
   // Scoped to the agent asked about. Without this every agent reports the POOL's credential,
   // which is the confusion per-agent logins exist to remove - and the answer would look right.
   const who = agentOf(req);
-  const status = statusArgs.length ? (await run(statusArgs[0], statusArgs.slice(1), who ? { CLAUDE_CONFIG_DIR: claudecode.configHomeFor(who) } : undefined)).trim() : "";
+  const user = userOf(req);
+  const status = statusArgs.length ? (await run(statusArgs[0], statusArgs.slice(1), who ? { CLAUDE_CONFIG_DIR: claudecode.configHomeFor(who, user) } : undefined)).trim() : "";
   res.writeHead(200, { "content-type": "application/json" });
   res.end(JSON.stringify({ loggedIn: looksLoggedIn(status), status }) + "\n");
 }
