@@ -240,6 +240,9 @@ export interface TurnRunReq {
   sessionId?: string;
   /** true = create it (`--session-id`); false = continue it (`--resume`). */
   sessionNew?: boolean;
+  /** WHO is speaking (the connector's sender id). Carried so the run closure can pick the speaker's
+   *  own credential when the agent runs inference per person; ignored for a shared-inference agent. */
+  user?: string;
 }
 
 export interface TurnInput {
@@ -888,6 +891,9 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
           model: deps.modelFor?.(input.conversation),
           sessionId: session?.id,
           sessionNew: session?.isNew,
+          // WHO is speaking — the run closure turns this into the speaker's own credential when the
+          // agent runs inference per person, and ignores it otherwise.
+          user: input.user,
         },
         // Passing the signal is what makes a steer actually stop the model. Without it the child
         // ran to completion after the person had already moved on — paid for, unread, and still

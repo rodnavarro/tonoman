@@ -146,6 +146,12 @@ export interface AgentConfig {
    * Undefined means "not tracked", which is the file-roster case: a self-hosted deployment keeps
    * today's behaviour and is never gated. */
   auth_state?: "unconfigured" | "ok" | "expired" | "error";
+  /** Whether inference is ONE login the whole agent shares (`shared`, the default and every agent
+   * today) or EACH PERSON's own (`per_user`) — a team where everyone brings their own Claude (or
+   * other-provider) subscription and the agent answers each on theirs. When `per_user`, a turn runs
+   * in the speaker's own credential directory (`configHomeFor(agent, user)`) and `!connect claude`
+   * signs THAT person in; `shared` keeps the single per-agent login untouched. Undefined = shared. */
+  inference_mode?: "shared" | "per_user";
   /** Who this agent recognises, and as whom. A Slack user id resolves to a name the agent can use,
    * which is how "Hi Celine" happens — from the registry, never from a spoofable display name.
    * Deliberately unrelated to console access (§7): talking to an agent is not signing in. */

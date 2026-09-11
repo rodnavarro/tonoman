@@ -26,8 +26,9 @@ export interface AgentDelta {
   rebuildConn: boolean;
   /** Rebuild the runner while KEEPING the live connector (no reconnect): a field the harness bakes in
    *  at construction and does not re-read per turn changed. `max_turns` is the one a person edits on
-   *  the Hub form and watches for; `url` (a remote runtime) is the other. Everything else the runner
-   *  needs — the model, the identity file — is read per turn, so a config swap alone carries it. */
+   *  the Hub form and watches for; `url` (a remote runtime) is another; `inference_mode` a third (the
+   *  run closure captures it). Everything else the runner needs — the model, the identity file — is
+   *  read per turn, so a config swap alone carries it. */
   rebuildRunner: boolean;
 }
 
@@ -80,7 +81,13 @@ export function planReload(oldCfgs: AgentConfig[], newCfgs: AgentConfig[]): Relo
       JSON.stringify(prev.slack?.allowed_users ?? null) !== JSON.stringify(next.slack?.allowed_users ?? null);
 
     const rebuildRunner =
-      rebuildConn || (prev.max_turns ?? 0) !== (next.max_turns ?? 0) || (prev.url ?? "") !== (next.url ?? "");
+      rebuildConn ||
+      (prev.max_turns ?? 0) !== (next.max_turns ?? 0) ||
+      (prev.url ?? "") !== (next.url ?? "") ||
+      // The run closure captures `inference_mode` (it decides per turn whether to use the speaker's
+      // own credential), so a change to it has to remake the closure — a plain cfg swap would leave
+      // the old mode answering. Treated like `max_turns`: rebuild the runner, keep the connector.
+      (prev.inference_mode ?? "shared") !== (next.inference_mode ?? "shared");
 
     updated.push({ key, rebuildConn, rebuildRunner });
   }

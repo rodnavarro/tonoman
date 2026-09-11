@@ -38,6 +38,27 @@ describe("configHomeFor", () => {
   it("keeps the characters a real agent name uses", () => {
     expect(configHomeFor("murphy-nelly_2")).toBe(`${CONFIG_HOME}/agents/murphy-nelly_2`);
   });
+
+  it("gives each PERSON their own directory under a per-user agent", () => {
+    // When an agent runs inference per person, the speaker's Slack user id names a login UNDER the
+    // agent, so two teammates on one agent answer on their own subscriptions.
+    expect(configHomeFor("sapien", "U123")).toBe(`${CONFIG_HOME}/agents/sapien/users/U123`);
+    expect(configHomeFor("sapien", "U123")).not.toBe(configHomeFor("sapien", "U999"));
+    // The per-user dir is never the agent's shared dir — that separation is the whole point.
+    expect(configHomeFor("sapien", "U123")).not.toBe(configHomeFor("sapien"));
+  });
+
+  it("no user means the agent's ONE shared login — every agent today", () => {
+    expect(configHomeFor("sapien", undefined)).toBe(`${CONFIG_HOME}/agents/sapien`);
+    expect(configHomeFor("sapien", "")).toBe(`${CONFIG_HOME}/agents/sapien`);
+  });
+
+  it("REFUSES to let a user id choose a path either", () => {
+    // The user id arrives over the wire the same way the agent name does, and points at where a
+    // person's credential is read and written.
+    expect(configHomeFor("sapien", "../../etc")).toBe(`${CONFIG_HOME}/agents/sapien/users/etc`);
+    expect(configHomeFor("sapien", "....//")).toBe(`${CONFIG_HOME}/agents/sapien/users/_invalid`);
+  });
 });
 
 describe("localEnv", () => {

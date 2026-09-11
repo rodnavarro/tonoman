@@ -55,6 +55,7 @@ export interface RegistryAgent {
   maxTurns?: number | null;
   identity?: string | null;
   authState?: string | null;
+  inferenceMode?: string | null;
   credentialSecretRef?: string | null;
   channel: string;
   teamId: string;
@@ -235,6 +236,9 @@ export class RegistryControlPlane implements ControlPlane {
         // Carried through so the runtime can refuse a turn and ask for a login, rather than
         // spending one to discover there is no credential.
         auth_state: (a.authState as AgentConfig["auth_state"]) ?? "unconfigured",
+        // Shared unless the registry says per-person, so an agent with no opinion (and every
+        // file-roster agent) keeps the single shared login.
+        inference_mode: a.inferenceMode === "per_user" ? "per_user" : "shared",
         principals: a.principals ?? [],
         flows: a.flows ?? {},
         // Mapped EXPLICITLY, like everything else here. This mapping is a whitelist by design — the

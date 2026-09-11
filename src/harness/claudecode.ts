@@ -46,7 +46,11 @@ export const CONFIG_HOME = process.env.CLAUDE_CONFIG_ROOT || "/root/.claude";
  *
  *  The name is sanitised because it arrives over the wire on the login endpoints. Anything that is
  *  not a plain name would let a caller choose a path, and this path is where credentials live. */
-export function configHomeFor(agent: string | undefined, root: string = CONFIG_HOME): string {
+export function configHomeFor(
+  agent: string | undefined,
+  user?: string,
+  root: string = CONFIG_HOME,
+): string {
   // No agent named at all: a self-hosted roster with one login, which should not grow a directory
   // level for a distinction it does not have.
   if (!agent) return root;
@@ -54,7 +58,14 @@ export function configHomeFor(agent: string | undefined, root: string = CONFIG_H
   // A name that was GIVEN but sanitises away is not the same thing as no name. Falling back to the
   // shared home there would hand the pool's credential to whatever nonsense was supplied — so it
   // gets a directory of its own that is nobody's and works for nothing.
-  return `${root}/agents/${safe || "_invalid"}`;
+  const agentHome = `${root}/agents/${safe || "_invalid"}`;
+  // No user: the agent's ONE shared login — every agent today, and the default. A user names a
+  // PER-PERSON login under that agent, so each teammate answers on their own subscription. Same
+  // sanitisation and same "given-but-empty gets its own nowhere dir" rule, because the user id
+  // also arrives over the wire (a Slack user id on the connect endpoints and in a turn).
+  if (!user) return agentHome;
+  const safeUser = user.replace(/[^A-Za-z0-9_-]/g, "");
+  return `${agentHome}/users/${safeUser || "_invalid"}`;
 }
 
 /** Where the per-agent identity dir (AGENTS.md/persona) bind-mounts READ-ONLY; the
@@ -246,7 +257,10 @@ export class Runner implements TurnRunner {
     let child;
     if (this.o.local) {
       // Backend-aware env (backend-*): bedrock sets CLAUDE_CODE_USE_BEDROCK, subscription clears it.
-      const env = localEnv(process.env, this.o.backend, this.o.configHome ?? CONFIG_HOME);
+      // `req.configHome` overrides the runner's per-agent default for THIS turn only — set when the
+      // agent runs inference per person, so the speaker's own login answers. Unset (every agent
+      // today) keeps the one shared per-agent login.
+      const env = localEnv(process.env, this.o.backend, req.configHome ?? this.o.configHome ?? CONFIG_HOME);
       child = spawn(bin, this.localArgs(req), { windowsHide: true, env });
     } else {
       const podman = this.o.podman ?? "podman";

@@ -308,8 +308,15 @@ function newRunnerFor(a: AgentConfig, harnesses: ReturnType<typeof defaultHarnes
 }
 
 /** Wrap a runner in the `run` closure the ingress uses — the model comes per turn (`!model`), so a
- *  reload that changes only the default model never has to touch the runner. */
-function runClosure(runner: TurnRunner): Wired["run"] {
+ *  reload that changes only the default model never has to touch the runner.
+ *
+ *  It is also where PER-PERSON inference is resolved: when the agent's `inference_mode` is
+ *  `per_user`, the speaker's own credential directory overrides the runner's per-agent default for
+ *  that turn, so each teammate answers on their own subscription. `shared` (the default, every agent
+ *  today) passes nothing and the one per-agent login answers — which is exactly the runner's
+ *  existing behaviour, so a shared agent is untouched. Resolved here rather than in the runner
+ *  because the runner is harness-agnostic and this dir is Claude Code's. */
+function runClosure(runner: TurnRunner, cfg: AgentConfig): Wired["run"] {
   return (r: TurnRunReq, signal?: AbortSignal) =>
     runner.run(
       {
@@ -318,6 +325,10 @@ function runClosure(runner: TurnRunner): Wired["run"] {
         model: r.model,
         sessionId: r.sessionId,
         sessionNew: r.sessionNew,
+        configHome:
+          cfg.inference_mode === "per_user" && r.user
+            ? claudecode.configHomeFor(cfg.name, r.user)
+            : undefined,
       },
       signal,
     );
@@ -347,7 +358,7 @@ function wireOne(a: AgentConfig, harnesses: ReturnType<typeof defaultHarnesses>)
     console.error(`worker: skipping ${label} — harness "${a.harness}" cannot run turns`);
     return null;
   }
-  return { cfg: a, conn, runner, run: runClosure(runner) };
+  return { cfg: a, conn, runner, run: runClosure(runner, a) };
 }
 
 function wire(cfg: Config, only: Set<string> = new Set()): Map<string, Wired> {
@@ -1337,7 +1348,7 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
             const runner = newRunnerFor(cfg2, harnesses);
             if (runner) {
               a.runner = runner;
-              a.run = runClosure(runner);
+              a.run = runClosure(runner, cfg2);
             }
           }
           console.log(`worker: reload — updated ${agentLabel(cfg2)} (${d.key})${d.rebuildRunner ? " — new runner" : ""}`);
