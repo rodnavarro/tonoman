@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { describe as describeVoice, voiceSettings } from "./flowcfg";
+import { describe as describeVoice, voiceSettings, plaudPerPerson } from "./flowcfg";
 
 describe("voiceSettings — the registry decides", () => {
   it("reads the channel and the recipient from the tenant's own rows", () => {
@@ -188,5 +188,22 @@ describe("voiceSettings — the runner switch", () => {
     expect(voiceSettings({ runner: "skil" }).runner).toBe("hardcoded");
     expect(voiceSettings({ runner: "hardcoded" }).runner).toBe("hardcoded");
     expect(voiceSettings({ runner: "" }).runner).toBe("hardcoded");
+  });
+});
+
+describe("voiceSettings — Plaud scope (per-person)", () => {
+  it("defaults to shared, so an existing agent is unchanged", () => {
+    expect(voiceSettings({}, {}).plaudScope).toBe("shared");
+    expect(plaudPerPerson({})).toBe(false);
+    expect(plaudPerPerson(undefined)).toBe(false);
+  });
+
+  it("reads an explicit per_person opt-in, case-insensitively", () => {
+    expect(voiceSettings({ plaud_scope: "per_person" }, {}).plaudScope).toBe("per_person");
+    expect(voiceSettings({ plaud_scope: "PER_PERSON" }, {}).plaudScope).toBe("per_person");
+    expect(plaudPerPerson({ plaud_scope: "per_person" })).toBe(true);
+    // Anything else is shared — a typo can never move a tenant off their one working account.
+    expect(voiceSettings({ plaud_scope: "each" }, {}).plaudScope).toBe("shared");
+    expect(plaudPerPerson({ plaud_scope: "each" })).toBe(false);
   });
 });

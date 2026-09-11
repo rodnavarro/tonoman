@@ -46,7 +46,7 @@ import * as calendar from "./calendar";
 import { serveWake } from "./wake";
 import { promises as fsp } from "node:fs";
 import { defaultHarnesses } from "../gateway";
-import { makeActivities, type TurnRunReq, type VoiceConfig } from "./activities";
+import { accountsFromUsers, makeActivities, type TurnRunReq, type VoiceConfig } from "./activities";
 import type { Step } from "./skill";
 import { conversationWorkflow, messageSignal, plaudPollWorkflow, type Inbound, type PollInput } from "./workflows";
 import { planReload } from "./reload";
@@ -597,18 +597,40 @@ export async function run(
     // Whose Plaud account this agent watches — from the registry, per tenant. An agent with no
     // credential is not misconfigured; it is a tenant whose person has not logged in yet, and
     // saying that plainly is the difference between "waiting for Celine" and "broken".
-    const tokenJson = await resolveRef(voice.credentialRef);
-    // Either credential counts. An agent that connected its own account through !connect needs no
-    // mounted secret at all — which is the whole point of the connect flow, and the state every
-    // tenant should end up in.
-    const viaCli = await plaudcli.connected(name);
-    if (!tokenJson && !viaCli) {
-      console.log(
-        `worker: ${name} voice flow is waiting for a Plaud login` +
-          `${voice.credentialRef ? ` (credential ${voice.credentialRef} is empty or unmounted)` : " (no credential_ref row)"}`,
-      );
-      disabledFlows.add(name);
-      return;
+    // Whose Plaud account(s) this agent watches. Two modes, from the voice flow's `plaud_scope`:
+    //  • shared (default, and Sapien's): ONE account for the tenant — a mounted secret or one account
+    //    connected through `!connect`. Unchanged from before per-person existed.
+    //  • per_person: each member signs in their own, and the poll fans out over them. The shared
+    //    secret and `credential_ref` are ignored here on purpose, so a per-person tenant is never
+    //    also polling a stray shared account (which would process a meeting twice).
+    const perPerson = voice.plaudScope === "per_person";
+    let tokenJson = "";
+    let viaCli = false;
+    let members: { user: string; connectedAt?: number }[] = [];
+    if (perPerson) {
+      members = await tokenstore.tokens().listUsers(name).catch(() => []);
+      if (members.length === 0) {
+        // The same shape as "waiting for a Plaud login" below: nothing to poll, so pause the
+        // schedule rather than tick against an empty account list.
+        console.log(`worker: ${name} voice flow (per-person) is waiting for a member to connect their Plaud account`);
+        disabledFlows.add(name);
+        return;
+      }
+      console.log(`worker: ${name} voice flow (per-person) — ${members.length} member account(s) connected`);
+    } else {
+      tokenJson = await resolveRef(voice.credentialRef);
+      // Either credential counts. An agent that connected its own account through !connect needs no
+      // mounted secret at all — which is the whole point of the connect flow, and the state every
+      // tenant should end up in.
+      viaCli = await plaudcli.connected(name);
+      if (!tokenJson && !viaCli) {
+        console.log(
+          `worker: ${name} voice flow is waiting for a Plaud login` +
+            `${voice.credentialRef ? ` (credential ${voice.credentialRef} is empty or unmounted)` : " (no credential_ref row)"}`,
+        );
+        disabledFlows.add(name);
+        return;
+      }
     }
     // WHO transcribes and WHO summarises, per tenant. Registry rows win outright; the environment
     // is the fallback for a tenant that has no rows yet. That order is the whole point: a
@@ -677,6 +699,10 @@ export async function run(
     const voiceSkill = (a.cfg.skills ?? []).find(
       (s) => (s.trigger as { poll?: unknown } | undefined)?.poll === "plaud",
     );
+    // Per-person: one account per member who connected, each reading from their own login and
+    // floored at their own connect time. Empty on the shared path, where `creds` below is the one
+    // account and `accountsOf` collapses to it — so a shared tenant is byte-identical.
+    const accounts = perPerson ? accountsFromUsers(name, members, floorMs) : undefined;
     voiceCreds.set(name, {
       notifyChannel: voice.notifyChannel || undefined,
       notifyUser: voice.notifyUser || undefined,
@@ -684,8 +710,10 @@ export async function run(
       pollSeconds: voice.pollSeconds,
       // An agent that has connected its own account through !connect reads from the third-party
       // API; one that has not is still on the mounted bearer. Per agent, so the two tenants can be
-      // on different halves of this migration at the same time.
-      creds: { tokenJson, cliAgent: viaCli ? name : undefined },
+      // on different halves of this migration at the same time. On the per-person path `creds` is
+      // required but unread — the poll iterates `accounts` — so it is the first member's account.
+      creds: accounts ? accounts[0].creds : { tokenJson, cliAgent: viaCli ? name : undefined },
+      accounts,
       calendars,
       calendarExclude: (voice.calendarExclude ?? []).filter(Boolean),
       calendarPadMinutes: voice.calendarPadMinutes,
@@ -715,8 +743,12 @@ export async function run(
       // A connected account IS a credential, so the line must not still read "waiting for a login"
       // for an agent that is about to start polling. A flow reporting the opposite of what it is
       // doing is the failure mode this whole boot line exists to prevent.
-      `worker: ${name} voice flow ready — ${describeVoice(viaCli ? { ...voice, credentialRef: `plaud-cli:${name}` } : voice)}` +
-        `${viaCli ? " [connected account]" : ""}; ` +
+      `worker: ${name} voice flow ready — ${
+        accounts
+          ? `per-person, ${accounts.length} member account(s)`
+          : describeVoice(viaCli ? { ...voice, credentialRef: `plaud-cli:${name}` } : voice)
+      }` +
+        `${viaCli && !accounts ? " [connected account]" : ""}; ` +
         `brain at ${dir}; only recordings from ${new Date(floorMs).toISOString()} onwards` +
         // Said out loud, because a flow with no calendar and a flow whose calendar failed to
         // resolve look identical from the outside and are entirely different problems.
@@ -925,7 +957,12 @@ export async function run(
       }
     },
     resetSession: (name, conversation) => void resetSession(name, conversation).catch(() => {}),
-    plaudConnected: (name) => plaudcli.connected(name),
+    plaudConnected: (name, user) => {
+      // Per-person: is the SPEAKER's own account connected. Shared: the tenant's one account, and the
+      // user is ignored — same question either way for a shared agent.
+      const u = flowcfg.plaudPerPerson(wired.get(name)?.cfg.flows?.voice) ? user : undefined;
+      return plaudcli.connected(name, u);
+    },
     // `!connect claude`, typed on purpose. The SAME offer the auth gate makes on its own when a
     // turn finds no credential - one mechanism, not two, so what a person is shown is identical
     // whether they asked for it or we volunteered it.
@@ -973,8 +1010,11 @@ export async function run(
       if (a && a.cfg.inference_mode !== "per_user") a.cfg.auth_state = "unconfigured";
       return "🔓 Signed out of Claude. Send me anything and I'll offer you a fresh login.";
     },
-    disconnectPlaud: async (name) => {
-      await plaudauth.disconnect(name);
+    disconnectPlaud: async (name, user) => {
+      // Per-person: forget only the SPEAKER's own account, so one teammate signing out never touches
+      // another's. Shared: the tenant's one account.
+      const u = flowcfg.plaudPerPerson(wired.get(name)?.cfg.flows?.voice) ? user : undefined;
+      await plaudauth.disconnect(name, u);
       // And STOP POLLING. This used to end "the running flow finishes its current cycle first",
       // which was a polite way of saying the credential stayed resolved in memory until the next
       // restart — so a disconnected account kept being read, potentially for days. Re-working the
@@ -987,8 +1027,11 @@ export async function run(
       }
       return "Disconnected - I've forgotten your Plaud account and asked Plaud to revoke it. Nothing is polling it any more.";
     },
-    finishPlaud: async (name, pasted) => {
-      const r = await plaudauth.complete(name, pasted);
+    finishPlaud: async (name, pasted, user) => {
+      // Per-person: store the SPEAKER's tokens under their own scope; the secrets-list route is what
+      // makes the account visible to the poll, so no connection row is needed here.
+      const u = flowcfg.plaudPerPerson(wired.get(name)?.cfg.flows?.voice) ? user : undefined;
+      const r = await plaudauth.complete(name, pasted, u);
       if (!r.ok) return `That didn't work - ${r.problem}.`;
       // THE SECOND COMPLETION PATH. The dialog is not the only way in — `!connect plaud <code>`
       // lands here — and a fix applied to one of two doors is not a fix. Starting the poll has to
@@ -1005,15 +1048,17 @@ Nothing will be picked up until that is sorted.`;
 Record something and I'll pick it up within a couple of minutes - I'll post what I find ${where ? `in <#${where}>` : "here"}.`
       );
     },
-    connectPlaud: async (name, conversation) => {
+    connectPlaud: async (name, conversation, user) => {
+      // Per-person: begin a login for the SPEAKER, whose tokens land in their own scope.
+      const u = flowcfg.plaudPerPerson(wired.get(name)?.cfg.flows?.voice) ? user : undefined;
       // Buttons and a private dialog, the same shape as connecting Claude. Two mechanisms for
       // one idea is something a person has to learn twice, and the typed version put an
       // authorization code into channel history.
-      const asked = await plaudgate.ask(plaudDeps, name, conversation).catch(() => false);
+      const asked = await plaudgate.ask(plaudDeps, name, conversation, u).catch(() => false);
       // The blocks ARE the message. Returning text as well would post the whole thing twice.
       if (asked) return "";
       // A client that cannot render blocks still gets a working, if wordier, flow.
-      const p = await plaudauth.begin(name);
+      const p = await plaudauth.begin(name, u);
       return (
         `Let's connect your Plaud account. Open this and sign in as yourself:\n\n${p.url}` +
         `\n\n*Then:* the page it sends you to will fail to load - that is expected. Copy the whole address 
@@ -1133,8 +1178,10 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
 
   const plaudDeps: plaudgate.PlaudGateDeps = {
     conn: (name) => wired.get(name)?.conn as SlackConnector | undefined,
-    begin: async (name) => (await plaudauth.begin(name)).url,
-    complete: (name, pasted) => plaudauth.complete(name, pasted),
+    // `user` arrives already gated by scope from the caller (connectPlaud / the dialog), so these
+    // just pass it through — the pending login and its completion share the same scope.
+    begin: async (name, user) => (await plaudauth.begin(name, user)).url,
+    complete: (name, pasted, user) => plaudauth.complete(name, pasted, user),
     notifyChannel: (name) => voiceCreds.get(name)?.notifyChannel,
     // The half that was missing. Storing the credential was never the end of connecting an account
     // — the flow has to be worked out again and the schedule created, both of which only happened

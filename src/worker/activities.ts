@@ -273,6 +273,24 @@ export function accountFor(v: VoiceConfig, user?: string): VoiceAccount {
   return all.find((a) => a.user === user) ?? all[0];
 }
 
+/** Turn the members who have connected (from `TokenStore.listUsers`) into the poll's per-member
+ *  accounts. Each reads from its member's own CLI-connected account (`cliAgent` + `cliUser`, the
+ *  bearer `tokenJson` unused on that path), announces to that member, and floors at the later of the
+ *  agent's floor and the member's own connect time — so somebody who joins today does not backfill
+ *  the tenant's history. PURE, so `wireVoice` stays a thin call and this is unit-tested on its own. */
+export function accountsFromUsers(
+  agent: string,
+  users: { user: string; connectedAt?: number }[],
+  agentFloorMs: number,
+): VoiceAccount[] {
+  return users.map((u) => ({
+    user: u.user,
+    creds: { tokenJson: "", cliAgent: agent, cliUser: u.user },
+    notifyUser: u.user,
+    floorMs: Math.max(agentFloorMs, u.connectedAt ?? 0),
+  }));
+}
+
 export interface TurnRunReq {
   prompt: string;
   systemPromptFile?: string;
@@ -394,6 +412,12 @@ export function makeActivities(deps: TurnDeps) {
     }> {
       const v = deps.voice?.(input.agent);
       if (!v) return { runner: "hardcoded" };
+      // Per-person falls back to the hardcoded pipeline, which threads the member through
+      // `processRecording`. The skill interpreter does NOT yet carry the member, so on a per-person
+      // agent it would read one shared account for everyone — wrong attribution. Same shape as the
+      // "armed but no skill granted" fallback below: degrade to the proven path, never do the wrong
+      // thing. (Removing this guard is safe only once the interpreter is user-threaded.)
+      if (v.accounts && v.accounts.length) return { runner: "hardcoded" };
       if (v.runner === "skill" && v.skill) return { runner: "skill", skill: v.skill };
       return { runner: "hardcoded" };
     },

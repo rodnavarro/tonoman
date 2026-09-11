@@ -42,6 +42,11 @@ export interface TokenStore {
   load(agent: string, user?: string): Promise<TokenSet | undefined>;
   save(agent: string, tokens: TokenSet, user?: string): Promise<void>;
   clear(agent: string, user?: string): Promise<void>;
+  /** The MEMBERS who have connected their own account under this agent — the per-person accounts the
+   *  poll fans out over. The shared account is never in this list (it has no member). `connectedAt`
+   *  is the account's own floor, so a member who joins today does not backfill the tenant's history.
+   *  Empty is the ordinary state for a shared tenant, and for a per-person one before anyone connects. */
+  listUsers(agent: string): Promise<{ user: string; connectedAt?: number }[]>;
   /** For `!status`, and for saying which of these two is in use without inferring it. */
   readonly where: string;
 }
@@ -54,10 +59,19 @@ export function plaudRefFor(base: string, user?: string): string {
   return user ? `${base}:${user}` : base;
 }
 
-/** The user id back out of a per-person ref (`plaud.tokens:<user>`), for the roster side. */
+/** A Slack user or bot id: `U…`/`W…` (users) or `B…` (bots), all-caps alphanumeric. The scope
+ *  suffix on a per-person ref is ALWAYS one of these, which is what lets `userFromPlaudRef`
+ *  distinguish a member's account from a per-AGENT secret like `plaud.tokens:sapien10` — the agent
+ *  name is not a Slack id, so it never parses as a member and never gets polled as one. */
+export const SLACK_ID = /^[UWB][A-Z0-9]{7,}$/;
+
+/** The user id back out of a per-person ref (`plaud.tokens:<user>`), for the poll and the roster.
+ *  Returns undefined unless the suffix is a Slack id — so `plaud.tokens` (shared) and any
+ *  per-agent-scoped ref are read as "not a member", never as one. */
 export function userFromPlaudRef(ref: string | undefined, base = "plaud.tokens"): string | undefined {
   if (!ref || !ref.startsWith(`${base}:`)) return undefined;
-  return ref.slice(base.length + 1) || undefined;
+  const suffix = ref.slice(base.length + 1);
+  return SLACK_ID.test(suffix) ? suffix : undefined;
 }
 
 // --- The volume ----------------------------------------------------------------------------------
@@ -86,6 +100,27 @@ export function fileStore(root?: string): TokenStore {
     async clear(agent, user) {
       await fsp.rm(at(agent, user), { force: true }).catch(() => {});
     },
+    async listUsers(agent) {
+      // The members are the subdirectories of `<agent home>/users` that actually hold a token file —
+      // a half-finished login that only wrote `pending-login.json` is not a connected account.
+      const dir = path.join(homeFor(agent, undefined, root), "users");
+      let entries: import("node:fs").Dirent[];
+      try {
+        entries = await fsp.readdir(dir, { withFileTypes: true });
+      } catch {
+        return []; // no per-member logins yet — the ordinary state
+      }
+      const out: { user: string; connectedAt?: number }[] = [];
+      for (const e of entries) {
+        if (!e.isDirectory()) continue;
+        const user = decodeURIComponent(e.name);
+        const tokenFile = path.join(dir, e.name, ".plaud", "tokens.json");
+        const st = await fsp.stat(tokenFile).catch(() => undefined);
+        if (!st) continue;
+        out.push({ user, connectedAt: st.mtimeMs });
+      }
+      return out;
+    },
   };
 }
 
@@ -98,8 +133,9 @@ export interface CloudOptions {
    *  knows them by uuid, and resolves the TENANT itself from that uuid — which is why a worker can
    *  never name a tenant it does not belong to. */
   guidOf(agent: string): string | undefined;
-  /** Which secret. Per-tenant by default: `plaud.tokens`. A per-agent one would be
-   *  `plaud.tokens:<name>`, and needs no change here or in the schema — scope lives in the ref. */
+  /** Which secret. Per-tenant by default: `plaud.tokens` (the one SHARED account). A member's own
+   *  is `plaud.tokens:<slack-id>` — the suffix is always a Slack id (see `SLACK_ID`), which is what
+   *  keeps a member's account distinct from the shared one; scope lives in the ref, no schema change. */
   ref?: string;
   fetchImpl?: typeof fetch;
 }
@@ -165,6 +201,25 @@ export function cloudStore(o: CloudOptions): TokenStore {
       const u = url(agent, user);
       if (!u) return;
       await f(u, { method: "DELETE", headers: auth }).catch(() => {});
+    },
+    async listUsers(agent) {
+      // The secrets list route returns REFS, never values, so this asks "who has a Plaud account" as
+      // one call and reads the answer out of the ref names — the same place scope has always lived.
+      // Secrets are tenant-scoped, so two voice agents in one tenant see the same members; that is
+      // already true of the shared `plaud.tokens` and is consistent.
+      const guid = o.guidOf(agent);
+      if (!guid) return [];
+      const r = await f(`${o.baseUrl}/v1/system/agents/${guid}/secrets`, { headers: auth }).catch(() => undefined);
+      if (!r || !r.ok) return [];
+      const body = (await r.json().catch(() => undefined)) as { secrets?: { ref: string; createdAt?: string }[] } | undefined;
+      const out: { user: string; connectedAt?: number }[] = [];
+      for (const s of body?.secrets ?? []) {
+        const user = userFromPlaudRef(s.ref, ref);
+        if (!user) continue; // the bare `plaud.tokens`, an `ics.url:x`, anything that is not a member
+        const t = s.createdAt ? Date.parse(s.createdAt) : NaN;
+        out.push({ user, connectedAt: Number.isNaN(t) ? undefined : t });
+      }
+      return out;
     },
   };
 }

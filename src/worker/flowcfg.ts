@@ -46,12 +46,24 @@ export interface VoiceSettings {
    *  interpreter). Default `hardcoded`, so arming a tenant onto the skill runner is a deliberate row
    *  and a typo can never move a working pipeline onto an unproven path. */
   runner: "skill" | "hardcoded";
+  /** Whether Plaud is ONE shared account for the tenant (`shared`, the default and Sapien's) or each
+   *  member's own (`per_person`). Default `shared`, so a tenant that has not opted in keeps a single
+   *  mounted/connected account and every existing flow is unchanged; only an explicit `per_person`
+   *  makes `!connect plaud` sign in the SPEAKER and the poll fan out over per-member accounts. */
+  plaudScope: "shared" | "per_person";
 }
 
 const num = (v: string | undefined, fallback: number): number => {
   const n = Number(v);
   return Number.isFinite(n) && n > 0 ? n : fallback;
 };
+
+/** Whether the voice flow's Plaud is per-person, without building the whole settings object — the
+ *  connect commands need only this one bit to decide whether `!connect plaud` signs in the SPEAKER
+ *  or the tenant's one shared account. Default shared, so nothing about an existing agent changes. */
+export function plaudPerPerson(props: Record<string, string> = {}): boolean {
+  return (props["plaud_scope"] ?? "shared").toLowerCase() === "per_person";
+}
 
 /**
  * Read the voice flow's settings.
@@ -113,6 +125,10 @@ export function voiceSettings(props: Record<string, string> = {}, env: NodeJS.Pr
     // Default hardcoded: only an explicit "skill" arms the interpreter, for the same reason `enabled`
     // defaults on — a working pipeline must never change runtime because of a missing or mistyped row.
     runner: (p("runner") ?? "hardcoded").toLowerCase() === "skill" ? "skill" : "hardcoded",
+    // Default shared: per-person is a deliberate opt-in, for the same reason as `enabled`/`runner` —
+    // a typo must never move a tenant off their one working account into a state where the poll finds
+    // no per-member accounts and stops.
+    plaudScope: (p("plaud_scope") ?? "shared").toLowerCase() === "per_person" ? "per_person" : "shared",
     journal,
   };
 }

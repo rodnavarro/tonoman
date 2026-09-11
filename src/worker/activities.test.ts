@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { makeActivities, accountsOf, accountFor, type TurnDeps, type VoiceConfig } from "./activities";
+import { makeActivities, accountsOf, accountFor, accountsFromUsers, type TurnDeps, type VoiceConfig } from "./activities";
 import * as recap from "./recap";
 import type { Step } from "./skill";
 
@@ -40,6 +40,38 @@ describe("voicePlan — which runtime, and the skill to run", () => {
       runner: "skill",
       skill: { name: "meeting-recap", steps: STEPS, version: 3 },
     });
+  });
+
+  it("FALLS BACK to hardcoded on a per-person agent even when armed for skill", async () => {
+    // The skill interpreter does not yet thread the member, so it would read one shared account for
+    // everyone. Until it does, a per-person agent must run the hardcoded path, which does thread it.
+    const acts = makeActivities(
+      depsWithVoice({
+        runner: "skill",
+        skill: { name: "meeting-recap", steps: STEPS, version: 3 },
+        accounts: [{ user: "U0A", creds: { tokenJson: "", cliAgent: "murphy", cliUser: "U0A" } }],
+      }),
+    );
+    expect(await acts.voicePlan({ agent: "murphy" })).toEqual({ runner: "hardcoded" });
+  });
+});
+
+describe("accountsFromUsers — members become per-person accounts", () => {
+  it("maps each member to their own CLI account, floored at the later of agent floor and connect time", () => {
+    const accts = accountsFromUsers(
+      "murphy",
+      [
+        { user: "U0A", connectedAt: 5000 }, // connected after the agent floor → their own floor wins
+        { user: "U0B", connectedAt: 500 }, // connected before → the agent floor wins (no backfill)
+        { user: "U0C" }, // no connect time → the agent floor
+      ],
+      1000,
+    );
+    expect(accts).toEqual([
+      { user: "U0A", creds: { tokenJson: "", cliAgent: "murphy", cliUser: "U0A" }, notifyUser: "U0A", floorMs: 5000 },
+      { user: "U0B", creds: { tokenJson: "", cliAgent: "murphy", cliUser: "U0B" }, notifyUser: "U0B", floorMs: 1000 },
+      { user: "U0C", creds: { tokenJson: "", cliAgent: "murphy", cliUser: "U0C" }, notifyUser: "U0C", floorMs: 1000 },
+    ]);
   });
 });
 

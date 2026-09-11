@@ -20,10 +20,12 @@ export const PLAUD_CONNECT_ACTION = "tonoman_connect_plaud";
 
 export interface PlaudGateDeps {
   conn(agent: string): SlackConnector | undefined;
-  /** Begin a login and return the URL to put in front of the person. */
-  begin(agent: string): Promise<string>;
-  /** Finish with whatever they pasted back. `problem` is shown to them when it fails. */
-  complete(agent: string, pasted: string): Promise<{ ok: boolean; problem?: string }>;
+  /** Begin a login and return the URL to put in front of the person. `user` is the member connecting
+   *  on a per-person agent, so the pending login is written under their own scope; absent = shared. */
+  begin(agent: string, user?: string): Promise<string>;
+  /** Finish with whatever they pasted back. `problem` is shown to them when it fails. `user` MUST be
+   *  the same one `begin` was called with — the pending PKCE verifier lives under that scope. */
+  complete(agent: string, pasted: string, user?: string): Promise<{ ok: boolean; problem?: string }>;
   /** Where this agent announces recaps, so the confirmation can say where to look. */
   notifyChannel(agent: string): string | undefined;
   /** Start this agent's recording poll, now that it has a credential to poll with.
@@ -38,7 +40,7 @@ export interface PlaudGateDeps {
 }
 
 /** The offer, in the channel: one link to open and one button to come back through. */
-export function connectBlocks(url: string, conversation: string): { text: string; blocks: unknown[] } {
+export function connectBlocks(url: string, conversation: string, user?: string): { text: string; blocks: unknown[] } {
   const text = "Connect your Plaud account — open the link, approve, then paste the address back here.";
   return {
     text,
@@ -69,7 +71,10 @@ export function connectBlocks(url: string, conversation: string): { text: string
             type: "button",
             text: { type: "plain_text", text: "I have my address" },
             action_id: PLAUD_CONNECT_ACTION,
-            value: conversation,
+            // Carries the connecting member alongside the conversation, so the dialog completes the
+            // SAME login `begin` started (the pending PKCE verifier is under that member's scope).
+            // A bare conversation string when there is no member keeps the shared flow unchanged.
+            value: user ? JSON.stringify({ c: conversation, u: user }) : conversation,
           },
         ],
       },
@@ -87,11 +92,11 @@ export function connectBlocks(url: string, conversation: string): { text: string
 }
 
 /** The dialog that collects the callback address. */
-export function urlModal(agent: string, conversation: string): Record<string, unknown> {
+export function urlModal(agent: string, conversation: string, user?: string): Record<string, unknown> {
   return {
     type: "modal",
     callback_id: PLAUD_CONNECT_ACTION,
-    private_metadata: JSON.stringify({ agent, conversation }),
+    private_metadata: JSON.stringify({ agent, conversation, user: user ?? null }),
     title: { type: "plain_text", text: "Connect Plaud" },
     submit: { type: "plain_text", text: "Connect" },
     close: { type: "plain_text", text: "Cancel" },
@@ -115,12 +120,12 @@ export function urlModal(agent: string, conversation: string): Record<string, un
 }
 
 /** Offer the connection in the channel. Returns false if a login could not even be started. */
-export async function ask(deps: PlaudGateDeps, agent: string, conversation: string): Promise<boolean> {
+export async function ask(deps: PlaudGateDeps, agent: string, conversation: string, user?: string): Promise<boolean> {
   const conn = deps.conn(agent);
   if (!conn) return false;
   let url: string;
   try {
-    url = await deps.begin(agent);
+    url = await deps.begin(agent, user);
   } catch (e) {
     await conn
       .reply(conversation)
@@ -128,9 +133,24 @@ export async function ask(deps: PlaudGateDeps, agent: string, conversation: stri
       .catch(() => {});
     return false;
   }
-  const { text, blocks } = connectBlocks(url, conversation);
+  const { text, blocks } = connectBlocks(url, conversation, user);
   await conn.postBlocks(conversation, text, blocks);
   return true;
+}
+
+/** The button's `value`: a bare conversation string (shared), or `{c, u}` carrying the connecting
+ *  member (per-person). Decoded back to `{conversation, user}` so the dialog runs under that member. */
+function decodeButtonValue(value: string | undefined): { conversation: string; user?: string } {
+  const raw = value ?? "";
+  if (raw.startsWith("{")) {
+    try {
+      const o = JSON.parse(raw) as { c?: string; u?: string };
+      return { conversation: String(o.c ?? ""), user: o.u || undefined };
+    } catch {
+      // fall through to the bare-string reading
+    }
+  }
+  return { conversation: raw };
 }
 
 /** Button press or dialog submission. Returns a short line for the log. */
@@ -140,17 +160,20 @@ export async function handleInteraction(deps: PlaudGateDeps, agent: string, it: 
 
   if (it.kind === "block_actions" && it.actionId === PLAUD_CONNECT_ACTION) {
     if (!it.triggerId) return "no trigger_id";
-    await conn.call("views.open", { trigger_id: it.triggerId, view: urlModal(agent, it.value ?? "") });
+    const { conversation, user } = decodeButtonValue(it.value);
+    await conn.call("views.open", { trigger_id: it.triggerId, view: urlModal(agent, conversation, user) });
     return "opened plaud address dialog";
   }
 
   if (it.kind === "view_submission" && it.callbackId === PLAUD_CONNECT_ACTION) {
     const meta = safeParse(it.privateMetadata);
     const conversation = String(meta.conversation ?? "");
+    // The member `begin` ran under — completing must use the same scope or the pending login misses.
+    const user = typeof meta.user === "string" && meta.user ? meta.user : undefined;
     const pasted = firstInputValue(it.values);
     if (!pasted) return "empty address";
 
-    const r = await deps.complete(agent, pasted);
+    const r = await deps.complete(agent, pasted, user);
     // BEFORE the confirmation, not after: the next two sentences promise a poll, so the poll has to
     // exist by the time they are read. A failure here changes what the person is TOLD, rather than
     // being logged somewhere nobody is looking while they wait for a recap.

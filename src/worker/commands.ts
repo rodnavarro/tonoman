@@ -175,10 +175,12 @@ export interface CommandDeps {
    *  session has nothing to forget, and `!new` says so instead of claiming a reset. */
   resetSession?(agent: string, conversation: string): void;
   /** Connect this agent's Plaud account. Returns the text to post — a login link the person
-   *  opens themselves, because the account being connected is theirs and not ours. */
-  connectPlaud?(agent: string, conversation: string): Promise<string>;
-  /** Forget this agent's Plaud account and revoke it upstream. */
-  disconnectPlaud?(agent: string): Promise<string>;
+   *  opens themselves, because the account being connected is theirs and not ours. `user` connects
+   *  the SPEAKER's own account on a per-person agent; ignored on a shared one. */
+  connectPlaud?(agent: string, conversation: string, user?: string): Promise<string>;
+  /** Forget this agent's Plaud account and revoke it upstream — the speaker's own on a per-person
+   *  agent, so one teammate signing out never touches another's. */
+  disconnectPlaud?(agent: string, user?: string): Promise<string>;
   /** Sign this agent out of its Claude subscription — the speaker's own when `user` is set and the
    *  agent runs inference per person. */
   disconnectClaude?(agent: string, user?: string): Promise<string>;
@@ -188,10 +190,12 @@ export interface CommandDeps {
   connectClaude?(agent: string, conversation: string, user?: string): Promise<string>;
   /** Offer the calendar dialog. Same contract: "" when the blocks are the message. */
   connectIcs?(agent: string, conversation: string): Promise<string>;
-  /** Finish a connection with the callback URL the person pasted back. */
-  finishPlaud?(agent: string, pasted: string): Promise<string>;
-  /** Whether this agent already has a Plaud account connected. */
-  plaudConnected?(agent: string): Promise<boolean>;
+  /** Finish a connection with the callback URL the person pasted back. `user` completes the
+   *  speaker's own login on a per-person agent (the pending PKCE verifier is under their scope). */
+  finishPlaud?(agent: string, pasted: string, user?: string): Promise<string>;
+  /** Whether this agent already has a Plaud account connected — the speaker's own on a per-person
+   *  agent, so "already connected" answers for the right person. */
+  plaudConnected?(agent: string, user?: string): Promise<boolean>;
 }
 
 const HELP = [
@@ -254,7 +258,7 @@ export function mergeConnections(registry: readonly ConnectionLine[], legacy: re
 async function gatherLegacy(deps: CommandDeps, agent: string, user?: string): Promise<ConnectionLine[]> {
   const out: ConnectionLine[] = [];
 
-  if (await deps.plaudConnected?.(agent).catch(() => false)) {
+  if (await deps.plaudConnected?.(agent, user).catch(() => false)) {
     out.push({ kind: "plaud", alias: "default", label: "Plaud account", status: "connected" });
   }
 
@@ -330,7 +334,7 @@ export async function run(
       const { which, rest } = splitConnector(cmd.arg);
       if (which && which !== "plaud") return unknownConnector(which, ["plaud"]);
       if (!rest) return "Paste the whole address from your browser after `!code plaud`, including the part after the `?`.";
-      return deps.finishPlaud(agent, rest);
+      return deps.finishPlaud(agent, rest, user);
     }
 
     case "disconnect":
@@ -343,7 +347,7 @@ export async function run(
       }
       if (which !== "plaud") return unknownConnector(which, ["plaud", "claude"]);
       if (!deps.disconnectPlaud) return "I have no way to disconnect an account on this deployment.";
-      return deps.disconnectPlaud(agent);
+      return deps.disconnectPlaud(agent, user);
     }
 
     case "connect": {
@@ -389,12 +393,12 @@ export async function run(
       }
 
       if (!deps.connectPlaud) return "I have no way to connect an account on this deployment.";
-      if (rest.toLowerCase() !== "again" && (await deps.plaudConnected?.(agent).catch(() => false))) {
+      if (rest.toLowerCase() !== "again" && (await deps.plaudConnected?.(agent, user).catch(() => false))) {
         // Reconnecting revokes nothing but does replace the tokens, so it is worth one sentence
         // rather than silently doing it to somebody who typed the wrong thing.
         return "✅ Your Plaud account is already connected. Type `!connect plaud again` to sign in with a different one.";
       }
-      return deps.connectPlaud(agent, conversation);
+      return deps.connectPlaud(agent, conversation, user);
     }
 
     case "new":

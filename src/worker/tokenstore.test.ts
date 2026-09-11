@@ -82,6 +82,19 @@ describe("the volume", () => {
     expect((await s.load("murphy"))?.access_token).toBe("shared");
     expect((await s.load("murphy", "U_ROD"))?.access_token).toBe("rod");
   });
+
+  it("listUsers returns the members who connected, and NEVER the shared account", async () => {
+    const root = await tmp();
+    const s = fileStore(root);
+    await s.save("murphy", { access_token: "shared" }); // the shared account has no member
+    await s.save("murphy", { access_token: "a" }, "U0C01N3R0KE");
+    await s.save("murphy", { access_token: "b" }, "U0RODNAV99");
+    const users = (await s.listUsers("murphy")).map((u) => u.user).sort();
+    expect(users).toEqual(["U0C01N3R0KE", "U0RODNAV99"]);
+    // Each carries a connect time (the floor), and an agent with no members lists nobody.
+    expect((await s.listUsers("murphy"))[0]?.connectedAt).toBeTypeOf("number");
+    expect(await s.listUsers("nobody")).toEqual([]);
+  });
 });
 
 describe("Tonoman Cloud", () => {
@@ -120,6 +133,26 @@ describe("Tonoman Cloud", () => {
     expect(url).toBe(`http://api/v1/system/agents/guid-1/secrets/${encodeURIComponent("plaud.tokens:U_CELINE")}`);
     await s.load("murphy");
     expect(url).toBe("http://api/v1/system/agents/guid-1/secrets/plaud.tokens");
+  });
+
+  it("listUsers reads members out of the secrets list, excluding the shared ref and non-Plaud refs", async () => {
+    const s = deps((async (u: string) => {
+      if (u.endsWith("/secrets")) {
+        return ok({
+          secrets: [
+            { ref: "plaud.tokens", createdAt: "2026-09-10T00:00:00Z" }, // shared — excluded
+            { ref: "plaud.tokens:U0C01N3R0KE", createdAt: "2026-09-10T01:00:00Z" },
+            { ref: "plaud.tokens:U0RODNAV99", createdAt: "2026-09-10T02:00:00Z" },
+            { ref: "ics.url:work", createdAt: "2026-09-10T03:00:00Z" }, // a calendar — excluded
+            { ref: "plaud.tokens:sapien10" }, // a per-agent ref, not a Slack id — excluded
+          ],
+        });
+      }
+      return ok({ value: "{}" });
+    }) as unknown as typeof fetch);
+    const users = await s.listUsers("murphy");
+    expect(users.map((u) => u.user).sort()).toEqual(["U0C01N3R0KE", "U0RODNAV99"]);
+    expect(users.find((u) => u.user === "U0C01N3R0KE")?.connectedAt).toBe(Date.parse("2026-09-10T01:00:00Z"));
   });
 
   it("carries the system token", async () => {
@@ -234,10 +267,13 @@ describe("plaudRefFor / userFromPlaudRef — scope lives in the ref", () => {
     expect(plaudRefFor("plaud.tokens", undefined)).toBe("plaud.tokens");
   });
 
-  it("round-trips the user back out of a scoped ref, and yields undefined for the shared one", () => {
-    expect(userFromPlaudRef("plaud.tokens:U_CELINE")).toBe("U_CELINE");
+  it("round-trips a Slack id back out of a scoped ref, and yields undefined otherwise", () => {
+    expect(userFromPlaudRef("plaud.tokens:U0C01N3R0KE")).toBe("U0C01N3R0KE");
     expect(userFromPlaudRef("plaud.tokens")).toBeUndefined();
     expect(userFromPlaudRef(undefined)).toBeUndefined();
-    expect(userFromPlaudRef("something.else:U_X")).toBeUndefined();
+    expect(userFromPlaudRef("something.else:U0C01N3R0KE")).toBeUndefined();
+    // A per-AGENT ref like `plaud.tokens:sapien10` must NOT parse as a member — the suffix is not a
+    // Slack id, so it can never be polled as one.
+    expect(userFromPlaudRef("plaud.tokens:sapien10")).toBeUndefined();
   });
 });

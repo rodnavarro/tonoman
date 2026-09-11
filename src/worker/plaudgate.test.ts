@@ -222,3 +222,70 @@ describe("connecting has to START the poll, not just store the credential", () =
   });
 });
 
+
+describe("per-person: the member is carried begin → dialog → complete", () => {
+  const recordingConn = () => {
+    const rec: { view?: Record<string, unknown> } = {};
+    const c = {
+      call: async (_m: string, args: { view?: Record<string, unknown> }) => ((rec.view = args.view), {}),
+      reply: () => ({ send: async () => "ts" }),
+      postBlocks: async () => "ts",
+    } as never;
+    return { c, rec };
+  };
+
+  it("the button carries the member, and the dialog opens under them", async () => {
+    const { c, rec } = recordingConn();
+    await handleInteraction(deps({ conn: () => c }) as never, "murphy", {
+      kind: "block_actions",
+      userId: "U1",
+      actionId: PLAUD_CONNECT_ACTION,
+      triggerId: "T1",
+      value: JSON.stringify({ c: "D1", u: "U0MEMBER1" }),
+    } as SlackInteraction);
+    expect(String(rec.view?.private_metadata)).toContain("U0MEMBER1");
+    expect(String(rec.view?.private_metadata)).toContain("D1");
+  });
+
+  it("completes the login under the SAME member the dialog carried", async () => {
+    let gotUser: string | undefined = "unset";
+    await handleInteraction(
+      deps({ complete: async (_a: string, _p: string, user?: string) => ((gotUser = user), { ok: true }) }) as never,
+      "murphy",
+      {
+        kind: "view_submission",
+        userId: "U1",
+        callbackId: PLAUD_CONNECT_ACTION,
+        privateMetadata: JSON.stringify({ agent: "murphy", conversation: "D1", user: "U0MEMBER1" }),
+        values: { url: { value: { value: "http://localhost:8199/auth/callback?code=abc" } } },
+      } as SlackInteraction,
+    );
+    expect(gotUser).toBe("U0MEMBER1");
+  });
+
+  it("a SHARED connect carries no member — a bare conversation value, and complete gets undefined", async () => {
+    const { c, rec } = recordingConn();
+    await handleInteraction(deps({ conn: () => c }) as never, "sapien", {
+      kind: "block_actions",
+      userId: "U1",
+      actionId: PLAUD_CONNECT_ACTION,
+      triggerId: "T1",
+      value: "D1", // the old bare-string form, unchanged for a shared agent
+    } as SlackInteraction);
+    expect(String(rec.view?.private_metadata)).toContain('"user":null');
+
+    let gotUser: string | undefined = "unset";
+    await handleInteraction(
+      deps({ complete: async (_a: string, _p: string, user?: string) => ((gotUser = user), { ok: true }) }) as never,
+      "sapien",
+      {
+        kind: "view_submission",
+        userId: "U1",
+        callbackId: PLAUD_CONNECT_ACTION,
+        privateMetadata: JSON.stringify({ agent: "sapien", conversation: "D1", user: null }),
+        values: { url: { value: { value: "http://localhost:8199/auth/callback?code=abc" } } },
+      } as SlackInteraction,
+    );
+    expect(gotUser).toBeUndefined();
+  });
+});
