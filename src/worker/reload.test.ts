@@ -45,6 +45,11 @@ describe("planReload", () => {
     expect(plan.updated).toEqual([{ key: "guid-1", rebuildConn: false, rebuildRunner: true }]);
   });
 
+  it("a flip to per-person inference rebuilds the runner — the run closure captures the mode", () => {
+    const plan = planReload([agent()], [agent({ inference_mode: "per_user" })]);
+    expect(plan.updated).toEqual([{ key: "guid-1", rebuildConn: false, rebuildRunner: true }]);
+  });
+
   it("a rotated Slack app token rebuilds the connector", () => {
     const plan = planReload([agent()], [agent({ slack: { app_token: "xapp-2", bot_token: "xoxb-1" } })]);
     expect(plan.updated).toEqual([{ key: "guid-1", rebuildConn: true, rebuildRunner: true }]);
