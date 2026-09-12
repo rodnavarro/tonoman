@@ -42,10 +42,6 @@ export interface VoiceSettings {
   /** How far either side of a recording to look for events. Generous by default: people start
    *  recording after a meeting begins, and this only gathers candidates — the content decides. */
   calendarPadMinutes?: number;
-  /** Which runtime processes a recording: `hardcoded` (the proven pipeline) or `skill` (the generic
-   *  interpreter). Default `hardcoded`, so arming a tenant onto the skill runner is a deliberate row
-   *  and a typo can never move a working pipeline onto an unproven path. */
-  runner: "skill" | "hardcoded";
   /** Whether Plaud is ONE shared account for the tenant (`shared`, the default and Sapien's) or each
    *  member's own (`per_person`). Default `shared`, so a tenant that has not opted in keeps a single
    *  mounted/connected account and every existing flow is unchanged; only an explicit `per_person`
@@ -122,10 +118,7 @@ export function voiceSettings(props: Record<string, string> = {}, env: NodeJS.Pr
     credentialRef: p("credential_ref") ?? "",
     pollSeconds: num(p("poll_seconds") ?? env.VOICE_POLL_SECONDS, 300),
     since: p("since") ?? (env.VOICE_SINCE ?? "").trim(),
-    // Default hardcoded: only an explicit "skill" arms the interpreter, for the same reason `enabled`
-    // defaults on — a working pipeline must never change runtime because of a missing or mistyped row.
-    runner: (p("runner") ?? "hardcoded").toLowerCase() === "skill" ? "skill" : "hardcoded",
-    // Default shared: per-person is a deliberate opt-in, for the same reason as `enabled`/`runner` —
+    // Default shared: per-person is a deliberate opt-in, for the same reason as `enabled` —
     // a typo must never move a tenant off their one working account into a state where the poll finds
     // no per-member accounts and stops.
     plaudScope: (p("plaud_scope") ?? "shared").toLowerCase() === "per_person" ? "per_person" : "shared",

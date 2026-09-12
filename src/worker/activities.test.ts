@@ -1,14 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 import { makeActivities, accountsOf, accountFor, accountsFromUsers, type TurnDeps, type VoiceConfig } from "./activities";
 import * as recap from "./recap";
-import type { Step } from "./skill";
-
-/** The voice plan is the one decision the poll trigger reads each tick: which runtime, and — when it
- *  is the interpreter — the skill to run. It is deliberately the ONLY place the fallback logic lives,
- *  so that "armed but nothing to run" degrades to the proven path rather than to a flow that silently
- *  does nothing. These tests pin that fallback. */
-
-const STEPS: Step[] = [{ id: "s1", tool: "mission get", out: "mission" }];
+/** voicePlan is the one decision the poll reads each tick: which Talent to run (name + version). It
+ *  falls back to the built-in Plaud Talent when the roster carried no grant — the voice flow IS
+ *  meeting-recap. There is no runner switch any more; a Talent is code and the poll always runs it. */
 
 function depsWithVoice(v: Partial<VoiceConfig> | undefined): TurnDeps {
   // Only `voice` is exercised by voicePlan; the rest of TurnDeps is never touched, so a narrow stub
@@ -16,43 +11,27 @@ function depsWithVoice(v: Partial<VoiceConfig> | undefined): TurnDeps {
   return { agent: () => undefined, voice: () => (v ? (v as VoiceConfig) : undefined) };
 }
 
-describe("voicePlan — which runtime, and the skill to run", () => {
-  it("is hardcoded when the agent has no voice config at all", async () => {
+describe("voicePlan — which Talent the poll runs", () => {
+  it("falls back to the built-in Plaud Talent when the agent has no voice config at all", async () => {
     const acts = makeActivities(depsWithVoice(undefined));
-    expect(await acts.voicePlan({ agent: "nelly" })).toEqual({ runner: "hardcoded" });
+    expect(await acts.voicePlan({ agent: "nelly" })).toEqual({ talent: { name: "meeting-recap", version: 1 } });
   });
 
-  it("is hardcoded when the runner is not armed, even with a skill present", async () => {
-    const acts = makeActivities(depsWithVoice({ runner: "hardcoded", skill: { name: "meeting-recap", steps: STEPS, version: 3 } }));
-    expect(await acts.voicePlan({ agent: "nelly" })).toEqual({ runner: "hardcoded" });
+  it("returns the installed Talent, pinned to its version, from the grant", async () => {
+    const acts = makeActivities(depsWithVoice({ talent: { name: "meeting-recap", version: 3 } }));
+    expect(await acts.voicePlan({ agent: "nelly" })).toEqual({ talent: { name: "meeting-recap", version: 3 } });
   });
 
-  it("FALLS BACK to hardcoded when armed for skill but no skill is granted", async () => {
-    // The failure this avoids: a runner pointed at an interpreter with nothing to interpret is a
-    // flow that does nothing and reports success. Better to run the proven path.
-    const acts = makeActivities(depsWithVoice({ runner: "skill", skill: undefined }));
-    expect(await acts.voicePlan({ agent: "nelly" })).toEqual({ runner: "hardcoded" });
-  });
-
-  it("runs the skill, pinned to its version, when armed and granted", async () => {
-    const acts = makeActivities(depsWithVoice({ runner: "skill", skill: { name: "meeting-recap", steps: STEPS, version: 3 } }));
-    expect(await acts.voicePlan({ agent: "nelly" })).toEqual({
-      runner: "skill",
-      skill: { name: "meeting-recap", steps: STEPS, version: 3 },
-    });
-  });
-
-  it("FALLS BACK to hardcoded on a per-person agent even when armed for skill", async () => {
-    // The skill interpreter does not yet thread the member, so it would read one shared account for
-    // everyone. Until it does, a per-person agent must run the hardcoded path, which does thread it.
+  it("returns the installed Talent on a per-person agent too — processRecording threads the member", async () => {
+    // Unlike the deleted interpreter, the Talent's run (processRecording) attributes per-member, so a
+    // per-person agent runs the Talent path like any other. No hardcoded fallback any more.
     const acts = makeActivities(
       depsWithVoice({
-        runner: "skill",
-        skill: { name: "meeting-recap", steps: STEPS, version: 3 },
+        talent: { name: "meeting-recap", version: 3 },
         accounts: [{ user: "U0A", creds: { tokenJson: "", cliAgent: "murphy", cliUser: "U0A" } }],
       }),
     );
-    expect(await acts.voicePlan({ agent: "murphy" })).toEqual({ runner: "hardcoded" });
+    expect(await acts.voicePlan({ agent: "murphy" })).toEqual({ talent: { name: "meeting-recap", version: 3 } });
   });
 });
 

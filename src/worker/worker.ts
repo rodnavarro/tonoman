@@ -47,7 +47,6 @@ import { serveWake } from "./wake";
 import { promises as fsp } from "node:fs";
 import { defaultHarnesses } from "../gateway";
 import { accountsFromUsers, makeActivities, type TurnRunReq, type VoiceConfig } from "./activities";
-import type { Step } from "./skill";
 import { conversationWorkflow, messageSignal, plaudPollWorkflow, type Inbound, type PollInput } from "./workflows";
 import { planReload } from "./reload";
 
@@ -703,10 +702,10 @@ export async function run(
     const token = await resolveRef(src.secret_ref);
     const pushUrl = token ? src.repo_url.replace("https://", `https://x-access-token:${token}@`) : src.repo_url;
     const dir = path.join(process.env.TONOMAN_STATE_ROOT ?? "/root/.tonoman", "secondbrain", name, src.id);
-    // The granted skill that drives the voice flow, if any — the one whose trigger polls Plaud. The
-    // steps and version are pinned here, off the roster, so a run started tonight keeps interpreting
-    // the definition it began with even if the row is edited under it. Absent = this agent has no
-    // voice skill granted, and `runner: skill` will fall back to hardcoded rather than do nothing.
+    // The installed Talent that drives the voice flow, if any — the one whose trigger polls Plaud.
+    // Its name and version are pinned onto each run (off the roster), so a run started tonight is
+    // recorded against the version it began with even if the row is edited under it. (The roster
+    // still carries the grant under the `skills` wire key this wave; the key renames later.)
     const voiceSkill = (a.cfg.skills ?? []).find(
       (s) => (s.trigger as { poll?: unknown } | undefined)?.poll === "plaud",
     );
@@ -741,10 +740,7 @@ export async function run(
       timezone: a.cfg.timezone ?? "UTC",
       // Which runtime, and the skill to run when it is the interpreter. Default hardcoded (from
       // flowcfg), so the proven pipeline stays in charge until a tenant is deliberately armed.
-      runner: voice.runner,
-      skill: voiceSkill
-        ? { name: voiceSkill.name, steps: voiceSkill.steps as Step[], version: voiceSkill.version }
-        : undefined,
+      talent: voiceSkill ? { name: voiceSkill.name, version: voiceSkill.version } : undefined,
       floorMs,
       vocab:
         process.env.GROQ_PROMPT ??
@@ -851,8 +847,8 @@ export async function run(
     // recording is not processed, so every failure here is logged and swallowed — the run proceeds,
     // the row is simply missing. Dedup does not depend on it (the git checkout still answers "already
     // published"); this makes a failing run visible, which nothing did before.
-    skillRun: {
-      open: async (name: string, skillName: string, itemKey: string, version: number) => {
+    talentRun: {
+      open: async (name: string, talentName: string, itemKey: string, version: number) => {
         const baseUrl = process.env.TONOMANCLOUD_API_URL;
         const guid = wired.get(name)?.cfg.guid;
         if (!baseUrl || !guid) return; // a file roster has no registry to record into
@@ -863,16 +859,16 @@ export async function run(
               authorization: `Bearer ${process.env.TONOMANCLOUD_API_TOKEN ?? ""}`,
               "content-type": "application/json",
             },
-            body: JSON.stringify({ skill: skillName, itemKey, version }),
+            body: JSON.stringify({ skill: talentName, itemKey, version }),
           });
-          if (!r.ok) console.error(`worker: ${name} skill_run open ${skillName}/${itemKey} → ${r.status}`);
+          if (!r.ok) console.error(`worker: ${name} talent_run open ${talentName}/${itemKey} → ${r.status}`);
         } catch (e) {
-          console.error(`worker: ${name} skill_run open ${skillName}/${itemKey} failed: ${String(e)}`);
+          console.error(`worker: ${name} talent_run open ${talentName}/${itemKey} failed: ${String(e)}`);
         }
       },
       close: async (
         name: string,
-        skillName: string,
+        talentName: string,
         itemKey: string,
         status: "done" | "failed",
         error?: string,
@@ -887,11 +883,11 @@ export async function run(
               authorization: `Bearer ${process.env.TONOMANCLOUD_API_TOKEN ?? ""}`,
               "content-type": "application/json",
             },
-            body: JSON.stringify({ skill: skillName, itemKey, status, error }),
+            body: JSON.stringify({ skill: talentName, itemKey, status, error }),
           });
-          if (!r.ok) console.error(`worker: ${name} skill_run close ${skillName}/${itemKey} → ${r.status}`);
+          if (!r.ok) console.error(`worker: ${name} talent_run close ${talentName}/${itemKey} → ${r.status}`);
         } catch (e) {
-          console.error(`worker: ${name} skill_run close ${skillName}/${itemKey} failed: ${String(e)}`);
+          console.error(`worker: ${name} talent_run close ${talentName}/${itemKey} failed: ${String(e)}`);
         }
       },
     },
