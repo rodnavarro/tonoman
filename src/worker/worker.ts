@@ -471,6 +471,9 @@ export async function registerBuiltinTalents(): Promise<void> {
       const r = await fetch(`${baseUrl}/v1/system/talents/${encodeURIComponent(t.name)}`, {
         method: "PUT",
         headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+        // Bounded: registration is on the BOOT path (unlike the talent_run rows), so an API that is
+        // up-but-hung, or a DNS blip, must not stall the worker for undici's ~5-minute default.
+        signal: AbortSignal.timeout(5000),
         body: JSON.stringify({
           version: t.version,
           description: t.description,
