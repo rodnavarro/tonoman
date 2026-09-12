@@ -1,0 +1,65 @@
+# The deployed Tonoman image — gateway AND agent runtime, one image, two commands.
+#
+# This file did not exist before: the images running in production were built by hand, so nothing
+# in any repo described how to reproduce them. That is fine until the day you need to rebuild one
+# under time pressure. This is that description.
+#
+# The two roles differ only in the command the Deployment passes:
+#   gateway  node /opt/tonoman/dist/cli.js --config /etc/tonoman/settings.json up
+#   agent    node /opt/tonoman/dist/cli.js runtime
+#
+# Build (context = repo root):
+#   podman build -t <your-registry>/tonoman:<tag> -f build/gateway/Containerfile .
+
+# --- build -------------------------------------------------------------------
+# tsc runs here so the runtime image carries no TypeScript and no devDependencies.
+FROM docker.io/library/node:22-bookworm-slim AS build
+WORKDIR /src
+
+# Dependencies first, so editing source does not re-resolve the tree on every build.
+COPY package.json package-lock.json ./
+RUN npm ci
+
+COPY tsconfig.json ./
+COPY src ./src
+RUN npm run build
+
+# --- runtime -----------------------------------------------------------------
+FROM docker.io/library/node:22-bookworm-slim
+
+# git + openssh-client: the second-brain tool clones and pushes over SSH (cfg-ssh-key).
+# ca-certificates: Slack, Anthropic and Harbor are all TLS.
+# ffmpeg: the voice flow re-encodes a recording to 16 kHz mono and splits it before upload. Not a
+# nicety — a real meeting is larger than a transcription API will accept in one request, and
+# without this the pipeline fails with a 413 at the end, after the person has already been told
+# their recording was picked up.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git openssh-client ca-certificates curl ffmpeg \
+ && rm -rf /var/lib/apt/lists/*
+
+# The harness drives this CLI as a subprocess; the Agent SDK resolves the subscription
+# credential through it via CLAUDE_CONFIG_DIR. Brain auth is NEVER baked in (§ A2) — it arrives
+# at run time on the agent's config volume, and ANTHROPIC_API_KEY is deliberately never set.
+RUN npm install -g @anthropic-ai/claude-code \
+ && claude --version
+
+# The official Plaud CLI. Its OAuth tokens last about 300 days and renew themselves; the
+# captured web bearer it replaces lasted 24 hours and needed a real browser on somebody's
+# laptop to renew, which is not a thing a customer can be asked to run every morning.
+RUN npm install -g @plaud-ai/cli \
+ && plaud version
+
+# Container-root git must trust bind-mounted workspaces, or "dubious ownership" blocks commits.
+RUN git config --system --add safe.directory '*'
+
+# Runtime dependencies. Tonoman had none until the Temporal worker landed — `@temporalio/worker`
+# also carries a native core, so it is installed here on the same base rather than copied from the
+# build stage, which would carry devDependencies (tsc, vitest) into a running pod.
+WORKDIR /opt/tonoman
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev && npm cache clean --force
+
+COPY --from=build /src/dist /opt/tonoman/dist
+
+WORKDIR /opt/tonoman
+CMD ["node", "/opt/tonoman/dist/cli.js", "runtime"]

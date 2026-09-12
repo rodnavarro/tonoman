@@ -28,7 +28,45 @@ export const IMAGE = "localhost/tonoman/claudecode:latest";
 
 // Where Claude Code keeps its state inside the sandbox; the per-agent config
 // volume is bind-mounted here so the OAuth credential store persists (A11).
-export const CONFIG_HOME = "/root/.claude";
+/** Where every agent's Claude credential directory lives.
+ *
+ *  `/root/.claude` in the pod, which is where the config volume is mounted. Overridable because the
+ *  worker is not always in that pod: running it on a workstation to iterate (architecture.md §11)
+ *  needs somewhere writable that is not the machine's own Claude login — mixing those would have a
+ *  developer's personal subscription answering as a customer's agent. */
+export const CONFIG_HOME = process.env.CLAUDE_CONFIG_ROOT || "/root/.claude";
+
+/** One agent's Claude credential directory, under the shared config volume.
+ *
+ *  A subscription belongs to a PERSON, and one worker pod runs every agent a deployment has. With
+ *  a single CLAUDE_CONFIG_DIR they all shared one login: the second person to sign in replaced the
+ *  first, and every agent then answered — and billed — on whoever had authenticated most recently.
+ *  Celine's assistant must run on Celine's subscription and Rod's on Rod's, and where that is true
+ *  is here.
+ *
+ *  The name is sanitised because it arrives over the wire on the login endpoints. Anything that is
+ *  not a plain name would let a caller choose a path, and this path is where credentials live. */
+export function configHomeFor(
+  agent: string | undefined,
+  user?: string,
+  root: string = CONFIG_HOME,
+): string {
+  // No agent named at all: a self-hosted roster with one login, which should not grow a directory
+  // level for a distinction it does not have.
+  if (!agent) return root;
+  const safe = agent.replace(/[^A-Za-z0-9_-]/g, "");
+  // A name that was GIVEN but sanitises away is not the same thing as no name. Falling back to the
+  // shared home there would hand the pool's credential to whatever nonsense was supplied — so it
+  // gets a directory of its own that is nobody's and works for nothing.
+  const agentHome = `${root}/agents/${safe || "_invalid"}`;
+  // No user: the agent's ONE shared login — every agent today, and the default. A user names a
+  // PER-PERSON login under that agent, so each teammate answers on their own subscription. Same
+  // sanitisation and same "given-but-empty gets its own nowhere dir" rule, because the user id
+  // also arrives over the wire (a Slack user id on the connect endpoints and in a turn).
+  if (!user) return agentHome;
+  const safeUser = user.replace(/[^A-Za-z0-9_-]/g, "");
+  return `${agentHome}/users/${safeUser || "_invalid"}`;
+}
 
 /** Where the per-agent identity dir (AGENTS.md/persona) bind-mounts READ-ONLY; the
  * turn-runner injects it via --append-system-prompt-file <identity>/AGENTS.md (A2). */
@@ -46,8 +84,17 @@ export interface RunnerOptions {
   // OWN tool taxonomy + its own knob, so this deliberately lives on the claude-code harness, not in
   // the harness-neutral roster. (`--allowedTools` is NOT used: it keeps schemas and ADDS guidance.)
   disallowedTools?: string[];
+  /** Where THIS runner's Claude credential lives. Defaults to the shared home, which is right for
+   *  a self-hosted roster with one login; a multi-tenant pool passes one per agent. */
+  configHome?: string;
   extraArgs?: string[]; // MUST NOT include --bare or --resume
-  settingSources?: string; // default "user" (discovers the preset skill, A2)
+  settingSources?: string;
+  /** Let the account's own MCP configuration through — claude.ai connectors included.
+   *
+   *  Off by default and it should stay off for anything serving a tenant: those connectors belong
+   *  to the account holding the credential, not to the customer. Present so a single-tenant or
+   *  developer deployment can opt back in deliberately rather than by forgetting. */
+  allowAmbientMcp?: boolean; // default "user" (discovers the preset skill, A2)
   // Ephemeral mode (gw-command-btw): instead of `podman exec <container>`, run a throwaway
   // `podman run --rm --volumes-from <caller>` sandbox from the harness image and tear it
   // down after the turn. Inherits the caller's mounts (shared credential, identity, skills).
@@ -75,8 +122,12 @@ export type BackendMode = "subscription" | "bedrock";
  *  - "subscription": clear CLAUDE_CODE_USE_BEDROCK / CLAUDE_CODE_USE_MANTLE / ANTHROPIC_MODEL so the
  *    OAuth credential resolves and no Bedrock model id leaks onto the subscription path.
  *  - undefined: leave whatever backend the pod env declares (back-compat). */
-export function localEnv(base: NodeJS.ProcessEnv, backend?: BackendMode): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { ...base, IS_SANDBOX: "1", CLAUDE_CONFIG_DIR: CONFIG_HOME };
+export function localEnv(
+  base: NodeJS.ProcessEnv,
+  backend?: BackendMode,
+  configHome: string = CONFIG_HOME,
+): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...base, IS_SANDBOX: "1", CLAUDE_CONFIG_DIR: configHome };
   delete env.ANTHROPIC_API_KEY;
   if (backend === "bedrock") {
     env.CLAUDE_CODE_USE_BEDROCK = "1";
@@ -125,13 +176,35 @@ export class Runner implements TurnRunner {
       "--setting-sources",
       this.o.settingSources ?? "user",
       "--dangerously-skip-permissions",
+      // NO MCP SERVER THIS AGENT WAS NOT EXPLICITLY GIVEN.
+      //
+      // `--setting-sources user` reads the account's own configuration, and on a claude.ai
+      // subscription that includes its CONNECTORS — Google Calendar, Gmail, Microsoft 365. They
+      // arrive as tools, so an agent serving a customer silently gains tools bound to whichever
+      // account holds its credential. That is one person's account answering on another's behalf,
+      // which is the single thing this platform exists to make impossible.
+      //
+      // It also made capability nondeterministic: the same agent reported 22 tools on one turn and
+      // 33 on the next, so what it could do changed between messages for reasons nothing recorded.
+      //
+      // And it produced a confidently wrong answer. Asked about calendars, the agent said Google
+      // Calendar "needs to be authorized via claude.ai connector settings" — true of the connector
+      // it could see, and nothing to do with the three Google calendars the TENANT had connected.
+      //
+      // `--strict-mcp-config` with no `--mcp-config` means none. A tenant that genuinely needs an
+      // MCP server gets it passed here, from the registry, per agent — which is the only way it can
+      // belong to the tenant rather than to whoever logged in.
+      ...(this.o.allowAmbientMcp ? [] : ["--strict-mcp-config"]),
     ];
     // Drop tools this agent never uses, so their schemas leave the context floor (claude-code-only).
     if (this.o.disallowedTools && this.o.disallowedTools.length) {
       args.push("--disallowedTools", this.o.disallowedTools.join(","));
     }
     if (req.systemPromptFile) args.push("--append-system-prompt-file", req.systemPromptFile);
-    if (this.model) args.push("--model", this.model); // mutable: /model switches it per turn
+    // Per-TURN model first, then the process-wide knob. The knob is right for a single-agent
+    // gateway and wrong for a worker serving many conversations at once.
+    const model = req.model ?? this.model;
+    if (model) args.push("--model", model);
     // Cap the internal agentic tool-loop so one open-ended turn (e.g. a research rabbit hole)
     // can't loop unbounded and drain the account's usage window. Hitting the cap exits with an
     // error result (subtype "error_max_turns") — parseLine treats that as DONE so the partial
@@ -184,7 +257,10 @@ export class Runner implements TurnRunner {
     let child;
     if (this.o.local) {
       // Backend-aware env (backend-*): bedrock sets CLAUDE_CODE_USE_BEDROCK, subscription clears it.
-      const env = localEnv(process.env, this.o.backend);
+      // `req.configHome` overrides the runner's per-agent default for THIS turn only — set when the
+      // agent runs inference per person, so the speaker's own login answers. Unset (every agent
+      // today) keeps the one shared per-agent login.
+      const env = localEnv(process.env, this.o.backend, req.configHome ?? this.o.configHome ?? CONFIG_HOME);
       child = spawn(bin, this.localArgs(req), { windowsHide: true, env });
     } else {
       const podman = this.o.podman ?? "podman";
@@ -479,7 +555,20 @@ export function spec(): Spec {
     // Keep ALL Claude Code state in the config volume (incl. the sibling ~/.claude.json
     // profile), so a destroy+recreate comes back fully configured (A2/A11).
     runEnv: { CLAUDE_CONFIG_DIR: CONFIG_HOME },
-    newRunner: (p: RunnerParams) => new Runner({ container: p.container, model: p.model, maxTurns: p.maxTurns }),
+    // No container configured means THIS pod is the sandbox (local-exec): `claude` is spawned as a
+    // direct child instead of through `podman exec`. That is what a Tonoman Cloud gateway does —
+    // an agent is a row, so there is no per-agent container to exec into, and the pod boundary is
+    // the isolation the container used to provide. A self-hosted roster still names a container
+    // and still goes through podman, unchanged.
+    newRunner: (p: RunnerParams) =>
+      new Runner({
+        container: p.container,
+        local: !p.container,
+        model: p.model,
+        maxTurns: p.maxTurns,
+        disallowedTools: p.disallowedTools,
+        configHome: configHomeFor(p.agent),
+      }),
     newEphemeralRunner: (p: EphemeralParams) =>
       new Runner({ container: p.volumesFrom, model: p.model, ephemeral: { volumesFrom: p.volumesFrom, image: p.image, env: p.env } }),
     loginArgs: ["claude", "auth", "login", "--claudeai"],

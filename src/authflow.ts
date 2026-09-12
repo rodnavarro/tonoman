@@ -73,6 +73,12 @@ export function resumeResetNotice(): string {
 /** The never-silent FLOOR (gw-turn-ended-actionable): a turn that failed for a reason we can't
  * auto-recover still gets an explicit, non-alarming message — never a dead typing cue. Keeps the
  * detail short (the full error is in the gateway log) and carries no secrets (harness/infra text). */
+// Re-exported rather than defined here: a Temporal workflow is bundled with no Node built-ins,
+// and this file imports `node:child_process` to drive the harness. A workflow importing it fails
+// the webpack build with `Module not found: node:child_process` and the worker never starts —
+// which presents as a hang, not as a bad import. Definitions live in `turnfailure.ts`.
+export { isNotLoggedInError, notLoggedInNotice } from "./turnfailure";
+
 export function turnErrorNotice(agentName: string, msg: string): string {
   const detail = (msg || "").replace(/\s+/g, " ").trim().slice(0, 200);
   return `⚠️ I hit an error and couldn't finish that${detail ? ` — ${detail}` : ""}.\nIt's logged; try again, or send /new to start a fresh session.`;
@@ -131,6 +137,9 @@ export interface AuthOps {
   startHeadless(): Promise<string>;
   /** deliver the code; ok is OUTCOME-TRUE (the credential file actually changed) */
   submitCode(code: string): Promise<{ ok: boolean; status: string; loginTail: string }>;
+  /** optional: what the harness reports about the credential in use — which account, which plan.
+   *  Optional because not every transport can ask; callers show what they get and nothing more. */
+  status?(): Promise<string>;
 }
 
 /** LOCAL agents: drive the login through `podman exec` (the original roster-auth-headless path). */
@@ -141,22 +150,61 @@ export function podmanAuthOps(container: string, loginArgs: string[], statusArgs
   };
 }
 
+/** PURE: what actually went wrong, when `fetch` refuses to say.
+ *
+ *  Node's fetch throws a bare `TypeError("fetch failed")` for every transport problem and hides the
+ *  real reason in `cause`. Unwrapped, that reached a person in Slack as
+ *  "I need an inference login, but I couldn't start one - fetch failed", which names neither what
+ *  was unreachable nor even that anything was: a connection refused, a DNS miss and a TLS failure
+ *  all read identically, and all read like a bug in the login rather than a missing process.
+ *
+ *  `cause` is sometimes an AggregateError - several addresses tried, IPv6 first - and its own
+ *  `code` is undefined, so reading `cause.code` alone would ship "fetch failed - undefined", which
+ *  is worse than what it replaced. Hence the walk: the first error carrying a code wins, and the
+ *  URL is named either way, because "which address" is half of what makes this actionable. */
+export function transportFailure(e: unknown, base: string): string {
+  const codes: string[] = [];
+  const messages: string[] = [];
+  const walk = (x: unknown, depth: number): void => {
+    if (!x || typeof x !== "object" || depth > 4) return;
+    const err = x as { code?: unknown; errors?: unknown; cause?: unknown; message?: unknown };
+    if (typeof err.code === "string") codes.push(err.code);
+    // "fetch failed" is the wrapper's own message and never the reason, so it is dropped here
+    // rather than allowed to win by being outermost.
+    if (typeof err.message === "string" && err.message && err.message !== "fetch failed") messages.push(err.message);
+    if (Array.isArray(err.errors)) for (const sub of err.errors) walk(sub, depth + 1);
+    walk(err.cause, depth + 1);
+  };
+  walk(e, 0);
+  // A code when there is one; otherwise the DEEPEST message, which is the one closest to the
+  // actual syscall - undici's "bad port" beats the "fetch failed" wrapped around it.
+  const why = codes[0] || messages[messages.length - 1] || (e instanceof Error && e.message) || "unknown error";
+  return `couldn't reach the agent runtime at ${base} (${why})`;
+}
+
 /** REMOTE agents (k8s split): drive the login through the agent's OWN HTTP runtime. There is no
  * podman and no shared filesystem here — the agent is the only half holding `claude` and the
  * credential store, so it runs the PTY dance itself (same reason /usage lives agent-side).
  * We send only the CODE, never a command: the login argv comes from the agent's harness spec,
  * so this can never become a remote-exec primitive. */
-export function httpAuthOps(baseUrl: string, token?: string): AuthOps {
+export function httpAuthOps(baseUrl: string, token?: string, agent?: string, user?: string): AuthOps {
   const base = baseUrl.replace(/\/$/, "");
   const headers: Record<string, string> = { "content-type": "application/json" };
   if (token) headers["authorization"] = `Bearer ${token}`;
 
   const call = async (path: string, body?: unknown): Promise<Record<string, unknown>> => {
-    const res = await fetch(`${base}${path}`, {
-      method: body === undefined ? "GET" : "POST",
-      headers,
-      body: body === undefined ? undefined : JSON.stringify(body),
-    });
+    let res: Response;
+    try {
+      res = await fetch(`${base}${path}`, {
+        method: body === undefined ? "GET" : "POST",
+        headers,
+        body: body === undefined ? undefined : JSON.stringify(body),
+      });
+    } catch (e) {
+      // TRANSPORT failure, which is a different thing from the runtime answering badly - and the
+      // one this function used to let through unexplained. See transportFailure().
+      throw new Error(transportFailure(e, base));
+    }
     const text = await res.text();
     let parsed: Record<string, unknown> = {};
     try {
@@ -168,15 +216,37 @@ export function httpAuthOps(baseUrl: string, token?: string): AuthOps {
     return parsed;
   };
 
+  // Whose subscription this login is for. One runtime serves every agent in a pool, so a login
+  // that does not say who it belongs to lands in a shared directory and the last person to sign
+  // in owns them all.
+  //
+  // On the QUERY STRING, not only in the body. Sent in the body alone the runtime never saw it —
+  // its login handler reads the URL, not the payload — so the name was silently dropped and the
+  // credential went to the shared home anyway. The endpoint reported success, because the login
+  // HAD succeeded; it just belonged to the wrong agent. Both are sent now: the query is what is
+  // read, the body costs nothing and keeps the two halves honest if the handler ever changes.
+  // `user` rides alongside `agent` — the per-person login dir when the agent runs inference per
+  // person. Same query-string rule and the same reason: the runtime reads it off the URL.
+  const params = new URLSearchParams();
+  if (agent) params.set("agent", agent);
+  if (user) params.set("user", user);
+  const q = params.toString() ? `?${params.toString()}` : "";
+  const who = { ...(agent ? { agent } : {}), ...(user ? { user } : {}) };
+
   return {
     async startHeadless(): Promise<string> {
-      const r = await call("/auth/login", {});
+      const r = await call(`/auth/login${q}`, who);
       const url = typeof r.url === "string" ? r.url : "";
       if (!url) throw new Error("auth: the agent runtime started a login but produced no URL");
       return url;
     },
+    /** What the harness reports for THIS agent (and person, if per-user): which account, which plan. */
+    async status(): Promise<string> {
+      const r = await call(`/auth/status${q}`);
+      return String(r.status ?? "");
+    },
     async submitCode(code: string): Promise<{ ok: boolean; status: string; loginTail: string }> {
-      const r = await call("/auth/code", { code });
+      const r = await call(`/auth/code${q}`, { code, ...who });
       return { ok: r.ok === true, status: String(r.status ?? ""), loginTail: String(r.loginTail ?? "") };
     },
   };

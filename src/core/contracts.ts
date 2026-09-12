@@ -82,6 +82,17 @@ export interface TurnRequest {
   sessionId?: string;
   /** true = this session doesn't exist yet → CREATE it (--session-id); false = RESUME it. */
   sessionNew?: boolean;
+  /** optional: the model for THIS turn only. The harness's own `setModel` knob is per-process and
+   * therefore shared by every conversation the process serves — which made one person's `/model`
+   * silently change everybody else's. A turn that names its model does not have that problem. */
+  model?: string;
+  /** optional: the credential/config directory for THIS turn, overriding the runner's per-agent
+   * default. Set only when an agent runs inference PER PERSON — then the speaker's own login is
+   * used, so each teammate answers (and bills) on their own subscription. Unset = the agent's one
+   * shared login, which is every agent today. Per turn rather than per process for the same reason
+   * `model` is: one process serves every conversation, so a per-process credential would be one
+   * person's login answering for everybody. */
+  configHome?: string;
 }
 
 /** Drives one harness turn and yields normalized events (A2). The iterable
