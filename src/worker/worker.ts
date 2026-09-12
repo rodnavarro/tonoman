@@ -1211,6 +1211,18 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
 
   // Interactions are wired per connector below, at construction.
   for (const [name, a] of wired) {
+    // Slash commands answer through the SAME dispatcher as `!` — the connector hands us the
+    // `!`-prefixed line, we parse and run it, and hand back the text for it to post ephemerally.
+    // A slash always parses to a known command (Slack only delivers ones we registered), so it can
+    // never fall through to a turn — unlike routing it as an envelope would risk.
+    (a.conn as SlackConnector).setSlashHandler?.(async ({ text, conversation, user }) => {
+      const cmd = cmds.parse(text);
+      if (!cmd) return null;
+      return cmds.run(commandDeps, name, conversation, cmd, user).catch((e) => {
+        console.error(`worker: ${name} slash ${cmd.name} failed: ${(e as Error).message}`);
+        return `I couldn't run that — ${String((e as Error)?.message ?? e).slice(0, 150)}`;
+      });
+    });
     (a.conn as SlackConnector).setInteractionHandler?.((it) => {
       // Two gates now, and each claims only what it recognises: connecting Claude and connecting
       // Plaud both end in a dialog, so the router asks the Plaud one first and falls through when

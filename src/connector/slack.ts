@@ -44,6 +44,21 @@ export interface SlackOptions {
    *  and a button press is not that — routing it as one would put "connect_claude" through the
    *  harness as if somebody had typed it. */
   onInteraction?: (p: SlackInteraction) => void;
+  /** A registered slash command (`/status`, `/connect`). Like `onInteraction` it is kept OFF the
+   *  envelope stream: a slash carries no `thread_ts` and expects its reply on a one-shot
+   *  `response_url`, not the channel. The handler returns the text to post back (ephemerally), or
+   *  null/"" to post nothing. Wired after construction via `setSlashHandler`, once the worker has
+   *  the dispatcher — the same reason `onInteraction` is. */
+  onSlash?: (input: SlashInput) => Promise<string | null>;
+}
+
+/** A slash command, normalized for the worker's `!` dispatcher. `text` is already the `!`-prefixed
+ *  command line (`/status` → `!status`, `/connect plaud` → `!connect plaud`), so the SAME parser and
+ *  dispatch answer both; `conversation` is the channel with no thread; `user` is who typed it. */
+export interface SlashInput {
+  text: string;
+  conversation: string;
+  user: string;
 }
 
 /** A Block Kit interaction, normalized to the two cases we act on. */
@@ -71,6 +86,19 @@ interface SocketEnvelope {
   envelope_id?: string;
   payload?: { event?: SlackEvent; team_id?: string };
   reason?: string;
+}
+
+/** The `slash_commands` socket payload — form fields, not an event, so it does not share the event
+ *  shape above. `response_url` is a one-shot reply endpoint (good for ~30 min / 5 posts), and there
+ *  is no `thread_ts`: a slash is not typed inside a thread the way a message is. */
+interface SlashPayload {
+  command?: string; // "/status"
+  text?: string; // everything the person typed after the command word
+  response_url?: string;
+  channel_id?: string;
+  user_id?: string;
+  team_id?: string;
+  trigger_id?: string; // used to dedup a slow-ack redelivery, as `ts` does for events
 }
 
 interface SlackFile {
@@ -264,6 +292,33 @@ export class SlackConnector implements Connector {
           return;
         }
 
+        // A registered slash command. It rides this socket but is not a message: no `thread_ts`,
+        // and its reply belongs on the one-shot `response_url` (ephemeral — a `/status` read or a
+        // `/connect` login link is personal, and the channel should not see it), not the channel.
+        // The ack already went out above. We dedup on `trigger_id` the same way `normalize` dedups
+        // an event on `ts`, then route the SAME text a `!` command produces through the worker's
+        // dispatcher — one code path answers both prefixes.
+        if (frame.type === "slash_commands" && frame.payload) {
+          const p = frame.payload as unknown as SlashPayload;
+          const key = `slash:${p.trigger_id ?? `${p.command}:${p.channel_id}:${p.user_id}`}`;
+          if (this.seen.has(key)) return;
+          this.seen.add(key);
+          if (this.seen.size > 500) this.seen.delete(this.seen.values().next().value as string);
+          const conversation = conversationKey(p.team_id ?? "", p.channel_id ?? "");
+          const text = `!${(p.command ?? "").replace(/^\//, "")}${p.text ? ` ${p.text}` : ""}`.trim();
+          const responseUrl = p.response_url;
+          void (async () => {
+            try {
+              const out = await this.o.onSlash?.({ text, conversation, user: p.user_id ?? "" });
+              if (out && responseUrl) await this.respondUrl(responseUrl, out);
+            } catch (e) {
+              console.error(`slack: slash ${p.command} failed: ${(e as Error).message}`);
+              if (responseUrl) await this.respondUrl(responseUrl, "Sorry — that command failed.").catch(() => {});
+            }
+          })();
+          return;
+        }
+
         if (frame.type !== "events_api" || !frame.payload?.event) return;
         // The ack already went out above, so downloading attachments here (async) cannot cause a
         // redelivery. Errors are handled inside normalize; a rejected promise would only mean no
@@ -307,6 +362,28 @@ export class SlackConnector implements Connector {
    *  only then has the dependencies (auth ops, registry client) the handler needs. */
   setInteractionHandler(fn: (p: SlackInteraction) => void): void {
     this.o.onInteraction = fn;
+  }
+
+  /** Register the slash-command handler after construction — same timing reason as the interaction
+   *  handler: the worker only has the `!`-command dispatcher once its deps are built. */
+  setSlashHandler(fn: (input: SlashInput) => Promise<string | null>): void {
+    this.o.onSlash = fn;
+  }
+
+  /** Reply to a slash command on its one-shot `response_url`. Ephemeral by default: a slash reply
+   *  is personal (a status read, a login link), so the channel should not see it. Unlike `call`,
+   *  the URL is not a Web API method and takes NO bot token — it wants a JSON body with
+   *  `response_type` + `text`, and the text is run through the same `toMrkdwn` the channel path uses
+   *  so a slash answer reads identically to a `!` one. */
+  private async respondUrl(url: string, text: string, ephemeral = true): Promise<void> {
+    await this.fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json; charset=utf-8" },
+      body: JSON.stringify({
+        response_type: ephemeral ? "ephemeral" : "in_channel",
+        text: toMrkdwn(text) || "…",
+      }),
+    });
   }
 
   /** Post a message carrying Block Kit blocks — a button, in practice. Outside the `Reply`

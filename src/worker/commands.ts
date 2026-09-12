@@ -1,14 +1,21 @@
 // In-channel commands for the Slack worker.
 //
-// Slack is the one channel where a leading `/` is NOT available to us: an unregistered slash
-// command never reaches the app at all — Slack intercepts it and tells the person it is not a
-// valid command. Registering one is a change to the app manifest, which is a deploy of the Slack
-// app rather than of this worker, and it arrives without `thread_ts`, so a command typed inside an
-// assistant thread cannot be mapped back to the conversation it was typed in.
+// TWO prefixes reach this dispatcher, and both parse and run through the ONE code path here:
 //
-// So the prefix here is `!`. It reaches the app today, it carries full thread context because it
-// is an ordinary message, and it is the same dispatch a registered slash command would use if one
-// is added later (`parse` accepts both prefixes).
+//   `!command`  — an ordinary message. It works on every connector, carries full `thread_ts`
+//                 context because it is a message, and needs no app-manifest change. The universal
+//                 fallback, and the only form on connectors that have no slash concept.
+//
+//   `/command`  — a native Slack slash command. It only reaches the app once REGISTERED in the app
+//                 manifest (Tonoman does this automatically from `KNOWN`, see the cloud
+//                 `SLACK_SLASH_COMMANDS` + `withCommands`); an unregistered `/word` is intercepted
+//                 by Slack and never delivered. It arrives with NO `thread_ts` and wants its reply
+//                 on a one-shot `response_url`, so the Slack connector normalizes it to the same
+//                 `!`-prefixed line and posts the answer ephemerally (see connector `onSlash`).
+//                 Every command in `KNOWN` is therefore both `!status` and `/status`.
+//
+// The connector erases the `/` transport detail before dispatch (a slash becomes its `!` line), so
+// `parse` recognises only `!` and nothing downstream needs to know which prefix the person typed.
 //
 // The parser is PURE. `run` takes its capabilities as deps so the dispatch is testable without a
 // Slack connection, a harness, or Temporal.
@@ -49,10 +56,12 @@ export const KNOWN = [
  *  anything is ever sent — so a second prefix here cannot help with a keystroke this code never
  *  sees. It was surface for a collision that cannot occur.
  *
- *  `/` is deliberately not one either, and used to be. Slack owns that namespace: an unregistered
- *  slash command is intercepted by Slack, answered with Slack's own error, and never delivered
- *  here. So `/status` has never once reached this function — support that is real in the code and
- *  imaginary in practice, which is worse than not having it. */
+ *  `/` is NOT a prefix here, but for a subtler reason now: Slack owns that namespace and only
+ *  delivers a slash command once it is REGISTERED in the app manifest (Tonoman registers every
+ *  `KNOWN` command automatically). A registered `/status` DOES reach the app — but as a
+ *  `slash_commands` frame, not a message, so the Slack connector normalizes it to the `!`-prefixed
+ *  line before it ever reaches `parse`. `parse` therefore still needs to recognise only `!`: it is
+ *  the one internal form, and `/` is a Slack transport detail the connector has already erased. */
 const PREFIX = /^!/;
 
 /** Turn a marketing model name into the exact name the Claude CLI understands.
