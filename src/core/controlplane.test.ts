@@ -176,7 +176,7 @@ describe("RegistryControlPlane — a connection flattens to its shared account, 
     await withCreds();
     const agent: RegistryAgent = {
       ...base,
-      connections: [
+      credentials: [
         {
           id: "c1",
           kind: "ics",
@@ -190,7 +190,7 @@ describe("RegistryControlPlane — a connection flattens to its shared account, 
       ],
     };
     const cfg = await plane([agent]).roster();
-    const c = cfg.agents[0]!.connections![0]!;
+    const c = cfg.agents[0]!.credentials![0]!;
     expect(c.secret_ref).toBe("ics.url:foley");
     expect(c.status).toBe("connected");
     expect(c.external_account).toBe("foley@acme.com");
@@ -202,7 +202,7 @@ describe("RegistryControlPlane — a connection flattens to its shared account, 
     await withCreds();
     const agent: RegistryAgent = {
       ...base,
-      connections: [
+      credentials: [
         {
           id: "c2",
           kind: "plaud",
@@ -216,7 +216,7 @@ describe("RegistryControlPlane — a connection flattens to its shared account, 
       ],
     };
     const cfg = await plane([agent]).roster();
-    const c = cfg.agents[0]!.connections![0]!;
+    const c = cfg.agents[0]!.credentials![0]!;
     expect(c.secret_ref).toBe("plaud.tokens:shared");
     expect(c.scope).toBe("per_person");
     expect((c.accounts ?? []).map((a) => a.secret_ref).sort()).toEqual(["plaud.tokens:celine", "plaud.tokens:shared"]);
@@ -229,10 +229,10 @@ describe("RegistryControlPlane — a connection flattens to its shared account, 
     await withCreds();
     const agent: RegistryAgent = {
       ...base,
-      connections: [{ id: "c3", kind: "plaud", alias: "default", scope: "per_person", accounts: [] }],
+      credentials: [{ id: "c3", kind: "plaud", alias: "default", scope: "per_person", accounts: [] }],
     };
     const cfg = await plane([agent]).roster();
-    const c = cfg.agents[0]!.connections![0]!;
+    const c = cfg.agents[0]!.credentials![0]!;
     expect(c.secret_ref).toBeUndefined();
     expect(c.accounts).toEqual([]);
   });

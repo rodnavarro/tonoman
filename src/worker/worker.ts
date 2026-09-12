@@ -28,6 +28,8 @@ import * as plaudauth from "./plaudauth";
 import * as tokenstore from "./tokenstore";
 import * as plaudgate from "./plaudgate";
 import * as icsgate from "./icsgate";
+import { BUILTIN_TALENTS, getTalent } from "./talents/registry";
+import { meetingRecap } from "./talents/meeting-recap";
 import {
   parseStatusMode,
   remoteAccountUsageCached,
@@ -455,6 +457,35 @@ export function sessionStore(
   };
 }
 
+/** Report the built-in Talents to the Cloud catalogue — the one OSS→Cloud bridge for what a Talent
+ *  IS. Git is the source of truth; this makes each `talent` row mirror the loaded manifest (version,
+ *  requires, configSchema), replacing the seed's guess. Best-effort and idempotent: a file roster
+ *  (no registry) is a no-op, and a registry that is briefly unreachable leaves the catalogue stale
+ *  rather than stopping the worker — exactly like the talent_run rows. */
+export async function registerBuiltinTalents(): Promise<void> {
+  const baseUrl = process.env.TONOMANCLOUD_API_URL;
+  if (!baseUrl) return; // a self-hosted / file-roster worker has no catalogue to register into
+  const token = process.env.TONOMANCLOUD_API_TOKEN ?? "";
+  for (const t of BUILTIN_TALENTS) {
+    try {
+      const r = await fetch(`${baseUrl}/v1/system/talents/${encodeURIComponent(t.name)}`, {
+        method: "PUT",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+        body: JSON.stringify({
+          version: t.version,
+          description: t.description,
+          requires: t.requires,
+          configSchema: t.configSchema,
+        }),
+      });
+      if (!r.ok) console.error(`worker: register Talent ${t.name}@${t.version} → ${r.status}`);
+      else console.log(`worker: registered Talent ${t.name}@${t.version}`);
+    } catch (e) {
+      console.error(`worker: register Talent ${t.name} failed: ${String(e)}`);
+    }
+  }
+}
+
 export async function run(
   cfg: Config,
   o: WorkerOptions,
@@ -468,6 +499,9 @@ export async function run(
   if (only.size > 0) {
     console.log(`worker: serving only ${[...only].join(", ")} (TONOMAN_AGENTS)`);
   }
+  // Register the built-in Talent catalogue before serving, so the Hub reads what this code actually
+  // loaded (version, requires, configSchema) rather than the seed's placeholder. Best-effort.
+  await registerBuiltinTalents();
   const wired = wire(cfg, only);
   if (wired.size === 0) {
     // Loudly: a worker with no connectors looks perfectly healthy while answering nobody.
@@ -520,7 +554,7 @@ export async function run(
       a.context = secondbrain.contextNote(
         ready,
         a.cfg.timezone ?? "UTC",
-        (a.cfg.connections ?? []).map((c) => ({
+        (a.cfg.credentials ?? []).map((c) => ({
           kind: c.kind,
           alias: c.alias,
           label: c.label,
@@ -685,7 +719,7 @@ export async function run(
     // unreadable must not silently become "no calendar": it is logged by alias, never by URL,
     // because a published feed's link IS its credential.
     const calendars: calendar.CalendarFeed[] = [];
-    for (const c of a.cfg.connections ?? []) {
+    for (const c of a.cfg.credentials ?? []) {
       if (c.kind !== "ics") continue; // google and outlook arrive with the OAuth callback
       if (c.status && c.status !== "connected") {
         console.log(`worker: ${name} calendar ${c.kind}/${c.alias} is ${c.status}, skipping`);
@@ -702,13 +736,20 @@ export async function run(
     const token = await resolveRef(src.secret_ref);
     const pushUrl = token ? src.repo_url.replace("https://", `https://x-access-token:${token}@`) : src.repo_url;
     const dir = path.join(process.env.TONOMAN_STATE_ROOT ?? "/root/.tonoman", "secondbrain", name, src.id);
-    // The installed Talent that drives the voice flow, if any — the one whose trigger polls Plaud.
-    // Its name and version are pinned onto each run (off the roster), so a run started tonight is
-    // recorded against the version it began with even if the row is edited under it. (The roster
-    // still carries the grant under the `skills` wire key this wave; the key renames later.)
-    const voiceSkill = (a.cfg.skills ?? []).find(
-      (s) => (s.trigger as { poll?: unknown } | undefined)?.poll === "plaud",
-    );
+    // The installed Talent that drives the voice flow, if any — the built-in Plaud reference Talent,
+    // found by NAME. A Talent is CODE behind a manifest: the worker resolves name→implementation
+    // from its own registry rather than reading steps off the wire. Any granted Talent the worker
+    // has no code for is logged and skipped (the day-2 marketplace case, surfaced honestly).
+    for (const t of a.cfg.talents ?? []) {
+      if (!getTalent(t.name)) {
+        console.warn(`worker: ${name} granted Talent '${t.name}' has no loaded implementation — skipping`);
+      }
+    }
+    const voiceGrant = (a.cfg.talents ?? []).find((t) => t.name === meetingRecap.name);
+    // Pin the loaded CODE's version, not the roster's — a run is recorded against the code that ran.
+    const voiceSkill = voiceGrant
+      ? { name: voiceGrant.name, version: getTalent(voiceGrant.name)?.version ?? voiceGrant.version }
+      : undefined;
     // Per-person: one account per member who connected, each reading from their own login and
     // floored at their own connect time. Empty on the shared path, where `creds` below is the one
     // account and `accountsOf` collapses to it — so a shared tenant is byte-identical.
@@ -738,8 +779,7 @@ export async function run(
       // round trip that can be stale on its own.
       mission: a.cfg.mission ?? "",
       timezone: a.cfg.timezone ?? "UTC",
-      // Which runtime, and the skill to run when it is the interpreter. Default hardcoded (from
-      // flowcfg), so the proven pipeline stays in charge until a tenant is deliberately armed.
+      // The Talent this voice flow runs — its name and pinned version, recorded onto every run.
       talent: voiceSkill ? { name: voiceSkill.name, version: voiceSkill.version } : undefined,
       floorMs,
       vocab:
@@ -853,13 +893,13 @@ export async function run(
         const guid = wired.get(name)?.cfg.guid;
         if (!baseUrl || !guid) return; // a file roster has no registry to record into
         try {
-          const r = await fetch(`${baseUrl}/v1/system/agents/${guid}/skill-runs`, {
+          const r = await fetch(`${baseUrl}/v1/system/agents/${guid}/talent-runs`, {
             method: "POST",
             headers: {
               authorization: `Bearer ${process.env.TONOMANCLOUD_API_TOKEN ?? ""}`,
               "content-type": "application/json",
             },
-            body: JSON.stringify({ skill: talentName, itemKey, version }),
+            body: JSON.stringify({ talent: talentName, itemKey, version }),
           });
           if (!r.ok) console.error(`worker: ${name} talent_run open ${talentName}/${itemKey} → ${r.status}`);
         } catch (e) {
@@ -877,13 +917,13 @@ export async function run(
         const guid = wired.get(name)?.cfg.guid;
         if (!baseUrl || !guid) return;
         try {
-          const r = await fetch(`${baseUrl}/v1/system/agents/${guid}/skill-runs`, {
+          const r = await fetch(`${baseUrl}/v1/system/agents/${guid}/talent-runs`, {
             method: "PATCH",
             headers: {
               authorization: `Bearer ${process.env.TONOMANCLOUD_API_TOKEN ?? ""}`,
               "content-type": "application/json",
             },
-            body: JSON.stringify({ skill: talentName, itemKey, status, error }),
+            body: JSON.stringify({ talent: talentName, itemKey, status, error }),
           });
           if (!r.ok) console.error(`worker: ${name} talent_run close ${talentName}/${itemKey} → ${r.status}`);
         } catch (e) {
@@ -932,7 +972,7 @@ export async function run(
       }
     },
     connections: async (name) =>
-      (wired.get(name)?.cfg.connections ?? []).map((c) => ({
+      (wired.get(name)?.cfg.credentials ?? []).map((c) => ({
         kind: c.kind,
         alias: c.alias,
         label: c.label,
@@ -1117,7 +1157,7 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
         if (!put.ok) return { ok: false, message: `⚠️ I couldn't store that — the registry said HTTP ${put.status}.` };
 
         const attach = await fetch(
-          `${baseUrl}/v1/system/agents/${guid}/connections/ics/${encodeURIComponent(alias)}`,
+          `${baseUrl}/v1/system/agents/${guid}/credentials/ics/${encodeURIComponent(alias)}`,
           { method: "PUT", headers: auth, body: JSON.stringify({ secretRef: ref, label: alias }) },
         );
         if (!attach.ok) return { ok: false, message: `⚠️ I stored it but couldn't attach it — HTTP ${attach.status}.` };
@@ -1132,7 +1172,7 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
       // the same way an auth_state change is, and the flow is worked out again.
       const a = wired.get(name);
       if (a) {
-        const conns = (a.cfg.connections ??= []);
+        const conns = (a.cfg.credentials ??= []);
         const at = conns.findIndex((c) => c.kind === "ics" && c.alias === alias);
         const row = { kind: "ics" as const, alias, secret_ref: ref, status: "connected" as const, label: alias };
         if (at >= 0) conns[at] = { ...conns[at], ...row };

@@ -70,16 +70,14 @@ export interface RegistryAgent {
   /** The tenant's display timezone, IANA. */
   timezone?: string;
   tools?: string[];
-  /** Skills GRANTED and enabled for this agent — the catalogue row (steps, version, trigger) plus
+  /** Talents GRANTED and enabled for this agent — the catalogue row (name, version, requires) plus
    *  the per-agent attachment's `config`. The registry has already filtered to enabled grants; the
-   *  worker reads `trigger` to find which one, if any, drives the voice flow. */
-  skills?: {
+   *  worker finds the one that drives the voice flow by NAME (a Talent is code, not wire steps). */
+  talents?: {
     id: string;
     name: string;
     description?: string | null;
     requires?: unknown;
-    trigger?: Record<string, unknown>;
-    steps: unknown;
     version: number;
     config?: Record<string, unknown>;
   }[];
@@ -93,11 +91,11 @@ export interface RegistryAgent {
     secretRef?: string | null;
     readOnly?: boolean;
   }[];
-  /** Outside accounts this agent has been GRANTED, identified by `(kind, alias)`. The alias is
+  /** Outside credentials this agent has been GRANTED, identified by `(kind, alias)`. The alias is
    *  what makes more than one of a kind possible — a work calendar and a personal one are both
    *  `google`. `secretRef` names a row in the registry's `secret` table; the material never
    *  travels on the roster. */
-  connections?: {
+  credentials?: {
     id: string;
     kind: string;
     alias: string;
@@ -250,14 +248,12 @@ export class RegistryControlPlane implements ControlPlane {
         // Mapped here too, and this is the field that taught the lesson: `mission` was added to the
         // registry, the roster and the voice flow, and dropped in this whitelist in between.
         timezone: a.timezone ?? "UTC",
-        // Same whitelist, same hazard: the voice flow reads `skills` to find the plaud-poll grant, so
-        // a skill that arrives on the roster but is dropped here would leave the interpreter with
-        // nothing to run and the flow silently falling back to hardcoded.
-        skills: (a.skills ?? []).map((s) => ({
+        // Same whitelist, same hazard: the voice flow finds its Talent by NAME among these grants,
+        // so a Talent that arrives on the roster but is dropped here would leave the voice flow with
+        // no grant and silently idle. A Talent is code, so only name/version/config travel.
+        talents: (a.talents ?? []).map((s) => ({
           name: s.name,
-          steps: s.steps,
           version: s.version,
-          trigger: s.trigger,
           config: s.config,
         })),
         // Present only when the tool is granted — the registry decides, not the runtime.
@@ -277,7 +273,7 @@ export class RegistryControlPlane implements ControlPlane {
         // reading `secret_ref`/`status` unchanged. `scope` and the full `accounts` ride along for
         // the per-member voice flow. Same whitelist hazard as everything else here: an account field
         // added to the roster and dropped in this map vanishes with no error.
-        connections: (a.connections ?? []).map((c) => {
+        credentials: (a.credentials ?? []).map((c) => {
           const accounts = c.accounts ?? [];
           const shared = accounts.find((x) => (x.accountId ?? null) === null) ?? accounts[0];
           return {
