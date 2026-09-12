@@ -332,9 +332,11 @@ export class SlackConnector implements Connector {
    *  posts — is dropped here rather than in the router. */
   private async normalize(e: SlackEvent, teamID: string): Promise<Envelope | null> {
     if (e.type !== "app_mention" && !(e.type === "message" && e.channel_type === "im")) return null;
-    // A subtype means it is not a plain human message: message_changed, message_deleted,
-    // channel_join, bot_message. None of them are something to answer.
-    if (e.subtype) return null;
+    // A subtype usually means it is not a plain human message: message_changed, message_deleted,
+    // channel_join, bot_message — none of them something to answer. The ONE exception is
+    // `file_share`: a person uploading a file (with an optional caption) is a real turn, and it is
+    // the only way an attachment ever arrives — dropping it here is why attachments never landed.
+    if (e.subtype && e.subtype !== "file_share") return null;
     if (e.bot_id) return null;
     if (!e.user || !e.channel) return null;
     if (this.botUserID && e.user === this.botUserID) return null;
