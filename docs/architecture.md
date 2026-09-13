@@ -17,205 +17,107 @@ share them — at which point they move here under A5+.
 
 ## A1 — Messaging gateway (harness-neutral)
 
-Where the deferred **the messaging substrate** substrate is realized. Some harnesses (Claude Code,
-codex) have **no channel of their own**, so messaging is a **Tonoman substrate
-service**: Tonoman owns channels + creds, normalizes inbound to a neutral
-**envelope**, drives the harness one **turn** at a time, and routes the streamed
-reply back. hermes was native (Part A); Claude Code rides this gateway; codex
-later rides the *same* substrate — harness-agnosticism made concrete.
+Some harnesses (Claude Code, codex) have **no channel of their own**, so messaging is a **Tonoman
+substrate service**: it owns channels + credentials, normalizes inbound to a neutral **`Envelope`**,
+drives the harness one **turn** at a time, and routes the streamed reply back — the *same* substrate
+for every harness. Five participants:
 
-```
-Telegram ─poll─▶ ┌──────────── Tonoman messaging substrate (Go, host-side, harness-neutral) ────────────┐
- (Teams =        │  Connector          Router (owns the loop)         Turn-runner         Stream         │
-  webhook,       │  • own transport    • chan+convo → agent+session   • podman exec        consumer      │
-  connector #2)  │  • inbound→envelope  • read memory → build prompt    claude -p           • events →    │
-   user ◀edit──  │  • send/update/      • run turn → stream → append    --output-format      send/update/ │
-       (stream)  │    finalize            + commit memory               stream-json          finalize     │
-                 └───────────────────────────│──────────────────────────────│─────────────────────────────┘
-                       podman exec, shared mounts │           normalized events │ {text-delta|tool-progress|done}
-                                    ┌─────────────▼──────────────┐
-                                    │  Agent sandbox (ephemeral)  │  brain = Claude (reads the card image
-                                    │  claude -p, NO --resume     │  natively via Read — no separate vision step)
-                                    │  --append-system-prompt-file│  + skills/register-business-card
-                                    │  mounts: workspace(git),card│    SKILL.md, reused UNCHANGED
-                                    └─────────────────────────────┘
-      memory + work product co-versioned in ONE mounted git repo: cards/ (output) + sessions/<convo>.jsonl (memory)
-```
+- **connector** — owns one transport; `receive → Envelope` + `send / update / finalize`. (Slack live;
+  Telegram, Teams behind the same interface.)
+- **router** — maps `channel + conversation → agent + session`; owns the per-turn loop.
+- **turn-runner** — the only harness-specific code: `claude -p … --output-format stream-json` (A2).
+- **stream consumer** — normalized events → the Reply contract (A4).
+- **memory store** — the git-backed JSONL transcript (A3).
 
-### Vocabulary
-- **gateway** — Tonoman-owned: owns channels + creds, normalizes inbound to a
-  neutral **envelope**, drives the harness one **turn** at a time, routes the
-  streamed reply back.
-- **connector** — one channel behind one interface (`receive→envelope` +
-  `send/update/finalize`), owns its **own** transport. Telegram in v0.1; **Teams**
-  is the second-connector gate.
-- **router** — maps `channel+conversation → agent+session`; owns the loop (read
-  memory → build prompt → run turn → stream → append+commit memory).
-- **turn-runner** — the only harness-specific code: `claude -p … --output-format
-  stream-json` (see A2).
-- **stream consumer** — normalized events → connector `send/update/finalize`
-  (see A4).
-- **memory store** — JSONL transcript per conversation in the mounted git
-  workspace (see A3).
+**Design gate — the channel-abstraction invariant:** the connector interface is the **only** thing a
+new channel implements; the router, memory store, turn-runner, and stream consumer contain **zero**
+channel-specific code (fidelity differences ride *property-named* streamer flags, never an `isTeams`
+branch). A leak into them is a defect. The harness stays a stateless turn-executor — no orchestrator
+state machine, control stays in the model.
 
-### Connector contract
-- **Inbound:** poll/receive its own transport, **download any media to a shared
-  mount** the sandbox can read, normalize to envelope
-  `{channel, conversation, user, text, media_paths[]}`. The router never sees
-  channel specifics.
-- **Outbound:** the abstract `send / update / finalize` contract (see A4).
-- **One token = one poller** — a Telegram bot token the gateway owns exclusively;
-  it cannot be shared with a hermes container.
-- **Transports:** Telegram = polling (`getUpdates`); Teams = webhook (Bot
-  Framework).
+**→ Full feature doc — the turn sequence (mermaid), the Reply contract, the four `TurnEvent` kinds:**
+[`features/gateway-turn-loop.md`](features/gateway-turn-loop.md). (It supersedes the older prose that
+labelled the substrate "Go" and named only three event kinds.)
 
-### Router loop (per turn)
-(a) resolve `channel + conversation → agent + session`; (b) read the memory
-window (A3); (c) assemble the prompt = system prompt + history window + new
-message (+ media path); (d) invoke the turn-runner (A2); (e) stream the reply
-back (A4); (f) append both messages to memory and commit (A3). The loop lives in
-the substrate; the harness is a stateless turn-executor — no orchestrator state
-machine, control stays in the model.
-
-### Channel-abstraction invariant (design gate)
-The connector interface (`receive → envelope`, `send / update / finalize`, owns
-its **own** inbound transport) is the **only** thing a new channel implements.
-The router, memory store, turn-runner, and stream consumer contain **zero**
-channel-specific code. A channel-specific change leaking into them is a
-**contract leak** and a defect — the channel analog of the harness-pluralism
-rule. Verified by adding Teams (gw-teams-connector–gw-dual-channel).
-
-_Grounding:_ openclaw already ships this Claude Code backend (the real `claude`
-args, the provider stream wrappers; the `stream-json` NDJSON parser lives in
-openclaw's plugin SDK). Tonoman mirrors the shape but chooses the
-**substrate-history** path — **no `--resume`** (openclaw uses it), so memory stays
-ours. The streaming-back patterns mirror hermes' stream consumer (cursor, throttle,
-overflow-split, flood-control backoff).
+_The turn-runner is A2; the transcript it reads and writes is A3; the streamed reply is A4._
 
 ---
 
 ## A2 — Claude Code harness & headless OAuth
 
-How the **turn-runner** drives Claude Code headless, and how its brain is
-authenticated.
+How the **turn-runner** drives Claude Code headless, and how its brain is authenticated.
 
-### Turn-runner command
-```
-podman exec -e IS_SANDBOX=1 <agent> claude -p "<prompt>" --output-format stream-json \
-  --include-partial-messages --verbose --setting-sources user \
-  --dangerously-skip-permissions --append-system-prompt-file <identity>
-```
-- Assembled prompt on **stdin**; **no `--resume`** (memory is substrate-owned, A3).
-- Parses NDJSON stdout into normalized events `{text-delta | tool-progress | done}`.
-- `--include-partial-messages` yields **token-level deltas** (confirmed by
-  openclaw's production config). _Smoke test asserts deltas actually stream._
-- `--model` selects the Claude model from **per-agent config** (cfg-per-agent) — e.g.
-  `sonnet` for cheaper runs, `opus` for best quality. **Never hardcoded.**
-- `--append-system-prompt-file` injects the agent **identity** (`AGENTS.md`) every
-  turn; that identity is what makes the model invoke the preset skill (without it,
-  it improvises its own format).
-- **`--dangerously-skip-permissions` (the sandbox is the boundary).** Headless `-p`
-  has no one to approve tool calls; a per-tool **allow-list silently denies anything
-  not enumerated** — including a skill's own sub-tools (e.g. `deep-research` spawns
-  `Task`/sub-agents), so skills fail in non-obvious ways. The container is the
-  isolation boundary, so the turn-runner skips permission prompts entirely instead of
-  maintaining a brittle allow-list. `IS_SANDBOX=1` is **required** because `claude`
-  refuses `--dangerously-skip-permissions` when running as root otherwise.
+The command is `claude -p … --output-format stream-json --include-partial-messages --verbose
+--setting-sources user --dangerously-skip-permissions --strict-mcp-config --append-system-prompt-file
+<identity>` — prompt on **stdin**, `--model` from **per-agent config** (never hardcoded),
+`--append-system-prompt-file` injecting the agent identity every turn. **`--dangerously-skip-permissions`
+because the sandbox is the boundary** — headless `-p` has no one to approve tools, and a per-tool
+allow-list silently denies a skill's own sub-tools; `IS_SANDBOX=1` is required for that as root.
 
-### Brain auth — subscription OAuth, not API key
-- Brain = **Claude.ai subscription via OAuth** (the analog of hermes' codex seed,
-  **NOT** an API key), injected as **`CLAUDE_CODE_OAUTH_TOKEN`** via the mounted,
-  never-committed settings file (cfg-mounted-settings).
-- **Hard invariants:** `ANTHROPIC_API_KEY` must stay **unset** (it outranks OAuth
-  and silently bypasses the subscription); the turn-runner uses plain `-p`,
-  **never `--bare`** (bare ignores `CLAUDE_CODE_OAUTH_TOKEN`). Without valid OAuth
-  the agent does not run; the token is **never committed** (cfg-no-secrets).
-- **Billing** runs against the Claude **subscription** (Pro/Max), not API credits.
+**Brain auth is a Claude.ai subscription (OAuth), never an API key** — billing runs on the plan, and
+`ANTHROPIC_API_KEY` must stay **unset** (it outranks OAuth). The mechanism is a per-config-directory
+**credential store** that `claude` manages: each turn runs with `CLAUDE_CONFIG_DIR` pointed at the
+agent's config home and the API key deleted, so the subscription resolves from
+`<config-home>/.credentials.json`. A login is provisioned by an in-container `claude auth login
+--claudeai`, verified outcome-true (the credential file changed *and* `claude auth status` agrees).
 
-### Headless provisioning (two paths)
-- **Primary — long-lived token:** `claude setup-token` (one interactive host
-  browser OAuth) mints a **1-year, inference-scoped** token; Tonoman stores it in
-  the agent's never-committed settings file and injects it as
-  `CLAUDE_CODE_OAUTH_TOKEN`. Container-friendly and cross-machine — no
-  per-container browser step.
-- **Alternative — seed the credential store:** copy the host
-  `~/.claude/.credentials.json` (Linux/Windows portable, mode `0600`) into the
-  sandbox's `~/.claude/` — the direct analog of seeding `~/.codex/auth.json`.
-  Interactive OAuth creds **auto-refresh**; the long-lived `setup-token` does not.
-- **Renewal seam:** the long-lived token expires in ~1 year → re-run
-  `setup-token` and update the settings file. No auto-renew (fine for v0.1; noted
-  for always-on). The same `CLAUDE_CODE_OAUTH_TOKEN` + settings mechanism is what
-  the onboarding wizard will later wrap.
+**→ Full feature doc — the command, the per-turn config-home selection (shared vs per-person login),
+and the auth-gate login sequence:** [`features/auth-and-harness.md`](features/auth-and-harness.md).
+(It supersedes the older prose, which described a `CLAUDE_CODE_OAUTH_TOKEN` injection and
+`setup-token` / host-copy provisioning paths that are **not** present in the code.)
+
+_The per-turn config home is what §A11's per-agent config and the per-person inference story rest on._
 
 ---
 
 ## A3 — Substrate-owned, git-backed memory
 
-The agent's workspace is **one git repo** = its whole brain: `cards/` (work
-product) **and** `sessions/<conversation>.jsonl` (memory), co-versioned in the
-mounted git workspace (substrate).
+The agent's memory is **Tonoman's**, not the harness's: a git-backed JSONL transcript per
+conversation, co-versioned in the mounted workspace alongside the agent's work product. The format is
+**ours** (one event per line — role, text, timestamp, tool summary), so we never migrate off a harness
+internal.
 
-- **The format is ours**, never Claude's private session files — so we never have
-  to migrate off a harness internal. One event per line: role, text, timestamp,
-  compact tool summary.
-- **Injected every turn:** because each turn is a fresh `claude -p` (no
-  `--resume`, A2), the router passes the system prompt
-  (`--append-system-prompt-file`) and the conversation window (in the prompt body)
-  on **every** turn. The window is the recent transcript (last N turns or a token
-  budget); the agent infers the conversation sequence from this context.
-- **Append + commit (auto, gentle):** after each turn the router writes both messages to the
-  JSONL and **commits** (and **auto-pushes** if a remote+token are configured) — the user runs
-  no git command. The cadence is event-driven (turn boundary) plus a low-frequency safety sweep
-  (~30 min) and a shutdown commit — no busy timer, so it never slows the host; per-agent
-  `workspace.auto_commit:false` disables it (`ws-git-autocommit`). The git log is a legible
-  record of every conversation; restarting the container (gw-ephemeral-continuity) loses
-  nothing — the next turn reads the committed transcript.
-- **Secret-safety (never commit credentials):** `ensureRepo` writes a default `.gitignore`
-  (once, never clobbered) so the automatic `git add -A` can't sweep a secret. The convention:
-  agent data + the **tools the agent builds** are versioned/pushed; any key/token/PEM they need
-  lives under **`secrets/`** (or `*.secret`) and is ignored (`cfg-no-secrets`). The push token
-  itself is supplied via env at run time, never written to `settings.json`. Memory is configured
-  with **`tonoman set memory git --remote … [--branch …] [--auto-commit …]`** (`git` is the
-  memory type — room for more later); **`tonoman get memory`** shows root/remote/branch/status
-  (`cfg-memory-cli`).
-- **Compaction seam (deferred — same format):** when a conversation exceeds the
-  window budget, older turns are **summarized** (openclaw's compaction-checkpoint
-  pattern) into the same JSONL stream, behind the **same contract** — no change to
-  the router or turn-runner. v0.1 ships the windowed transcript; **not on the v0.1
-  critical path.**
+- **Read into each turn:** by default the router passes the recent window in the prompt body (memory
+  stays substrate-owned); an opt-in `session_persist` path resumes a harness session for prompt-cache
+  reuse instead.
+- **Append + commit, best-effort:** after each turn the router writes both messages and commits (and
+  auto-pushes if a remote+token are configured) — the user runs no git, and a commit failure is
+  logged, never fatal. Restarting the container loses nothing.
+- **Secret-safety (design gate):** `ensureRepo` installs a once-only, never-clobbered `.gitignore`
+  (`secrets/`, `*.secret`), and the push token is supplied via env, never written to config — so the
+  automatic `git add -A` can't sweep a credential.
+- **Compaction** (summarise an old window behind the same contract) remains **deferred**, off the
+  v0.1 path.
+
+**→ Full feature doc — the `MemoryStore` contract, one turn's read/append/commit, and the harness-UUID
+cache reuse:** [`features/git-memory.md`](features/git-memory.md). (It supersedes the older prose: the
+on-disk layout is now a per-conversation *directory* selected by a `CURRENT` pointer, not a flat
+`sessions/<conversation>.jsonl`, and "no `--resume`" is the default, not an absolute.)
 
 ---
 
 ## A4 — Streaming reply contract
 
-The stream consumer turns normalized turn events into a live reply via an
-abstract **`send / update / finalize`** contract.
+The stream consumer turns normalized turn events into a live reply via an abstract **`send / update /
+finalize`** contract, so it speaks one language to every channel:
 
-- **Activity signal (typing).** From the moment a message is received, the
-  connector shows a busy cue — Telegram's `sendChatAction: typing` — re-sent on a
-  **heartbeat** (Telegram's typing state expires in ~5s) by the router while the
-  turn runs, so the user sees activity through the long tool phase **before** any
-  reply text exists. A connector with no activity cue no-ops. (Mirrors hermes'
-  `send_typing` + `_keep_typing`.) The abstract hook is `Reply.Working`.
-- **Telegram fidelity:** the reply **streams into one message** via progressive
-  edits with a **configurable cursor** (default a typing cue that renders on all
-  clients — `▉` shows as tofu on some); **tool-progress shows live** (e.g.
-  `🔧 Bash: git commit…`); the message is **finalized** (cursor stripped) on
-  `done` — the same experience as the containerized-hermes agent.
-- **Formatting:** intermediate edits stream **plain** (mid-stream markdown can be
-  half-formed); the **final** message renders a small markdown subset
-  (`**bold**`, `` `code` ``, `*italic*`) as **Telegram HTML** (`parse_mode=HTML`),
-  with a **plain-text fallback** if the generated HTML is rejected. Formatting is
-  a connector concern — the router/consumer stay format-agnostic.
-- **Idempotent edits.** Re-sending content identical to what's on screen is
-  suppressed by the consumer, and a platform "message is not modified" rejection
-  is treated as success — never a turn-failing error.
-- **Robustness:** throttling + overflow-split + flood-control backoff (patterns
-  from hermes' `stream_consumer.py` / openclaw's `draft-stream-loop.ts`).
-- **Graceful degradation:** a connector that cannot do smooth edits **degrades to
-  chunked updates** rather than breaking — **one code path**, different fidelity.
-  Telegram renders the cursor stream; Teams renders correct, chunkier updates; no
-  special-casing upstream.
+- **Activity cue** — a busy signal (`working()`) on a heartbeat while the turn runs, updated to
+  `🔧 <tool>` as tools fire, and closed to a finished state by `settle()` on every exit (so it never
+  dangles as in-progress).
+- **Progressive reply** — text streams into one message via in-place edits with a configurable cursor;
+  the message is **finalized** (cursor stripped) on `done`. Intermediate edits stream plain; the final
+  renders a small markdown subset. Edits are **idempotent** — a platform "not modified" rejection is
+  success, never a turn-failing error. Throttle + overflow-split + flood-backoff keep a long or fast
+  answer in bounds.
+- **Graceful degradation** — a connector that cannot do smooth edits **degrades to chunked `send`**:
+  **one code path, different fidelity.** Fidelity differences ride *property-named* streamer flags
+  (`prefixStream`, `collapsesBlankLines`) set at the composition root — never an `isTeams` branch in
+  the loop.
+
+**→ Full feature doc — the Reply contract inside the turn sequence, and the four `TurnEvent` kinds:**
+[`features/gateway-turn-loop.md`](features/gateway-turn-loop.md). (It supersedes the older prose,
+which named the cue `Reply.Working` — the method is `working()` — and is written Telegram-first; Slack
+is the live channel.)
 
 ---
 
@@ -378,6 +280,11 @@ One gateway runs a **roster** of agents. An agent is a **GUID-identified instanc
 not a harness type — so the roster holds many agents of the same harness (different
 configs) and mixed harnesses side by side, all from one config.
 
+**→ For how the worker fetches the roster and reconciles changes live** — the reload diff, its
+`rebuildConn`/`rebuildRunner` classifier, and why a model or identity edit lands without a reconnect —
+see the feature doc [`features/roster-and-reload.md`](features/roster-and-reload.md). The rest of this
+section is the config-plug, GUID identity, provisioning, and isolation design (the map keeps those).
+
 **Generic contract + harness spec.** The agent contract is generic:
 `{ GUID, harness, config-volume, connector, workspace, memory, model }`. Each harness
 plugs in via a **small spec** — only the harness-specific parts:
@@ -427,12 +334,11 @@ skills inside the volume.)
 credentials → unauthenticated. The operator runs **`tonoman auth login <agent>`** —
 the substrate resolves the agent to its sandbox + harness and runs that harness's
 login flow inside it (via `podman exec -it`; the operator never types podman). The
-auth flow is part of the harness **Spec** (`LoginArgs`/`StatusArgs`/`LogoutArgs`), so
+auth flow is part of the harness **Spec** (`loginArgs`/`statusArgs`/`logoutArgs`), so
 a new harness contributes its own login without touching the CLI. The flow writes the
 harness's **credential store into the volume** — for Claude Code the auto-refreshing
-`~/.claude/.credentials.json` (the seed-the-credential-store path of A2, *not*
-`setup-token`, whose token lives in env/settings outside the volume). Because the
-store is in the volume it **persists across restart and auto-refreshes in place**.
+`~/.claude/.credentials.json`, produced by the in-container `claude auth login --claudeai`
+(A2). Because the store is in the volume it **persists across restart and auto-refreshes in place**.
 Re-auth touches only that agent's volume. _Proven live: two agents authenticated to
 two different Claude accounts (distinct subscriptions), each in its own volume, and a
 container destroy+recreate comes back authenticated with no re-login._
@@ -440,8 +346,8 @@ container destroy+recreate comes back authenticated with no re-login._
 **Provisioning (`tonoman create agent`).** Standing up a new agent is **by convention,
 adding zero new config-schema fields**: Tonoman mints a GUID, writes the roster entry,
 scaffolds `<root>/<guid>/{config,memory,identity}`, and creates the sandbox from a
-**pure `podmanRunArgs(agent, cfg)`** — the single source of truth that derives the
-container name (env-suffixed), the **image (from `harness`)**, the infra mounts
+**`podmanRunArgs(agent, cfg, spec)`** — the single source of truth that derives the
+container name (env-suffixed), the **image (from the harness `spec`)**, the infra mounts
 (config-home, memory, identity ro), the project grants (A9), and the `tonoman.agent`
 ownership label. Credential bootstrap is one of two explicit paths — **`--login`**
 (fresh) or **`--from <agent>`** (seed the new agent's volume from an existing agent's,
@@ -458,10 +364,10 @@ of installable agent *types*.
 
 **Name & role awareness (roster-name-role).** An agent's display **name and role live in the
 roster**, so one shared, skill-agnostic identity file backs differently-named,
-differently-scoped agents. The gateway injects name + role into the prompt body every
-turn (not via `--append-system-prompt`, which Claude Code forbids alongside the
-identity `--append-system-prompt-file`). The agent identifies by its roster name and
-presents itself by its role; renaming/re-scoping is a roster edit with no content change.
+differently-scoped agents. The gateway injects the authoritative **name** into the prompt body every
+turn as a preamble (not via `--append-system-prompt`, which Claude Code forbids alongside the identity
+`--append-system-prompt-file`); the **role** lives in the roster and is reflected through the identity
+rather than a separate prompt-body injection. Renaming/re-scoping is a roster edit with no content change.
 
 **Skill scoping (Claude Code).** An agent's capabilities = its **seeded custom skills**
 (registered into `config/skills/` at provision via `tonoman create agent --skill <dir>`,
@@ -610,7 +516,7 @@ before going live:
 
 - **Container & brain auth (gw-sandbox-boot, gw-headless-auth).** A podman container named
   `agent.container` with the `claude` CLI installed, the brain authenticated —
-  `CLAUDE_CODE_OAUTH_TOKEN` set, **`ANTHROPIC_API_KEY` unset** (A2) — and the
+  a valid `.credentials.json` in the agent's config home, **`ANTHROPIC_API_KEY` unset** (A2) — and the
   agent identity + the `register-business-card` skill mounted **where Claude Code
   discovers them** (so `--setting-sources user` loads the skill). If the skill
   isn't discovered, the turn silently degrades to *describing* the card instead
