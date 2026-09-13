@@ -7,7 +7,6 @@ import * as recap from "./recap";
 import * as calendar from "./calendar";
 import type { CalEvent } from "./calendar";
 import * as plaudapi from "./plaudapi";
-import { budgetFor } from "./inference";
 import { accountFor, type TurnDeps } from "./activities";
 import type { TalentOutcome } from "../talent-sdk";
 
@@ -203,16 +202,17 @@ export async function startCapabilityPlane(deps: TurnDeps): Promise<CapabilityPl
           return reply(200, out);
         }
 
-        // infer: one JSON-mode completion through the tenant's SUMMARISE chain. The prompt is the
-        // Talent's; the plane budgets the user message to the provider's window (the Talent does not
-        // know the providers) and routes it. The Talent parses the returned text against its schema.
+        // infer: the reasoning runs on the AGENT'S OWN inference provider (the Claude Code harness /
+        // its subscription), NOT a side model — a recap is the agent thinking about the meeting. The
+        // prompt is the Talent's; the plane budgets the user message to a generous window (Claude is
+        // large) and routes it through deps.infer. The Talent parses the returned text.
         if (req.method === "POST" && pathname === "/cap/infer") {
-          const raw = await recap.inferJson(
-            voice.summarize,
-            String(body.system ?? ""),
-            recap.budgetTranscript(String(body.user ?? ""), budgetFor(voice.summarize)),
-          );
-          return reply(200, { text: raw });
+          if (!deps.infer) return reply(503, { error: "this runtime has no inference provider" });
+          const text = await deps.infer(run.agent, {
+            system: String(body.system ?? ""),
+            user: recap.budgetTranscript(String(body.user ?? ""), 500_000),
+          });
+          return reply(200, { text });
         }
 
         // publish: file the artifact in the tenant's git-backed second brain. The Talent supplies the

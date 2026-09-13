@@ -33,6 +33,13 @@ export interface TurnDeps {
    *  plane provides the Talent transcription/inference/publish over localhost. Undefined in tests and
    *  on a file roster with no plane. */
   talentPlane?: CapabilityPlane;
+  /** Run an inference on the AGENT'S OWN inference provider — the Claude Code harness (its
+   *  subscription), not a side model — and return the reply text. A headless turn: the prompt runs
+   *  through the agent's runner and the `done` text is captured, never posted. This is what the
+   *  Talent `infer` capability routes to, so a recap is the agent thinking, on its own brain. The
+   *  provider is the agent's harness today (claude-code); codex / an OpenAI subscription plug in at
+   *  this one dispatch point later. */
+  infer?(agent: string, p: { system: string; user: string }): Promise<string>;
   /** Say something verbatim to a person, opening a DM if needed. */
   say?(agent: string, user: string, text: string): Promise<void>;
   /** The durable record of one item of one Talent run: opened before the run, closed either way.
@@ -560,21 +567,37 @@ export function makeActivities(deps: TurnDeps) {
       const plane = deps.talentPlane;
       if (!plane) throw new Error("runTalent: the capability plane is not running");
       const ctx = Context.current();
-      const outcome = await plane.spawn(
-        { agent: input.agent, item: input.item, user: input.user, talent: input.talent },
-        { signal: ctx.cancellationSignal, onProgress: (note) => ctx.heartbeat(note) },
-      );
-      if (outcome.status === "failed") {
-        // A throw, not a return: the workflow's catch closes talent_run `failed` and Temporal retries,
-        // exactly as a thrown processRecording did. The reason is the Talent's own.
-        throw new Error(outcome.reason ?? "talent failed");
+      // Heartbeat on a TIMER, not only on the Talent's progress notes: transcribing a 112-minute
+      // recording and running the inference are each a single long capability call during which the
+      // Talent emits nothing, and a heartbeat that fired only on progress would let Temporal declare
+      // a healthy run dead mid-transcription. The note rides the beat so the Temporal UI stays useful.
+      let lastNote = "starting";
+      const beat = setInterval(() => ctx.heartbeat(lastNote), 20_000);
+      try {
+        const outcome = await plane.spawn(
+          { agent: input.agent, item: input.item, user: input.user, talent: input.talent },
+          {
+            signal: ctx.cancellationSignal,
+            onProgress: (note) => {
+              lastNote = note;
+              ctx.heartbeat(note);
+            },
+          },
+        );
+        if (outcome.status === "failed") {
+          // A throw, not a return: the workflow's catch closes talent_run `failed` and Temporal
+          // retries, exactly as a thrown processRecording did. The reason is the Talent's own.
+          throw new Error(outcome.reason ?? "talent failed");
+        }
+        // Report, don't speak: announce the Talent's steer as a real turn, so follow-ups land in the
+        // same conversation. Skipped outcomes (no speech, already filed) carry no steer, say nothing.
+        if (outcome.status === "done" && outcome.steer) {
+          await deps.ask?.(input.agent, input.notify ?? "", outcome.steer);
+        }
+        return { status: outcome.status };
+      } finally {
+        clearInterval(beat);
       }
-      // Report, don't speak: announce the Talent's steer as a real turn, so follow-ups land in the
-      // same conversation. Skipped outcomes (no speech, already filed) carry no steer and say nothing.
-      if (outcome.status === "done" && outcome.steer) {
-        await deps.ask?.(input.agent, input.notify ?? "", outcome.steer);
-      }
-      return { status: outcome.status };
     },
 
     /** Open — or re-open — the durable record for one item of one Talent run.

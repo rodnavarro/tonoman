@@ -883,6 +883,23 @@ export async function run(
         signalArgs: [{ text, user, ts: String(Date.now()) }],
       });
     },
+    // Inference on the AGENT'S OWN provider — a headless harness turn, captured not posted. The
+    // recap is the agent reasoning about the meeting on its own subscription, which is why this runs
+    // the same runner that answers messages rather than a side model with its own key. No
+    // systemPromptFile: the identity/persona is for conversation; a recap wants the agent's model,
+    // not its voice. Dispatches on the harness the agent runs — claude-code today; a second provider
+    // (codex, an OpenAI subscription) slots in here without the Talent ever knowing.
+    infer: async (name: string, p: { system: string; user: string }): Promise<string> => {
+      const a = wired.get(name);
+      if (!a) throw new Error(`infer: ${name} is not a wired agent`);
+      let out = "";
+      for await (const ev of a.run({ prompt: `${p.system}\n\n${p.user}` })) {
+        if (ev.kind === "done" && ev.text) out = ev.text;
+        else if (ev.kind === "error") throw new Error(ev.text || "infer: the harness returned an error");
+      }
+      if (!out.trim()) throw new Error("infer: the harness returned no text");
+      return out;
+    },
     // The durable record of one item of one skill, over the same system-token API the worker uses
     // for everything else — the worker holds no database connection string.
     //
