@@ -749,18 +749,21 @@ runtime keep control while the Talent stays self-contained:
 1. **Credentials** — raw, the Talent uses them directly (Plaud: the env hands over the token, the
    Talent calls Plaud itself; groq is the same shape — a pluggable third party).
 2. **Capabilities** — runtime-*mediated* endpoints the Talent calls through a provided
-   `TONOMAN_CAPABILITY_URL` + token: `transcribe`, `infer`, `publish`, `say`. Mediated on purpose, so
+   `TONOMAN_CAPABILITY_URL` + token: `transcribe`, `infer`, `publish`. Mediated on purpose, so
    **local-gpu routing, inference metering, and the git-backed second brain (A3/second-brain) stay
    the runtime's**, never baked into the Talent — the concrete form of "local-gpu is inference you
    access *via* Tonoman Cloud."
 
 Shape of the contract: **env** carries resolved credentials + the capability URL + config; **stdin**
 carries the item to work (a recording id) + config; **stdout** carries a structured **outcome +
-steer**; progress lines drive the activity heartbeat. The manifest's `requires` declares which
-credentials and capabilities the Talent needs. Locally, a **dev harness** stands up the capability
-endpoints against the developer's own keys, so the same CLI runs unchanged. The agent consumes the
-outcome/steer to decide what to surface to the user — the Talent does the work and reports; the agent
-judges and speaks (a direct `say` capability exists for the cases that need it).
+steer** (progress for the heartbeat goes on a *separate* stream so a large outcome can't starve it).
+The manifest's `requires` declares which credentials and capabilities the Talent needs. Locally, a
+**dev harness** stands up the capability endpoints against the developer's own keys, so the same CLI
+runs unchanged. Announcing is deliberately **not** a capability — the Talent *reports* an outcome, it
+does not speak: the durable `runTalent` wrapper announces through the existing say path, and the
+agent consumes the steer to decide any further step to bubble to the user. So a Talent never holds a
+channel. (A long-lived Plaud login is resolved through a mediated credential endpoint rather than a
+raw token in env, so the CLI can refresh across a 112-minute run.)
 
 ### Layout, distribution, and the line
 
