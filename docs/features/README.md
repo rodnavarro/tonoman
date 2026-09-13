@@ -16,6 +16,7 @@ not every design gate does. The rest stay in the architecture map.
 | **Agent roster & reconcile-on-change** — the worker's whole view of an agent; reload diff | [`roster-and-reload.md`](roster-and-reload.md) | §A11 |
 | **Talents** — self-contained CLIs the runtime spawns | [`tonoman-talents.md`](tonoman-talents.md) | §A15 |
 | **Second brain** — the per-account, git-backed knowledge store agents file into | [`second-brain.md`](second-brain.md) | §A3 |
+| **Coding agent** _(proposed)_ — equipping an agent with Git + cluster access | [`coding-agent.md`](coding-agent.md) | — |
 
 The remaining architecture sections (A5 tunnels, A6 long-lived agents, A7 web, A8 tunnels API, A9
 mounts, A10 commands, A12 observability, A13 podman runtime, A14 browser) are design gates and
