@@ -15,7 +15,7 @@
 import type { Recording } from "./recap";
 import { stamp, storeFor, type TokenSet } from "./tokenstore";
 
-const API_BASE = process.env.PLAUD_API_BASE ?? "https://platform.plaud.ai/developer/api";
+export const API_BASE = process.env.PLAUD_API_BASE ?? "https://platform.plaud.ai/developer/api";
 const REFRESH_URL =
   process.env.PLAUD_REFRESH_URL ?? "https://platform.plaud.ai/developer/api/oauth/third-party/access-token/refresh";
 const CLIENT_ID = process.env.PLAUD_CLI_CLIENT_ID ?? "client_f9e0b214-c11f-434b-8b95-c4497d1feb81";

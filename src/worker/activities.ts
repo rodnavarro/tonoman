@@ -21,6 +21,7 @@ import { meetingRecap } from "./talents/meeting-recap";
 import * as calendar from "./calendar";
 import * as worklog from "./worklog";
 import { randomMysticVerb } from "../core/mystic";
+import type { CapabilityPlane } from "./capability-plane";
 
 /** How the worker finds an agent's connector and runner. Injected at worker construction so this
  *  module holds no globals and can be unit-tested without Temporal. */
@@ -28,6 +29,10 @@ export interface TurnDeps {
   agent(name: string): { cfg: AgentConfig; conn: Connector; context?: string; run: (req: TurnRunReq, signal?: AbortSignal) => AsyncIterable<TurnEvent> } | undefined;
   /** What this agent needs to run the voice flow, or undefined if it is not configured for one. */
   voice?(name: string): VoiceConfig | undefined;
+  /** The capability plane, started at worker boot. `runTalent` spawns a Talent CLI through it; the
+   *  plane provides the Talent transcription/inference/publish over localhost. Undefined in tests and
+   *  on a file roster with no plane. */
+  talentPlane?: CapabilityPlane;
   /** Say something verbatim to a person, opening a DM if needed. */
   say?(agent: string, user: string, text: string): Promise<void>;
   /** The durable record of one item of one Talent run: opened before the run, closed either way.
@@ -544,6 +549,32 @@ export function makeActivities(deps: TurnDeps) {
           `and giving the three most useful things from it, in your own words, then offer to answer ` +
           `questions about it. The three: ${top.map((h, i) => `(${i + 1}) ${h}`).join(" ")}`,
       );
+    },
+
+    /** Run a Talent as a self-contained CLI through the capability plane — the replacement for
+     *  `processRecording` once cut over. The Talent does the work and REPORTS an outcome; this
+     *  activity announces it (a real agent turn, from the Talent's `steer`) and lets a failure
+     *  surface as a throw so Temporal retries and the `talent_run` record closes `failed`. The work
+     *  itself is a subprocess, so its progress drives the heartbeat and a cancel kills the child. */
+    async runTalent(input: { agent: string; item: string; notify?: string; user?: string; talent?: string }): Promise<{ status: string }> {
+      const plane = deps.talentPlane;
+      if (!plane) throw new Error("runTalent: the capability plane is not running");
+      const ctx = Context.current();
+      const outcome = await plane.spawn(
+        { agent: input.agent, item: input.item, user: input.user, talent: input.talent },
+        { signal: ctx.cancellationSignal, onProgress: (note) => ctx.heartbeat(note) },
+      );
+      if (outcome.status === "failed") {
+        // A throw, not a return: the workflow's catch closes talent_run `failed` and Temporal retries,
+        // exactly as a thrown processRecording did. The reason is the Talent's own.
+        throw new Error(outcome.reason ?? "talent failed");
+      }
+      // Report, don't speak: announce the Talent's steer as a real turn, so follow-ups land in the
+      // same conversation. Skipped outcomes (no speech, already filed) carry no steer and say nothing.
+      if (outcome.status === "done" && outcome.steer) {
+        await deps.ask?.(input.agent, input.notify ?? "", outcome.steer);
+      }
+      return { status: outcome.status };
     },
 
     /** Open — or re-open — the durable record for one item of one Talent run.

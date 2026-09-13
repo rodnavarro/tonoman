@@ -2,10 +2,14 @@ import * as http from "node:http";
 import type { AddressInfo } from "node:net";
 import * as path from "node:path";
 import { randomBytes } from "node:crypto";
+import { spawn } from "node:child_process";
 import * as recap from "./recap";
+import * as calendar from "./calendar";
 import type { CalEvent } from "./calendar";
+import * as plaudapi from "./plaudapi";
 import { budgetFor } from "./inference";
 import { accountFor, type TurnDeps } from "./activities";
+import type { TalentOutcome } from "../talent-sdk";
 
 // The capability plane — the runtime side of the Talent SDK's mediated capabilities (A15).
 //
@@ -34,6 +38,12 @@ export interface CapabilityPlane {
   mint(run: { agent: string; item: string; user?: string }): string;
   /** Drop a token once its child has exited. */
   revoke(token: string): void;
+  /** Spawn a Talent CLI for one run against this plane and return its outcome. Used by the runTalent
+   *  activity and the dev-run endpoint. */
+  spawn(
+    run: { agent: string; item: string; user?: string; talent?: string },
+    opts?: { signal?: AbortSignal; onProgress?: (note: string) => void },
+  ): Promise<TalentOutcome>;
   close(): Promise<void>;
 }
 
@@ -54,8 +64,90 @@ function readJson(req: http.IncomingMessage): Promise<Record<string, unknown>> {
   });
 }
 
+/** name → the Talent CLI's entrypoint, relative to the repo root (the worker's cwd). One entry while
+ *  there is one built-in Talent; this becomes the loader's registry when a second arrives. */
+const TALENT_ENTRY: Record<string, string> = {
+  "meeting-recap": "src/talents/voice/plaud-and-calendar-meetings/index.ts",
+};
+
+/** Spawn a Talent CLI as a subprocess and collect its outcome. This is the core both the `runTalent`
+ *  Temporal activity and the dev-run endpoint share: mint a scoped token, assemble the input (the
+ *  item + this agent's config + the runtime context the Talent needs but must not hold — mission,
+ *  journal, vocab), run `tsx <entry>` with the capability coordinates in its env, pipe the input on
+ *  stdin, read the single outcome JSON on stdout and progress lines on stderr, then revoke the token.
+ *  A cancellation (Temporal activity timeout/cancel) kills the child. */
+async function runTalentProcess(
+  deps: TurnDeps,
+  baseUrl: string,
+  mint: (r: RunToken) => string,
+  revoke: (t: string) => void,
+  run: { agent: string; item: string; user?: string; talent?: string },
+  opts?: { signal?: AbortSignal; onProgress?: (note: string) => void },
+): Promise<TalentOutcome> {
+  const talent = run.talent ?? "meeting-recap";
+  const entry = TALENT_ENTRY[talent];
+  if (!entry) return { status: "failed", reason: `no CLI registered for talent ${talent}` };
+  const voice = deps.voice?.(run.agent);
+  if (!voice) return { status: "failed", reason: `no voice configuration for ${run.agent}` };
+
+  const token = mint({ agent: run.agent, item: run.item, user: run.user, expiresAt: Date.now() + 6 * 60 * 60 * 1000 });
+  try {
+    const input = {
+      item: run.item,
+      user: run.user,
+      config: {},
+      // The tenant context the recap prompt needs — provided by the runtime, never held by the Talent.
+      context: { mission: voice.mission ?? "", journal: voice.journal, vocab: voice.vocab, timezone: voice.timezone },
+    };
+    const child = spawn("tsx", [entry], {
+      env: { ...process.env, TONOMAN_CAPABILITY_URL: baseUrl, TONOMAN_CAPABILITY_TOKEN: token },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    const onAbort = (): void => void child.kill("SIGTERM");
+    opts?.signal?.addEventListener("abort", onAbort);
+
+    child.stdin.write(JSON.stringify(input));
+    child.stdin.end();
+
+    let out = "";
+    let err = "";
+    let carry = "";
+    child.stdout.on("data", (d: Buffer) => (out += d.toString()));
+    child.stderr.on("data", (d: Buffer) => {
+      err += d.toString();
+      carry += d.toString();
+      const lines = carry.split("\n");
+      carry = lines.pop() ?? "";
+      for (const line of lines) {
+        if (line.startsWith("@progress ")) opts?.onProgress?.(line.slice("@progress ".length).trim());
+        else if (line.trim()) console.log(`talent:${run.agent}:${talent} ${line}`);
+      }
+    });
+
+    const code = await new Promise<number>((resolve) => child.on("close", (c) => resolve(c ?? 0)));
+    opts?.signal?.removeEventListener("abort", onAbort);
+
+    const trimmed = out.trim();
+    if (!trimmed) {
+      return { status: "failed", reason: `talent exited ${code} with no outcome — ${err.slice(-400)}` };
+    }
+    return JSON.parse(trimmed) as TalentOutcome;
+  } finally {
+    revoke(token);
+  }
+}
+
 export async function startCapabilityPlane(deps: TurnDeps): Promise<CapabilityPlane> {
   const tokens = new Map<string, RunToken>();
+  let baseUrl = "";
+  const mint = (run: RunToken): string => {
+    const token = randomBytes(24).toString("hex");
+    tokens.set(token, run);
+    return token;
+  };
+  const revoke = (token: string): void => void tokens.delete(token);
+  const spawnTalent: CapabilityPlane["spawn"] = (run, opts) =>
+    runTalentProcess(deps, baseUrl, mint, revoke, run, opts);
 
   const server = http.createServer((req, res) => {
     void (async () => {
@@ -63,6 +155,22 @@ export async function startCapabilityPlane(deps: TurnDeps): Promise<CapabilityPl
         res.writeHead(code, { "content-type": "application/json" });
         res.end(JSON.stringify(obj));
       };
+
+      const pathname = new URL(req.url ?? "/", "http://plane").pathname;
+
+      // Dev harness: run a Talent end-to-end against this plane without the Temporal poll. Gated by
+      // TONOMAN_TALENT_DEV so it never exists in a real deployment. This is the "develop locally"
+      // path and the step-6 proof hook — it mints its own token, so it is the one route without one.
+      if (process.env.TONOMAN_TALENT_DEV && req.method === "POST" && pathname === "/dev/run") {
+        const b = await readJson(req);
+        const outcome = await spawnTalent({
+          agent: String(b.agent ?? ""),
+          item: String(b.item ?? ""),
+          user: b.user ? String(b.user) : undefined,
+          talent: b.talent ? String(b.talent) : undefined,
+        });
+        return reply(200, outcome);
+      }
 
       const auth = req.headers.authorization ?? "";
       const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
@@ -72,7 +180,6 @@ export async function startCapabilityPlane(deps: TurnDeps): Promise<CapabilityPl
       const voice = deps.voice?.(run.agent);
       if (!voice) return reply(404, { error: `no voice configuration for ${run.agent}` });
 
-      const pathname = new URL(req.url ?? "/", "http://plane").pathname;
       const body = req.method === "POST" ? await readJson(req) : {};
 
       try {
@@ -130,12 +237,34 @@ export async function startCapabilityPlane(deps: TurnDeps): Promise<CapabilityPl
           return reply(200, { published, path: where.page, route });
         }
 
-        // credential: a fresh, usable credential for a kind the Talent declared in `requires`. Plaud
-        // is resolved per run (the member's own account when per-person, else the shared one), so the
-        // Talent can re-fetch across a long run rather than hold a token that expires under it.
+        // calendar candidates around a recording. TRANSITIONAL: calendar is a `requires` credential,
+        // so the clean shape is the Talent fetching the feed itself via credential('calendar'). Until
+        // the ICS parsing is ported into the Talent, the plane resolves candidates from the tenant's
+        // configured feeds and applies the same padded window the live pipeline does.
+        if (req.method === "POST" && pathname === "/cap/calendar-candidates") {
+          if (!voice.calendars?.length) return reply(200, []);
+          const w = calendar.windowFor(Number(body.from ?? 0), Number(body.to ?? 0), voice.calendarPadMinutes);
+          const cands = await calendar.gather(voice.calendars, w.from, w.to, {
+            exclude: voice.calendarExclude,
+            log: (m: string) => console.log(m),
+          });
+          return reply(200, cands);
+        }
+
+        // credential: a fresh, usable credential for a kind the Talent declared in `requires`. For
+        // Plaud the plane resolves (and refreshes) the OAuth bearer from the tokenstore and hands the
+        // Talent a ready {token, base} — so the Talent only needs the Plaud API, never the tokenstore,
+        // and can re-fetch across a long run. (The legacy captured-bearer path returns tokenJson.)
         if (req.method === "GET" && pathname.startsWith("/cap/credential/")) {
           const kind = decodeURIComponent(pathname.slice("/cap/credential/".length));
-          if (kind === "plaud") return reply(200, { creds: accountFor(voice, run.user).creds });
+          if (kind === "plaud") {
+            const creds = accountFor(voice, run.user).creds;
+            if (creds.cliAgent) {
+              const token = await plaudapi.accessToken(creds.cliAgent, creds.cliUser);
+              return reply(200, { creds: { token, base: plaudapi.API_BASE } });
+            }
+            return reply(200, { creds: { tokenJson: creds.tokenJson } });
+          }
           return reply(404, { error: `no credential of kind ${kind}` });
         }
 
@@ -146,20 +275,21 @@ export async function startCapabilityPlane(deps: TurnDeps): Promise<CapabilityPl
     })();
   });
 
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  // A fixed port only when asked (dev, so the dev-run endpoint is reachable by `podman exec curl`);
+  // 0 = an ephemeral port in a real deployment, since the only caller is a child on this host.
+  const wantPort = Number(process.env.TONOMAN_CAPABILITY_PORT) || 0;
+  await new Promise<void>((resolve) => server.listen(wantPort, "127.0.0.1", resolve));
   const port = (server.address() as AddressInfo).port;
+  baseUrl = `http://127.0.0.1:${port}`;
 
   return {
-    url: `http://127.0.0.1:${port}`,
+    url: baseUrl,
+    // Public mint stamps the standard 6-hour expiry; internal spawns pass their own RunToken.
     mint(run) {
-      const token = randomBytes(24).toString("hex");
-      // Generous but bounded: long enough for a 112-minute transcription, gone when the child exits.
-      tokens.set(token, { ...run, expiresAt: Date.now() + 6 * 60 * 60 * 1000 });
-      return token;
+      return mint({ ...run, expiresAt: Date.now() + 6 * 60 * 60 * 1000 });
     },
-    revoke(token) {
-      tokens.delete(token);
-    },
+    revoke,
+    spawn: spawnTalent,
     close() {
       return new Promise((resolve) => server.close(() => resolve()));
     },

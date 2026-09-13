@@ -64,6 +64,7 @@ export async function runCli(manifest: TalentManifest, run: TalentRun): Promise<
         transcribe: (i) => callCap('POST', '/cap/transcribe', i),
         infer: (i) => callCap('POST', '/cap/infer', i),
         publish: (p) => callCap('POST', '/cap/publish', p),
+        calendarCandidates: (i) => callCap('POST', '/cap/calendar-candidates', i),
       },
       progress,
       log,

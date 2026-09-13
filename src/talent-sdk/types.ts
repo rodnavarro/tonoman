@@ -55,6 +55,11 @@ export interface TalentInput {
   item: string;
   config: Record<string, unknown>;
   user?: string;
+  /** Runtime-provided context for this run that is not the agent's own config — the tenant values a
+   *  Talent needs but must not hold (the mission it judges against, the journal it files into). The
+   *  runtime assembles it; the Talent reads what it declared it needs. Generic by design; its
+   *  contents are the Talent's concern. */
+  context?: Record<string, unknown>;
 }
 
 /** The structured result a Talent reports on stdout. The Talent does the work and REPORTS; it does
@@ -104,6 +109,22 @@ export interface PublishCapability {
   (payload: Record<string, unknown>): Promise<{ published: boolean; path: string; route: string }>;
 }
 
+/** One calendar entry near a recording, for "which meeting was this". */
+export interface CalendarCandidate {
+  summary: string;
+  attendees: string[];
+  start?: number;
+  end?: number;
+}
+
+/** Calendar entries around a time window. NOTE (transitional): calendar is declared as a `requires`
+ *  credential, so the CLEAN shape is the Talent fetching and parsing the feed itself via
+ *  `credential('calendar')`. Until the ICS parsing is ported into the Talent, the plane resolves
+ *  candidates from the tenant's configured feeds — a stated impurity, like `publish`'s payload. */
+export interface CalendarCandidatesCapability {
+  (input: { from: number; to: number }): Promise<CalendarCandidate[]>;
+}
+
 /** Everything a running Talent is handed. It imports this type; the SDK's `runCli` constructs the
  *  concrete object (capability clients over `TONOMAN_CAPABILITY_URL`, creds from the environment)
  *  and calls the Talent's `run`. */
@@ -118,6 +139,8 @@ export interface TalentContext {
     transcribe: TranscribeCapability;
     infer: InferCapability;
     publish: PublishCapability;
+    /** Transitional — see CalendarCandidatesCapability. */
+    calendarCandidates: CalendarCandidatesCapability;
   };
   /** Emit a progress note on the side channel (stderr), so the `runTalent` activity keeps Temporal's
    *  heartbeat alive without the outcome stream having to carry it. */

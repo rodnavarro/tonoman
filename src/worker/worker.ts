@@ -49,6 +49,7 @@ import { serveWake } from "./wake";
 import { promises as fsp } from "node:fs";
 import { defaultHarnesses } from "../gateway";
 import { accountsFromUsers, makeActivities, type TurnRunReq, type VoiceConfig } from "./activities";
+import { startCapabilityPlane, type CapabilityPlane } from "./capability-plane";
 import { conversationWorkflow, messageSignal, plaudPollWorkflow, type Inbound, type PollInput } from "./workflows";
 import { planReload } from "./reload";
 
@@ -935,6 +936,21 @@ export async function run(
       },
     },
   };
+
+  // The capability plane — a localhost server a spawned Talent CLI calls for transcription,
+  // inference and publishing. Started once, closed over `deps` (so it resolves each run's VoiceConfig
+  // live, across reloads), and attached to `deps` so the `runTalent` activity can spawn through it.
+  // Best-effort: a failure here must not stop the worker from answering messages.
+  let talentPlane: CapabilityPlane | undefined;
+  try {
+    talentPlane = await startCapabilityPlane(deps as unknown as Parameters<typeof startCapabilityPlane>[0]);
+    (deps as { talentPlane?: CapabilityPlane }).talentPlane = talentPlane;
+    console.log(`worker: capability plane listening on ${talentPlane.url}`);
+    signal.addEventListener("abort", () => void talentPlane?.close());
+  } catch (e) {
+    console.error(`worker: capability plane failed to start: ${String(e)}`);
+  }
+
   const activities = makeActivities(deps);
 
   // In-channel commands. They read and write the same maps the status footer uses, so what

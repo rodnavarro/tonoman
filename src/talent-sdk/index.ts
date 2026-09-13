@@ -14,4 +14,6 @@ export type {
   TranscribeCapability,
   InferCapability,
   PublishCapability,
+  CalendarCandidate,
+  CalendarCandidatesCapability,
 } from './types';
