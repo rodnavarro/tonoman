@@ -72,42 +72,36 @@ export interface TalentOutcome {
 }
 
 // --- The capability plane, as the Talent sees it -------------------------------------------------
+//
+// These signatures match the plane's wire exactly, and they are free of any runtime type — a Talent
+// imports only this SDK. The engine, budget and routing behind each call are the tenant's, resolved
+// below the Talent.
 
-/** Transcribe a recording the Talent fetched from its source. The engine (groq, local-gpu) and its
- *  ordering are the tenant's provider chain, resolved below the Talent — the Talent asks only for a
- *  transcript. `onProgress` lets a long, chunked transcription keep the run's heartbeat alive. */
+/** Transcribe audio the Talent obtained from its source. `audioUrl` is a URL the plane can fetch
+ *  (for Plaud, the pre-signed temp URL the Talent resolved with its credential); `cacheId` keys the
+ *  chunk cache so a retry resumes; `label` is for logs. The plane segments and routes it through the
+ *  tenant's transcription chain (groq / local-gpu) and returns which providers answered in `by`. */
 export interface TranscribeCapability {
-  (input: {
-    /** The audio to transcribe, as the Talent obtained it — a URL the plane can fetch, or bytes. */
-    audio: { url: string } | { bytes: Uint8Array; contentType: string };
-    /** Domain vocabulary to bias the model toward (names, product terms). */
-    vocab?: string;
-    onProgress?: (done: number, total: number) => void;
-  }): Promise<{ text: string; seconds: number; by: string[] }>;
+  (input: { audioUrl: string; label?: string; cacheId?: string; vocab?: string }): Promise<{
+    text: string;
+    seconds: number;
+    by: string[];
+  }>;
 }
 
-/** Run an inference against the tenant's provider — the recap-vs-mission summary. The prompt and
- *  schema are the Talent's; the model, budget and billing are the runtime's. */
+/** One JSON-mode completion through the tenant's model chain. The PROMPT is the Talent's (it owns
+ *  `system` and `user`); the plane budgets `user` to the model's window and routes it. The Talent
+ *  parses the returned `text` against its own schema. */
 export interface InferCapability {
-  <T = unknown>(input: {
-    prompt: string;
-    /** Named inputs interpolated into the prompt (transcript, candidates, mission). */
-    vars?: Record<string, unknown>;
-    /** The name of the output schema the runtime validates the result against. */
-    schema?: string;
-  }): Promise<T>;
+  (input: { system: string; user: string }): Promise<{ text: string }>;
 }
 
-/** File an artifact in the tenant's git-backed second brain and return where it landed. The repo,
- *  key and routing are the runtime's; the Talent supplies the content and a route hint. */
+/** File an artifact in the tenant's git-backed second brain; returns where it landed. The repo, push
+ *  credential, journal and timezone are the runtime's. NOTE (transitional): the payload is the recap
+ *  artifact's shape for now — a stated impurity, to be cut to a domain-neutral `{route, title, body}`
+ *  when a second Talent forces it. The Talent fills it; the SDK forwards it opaquely. */
 export interface PublishCapability {
-  (input: {
-    route: string;
-    title: string;
-    body: string;
-    /** Opaque metadata stored alongside (source item id, timestamps, participants). */
-    meta?: Record<string, unknown>;
-  }): Promise<{ published: boolean; path: string; url?: string }>;
+  (payload: Record<string, unknown>): Promise<{ published: boolean; path: string; route: string }>;
 }
 
 /** Everything a running Talent is handed. It imports this type; the SDK's `runCli` constructs the
@@ -115,17 +109,17 @@ export interface PublishCapability {
  *  and calls the Talent's `run`. */
 export interface TalentContext {
   input: TalentInput;
-  /** Raw credentials by kind, as declared in `requires`. A value may be a ready token or a ref the
-   *  Talent exchanges via `credential` for a fresh one (the long-lived-login case). */
+  /** Raw credentials by kind, as declared in `requires`, delivered in the environment. May be empty
+   *  for a kind whose login is long-lived — fetch that fresh with `credential` instead. */
   creds: Record<string, unknown>;
-  /** Exchange a credential ref for a fresh, usable credential — refreshable across a long run. */
+  /** Fetch a fresh, usable credential of a declared kind — refreshable across a long run (Plaud). */
   credential(kind: string): Promise<unknown>;
   cap: {
     transcribe: TranscribeCapability;
     infer: InferCapability;
     publish: PublishCapability;
   };
-  /** Emit a progress note on the side channel, so the `runTalent` activity keeps Temporal's
+  /** Emit a progress note on the side channel (stderr), so the `runTalent` activity keeps Temporal's
    *  heartbeat alive without the outcome stream having to carry it. */
   progress(note: string): void;
   /** Structured logging to stderr; never stdout (stdout carries only the outcome). */
