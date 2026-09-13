@@ -710,85 +710,24 @@ A2 (sandbox boundary)._
 ## A15 — Talents (self-contained CLIs on the runtime)
 
 A **Talent** is the one versioned unit an agent *runs* — distinct from a harness **skill** (A10,
-the `/<skill>` menu the model invokes mid-turn). The Plaud voice pipeline is the first Talent. An
-earlier design interpreted a Talent as a list of steps carried on the wire and executed by a step
-interpreter in the worker; that model and its interpreter are **deleted**. A Talent is **code behind
-a manifest**, and the load-bearing decision is that the code is a **self-contained CLI** the runtime
-*spawns* — not a module the worker `import()`s.
+the `/<skill>` menu the model invokes mid-turn). The Plaud voice pipeline is the first Talent. A
+Talent is **code behind a manifest**, and the load-bearing decisions are:
 
-### Why a CLI, and not an in-process module
+- **A self-contained CLI the runtime *spawns*** — not a module the worker `import()`s. The process
+  boundary buys self-containment, dev/prod parity, and isolation-as-a-trajectory (subprocess →
+  per-conversation pod) at once. (An earlier step-interpreter model is **deleted**.)
+- **Temporal stays minimal:** one generic `runTalent` activity, forever — it spawns the CLI, streams
+  progress to the heartbeat, returns the outcome, and never knows individual Talents. Adding a Talent
+  touches neither worker code nor Temporal registration.
+- **Report, don't speak:** the Talent returns an *outcome* + a `steer`; the runtime announces through
+  the agent (a real turn, in the agent's own words). A Talent never holds a channel.
+- **`infer` runs on the agent's OWN provider** (its Claude subscription, a lean captured turn), while
+  `transcribe`/`publish` route through the runtime's provider chain and git-backed second brain. So a
+  recap is the agent thinking on the same brain it answers with.
 
-The boundary is a **process boundary**, and that one choice is three properties at once:
-
-- **Self-contained by construction.** Its own entrypoint and deps; it *cannot* reach into worker
-  internals. (Rejected: in-process import "just for first-party now" — with one consumer the
-  boundary rots, and the whole point is that the unit is liftable into a separate repo.)
-- **Dev/prod parity.** The same CLI runs on a developer's laptop against their own credentials, or
-  in Tonoman where the environment injects them. The contract is env + stdin/stdout, not a TS import.
-- **Hot-load and isolation as a trajectory.** Running a Talent is `spawn` — a new or changed Talent
-  is a new executable on disk: no module cache, no worker restart. A subprocess-in-a-container today
-  becomes a **per-conversation pod** later behind the *same* contract (isolation hardens without a
-  redesign). (Rejected: Go-style dynamic Temporal activities — the TS SDK has no dynamic handler, and
-  we don't need one.)
-
-### Temporal stays minimal: one generic activity
-
-The worker registers exactly **one** Talent-facing activity, forever: `runTalent(name, input)`. It
-spawns the Talent CLI, streams the subprocess's progress to the activity **heartbeat**, and returns
-the outcome. Temporal provides the durability — retry, heartbeat, and the `talent_run`
-dedup/observability that ended the 611-attempts bug — and **never knows individual Talents**. Because
-the Talent is imperative work it lives in the activity, never in the deterministic/replayed workflow,
-so the determinism rule never touches a Talent author. Adding a Talent touches **neither** the worker
-code **nor** Temporal registration.
-
-### The SDK convention (the contract — keep it minimal)
-
-The environment provides a Talent two *different kinds* of things, and the split is what lets the
-runtime keep control while the Talent stays self-contained:
-
-1. **Credentials** — raw, the Talent uses them directly (Plaud: the env hands over the token, the
-   Talent calls Plaud itself; groq is the same shape — a pluggable third party).
-2. **Capabilities** — runtime-*mediated* endpoints the Talent calls through a provided
-   `TONOMAN_CAPABILITY_URL` + token: `transcribe`, `infer`, `publish`. `transcribe` routes audio over
-   the tenant's provider chain (groq / local-gpu); `publish` writes the git-backed second brain
-   (A3) — provider routing and the brain stay the runtime's, never baked into the Talent. **`infer`
-   is deliberately different: it runs on the AGENT'S OWN inference provider — the Claude Code harness
-   (its subscription), via a headless captured turn — not a side model with its own key.** A recap is
-   the agent thinking about the meeting, on the same brain it answers with. The dispatch is the one
-   place a second provider (codex, an OpenAI subscription) plugs in; the Talent only calls
-   `ctx.cap.infer`. (So recaps consume the agent's plan, not a separate quota — intended.)
-
-Shape of the contract: **env** carries resolved credentials + the capability URL + config; **stdin**
-carries the item to work (a recording id) + config; **stdout** carries a structured **outcome +
-steer** (progress for the heartbeat goes on a *separate* stream so a large outcome can't starve it).
-The manifest's `requires` declares which credentials and capabilities the Talent needs. Locally, a
-**dev harness** stands up the capability endpoints against the developer's own keys, so the same CLI
-runs unchanged. Announcing is deliberately **not** a capability — the Talent *reports* an outcome, it
-does not speak: the durable `runTalent` wrapper announces through the existing say path, and the
-agent consumes the steer to decide any further step to bubble to the user. So a Talent never holds a
-channel. (A long-lived Plaud login is resolved through a mediated credential endpoint rather than a
-raw token in env, so the CLI can refresh across a 112-minute run.)
-
-### Layout, distribution, and the line
-
-```
-src/talents/voice/plaud-and-calendar-meetings/
-  manifest.ts   # name, version, requires (credentials + capabilities), config schema
-  run.ts        # the CLI: transcribe → classify vs mission → recap → publish → report
-  index.ts      # { manifest } + the CLI entrypoint
-```
-
-Talents are **git repos**, integrated GitOps-style (a pinned ref → manifest + CLI); third parties
-keep their own, and this repo carries the Plaud Talent as the canonical, collaborate-on-it reference.
-First-party gets **no shortcut** — it loads through the same external-unit path a stranger's repo
-would. Running arbitrary third-party code is a real risk accepted deliberately: the container is the
-interim isolation boundary, per-conversation-pod isolation the planned hardening.
-
-**What is OSS here:** the **Talent runner**, the **SDK / capability plane** (the CLI contract + the
-mediated endpoints), and the reference Plaud Talent — all runtime. **What is Cloud's:** the `talent`
-registry (mirrored by worker-boot registration), install/config per agent, the routing + billing
-*behind* the mediated capabilities, and the future marketplace + vetting. The **"Develop a Talent"
-Dev Guide** (tonoman.com) documents this contract, written so a coding agent can scaffold one.
+**→ Full feature doc, with the run sequence diagram, the outcome/`steer` contract, the capability
+plane, idempotency, and the OSS/Cloud line:** [`features/tonoman-talents.md`](features/tonoman-talents.md).
+The developer guide (how to *build* one) is [`product/talent-sdk.md`](product/talent-sdk.md).
 
 _Built on A2 (sandbox boundary), A3 (git-backed second brain), A11 (per-agent config); the worker's
 Temporal orchestration hosts `runTalent`. Supersedes the deleted step-interpreter model._

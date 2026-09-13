@@ -16,6 +16,11 @@ git repo.
 > local dev harness — is landing increment by increment; sections below are marked _(available)_ or
 > _(landing)_ so you know what you can run today. The shape will not change under you.
 
+> **See also.** For how a run is *wired* — the sequence from trigger to the agent's announcement, the
+> outcome contract, and the capability plane — read the feature doc
+> [`../features/tonoman-talents.md`](../features/tonoman-talents.md). This page is how to *build* a
+> Talent; that one is how the runtime *runs* it.
+
 ---
 
 ## 1. Anatomy of a Talent
