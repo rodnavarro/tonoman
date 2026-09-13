@@ -77,6 +77,11 @@ conversation, co-versioned in the mounted workspace alongside the agent's work p
 **ours** (one event per line — role, text, timestamp, tool summary), so we never migrate off a harness
 internal.
 
+> The **second brain** — the git-backed store of a person's *work product* (meeting recaps, notes),
+> as opposed to this per-conversation transcript — is a distinct, **per-account** subsystem: a service
+> of Tonoman that agents reach through the capability plane by naming *whose* brain. See
+> [`features/second-brain.md`](features/second-brain.md).
+
 - **Read into each turn:** by default the router passes the recent window in the prompt body (memory
   stays substrate-owned); an opt-in `session_persist` path resumes a harness session for prompt-cache
   reuse instead.
