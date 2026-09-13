@@ -378,8 +378,11 @@ async function probeSeconds(file: string): Promise<number | undefined> {
  *  what a retry is retrying, and by chunk INDEX and COUNT together — a different count means the
  *  audio was segmented differently and index 3 is no longer the same three minutes, so the whole
  *  set is stale and must not be reused. */
+export function chunkCachePathById(cacheDir: string, id: string, index: number, total: number): string {
+  return path.join(cacheDir, id, `of-${total}`, `chunk-${String(index).padStart(3, "0")}.txt`);
+}
 export function chunkCachePath(cacheDir: string, rec: Recording, index: number, total: number): string {
-  return path.join(cacheDir, rec.id, `of-${total}`, `chunk-${String(index).padStart(3, "0")}.txt`);
+  return chunkCachePathById(cacheDir, rec.id, index, total);
 }
 
 /** Text only, never audio. The transcript is going to the second brain anyway, so keeping it for a
@@ -407,14 +410,34 @@ export async function transcribe(
    *  single-machine path passes none and behaves exactly as before. */
   cacheDir?: string,
 ): Promise<TranscribeResult> {
-  const t0 = Date.now();
   // The audio, and ONLY the audio. Plaud will also hand over its own transcript and summary, and
   // taking them would put the quality of every recap in somebody else's model, tuned for somebody
   // else's purpose, with our vocabulary hints discarded. ffmpeg and Groq stay.
   const tempUrl = creds.cliAgent
     ? await plaudapi.audioUrl(creds.cliAgent, rec.id, creds.cliUser)
     : (await plaudGet<{ temp_url: string }>(creds, `/file/temp-url/${rec.id}`)).temp_url;
-  const audio = Buffer.from(await (await fetch(tempUrl)).arrayBuffer());
+  // Everything past resolving that URL is source-agnostic — it is the `transcribe` CAPABILITY.
+  return transcribeAudio(tempUrl, rec.title, rec.id, providers, vocab, onProgress, cacheDir);
+}
+
+/** The provider-routing core of transcription, with NOTHING tied to a source: fetch a ready audio
+ *  URL, segment it, and route each chunk through the provider chain with resume-from-cache and
+ *  dead-provider skipping. `transcribe` above is the thin Plaud adapter that resolves a temp URL
+ *  first; the Talent runtime's `transcribe` capability calls THIS directly with a URL the Talent
+ *  resolved from its own credential. `cacheId` keys the chunk cache (a recording id); `label` is for
+ *  logs only. These `console.log`s are fine here — this runs worker-side (the capability plane),
+ *  never inside a Talent CLI whose stdout carries the outcome. */
+export async function transcribeAudio(
+  audioUrl: string,
+  label: string,
+  cacheId: string,
+  providers: Provider[],
+  vocab: string,
+  onProgress?: (done: number, total: number) => void,
+  cacheDir?: string,
+): Promise<TranscribeResult> {
+  const t0 = Date.now();
+  const audio = Buffer.from(await (await fetch(audioUrl)).arrayBuffer());
 
   // A scratch directory per recording, removed whether or not this succeeds. The audio is the
   // customer's meeting; it has no business outliving the transcription.
@@ -426,7 +449,7 @@ export async function transcribe(
     const durations = await Promise.all(parts.map(probeSeconds));
     const totalSecs = durations.reduce((a: number, b) => a + (b ?? 0), 0);
     console.log(
-      `recap: ${rec.title} — ${(audio.length / 1e6).toFixed(1)}MB in ${parts.length} chunk(s), ` +
+      `recap: ${label} — ${(audio.length / 1e6).toFixed(1)}MB in ${parts.length} chunk(s), ` +
         `${Math.round(totalSecs)}s of audio [${durations.map((d) => (d === undefined ? "?" : Math.round(d))).join(", ")}]`,
     );
 
@@ -434,14 +457,13 @@ export async function transcribe(
     let reused = 0;
     const by: string[] = [];
     // A provider that is DEAD AT THE TRANSPORT — nothing listening, DNS gone, the container stopped —
-    // is skipped for the rest of this recording rather than waited on once per chunk. Scoped to the
-    // recording, not the process: a server that comes back is asked again on the next one.
+    // is skipped for the rest of this recording rather than waited on once per chunk.
     let dead: string[] = [];
     for (const [i, file] of parts.entries()) {
       // RESUME, don't restart. Without this a meeting that failed on chunk 6 of 9 threw away the
-      // five it had already paid for and asked for them again on the next tick — which is how a
-      // handful of meetings consumed a whole day's audio quota: 611 attempts, 4 published.
-      const at = cacheDir ? chunkCachePath(cacheDir, rec, i, parts.length) : undefined;
+      // five it had already paid for — which is how a handful of meetings consumed a whole day's
+      // audio quota: 611 attempts, 4 published.
+      const at = cacheDir ? chunkCachePathById(cacheDir, cacheId, i, parts.length) : undefined;
       const already = at ? await cachedChunk(at) : undefined;
       if (already !== undefined) {
         texts.push(already);
@@ -449,20 +471,15 @@ export async function transcribe(
         onProgress?.(i + 1, parts.length);
         continue;
       }
-      // Sequential on purpose: the chunks are one conversation, and a rate-limited burst would
-      // fail a whole meeting to save a few seconds on one.
-      // Said before the request, not after: when a chunk is REFUSED, this is the only record of
       // An empty list after filtering means every provider looked dead, which is far more likely to
       // be this machine's network than all of them being down — so ask everyone again rather than
       // fail a meeting on the strength of one blip.
       const live = providers.filter((x) => !dead.includes(x.name));
       const asking = live.length ? live : providers;
-      // Said BEFORE the request, not after: when a chunk is REFUSED this is the only record of how
-      // much audio we asked for, and that is exactly the number the limiter is counting. It names
-      // the ORDER rather than one provider, because which one answers is not known until one does —
-      // this line said "groq" unconditionally, which stopped being true the day a second existed.
+      // Said BEFORE the request: when a chunk is REFUSED this is the only record of how much audio we
+      // asked for, and it names the ORDER, since which provider answers is not known until one does.
       console.log(
-        `recap: ${rec.title} — chunk ${i + 1}/${parts.length}, ${Math.round(durations[i] ?? 0)}s → ${asking.map((x) => x.name).join(" → ")}`,
+        `recap: ${label} — chunk ${i + 1}/${parts.length}, ${Math.round(durations[i] ?? 0)}s → ${asking.map((x) => x.name).join(" → ")}`,
       );
       const served = await transcribeWith(asking, file, vocab, {
         onDead: (n) => { dead = [...dead, n]; },
@@ -478,7 +495,7 @@ export async function transcribe(
       texts.push(text);
       onProgress?.(i + 1, parts.length);
     }
-    if (reused) console.log(`recap: ${rec.title} — reused ${reused}/${parts.length} chunk(s) from a previous attempt`);
+    if (reused) console.log(`recap: ${label} — reused ${reused}/${parts.length} chunk(s) from a previous attempt`);
     return { text: joinChunks(texts), seconds: (Date.now() - t0) / 1000, by };
   } finally {
     await fs.rm(work, { recursive: true, force: true }).catch(() => {});
@@ -658,6 +675,26 @@ export function parseRecapJson(raw: string): Recap {
   throw new Error(`summarize: the model did not return JSON — ${text.slice(0, 200)}`);
 }
 
+/** The model-routing core of a recap inference: one JSON-mode chat completion through the provider
+ *  chain, returning the raw string. This is the `infer` CAPABILITY — which model, its budget and its
+ *  billing are the tenant's provider chain; the PROMPT and the parsing of the result are the caller's
+ *  (the Talent's) domain. Worker-side, so `console.log` is fine. */
+export async function inferJson(providers: Provider[], system: string, user: string): Promise<string> {
+  const served = await chatWith(
+    providers,
+    {
+      temperature: 0.2,
+      response_format: { type: "json_object" },
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: user },
+      ],
+    },
+    { log: (line) => console.log(line) },
+  );
+  return served.value;
+}
+
 export async function summarize(
   transcript: string,
   title: string,
@@ -748,20 +785,11 @@ export async function summarize(
     .join(" ");
   // The MODEL comes from the provider row, so which model summarises is a tenant's configuration
   // rather than this file's opinion — and pointing it at a gateway with room is what removes the
-  // 413 that made a 62-minute meeting unsummarisable at any price.
-  const served = await chatWith(
-    providers,
-    {
-      temperature: 0.2,
-      response_format: { type: "json_object" },
-      messages: [
-        { role: "system", content: system },
-        { role: "user", content: `Meeting: ${title}\n\nTranscript:\n${budgetTranscript(transcript, budgetFor(providers))}` },
-      ],
-    },
-    { log: (line) => console.log(line) },
-  );
-  const out = parseRecapJson(served.value);
+  // 413 that made a 62-minute meeting unsummarisable at any price. `inferJson` is the model-routing
+  // core — the `infer` capability the Talent runtime calls; the PROMPT above and the parse below are
+  // the recap's own, which is why they stay here (and move into the Talent with the port).
+  const raw = await inferJson(providers, system, `Meeting: ${title}\n\nTranscript:\n${budgetTranscript(transcript, budgetFor(providers))}`);
+  const out = parseRecapJson(raw);
   // A verdict outside the closed set is DROPPED, not coerced. See `resolveAlignment`.
   out.alignment = resolveAlignment(out.alignment);
   if (!out.alignment) out.alignmentReason = undefined;
