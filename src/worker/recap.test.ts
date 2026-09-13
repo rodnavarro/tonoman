@@ -49,6 +49,14 @@ describe("overviewMarkdown", () => {
     const md = overviewMarkdown(rec, { summary: "s", highlights: [], decisions: [], followups: [] });
     expect(md).toContain("_none recorded_");
   });
+  it("stamps the owner in frontmatter when a per-person account is named", () => {
+    const md = overviewMarkdown(rec, { summary: "s", highlights: [], decisions: [], followups: [] }, undefined, [], [], "UTC", "U0C01QX7YAY");
+    expect(md).toContain("\nowner: U0C01QX7YAY\n");
+  });
+  it("omits owner on the shared path, so the page is byte-identical", () => {
+    const md = overviewMarkdown(rec, { summary: "s", highlights: [], decisions: [], followups: [] });
+    expect(md).not.toContain("owner:");
+  });
 });
 
 describe("floorFor", () => {

@@ -231,6 +231,10 @@ export async function startCapabilityPlane(deps: TurnDeps): Promise<CapabilityPl
             (body.candidates as CalEvent[]) ?? [],
             (body.by as string[]) ?? [],
             voice.timezone,
+            // WHOSE recap — the per-person account this run was polled from. The brain is still keyed
+            // by agent today, but the page now carries the owner so a later per-user split is a
+            // re-file, not a reconstruction. Undefined on the shared path (Sapien), so unchanged.
+            run.user,
           );
           const route = recap.resolveRoute(voice.journal, r?.route);
           const where = recap.pathsFor(voice.journal, rec, route, r?.highlights?.[0] ?? r?.summary);

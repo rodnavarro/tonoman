@@ -923,6 +923,7 @@ export function overviewMarkdown(
   candidates: CalEvent[] = [],
   by: string[] = [],
   timezone = "UTC",
+  owner?: string,
 ): string {
   const when = localWhen(rec.startTime, timezone);
   const transcript = folder ? `${path.posix.basename(folder)}/Transcript.md` : `./${rec.stamp}/Transcript.md`;
@@ -930,6 +931,12 @@ export function overviewMarkdown(
     "---",
     `recording_id: ${rec.id}`,
     "source: plaud",
+    // WHOSE recap this is — the Slack id of the per-person account it was polled from, the same id
+    // that keys the token (`plaud.tokens:<owner>`) and, later, the per-user brain. Absent on the
+    // shared path, so a shared tenant's page is byte-identical. This is the (tenant, user) key the
+    // per-account second brain resolves on — recorded now so a later repo split is a re-file by
+    // owner, never a forensic reconstruction. See docs/features/second-brain.md.
+    ...(owner ? [`owner: ${owner}`] : []),
     // The INSTANT, unchanged and still UTC — that is what an instant is, and every existing page
     // has it. `local_time` is the same moment as the tenant reads a clock, so a vault query can ask
     // "what did I do on Tuesday" and mean the tenant's Tuesday.
@@ -994,6 +1001,7 @@ export async function publish(
   candidates: CalEvent[] = [],
   by: string[] = [],
   timezone = "UTC",
+  owner?: string,
 ): Promise<boolean> {
   const route = resolveRoute(journal, recap.route);
   const where = pathsFor(journal, rec, route, recap.highlights?.[0] ?? recap.summary);
@@ -1001,7 +1009,7 @@ export async function publish(
   await fs.mkdir(dir, { recursive: true });
   await fs.writeFile(
     path.join(brainDir, where.page),
-    overviewMarkdown(rec, { ...recap, route }, where.folder, candidates, by, timezone),
+    overviewMarkdown(rec, { ...recap, route }, where.folder, candidates, by, timezone, owner),
     "utf8",
   );
   await fs.writeFile(

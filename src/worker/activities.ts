@@ -541,7 +541,7 @@ export function makeActivities(deps: TurnDeps) {
         route,
         summary.meeting || summary.highlights?.[0] || summary.summary,
       );
-      const published = await recap.publish(v.brainDir, rec, summary, text, v.pushUrl, v.journal, candidates, by, v.timezone);
+      const published = await recap.publish(v.brainDir, rec, summary, text, v.pushUrl, v.journal, candidates, by, v.timezone, input.user);
       console.log(
         `recap: ${rec.title} ${published ? "published" : "already present"} at ${where.page}` +
           (route ? ` (route ${route}${summary.route && summary.route !== route ? `, model said "${summary.route}"` : ""})` : "") +
