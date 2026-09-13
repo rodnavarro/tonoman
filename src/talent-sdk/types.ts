@@ -63,14 +63,18 @@ export interface TalentInput {
 }
 
 /** The structured result a Talent reports on stdout. The Talent does the work and REPORTS; it does
- *  not speak — `runTalentWorkflow` announces `summary` through the existing say path, and the agent
- *  consumes `steer` to decide any further step to bubble to the user. `status` is what the
- *  `talent_run` record closes as. */
+ *  NOT speak. Report, don't speak: the *instruction* to the agent lives here as `steer`, authored by
+ *  the Talent, so it versions with the Talent — the runtime relays it and knows nothing of its
+ *  content. `runTalentWorkflow` hands `steer` to the agent (which rewords it in its own voice);
+ *  `summary` is the record line; `status` is what the `talent_run` record closes as. */
 export interface TalentOutcome {
   status: 'done' | 'skipped' | 'failed';
-  /** A human-facing line the runtime announces verbatim (e.g. the recap notice). */
+  /** A one-line record of what happened, for the run log / `talent_run` — NOT announced. */
   summary?: string;
-  /** A hint to the agent about a sensible next step; consumed by the agent loop, not announced. */
+  /** The instruction the Talent hands back for the runtime to steer the agent with: relayed to the
+   *  agent, which rewords it in its own voice. Authored in the Talent and versioned with it, because
+   *  it encodes Talent-specific knowledge — where it filed, what it found — that the runtime
+   *  deliberately does not have. The one field that reaches the agent. */
   steer?: string;
   /** Why a run was skipped or failed — recorded, not announced. */
   reason?: string;

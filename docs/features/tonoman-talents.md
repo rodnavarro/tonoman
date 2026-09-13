@@ -84,11 +84,13 @@ sequenceDiagram
     SB-->>Plane: filed path (or "already present")
     Plane-->>CLI: { published, path }
     Note over CLI: stderr `@progress …` lines → the activity heartbeat throughout
+    Note over CLI: the CLI AUTHORS the `steer` here — it names the filed path,<br/>the title, the highlights: knowledge only the Talent has
     CLI-->>Plane: stdout = outcome { status, summary, steer }
     Plane-->>Act: outcome
     alt status = done and steer present
         Act->>User: deps.ask(agent, notify, steer)
-        Note over User,Inf: a REAL agent turn — reads the filed page from the second brain,<br/>writes the message in its own words, posts it
+        Note over Act,User: the runtime RELAYS the steer verbatim — it knows nothing of its<br/>content; it only supplies the envelope (who / which channel)
+        Note over User,Inf: a REAL agent turn — reads the filed page from the second brain,<br/>rewords the steer in its own voice, posts it
     end
     Act-->>WF: { status }
     WF->>Reg: closeTalentRun(done | failed)
@@ -111,26 +113,43 @@ The Talent returns a **`TalentOutcome`** to the **runtime** (never directly to t
 
 - **`status`** — drives the `talent_run` record and Temporal retry. `failed` is thrown so the run
   closes `failed` and retries; `skipped` says nothing.
-- **`summary`** — a one-line "what happened" for the record (*"Filed 'Foley…' at &lt;path&gt;,
-  transcribed by local-gpu"*). Observability only today — **not forwarded to the agent**.
+- **`summary`** — a one-line **record** of what happened (*"Filed 'Foley…' at &lt;path&gt;, transcribed by
+  local-gpu"*). For the run log / `talent_run` — **not announced, and not forwarded to the agent**.
 - **`reason`** — the cause, on `skipped` / `failed`.
 - **`steer`** — the **only** field that reaches the agent.
 
+### The steer is Talent-authored, and versions with the Talent
+
+This is the load-bearing seam. The **instruction to the agent lives in the outcome as `steer`, and the
+Talent's own code writes it** — so it versions with the Talent, and changing what it says (or what it
+points at) is a code change → a new Talent version. The division of labour:
+
+- **The Talent owns the *instruction*.** Only the Talent knows its domain — *that* there is a "second
+  brain," *that* it filed a "transcript," *where*, and *what* the highlights are. That knowledge is
+  far too specific to live in a generic runtime, so it surfaces exactly once, in the `steer` the
+  Talent authors.
+- **The runtime owns only the *envelope*.** It supplies who to notify and which channel (config), and
+  it runs the agent turn. It **relays the steer verbatim and understands nothing of its content** —
+  a dumb, universal relay. That is why `steer` rides on the outcome rather than being composed
+  runtime-side.
+
 The runtime forwards **just the `steer`** to the agent (`deps.ask(agent, notify, steer)`). It is
-**instructions, not a finished message** — *report, don't speak*. For the Plaud Talent:
+**instructions, not a finished message** — *report, don't speak*. For the Plaud Talent the Talent's
+code assembles:
 
 > *"A recording has just finished processing and is filed in the second brain at `<path>`: "&lt;title&gt;".
 > Write a short message telling them it is ready and giving the three most useful things from it, in
 > your own words, then offer to answer questions about it. The three: (1)… (2)… (3)…"*
 
 So the agent receives the second-brain **path**, the **title**, and the **top-3 highlights**, then
-independently **reads the filed page** to write its message with full context. Every Talent's steer
-will differ; the seam is the same — outcome to the runtime, `steer` to the agent, agent reads the
-artifact and speaks.
+independently **reads the filed page** and **rewords it in its own voice**. Every Talent's steer will
+differ — that is the point; the seam stays the same: the Talent authors the instruction into the
+outcome, the runtime relays it, the agent reads the artifact and speaks.
 
 > **Known nits (design-neutral):** the steer inlines the top-3 highlights *and* the agent re-reads the
-> page (mild redundancy — the inline set is a fallback if the read fails); and `outcome.summary` is
-> currently unused by the runtime. Neither changes the contract.
+> page (mild redundancy — the inline set is a fallback if the read fails); and `summary` is authored
+> but **not yet written to the record** it names (returned and dropped) — wire it into `talent_run`
+> or drop the field. Neither changes the contract.
 
 ---
 
