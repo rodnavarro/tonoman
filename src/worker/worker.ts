@@ -50,7 +50,8 @@ import { promises as fsp } from "node:fs";
 import { defaultHarnesses } from "../gateway";
 import { accountsFromUsers, makeActivities, type TurnRunReq, type VoiceConfig } from "./activities";
 import { startCapabilityPlane, type CapabilityPlane } from "./capability-plane";
-import { conversationWorkflow, messageSignal, plaudPollWorkflow, type Inbound, type PollInput } from "./workflows";
+import { conversationWorkflow, messageSignal, plaudPollWorkflow, runTalentWorkflow, type Inbound, type PollInput } from "./workflows";
+import { WorkflowExecutionAlreadyStartedError } from "@temporalio/common";
 import { planReload } from "./reload";
 
 export interface WorkerOptions {
@@ -1015,6 +1016,27 @@ export async function run(
         status: c.status,
         externalAccount: c.external_account,
       })),
+    // On-demand: start the SAME per-item workflow the poll starts, so an on-demand run and a
+    // scheduled one dedup against each other (the deterministic id). AlreadyStarted is the normal
+    // answer for an item in flight or already done — reported, not an error.
+    runTalent: async (name, talent, item, user) => {
+      const tdef = getTalent(talent);
+      if (!tdef) return { started: false, message: `I don't run a Talent called "${talent}".` };
+      const wfId = user ? `talent:${name}:${user}:${item}` : `talent:${name}:${item}`;
+      try {
+        await client.workflow.start(runTalentWorkflow, {
+          workflowId: wfId,
+          taskQueue: o.taskQueue,
+          args: [{ agent: name, talent, itemKey: item, version: tdef.version, notify: user ?? "", user }],
+        });
+        return { started: true, message: `Running *${talent}* on \`${item}\` now — I'll post the recap when it's done.` };
+      } catch (e) {
+        if (e instanceof WorkflowExecutionAlreadyStartedError) {
+          return { started: false, message: `\`${item}\` is already being processed (or was already done).` };
+        }
+        throw e;
+      }
+    },
     getMode: modeFor,
     setMode: (conversation, mode) => statusModes.set(conversation, mode),
     lastUsage: (conversation) => lastUsage.get(conversation),
@@ -1654,7 +1676,21 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
       return;
     }
     const scheduleId = voiceScheduleId(name);
-    const every: Duration = `${v.pollSeconds ?? 300} seconds`;
+    // Cadence is configuration: a positive interval polls every N seconds; zero (or less) means OFF
+    // — the Talent runs ON DEMAND only (invoked like a tool), with no schedule at all. Removing any
+    // existing schedule makes "set the cadence to 0" actually stop the polling rather than leave a
+    // stale one running.
+    const secs = v.pollSeconds ?? 300;
+    if (secs <= 0) {
+      try {
+        await client.schedule.getHandle(scheduleId).delete();
+        console.log(`worker: ${name} voice poll disabled (cadence 0) — on-demand only`);
+      } catch {
+        /* no schedule to remove, which is the normal case when it was never scheduled */
+      }
+      return;
+    }
+    const every: Duration = `${secs} seconds`;
     const action = {
       type: "startWorkflow" as const,
       workflowType: plaudPollWorkflow,

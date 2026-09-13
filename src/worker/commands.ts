@@ -153,6 +153,10 @@ export interface ConnectionLine {
 export interface CommandDeps {
   /** What this agent is connected to. Absent on a deployment with no registry behind it. */
   connections?(agent: string): Promise<ConnectionLine[]>;
+  /** Run a Talent on ONE item now, out of band from its schedule — the on-demand, tool-like trigger.
+   *  Shares the poll's per-item workflow id, so an on-demand run and a scheduled one never
+   *  double-process the same item. Absent on a deployment with no Talent runtime behind it. */
+  runTalent?(agent: string, talent: string, item: string, user?: string): Promise<{ started: boolean; message: string }>;
   /** Start a three-legged login and return the URL to put in front of the person, or a problem to
    *  show them. The registry owns the flow — it holds the client secret and the pending state; the
    *  worker only carries the answer into the channel. */
@@ -220,6 +224,7 @@ const HELP = [
   "• `!disconnect plaud` — forget it again",
   "• `!disconnect claude` — sign out of the Claude subscription I answer on",
   "• `!connections` — what this agent is connected to",
+  "• `!talent <name> <id>` — run a Talent on one item now, instead of waiting for its schedule",
   "• `!new` — forget this thread and start over",
   "• `!help` — this",
 ].join("\n");
@@ -482,6 +487,19 @@ export async function run(
         return `• *${name}* (\`${c.kind}/${c.alias}\`)${who}${bad}`;
       });
       return [`*Connected* — ${list.length} thing${list.length === 1 ? "" : "s"}:`, ...lines].join("\n");
+    }
+
+    // On-demand, like a tool: `!talent meeting-recap <recording-id>` runs the Talent on that one
+    // item now. The same Talent a schedule polls, invoked by hand — a Talent is triggered by
+    // schedule, on demand, or both.
+    case "talent": {
+      if (!deps.runTalent) return "This deployment can't run a Talent on demand.";
+      const parts = (cmd.arg ?? "").trim().split(/\s+/).filter(Boolean);
+      const [name, ...rest] = parts;
+      const item = rest.join(" ");
+      if (!name || !item) return "Usage: `!talent <name> <recording-id>` — runs a Talent on one item now.";
+      const r = await deps.runTalent(agent, name, item, user);
+      return r.message;
     }
 
     default: {
