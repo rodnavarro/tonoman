@@ -96,11 +96,12 @@ export const run: TalentRun = async (ctx) => {
   if (!text.trim()) return { status: 'skipped', reason: 'no speech' };
 
   ctx.progress('summarising');
-  const recap = await ctx.cap.infer<{ title: string; body: string; route: string }>({
-    prompt: 'recap-vs-mission',
-    vars: { transcript: text },
-    schema: 'Recap',
+  // You own the prompt and the parse; the runtime runs it on the agent's own provider.
+  const { text: json } = await ctx.cap.infer({
+    system: 'Summarise this meeting as STRICT JSON: {"title","body","route"}.',
+    user: `Transcript:\n${text}`,
   });
+  const recap = JSON.parse(json) as { title: string; body: string; route: string };
 
   ctx.progress('filing');
   const filed = await ctx.cap.publish({ route: recap.route, title: recap.title, body: recap.body });
@@ -138,10 +139,13 @@ The engine (groq, a Cloud-hosted local GPU) and its fallback order are the **ten
 chain, resolved below you — you get `{ text, seconds, by }`. Call `onProgress(done, total)` for long,
 chunked audio so the run's heartbeat stays alive.
 
-### `ctx.cap.infer({ prompt, vars?, schema? })`
-Runs an inference against the tenant's model. `vars` are interpolated into the prompt (transcript,
-mission, candidates); `schema` names the output shape Tonoman validates against. Model choice, token
-budget and billing are Tonoman's.
+### `ctx.cap.infer({ system, user })`
+Runs an inference **on the agent's own inference provider** — the Claude Code harness (its
+subscription), the same brain that answers the agent's messages — not a side model with its own key.
+A recap is the agent *thinking* about the meeting, so it runs on the agent's plan. You own the prompt
+(`system` + `user`) and parse the returned `text`; the runtime owns which provider, the budget and
+the billing. The provider is `claude-code` today; `codex` and an OpenAI subscription plug in at one
+dispatch point later, and your Talent never changes — it just calls `ctx.cap.infer`.
 
 ### `ctx.cap.publish({ route, title, body, meta? })`
 Files an artifact in the tenant's git-backed second brain and returns `{ published, path, url? }`. The
@@ -197,19 +201,31 @@ runCli(manifest, run);   // reads env + stdin, builds ctx, calls run(), writes t
 
 ---
 
-## 7. Running it
+## 7. How a Talent is triggered
 
-**In Tonoman** _(landing — increment 6)_: the agent is granted the Talent in the Hub; the worker's
-poll schedules one run per new item and spawns your CLI with the environment above. You do nothing
-per-run.
+A Talent runs on a **schedule**, **on demand**, or both — the install decides:
 
-**Locally** _(landing — dev harness)_: `tonoman talent dev <path> --item <id>` stands up the
-capability endpoints against *your own* keys and runs your CLI exactly as Tonoman would — the
-dev/prod-parity claim, so "works on my laptop" means "works in Tonoman."
+- **Scheduled.** A cadence config (`poll_seconds`) wakes the Talent every N seconds to look for new
+  items. Set it to **0** to turn the schedule **off** entirely — the Talent then runs on demand only.
+- **On demand, like a tool.** `!talent <name> <item>` (in the agent's channel) runs the Talent on one
+  item immediately, out of band from any schedule. Scheduled and on-demand runs share one per-item
+  workflow id, so the same item is never processed twice.
+
+## 8. Running it
+
+**In Tonoman**: the agent is granted the Talent in the Hub; the worker spawns your CLI (scheduled or
+on demand) with the environment above. You do nothing per-run. The agent's Claude CLI is already
+authenticated there — which is exactly why `ctx.cap.infer` can run on its subscription.
+
+**Locally** _(dev harness, landing)_: your Talent runs against the capability endpoints with your
+*own* keys — and crucially, **your `claude` CLI must already be logged in**, because `infer` is a
+cross-call to that same CLI (the agent's inference provider). That is the one setup step; it mirrors
+the authenticated-harness state Tonoman's `runTalent` assumes. "Works on my laptop" then means "works
+in Tonoman."
 
 ---
 
-## 8. Checklist for a new Talent
+## 9. Checklist for a new Talent
 
 1. Create `src/talents/<group>/<name>/` with `manifest.ts`, `run.ts`, `index.ts`.
 2. Declare `requires` (raw credentials), `capabilities` (mediated), and `configSchema`.

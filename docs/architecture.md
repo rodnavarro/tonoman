@@ -749,10 +749,14 @@ runtime keep control while the Talent stays self-contained:
 1. **Credentials** — raw, the Talent uses them directly (Plaud: the env hands over the token, the
    Talent calls Plaud itself; groq is the same shape — a pluggable third party).
 2. **Capabilities** — runtime-*mediated* endpoints the Talent calls through a provided
-   `TONOMAN_CAPABILITY_URL` + token: `transcribe`, `infer`, `publish`. Mediated on purpose, so
-   **local-gpu routing, inference metering, and the git-backed second brain (A3/second-brain) stay
-   the runtime's**, never baked into the Talent — the concrete form of "local-gpu is inference you
-   access *via* Tonoman Cloud."
+   `TONOMAN_CAPABILITY_URL` + token: `transcribe`, `infer`, `publish`. `transcribe` routes audio over
+   the tenant's provider chain (groq / local-gpu); `publish` writes the git-backed second brain
+   (A3) — provider routing and the brain stay the runtime's, never baked into the Talent. **`infer`
+   is deliberately different: it runs on the AGENT'S OWN inference provider — the Claude Code harness
+   (its subscription), via a headless captured turn — not a side model with its own key.** A recap is
+   the agent thinking about the meeting, on the same brain it answers with. The dispatch is the one
+   place a second provider (codex, an OpenAI subscription) plugs in; the Talent only calls
+   `ctx.cap.infer`. (So recaps consume the agent's plan, not a separate quota — intended.)
 
 Shape of the contract: **env** carries resolved credentials + the capability URL + config; **stdin**
 carries the item to work (a recording id) + config; **stdout** carries a structured **outcome +
