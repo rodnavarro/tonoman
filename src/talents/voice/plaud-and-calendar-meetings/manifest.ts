@@ -19,10 +19,16 @@ import type { TalentManifest } from '../../../talent-sdk';
 // `version`, reported to the Cloud catalogue by worker-boot registration.
 export const manifest: TalentManifest = {
   name: 'meeting-recap',
-  version: 1,
+  version: 2,
   description:
     'Transcribe a recording, summarise it against the tenant mission, file it in the second brain and report it.',
   requires: [{ kind: 'plaud' }, { kind: 'calendar', optional: true }],
   capabilities: ['transcribe', 'infer', 'publish'],
-  configSchema: [{ key: 'output_channel', type: 'channel', label: 'Where recaps are announced' }],
+  configSchema: [
+    { key: 'output_channel', type: 'channel', label: 'Where recaps are announced' },
+    // Reply-in-thread mode; the channel decision and the watching are the worker's (the runtime owns
+    // the connector), so this field is a runtime hint, not something the CLI acts on. Kept in step
+    // with the worker manifest — the registered one — so the two never disagree on the schema.
+    { key: 'reply_in_thread', type: 'toggle', label: 'Answer questions in-thread in the output channel' },
+  ],
 };

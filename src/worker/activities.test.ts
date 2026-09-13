@@ -14,7 +14,7 @@ function depsWithVoice(v: Partial<VoiceConfig> | undefined): TurnDeps {
 describe("voicePlan — which Talent the poll runs", () => {
   it("falls back to the built-in Plaud Talent when the agent has no voice config at all", async () => {
     const acts = makeActivities(depsWithVoice(undefined));
-    expect(await acts.voicePlan({ agent: "nelly" })).toEqual({ talent: { name: "meeting-recap", version: 1 } });
+    expect(await acts.voicePlan({ agent: "nelly" })).toEqual({ talent: { name: "meeting-recap", version: 2 } });
   });
 
   it("returns the installed Talent, pinned to its version, from the grant", async () => {

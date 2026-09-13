@@ -50,6 +50,15 @@ export interface SlackOptions {
    *  null/"" to post nothing. Wired after construction via `setSlashHandler`, once the worker has
    *  the dispatcher — the same reason `onInteraction` is. */
   onSlash?: (input: SlashInput) => Promise<string | null>;
+  /** The set of channel ids this agent WATCHES — Wave 6's reply-in-thread mode. In a watched
+   *  channel the gate admits a plain human message (no @mention needed) and every reply lands
+   *  in-thread. Called PER MESSAGE, never read once at construction: the watched set is derived from
+   *  the agent's live Talent config, which a rewire changes, and a set baked in at wire time would
+   *  answer to a channel the config had since dropped. Empty / undefined = today's behaviour exactly
+   *  (mentions and DMs only), which is every agent until one turns the toggle on — and even then,
+   *  the app needs `channels:history` + a `message.channels` subscription before Slack delivers a
+   *  channel message at all. */
+  watchedChannels?: () => Set<string>;
 }
 
 /** A slash command, normalized for the worker's `!` dispatcher. `text` is already the `!`-prefixed
@@ -404,11 +413,17 @@ export class SlackConnector implements Connector {
 
   /** Turns a Slack event into a neutral envelope, or null to ignore it.
    *
-   *  We answer exactly two things: an `app_mention` (someone said @nelly), and a `message` in a
-   *  DM. Everything else — channel chatter we were not addressed in, edits, joins, our own
-   *  posts — is dropped here rather than in the router. */
+   *  We answer three things: an `app_mention` (someone said @nelly), a `message` in a DM, and — when
+   *  Wave 6's reply-in-thread mode is on — a plain `message` in a WATCHED channel (the Talent's
+   *  output channel). Everything else — channel chatter we were not addressed in, edits, joins, our
+   *  own posts — is dropped here rather than in the router. */
   private async normalize(e: SlackEvent, teamID: string): Promise<Envelope | null> {
-    if (e.type !== "app_mention" && !(e.type === "message" && e.channel_type === "im")) return null;
+    // A watched channel is read live, per message, so a rewire that changes the config takes effect
+    // on the next message rather than at the next restart.
+    const watched = !!(e.channel && this.o.watchedChannels?.().has(e.channel));
+    const isDm = e.type === "message" && e.channel_type === "im";
+    const isWatchedMessage = e.type === "message" && watched;
+    if (e.type !== "app_mention" && !isDm && !isWatchedMessage) return null;
     // A subtype usually means it is not a plain human message: message_changed, message_deleted,
     // channel_join, bot_message — none of them something to answer. The ONE exception is
     // `file_share`: a person uploading a file (with an optional caption) is a real turn, and it is
@@ -450,11 +465,17 @@ export class SlackConnector implements Connector {
       console.log(`slack: accepted ${e.type} ts=${ts} chan=${e.channel} user=${e.user}`);
     }
 
+    // In a watched channel, a message that is NOT already in a thread roots its own: `thread_ts ?? ts`
+    // makes the reply land under the message it answers, so every recap and its follow-ups stay
+    // together instead of piling up at channel top-level. A mention or DM keeps today's behaviour —
+    // `thread_ts` only — so a top-level @mention still answers top-level.
+    const rootTs = watched ? (e.thread_ts ?? e.ts) : e.thread_ts;
+
     return {
       channel: this.name(),
       // The conversation key, and the thing the durable half turns into a workflow id. Thread
       // is part of the identity: two threads in one channel are two conversations.
-      conversation: conversationKey(teamID, e.channel, e.thread_ts),
+      conversation: conversationKey(teamID, e.channel, rootTs),
       user: e.user,
       text: stripMention(e.text ?? ""),
       // Files attached to the message, downloaded so the turn can read them. Empty for an ordinary

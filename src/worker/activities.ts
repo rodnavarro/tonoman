@@ -50,6 +50,11 @@ export interface TurnDeps {
   talentRun?: {
     open(agent: string, talent: string, itemKey: string, version: number): Promise<void>;
     close(agent: string, talent: string, itemKey: string, status: "done" | "failed", error?: string): Promise<void>;
+    /** The durable status of one item, for the recording-level idempotency guard: a prior `done`
+     *  lets a re-run skip the transcription + inference it would otherwise re-pay. Best-effort like
+     *  the rest — it returns `undefined` on any read failure so the guard fails OPEN (the run
+     *  proceeds), never blocking a genuinely-new recording because the registry blinked. */
+    status?(agent: string, talent: string, itemKey: string): Promise<"running" | "done" | "failed" | undefined>;
   };
   /** Run text as a turn addressed to a person. */
   ask?(agent: string, user: string, text: string): Promise<void>;
@@ -622,6 +627,18 @@ export function makeActivities(deps: TurnDeps) {
       error?: string;
     }): Promise<void> {
       await deps.talentRun?.close(input.agent, input.talent, input.itemKey, input.status, input.error);
+    },
+
+    /** The recording-level idempotency guard, read before a run spends anything. Returns the durable
+     *  status of this (agent, talent, item), or `undefined` when there is no record OR the read
+     *  failed — the workflow treats both the same (go ahead), so a registry blip can only ever let a
+     *  done item be re-run, never block a new one. */
+    async talentRunStatus(input: {
+      agent: string;
+      talent: string;
+      itemKey: string;
+    }): Promise<"running" | "done" | "failed" | undefined> {
+      return (await deps.talentRun?.status?.(input.agent, input.talent, input.itemKey)) ?? undefined;
     },
 
     /** Say something verbatim to a person, opening a DM if needed. Used for the acknowledgement and

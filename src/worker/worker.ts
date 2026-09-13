@@ -339,6 +339,14 @@ function runClosure(runner: TurnRunner, cfg: AgentConfig): Wired["run"] {
     );
 }
 
+/** Channels each agent WATCHES for Wave 6's reply-in-thread mode, keyed by agent name. Module-level
+ *  because the connector (built in `wireOne`) and the voice wiring (`wireVoice`, which knows the
+ *  Talent config) live in different scopes but must share one source of truth. The connector reads
+ *  it PER MESSAGE, and `wireVoice` rewrites it on every (re)wire, so turning the toggle on or off,
+ *  or moving the output channel, takes effect on the next message without a restart. Empty for every
+ *  agent until one enables the toggle — which is every agent today. */
+const voiceWatch = new Map<string, Set<string>>();
+
 /** Build the connector + runner for ONE agent, or return null with a logged reason. Shared by the
  *  boot wiring and by live reload (which wires a newly-added or structurally-changed agent), so the
  *  skip rules — channel, tokens, harness — are decided in exactly one place. The `only` filter is
@@ -366,6 +374,8 @@ function wireOne(a: AgentConfig, harnesses: ReturnType<typeof defaultHarnesses>)
     allowedUsers: a.slack?.allowed_users,
     mediaDir,
     mediaMount: mediaDir,
+    // Read live per message: `wireVoice` keeps this set in step with the agent's Talent config.
+    watchedChannels: () => voiceWatch.get(a.name) ?? new Set<string>(),
   });
 
   const runner = newRunnerFor(a, harnesses);
@@ -756,12 +766,34 @@ export async function run(
     const voiceSkill = voiceGrant
       ? { name: voiceGrant.name, version: getTalent(voiceGrant.name)?.version ?? voiceGrant.version }
       : undefined;
+    // Wave 4: the output channel is now a Talent CONFIG value (`output_channel`, a Slack channel id),
+    // set per-agent in the Hub and carried on the roster grant. It takes precedence over the legacy
+    // `voice.notify_channel` flow property, which stays as the fallback so an agent whose Talent
+    // config is unset behaves exactly as before. A blank config value is not a value — it falls
+    // through rather than silently sending recaps nowhere.
+    const configChannel =
+      typeof voiceGrant?.config?.output_channel === "string" ? voiceGrant.config.output_channel.trim() : "";
+    if (configChannel)
+      console.log(`worker: ${name} voice output channel from Talent config: ${configChannel}`);
+
+    // Wave 6: watch the output channel for reply-in-thread mode when the Talent config turns it on.
+    // Rewritten on every (re)wire so a toggle or a channel move is picked up without a restart; the
+    // connector reads `voiceWatch` per message. The resolved channel is the same one recaps land in
+    // (config first, legacy flow property as fallback) — you answer questions where you posted.
+    const replyInThread = voiceGrant?.config?.reply_in_thread === true;
+    const watchChannel = configChannel || voice.notifyChannel || "";
+    if (replyInThread && watchChannel) {
+      voiceWatch.set(name, new Set([watchChannel]));
+      console.log(`worker: ${name} watching ${watchChannel} for in-thread replies`);
+    } else {
+      voiceWatch.delete(name);
+    }
     // Per-person: one account per member who connected, each reading from their own login and
     // floored at their own connect time. Empty on the shared path, where `creds` below is the one
     // account and `accountsOf` collapses to it — so a shared tenant is byte-identical.
     const accounts = perPerson ? accountsFromUsers(name, members, floorMs) : undefined;
     voiceCreds.set(name, {
-      notifyChannel: voice.notifyChannel || undefined,
+      notifyChannel: configChannel || voice.notifyChannel || undefined,
       notifyUser: voice.notifyUser || undefined,
       journal: voice.journal,
       pollSeconds: voice.pollSeconds,
@@ -957,6 +989,29 @@ export async function run(
           console.error(`worker: ${name} talent_run close ${talentName}/${itemKey} failed: ${String(e)}`);
         }
       },
+      status: async (name: string, talentName: string, itemKey: string) => {
+        const baseUrl = process.env.TONOMANCLOUD_API_URL;
+        const guid = wired.get(name)?.cfg.guid;
+        if (!baseUrl || !guid) return undefined; // a file roster has no registry to ask
+        try {
+          const qs = `talent=${encodeURIComponent(talentName)}&itemKey=${encodeURIComponent(itemKey)}`;
+          const r = await fetch(`${baseUrl}/v1/system/agents/${guid}/talent-runs?${qs}`, {
+            headers: { authorization: `Bearer ${process.env.TONOMANCLOUD_API_TOKEN ?? ""}` },
+          });
+          if (!r.ok) {
+            // 404 (no such agent/talent) and every other non-OK read FAIL OPEN: the guard's only job
+            // is to skip an item that is already done, so "can't tell" must mean "go ahead".
+            return undefined;
+          }
+          const body = (await r.json()) as { status?: string | null };
+          return body.status === "running" || body.status === "done" || body.status === "failed"
+            ? body.status
+            : undefined;
+        } catch (e) {
+          console.error(`worker: ${name} talent_run status ${talentName}/${itemKey} failed: ${String(e)}`);
+          return undefined;
+        }
+      },
     },
   };
 
@@ -1024,7 +1079,7 @@ export async function run(
     // On-demand: start the SAME per-item workflow the poll starts, so an on-demand run and a
     // scheduled one dedup against each other (the deterministic id). AlreadyStarted is the normal
     // answer for an item in flight or already done — reported, not an error.
-    runTalent: async (name, talent, item, user) => {
+    runTalent: async (name, talent, item, user, force) => {
       const tdef = getTalent(talent);
       if (!tdef) return { started: false, message: `I don't run a Talent called "${talent}".` };
       const wfId = user ? `talent:${name}:${user}:${item}` : `talent:${name}:${item}`;
@@ -1032,9 +1087,14 @@ export async function run(
         await client.workflow.start(runTalentWorkflow, {
           workflowId: wfId,
           taskQueue: o.taskQueue,
-          args: [{ agent: name, talent, itemKey: item, version: tdef.version, notify: user ?? "", user }],
+          args: [{ agent: name, talent, itemKey: item, version: tdef.version, notify: user ?? "", user, force }],
         });
-        return { started: true, message: `Running *${talent}* on \`${item}\` now — I'll post the recap when it's done.` };
+        return {
+          started: true,
+          message: force
+            ? `Re-running *${talent}* on \`${item}\` now — a fresh recap, even though it was already filed.`
+            : `Running *${talent}* on \`${item}\` now — I'll post the recap when it's done.`,
+        };
       } catch (e) {
         if (e instanceof WorkflowExecutionAlreadyStartedError) {
           return { started: false, message: `\`${item}\` is already being processed (or was already done).` };

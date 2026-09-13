@@ -462,3 +462,32 @@ describe("run — !model normalises the marketing name", () => {
     expect(setModel).toHaveBeenCalledWith("sapien", "t", "claude-opus-4-8");
   });
 });
+
+describe("!talent — on-demand run, with `again` to bypass the idempotency guard", () => {
+  it("runs a Talent on one item, force off by default", async () => {
+    const runTalent = vi.fn(async () => ({ started: true, message: "Running." }));
+    await run(deps({ runTalent }), "sapien", "c", { name: "talent", arg: "meeting-recap REC123" }, "U7");
+    expect(runTalent).toHaveBeenCalledWith("sapien", "meeting-recap", "REC123", "U7", false);
+  });
+
+  it("reads a trailing `again` as force, without swallowing it into the recording id", async () => {
+    const runTalent = vi.fn(async () => ({ started: true, message: "Re-running." }));
+    await run(deps({ runTalent }), "sapien", "c", { name: "talent", arg: "meeting-recap REC123 again" }, "U7");
+    expect(runTalent).toHaveBeenCalledWith("sapien", "meeting-recap", "REC123", "U7", true);
+  });
+
+  it("accepts `force` and `--force` as the same bypass", async () => {
+    const runTalent = vi.fn(async () => ({ started: true, message: "ok" }));
+    await run(deps({ runTalent }), "sapien", "c", { name: "talent", arg: "meeting-recap REC9 force" }, "U7");
+    expect(runTalent).toHaveBeenLastCalledWith("sapien", "meeting-recap", "REC9", "U7", true);
+    await run(deps({ runTalent }), "sapien", "c", { name: "talent", arg: "meeting-recap REC9 --force" }, "U7");
+    expect(runTalent).toHaveBeenLastCalledWith("sapien", "meeting-recap", "REC9", "U7", true);
+  });
+
+  it("still needs a name and an id", async () => {
+    const runTalent = vi.fn(async () => ({ started: true, message: "ok" }));
+    const out = await run(deps({ runTalent }), "sapien", "c", { name: "talent", arg: "meeting-recap" }, "U7");
+    expect(out).toContain("Usage:");
+    expect(runTalent).not.toHaveBeenCalled();
+  });
+});

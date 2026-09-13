@@ -156,7 +156,7 @@ export interface CommandDeps {
   /** Run a Talent on ONE item now, out of band from its schedule — the on-demand, tool-like trigger.
    *  Shares the poll's per-item workflow id, so an on-demand run and a scheduled one never
    *  double-process the same item. Absent on a deployment with no Talent runtime behind it. */
-  runTalent?(agent: string, talent: string, item: string, user?: string): Promise<{ started: boolean; message: string }>;
+  runTalent?(agent: string, talent: string, item: string, user?: string, force?: boolean): Promise<{ started: boolean; message: string }>;
   /** Start a three-legged login and return the URL to put in front of the person, or a problem to
    *  show them. The registry owns the flow — it holds the client secret and the pending state; the
    *  worker only carries the answer into the channel. */
@@ -224,7 +224,7 @@ const HELP = [
   "• `!disconnect plaud` — forget it again",
   "• `!disconnect claude` — sign out of the Claude subscription I answer on",
   "• `!connections` — what this agent is connected to",
-  "• `!talent <name> <id>` — run a Talent on one item now, instead of waiting for its schedule",
+  "• `!talent <name> <id> [again]` — run a Talent on one item now, instead of waiting for its schedule (`again` re-runs an already-filed item)",
   "• `!new` — forget this thread and start over",
   "• `!help` — this",
 ].join("\n");
@@ -495,10 +495,16 @@ export async function run(
     case "talent": {
       if (!deps.runTalent) return "This deployment can't run a Talent on demand.";
       const parts = (cmd.arg ?? "").trim().split(/\s+/).filter(Boolean);
-      const [name, ...rest] = parts;
+      // A trailing `again` (or `force`) re-runs an item already filed — bypassing the idempotency
+      // guard that otherwise makes "run this again" a no-op. It is the last word, so it never
+      // collides with a recording id (ids carry no spaces).
+      const force = /^(again|force|--force)$/i.test(parts[parts.length - 1] ?? "");
+      const tokens = force ? parts.slice(0, -1) : parts;
+      const [name, ...rest] = tokens;
       const item = rest.join(" ");
-      if (!name || !item) return "Usage: `!talent <name> <recording-id>` — runs a Talent on one item now.";
-      const r = await deps.runTalent(agent, name, item, user);
+      if (!name || !item)
+        return "Usage: `!talent <name> <recording-id> [again]` — runs a Talent on one item now; `again` re-runs an already-filed item.";
+      const r = await deps.runTalent(agent, name, item, user, force);
       return r.message;
     }
 

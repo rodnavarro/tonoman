@@ -157,8 +157,16 @@ export async function conversationWorkflow(input: ConversationInput): Promise<vo
 
 // --- the voice flow -----------------------------------------------------------------------------
 
-const { voicePlan, findNewRecordings, processRecording, runTalent, sayVerbatim, openTalentRun, closeTalentRun } =
-  proxyActivities<Activities>({
+const {
+  voicePlan,
+  findNewRecordings,
+  processRecording,
+  runTalent,
+  sayVerbatim,
+  openTalentRun,
+  closeTalentRun,
+  talentRunStatus,
+} = proxyActivities<Activities>({
   // Listing is a cheap HTTP call; processing downloads audio and runs two models. openTalentRun /
   // closeTalentRun are quick DB writes that ride the same block — the timeout is a ceiling, not a cost.
   startToCloseTimeout: "15 minutes",
@@ -324,6 +332,10 @@ export interface RunTalentInput {
   /** The member whose Plaud account this recording came from, when the poll fanned out per-person;
    *  undefined for the shared account. Threaded into `processRecording`, which attributes it. */
   user?: string;
+  /** Bypass the recording-level idempotency guard and re-run an already-`done` item. The poll never
+   *  sets this (a filed recording should stay filed); the on-demand `!talent <name> <id> again`
+   *  does, for the deliberate "recap that one again" — a fresh run, a fresh announcement. */
+  force?: boolean;
 }
 
 /**
@@ -336,6 +348,20 @@ export interface RunTalentInput {
  * nothing could answer before (the 611-attempts lesson).
  */
 export async function runTalentWorkflow(input: RunTalentInput): Promise<void> {
+  // Recording-level idempotency guard. A prior `done` means this item is already filed, so a re-run
+  // would re-pay transcription + inference only to have the CLI's publish step discard it as already
+  // present — the same work, the same cost, for nothing. The workflowId dedup above only catches a
+  // run still IN FLIGHT; this catches one that already FINISHED (a re-tick after retention, or an
+  // on-demand re-ask). `force` is the deliberate "recap it again". The read fails OPEN (returns
+  // undefined on any error), so this can only skip a genuinely-done item, never block a new one.
+  if (!input.force) {
+    const prior = await talentRunStatus({ agent: input.agent, talent: input.talent, itemKey: input.itemKey });
+    if (prior === "done") {
+      console.log(`recap: ${input.agent} — “${input.itemKey}” already filed (talent_run done); skipping re-run`);
+      return;
+    }
+  }
+
   // The durable record whose absence produced 611 attempts for 4 published recaps. Opened BEFORE the
   // run, so "being worked on" is a state that exists at all — which it never was. Best-effort inside
   // the activity: a missing row never stops a recording.
