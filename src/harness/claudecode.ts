@@ -139,6 +139,15 @@ export function localEnv(
   return env;
 }
 
+/** Every built-in Claude Code tool, disallowed for a LEAN inference turn so a recap is a pure
+ *  completion — no tool is offered and no tool schema sits in the context. Connectors/MCP are a
+ *  separate axis, already excluded by `--strict-mcp-config`. Kept deliberately broad: a tool that
+ *  does not exist is a harmless no-op in `--disallowedTools`, an extra one that slips through is not. */
+const LEAN_DISALLOWED = [
+  "Bash", "BashOutput", "KillShell", "Read", "Write", "Edit", "MultiEdit", "NotebookEdit",
+  "NotebookRead", "Glob", "Grep", "LS", "WebFetch", "WebSearch", "Task", "TodoWrite", "ExitPlanMode",
+];
+
 export class Runner implements TurnRunner {
   // The model is mutable so `/model` can switch it (gw-command-model). podmanArgs reads
   // it per turn, so a change takes effect on the NEXT turn — a turn already spawned keeps
@@ -197,8 +206,11 @@ export class Runner implements TurnRunner {
       ...(this.o.allowAmbientMcp ? [] : ["--strict-mcp-config"]),
     ];
     // Drop tools this agent never uses, so their schemas leave the context floor (claude-code-only).
-    if (this.o.disallowedTools && this.o.disallowedTools.length) {
-      args.push("--disallowedTools", this.o.disallowedTools.join(","));
+    // A LEAN turn (Talent `infer`) disallows EVERY built-in — the agent reasons on its subscription
+    // and nothing else, and no tool schema sits in context. Connectors are already out (strict-mcp).
+    const disallowed = req.lean ? LEAN_DISALLOWED : (this.o.disallowedTools ?? []);
+    if (disallowed.length) {
+      args.push("--disallowedTools", disallowed.join(","));
     }
     if (req.systemPromptFile) args.push("--append-system-prompt-file", req.systemPromptFile);
     // Per-TURN model first, then the process-wide knob. The knob is right for a single-agent
@@ -209,7 +221,9 @@ export class Runner implements TurnRunner {
     // can't loop unbounded and drain the account's usage window. Hitting the cap exits with an
     // error result (subtype "error_max_turns") — parseLine treats that as DONE so the partial
     // answer still lands rather than surfacing as a failure.
-    if (this.o.maxTurns && this.o.maxTurns > 0) args.push("--max-turns", String(this.o.maxTurns));
+    // A lean inference turn is ONE turn — a completion, not an agentic loop.
+    const maxTurns = req.lean ? 1 : this.o.maxTurns ?? 0;
+    if (maxTurns > 0) args.push("--max-turns", String(maxTurns));
     // Session mode (opt-in, session-persist agents): resume the harness's OWN session so the
     // conversation history is cached across turns instead of re-sent on stdin every turn — only
     // the new message rides in req.prompt. First turn CREATES it (--session-id); later turns

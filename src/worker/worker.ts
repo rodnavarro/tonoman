@@ -329,6 +329,7 @@ function runClosure(runner: TurnRunner, cfg: AgentConfig): Wired["run"] {
         mediaPaths: r.mediaPaths,
         sessionId: r.sessionId,
         sessionNew: r.sessionNew,
+        lean: r.lean,
         configHome:
           cfg.inference_mode === "per_user" && r.user
             ? claudecode.configHomeFor(cfg.name, r.user)
@@ -894,7 +895,8 @@ export async function run(
       const a = wired.get(name);
       if (!a) throw new Error(`infer: ${name} is not a wired agent`);
       let out = "";
-      for await (const ev of a.run({ prompt: `${p.system}\n\n${p.user}` })) {
+      // lean: no tools, no connectors, one turn — a completion, not an agent session.
+      for await (const ev of a.run({ prompt: `${p.system}\n\n${p.user}`, lean: true })) {
         // The COMPLETE reply rides the `done` event's `final` (the agent's full answer for memory +
         // render); `text` is only the streaming delta and `err` carries an error — reading `text`
         // here is why the first cut saw "no text" while the model had plainly answered.

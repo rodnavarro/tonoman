@@ -31,6 +31,17 @@ describe("claudecode Runner.podmanArgs — model knob is per-turn (gw-command-mo
     expect(new Runner({ container: "cody", disallowedTools: [] }).podmanArgs(req)).not.toContain("--disallowedTools");
   });
 
+  it("a LEAN turn disallows every tool and caps to one turn, overriding the runner's own knobs", () => {
+    // Inference only: the agent reasons on its subscription and nothing else.
+    const r = new Runner({ container: "cody", disallowedTools: ["Task"], maxTurns: 10 });
+    const dis = flagValue(r.podmanArgs({ prompt: "hi", lean: true }), "--disallowedTools") ?? "";
+    for (const t of ["Bash", "Read", "Write", "WebSearch", "Task", "Glob"]) expect(dis).toContain(t);
+    expect(flagValue(r.podmanArgs({ prompt: "hi", lean: true }), "--max-turns")).toBe("1");
+    // A non-lean turn is unchanged — the runner's own disallow list and cap still apply.
+    expect(flagValue(r.podmanArgs({ prompt: "hi" }), "--disallowedTools")).toBe("Task");
+    expect(flagValue(r.podmanArgs({ prompt: "hi" }), "--max-turns")).toBe("10");
+  });
+
   it("emits --max-turns N to cap the agentic loop; omits it when uncapped (0/undefined)", () => {
     expect(flagValue(new Runner({ container: "cody", maxTurns: 10 }).podmanArgs(req), "--max-turns")).toBe("10");
     expect(new Runner({ container: "cody" }).podmanArgs(req)).not.toContain("--max-turns");

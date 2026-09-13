@@ -267,6 +267,8 @@ export interface TurnRunReq {
   user?: string;
   /** Paths to attached files on the shared mount, passed through to the harness. */
   mediaPaths?: string[];
+  /** A lean inference turn — no tools, no connectors, one turn. Set by Talent `infer`. */
+  lean?: boolean;
 }
 
 export interface TurnInput {
