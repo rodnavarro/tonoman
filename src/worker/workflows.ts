@@ -157,7 +157,7 @@ export async function conversationWorkflow(input: ConversationInput): Promise<vo
 
 // --- the voice flow -----------------------------------------------------------------------------
 
-const { voicePlan, findNewRecordings, processRecording, sayVerbatim, openTalentRun, closeTalentRun } =
+const { voicePlan, findNewRecordings, processRecording, runTalent, sayVerbatim, openTalentRun, closeTalentRun } =
   proxyActivities<Activities>({
   // Listing is a cheap HTTP call; processing downloads audio and runs two models. openTalentRun /
   // closeTalentRun are quick DB writes that ride the same block — the timeout is a ceiling, not a cost.
@@ -342,7 +342,11 @@ export async function runTalentWorkflow(input: RunTalentInput): Promise<void> {
   await openTalentRun({ agent: input.agent, talent: input.talent, itemKey: input.itemKey, version: input.version });
 
   try {
-    await processRecording({ agent: input.agent, notify: input.notify ?? "", id: input.itemKey, user: input.user });
+    // CUT OVER to the self-contained Talent CLI (spawned via the capability plane). `processRecording`
+    // remains for a one-line revert: swap `runTalent` back to it and restart the worker. The announce
+    // is the Talent's steer, run as a real agent turn inside runTalent — same behaviour as before.
+    await runTalent({ agent: input.agent, notify: input.notify ?? "", item: input.itemKey, user: input.user, talent: input.talent });
+    void processRecording; // kept importable for the revert; see above
     await closeTalentRun({ agent: input.agent, talent: input.talent, itemKey: input.itemKey, status: "done" });
   } catch (e) {
     // Recorded, then rethrown. Temporal owns the retry; this record owns the ANSWER to "is this
