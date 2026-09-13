@@ -8,10 +8,12 @@ import { run } from './run';
 // cutover + a live recording; this is the fast, deterministic check of the logic that moved into the
 // Talent.
 
+// start_at as Plaud actually sends it: an ISO string, often without a timezone. A naive Number()
+// parse would file this at 1970 — the bug toMs exists to avoid.
 const okFile = {
   id: 'rec1',
   name: 'Q3 planning.m4a',
-  start_at: 1_757_700_000_000,
+  start_at: '2026-09-12T18:00:00.000000',
   duration: 2_580_000,
   presigned_url: 'https://plaud.test/audio/rec1',
 };
@@ -65,8 +67,17 @@ afterEach(() => vi.unstubAllGlobals());
 describe('the Plaud Talent run', () => {
   it('files a recording and reports a steer the agent announces (not a channel message)', async () => {
     mockPlaud();
-    const outcome = await run(ctx());
+    let publishedRec: { startTime?: number } | undefined;
+    const c = ctx({
+      publish: async (p) => {
+        publishedRec = p.rec as { startTime?: number };
+        return { published: true, path: 'Meetings/foley-meetings/rec1.md', route: 'foley-meetings' };
+      },
+    });
+    const outcome = await run(c);
     expect(outcome.status).toBe('done');
+    // The ISO start_at parsed to a real epoch (not 0/1970) — the bug toMs guards.
+    expect(publishedRec?.startTime).toBe(Date.parse('2026-09-12T18:00:00.000000Z'));
     // Reports, does not speak: the steer names where it landed and carries the three highlights for
     // the agent to phrase in its own words.
     expect(outcome.steer).toContain('Meetings/foley-meetings/rec1.md');

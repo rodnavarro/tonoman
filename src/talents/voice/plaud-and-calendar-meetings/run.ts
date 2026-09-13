@@ -48,9 +48,14 @@ interface PlaudRecording {
   audioUrl: string;
 }
 
-const toMs = (v: unknown): number => {
-  const n = Number(v) || 0;
-  return n > 1e12 ? n : n * 1000;
+// Plaud's `start_at` is an ISO STRING ("2026-09-07T03:10:46.379000"), often without a timezone;
+// `created_at`/number forms may be epoch seconds or ms. Parse both exactly as the runtime does — a
+// naive Number() on the ISO string yields NaN and files every recap at 1970.
+const toMs = (v: string | number | undefined): number => {
+  if (!v) return 0;
+  if (typeof v === 'number') return v > 1e11 ? v : v * 1000;
+  const t = Date.parse(/[Zz]|[+-]\d\d:?\d\d$/.test(v) ? v : `${v}Z`);
+  return Number.isFinite(t) ? t : 0;
 };
 
 /** `YYYY-MM-DD-HHMM` in UTC — the folder-per-recording name, stable so re-processing is a no-op. */
@@ -62,14 +67,15 @@ const stampFor = (startMs: number): string => {
 
 async function fetchRecording(access: PlaudAccess, id: string): Promise<PlaudRecording> {
   const res = await fetch(`${access.base}/open/third-party/files/${encodeURIComponent(id)}`, {
-    headers: { authorization: `Bearer ${access.token ?? ''}` },
+    headers: { authorization: `Bearer ${access.token ?? ''}`, accept: 'application/json' },
   });
+  if (res.status === 401 || res.status === 403) throw new Error('plaud: the connected account is no longer authorized');
   if (!res.ok) throw new Error(`plaud: file ${id} → ${res.status}`);
   const f = (await res.json()) as {
     id: string;
     name?: string;
-    start_at?: unknown;
-    created_at?: unknown;
+    start_at?: string | number;
+    created_at?: string | number;
     duration?: number;
     presigned_url?: string;
   };
