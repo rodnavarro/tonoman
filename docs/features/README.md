@@ -10,6 +10,12 @@ not every design gate does. The rest stay in the architecture map.
 
 | Feature | Doc | Architecture map |
 |---|---|---|
+| **Messaging gateway turn loop** — inbound message → streamed reply | [`gateway-turn-loop.md`](gateway-turn-loop.md) | §A1, §A4 |
+| **Claude Code harness & subscription auth** — the `claude -p` command + the OAuth credential store | [`auth-and-harness.md`](auth-and-harness.md) | §A2 |
+| **Git-backed memory** — the substrate-owned JSONL transcript + harness-session cache reuse | [`git-memory.md`](git-memory.md) | §A3 |
+| **Agent roster & reconcile-on-change** — the worker's whole view of an agent; reload diff | [`roster-and-reload.md`](roster-and-reload.md) | §A11 |
 | **Talents** — self-contained CLIs the runtime spawns | [`tonoman-talents.md`](tonoman-talents.md) | §A15 |
 
-_(More to come — the set of subsystems that get their own doc is being scoped; see the sprint notes.)_
+The remaining architecture sections (A5 tunnels, A6 long-lived agents, A7 web, A8 tunnels API, A9
+mounts, A10 commands, A12 observability, A13 podman runtime, A14 browser) are design gates and
+rationale without a distinct runtime sequence — they stay in the [map](../architecture.md).
