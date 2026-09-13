@@ -1575,6 +1575,10 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
         a.abort?.abort();
         await pauseVoiceSchedule(key, "agent left the roster").catch(() => {});
         wired.delete(key);
+        // Drop the Wave-6 watched-channel entry with the agent. Its connector is aborted above, so a
+        // stale key would never be read — but clearing it keeps the map exactly the set of live
+        // agents, and a re-add rebuilds it from the fresh config anyway.
+        voiceWatch.delete(key);
         console.log(`worker: reload — retired ${agentLabel(a.cfg)} (${key})`);
       }
 
@@ -1604,6 +1608,7 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
           const w = wireOne(cfg2, harnesses);
           if (!w) {
             wired.delete(d.key);
+            voiceWatch.delete(d.key); // agent no longer servable — drop its watched-channel entry too
             continue;
           }
           wired.set(d.key, w);
