@@ -895,8 +895,11 @@ export async function run(
       if (!a) throw new Error(`infer: ${name} is not a wired agent`);
       let out = "";
       for await (const ev of a.run({ prompt: `${p.system}\n\n${p.user}` })) {
-        if (ev.kind === "done" && ev.text) out = ev.text;
-        else if (ev.kind === "error") throw new Error(ev.text || "infer: the harness returned an error");
+        // The COMPLETE reply rides the `done` event's `final` (the agent's full answer for memory +
+        // render); `text` is only the streaming delta and `err` carries an error — reading `text`
+        // here is why the first cut saw "no text" while the model had plainly answered.
+        if (ev.kind === "done" && ev.final) out = ev.final;
+        else if (ev.kind === "error") throw ev.err ?? new Error("infer: the harness returned an error");
       }
       if (!out.trim()) throw new Error("infer: the harness returned no text");
       return out;
