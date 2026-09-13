@@ -89,7 +89,7 @@ sequenceDiagram
     Plane-->>Act: outcome
     alt status = done and steer present
         Act->>User: deps.ask(agent, notify, steer)
-        Note over Act,User: the runtime RELAYS the steer verbatim — it knows nothing of its<br/>content; it only supplies the envelope (who / which channel)
+        Note over Act,User: the runtime RELAYS the steer verbatim — it knows nothing of its<br/>content — it only supplies the envelope (who / which channel)
         Note over User,Inf: a REAL agent turn — reads the filed page from the second brain,<br/>rewords the steer in its own voice, posts it
     end
     Act-->>WF: { status }

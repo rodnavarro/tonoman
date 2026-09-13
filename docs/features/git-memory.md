@@ -33,7 +33,7 @@ sequenceDiagram
     else session_persist (harness holds history)
         R->>Mem: harnessSession(conv) → { id, isNew }
         Mem-->>R: a harness UUID (minted on first turn)
-        Note over R,Run: window read only when isNew; else just the new message rides in
+        Note over R,Run: window read only when isNew — else just the new message rides in
         R->>Run: run(req + sessionId)  %% --session-id (create) then --resume (reuse cache)
         R->>Mem: markHarnessSession(conv)  %% first turn only
     end
@@ -41,7 +41,7 @@ sequenceDiagram
     Note over R: skip the write on a hard cut (interrupt / reset)
     R->>Mem: append(conv, {user…}, {assistant…})  %% one JSON object per line
     R->>Mem: commit("turn: <conv> (<agent>)")
-    Note over Mem: git add -A → commit → push only if remote + token;<br/>BEST-EFFORT — any failure is logged, never thrown, so a bad<br/>workspace file cannot kill the turn. "nothing to commit" = success.
+    Note over Mem: git add -A → commit → push only if remote + token —<br/>BEST-EFFORT — any failure is logged, never thrown, so a bad<br/>workspace file cannot kill the turn. "nothing to commit" = success.
 ```
 
 The push authenticates with an `http.extraheader` bearer built from an env token — **never written to

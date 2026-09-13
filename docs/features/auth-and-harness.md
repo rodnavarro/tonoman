@@ -55,7 +55,7 @@ sequenceDiagram
     participant CC as `claude auth login --claudeai` (PTY)
     participant User as Slack (Block Kit)
 
-    Note over Turn: shared agent gates on registry auth_state ≠ "ok";<br/>per-person gates on a missing <config-home>/.credentials.json
+    Note over Turn: shared agent gates on registry auth_state ≠ "ok" —<br/>per-person gates on a missing <config-home>/.credentials.json
     Turn->>Gate: ask(agent, [user], conversation)
     Gate->>Ops: startHeadless(agent, user)
     Ops->>RT: POST /auth/login

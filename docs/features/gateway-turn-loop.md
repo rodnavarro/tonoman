@@ -51,7 +51,7 @@ sequenceDiagram
         GW->>Q: steer / pop / interrupt / new … (acts on the queue, not a turn)
     else plain message
         GW->>Q: message(text, user, media)
-        Note over Q: enqueue + merge; a burst becomes one turn
+        Note over Q: enqueue + merge — a burst becomes one turn
         Q->>Q: drain → new AbortController → runTurn(msg, signal)
         Q->>R: Router.handle(conn, Envelope, turnSignal)
         R->>Mem: readWindow(conv, windowSize)
