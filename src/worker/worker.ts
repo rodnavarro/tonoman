@@ -791,7 +791,22 @@ export async function run(
     // Per-person: one account per member who connected, each reading from their own login and
     // floored at their own connect time. Empty on the shared path, where `creds` below is the one
     // account and `accountsOf` collapses to it — so a shared tenant is byte-identical.
-    const accounts = perPerson ? accountsFromUsers(name, members, floorMs) : undefined;
+    // Per-member floor overrides (`plaud_floor.<slack-id>`), for backfilling the recordings somebody
+    // already had when they connected. Read here rather than baked in, so turning a backfill on and
+    // off is a registry row and not a deploy — and scoped to the one member the key names.
+    const floorOverrides: Record<string, number> = {};
+    for (const mem of members) {
+      const raw = rows[`plaud_floor.${mem.user}`];
+      if (raw === undefined || raw === null || String(raw).trim() === "") continue;
+      const t = Date.parse(String(raw));
+      if (Number.isNaN(t)) {
+        console.error(`worker: ${name} plaud_floor.${mem.user} is not a date — ignoring "${String(raw).slice(0, 40)}"`);
+        continue;
+      }
+      floorOverrides[mem.user] = t;
+      console.log(`worker: ${name} plaud_floor override — ${mem.user} floored at ${new Date(t).toISOString()}`);
+    }
+    const accounts = perPerson ? accountsFromUsers(name, members, floorMs, floorOverrides) : undefined;
     voiceCreds.set(name, {
       notifyChannel: configChannel || voice.notifyChannel || undefined,
       notifyUser: voice.notifyUser || undefined,

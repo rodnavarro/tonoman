@@ -249,12 +249,20 @@ export function accountsFromUsers(
   agent: string,
   users: { user: string; connectedAt?: number }[],
   agentFloorMs: number,
+  /** Per-member floor OVERRIDES, from `plaud_floor.<slack-id>` flow properties.
+   *
+   *  An override wins outright — over the agent floor AND over the member's own connect time — because
+   *  that is precisely what it is for: backfilling the recordings somebody already had when they
+   *  connected, which the default "floor at your connect time" rule exists to keep out. Keyed by
+   *  member, so backfilling one person can never reach into another's account, and removing the row
+   *  restores the default with nothing else to undo. */
+  floorOverrides: Record<string, number> = {},
 ): VoiceAccount[] {
   return users.map((u) => ({
     user: u.user,
     creds: { tokenJson: "", cliAgent: agent, cliUser: u.user },
     notifyUser: u.user,
-    floorMs: Math.max(agentFloorMs, u.connectedAt ?? 0),
+    floorMs: floorOverrides[u.user] ?? Math.max(agentFloorMs, u.connectedAt ?? 0),
   }));
 }
 
