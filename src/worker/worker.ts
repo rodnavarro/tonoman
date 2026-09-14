@@ -1242,7 +1242,7 @@ export async function run(
       const a = wired.get(name);
       if (a) {
         await wireVoice(name, a);
-        if (!voiceCreds.has(name)) await pauseVoiceSchedule(name, "the Plaud account was disconnected");
+        if (!voiceCreds.has(name)) await pauseVoiceSchedule(name, DISCONNECTED_NOTE);
       }
       return "Disconnected - I've forgotten your Plaud account and asked Plaud to revoke it. Nothing is polling it any more.";
     },
@@ -1767,6 +1767,13 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
    *  recaps nobody had approved. */
   const DISABLED_NOTE = "flow_property enabled=false";
 
+  /** The note this worker writes when it pauses a schedule because the account was disconnected.
+   *  Like DISABLED_NOTE it is OUR pause, not a person's — reconnecting an account is the explicit
+   *  action that undoes it, so `ensureVoiceSchedule` auto-resumes it. Without this, disconnecting
+   *  one member (e.g. to switch Plaud accounts) paused the schedule and reconnecting left it paused,
+   *  so the poll never ran again and nothing was ever picked up. */
+  const DISCONNECTED_NOTE = "the Plaud account was disconnected";
+
   /** The voice schedule's id, keyed by the agent's STABLE guid rather than its (mutable) name.
    *  Renaming an agent must not re-key its schedule: the old one would be left polling in parallel
    *  with the new — the double-process this whole flow guards against, in a rename's costume. Falls
@@ -1882,8 +1889,10 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
       // so a backlog held back for inspection drained itself the next time the pod came up.
       const state = (await h.describe()).state;
       if (state.paused) {
-        if (state.note === DISABLED_NOTE) {
-          await h.unpause("flow_property enabled=true");
+        if (state.note === DISABLED_NOTE || state.note === DISCONNECTED_NOTE) {
+          // Both are OUR pauses, and we only reach here with live creds in hand — the account is
+          // connected and the flow is enabled — so the reason for either pause no longer holds.
+          await h.unpause(state.note === DISCONNECTED_NOTE ? "a member reconnected their Plaud account" : "flow_property enabled=true");
           console.log(`worker: ${name} voice schedule resumed`);
         } else {
           console.log(
