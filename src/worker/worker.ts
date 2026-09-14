@@ -1052,9 +1052,11 @@ export async function run(
     let email: string | undefined;
     try {
       const conn = a?.conn as SlackConnector | undefined;
+      // users.info reads `user` from the QUERY STRING, not a JSON body — posting it in the body
+      // (which conn.call does by default) silently returns user_not_found. So put it in the URL.
       const info = await conn?.call<{
         user?: { real_name?: string; profile?: { real_name?: string; display_name?: string; email?: string } };
-      }>("users.info", { user });
+      }>(`users.info?user=${encodeURIComponent(user)}`);
       const p = info?.user;
       profileName = p?.profile?.real_name || p?.real_name || p?.profile?.display_name || undefined;
       email = p?.profile?.email || undefined;
