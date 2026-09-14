@@ -3,6 +3,7 @@ import type { AddressInfo } from "node:net";
 import * as path from "node:path";
 import { randomBytes } from "node:crypto";
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import * as recap from "./recap";
 import * as calendar from "./calendar";
 import type { CalEvent } from "./calendar";
@@ -98,15 +99,31 @@ async function runTalentProcess(
       // The tenant context the recap prompt needs — provided by the runtime, never held by the Talent.
       context: { mission: voice.mission ?? "", journal: voice.journal, vocab: voice.vocab, timezone: voice.timezone },
     };
-    const child = spawn("tsx", [entry], {
+    // The production image ships compiled `dist` and omits `tsx` and `src` (`npm ci --omit=dev`), so
+    // `tsx src/…/index.ts` cannot run there. Prefer the compiled Talent (`node dist/…/index.js`), and
+    // fall back to tsx on the TS source for local dev, which runs from a bind-mounted tree with no
+    // build. `existsSync` is resolved against the worker's cwd, the same base the spawn uses.
+    const distEntry = entry.replace(/^src[/\\]/, "dist/").replace(/\.ts$/, ".js");
+    const compiled = existsSync(distEntry);
+    const child = spawn(compiled ? "node" : "tsx", [compiled ? distEntry : entry], {
       env: { ...process.env, TONOMAN_CAPABILITY_URL: baseUrl, TONOMAN_CAPABILITY_TOKEN: token },
       stdio: ["pipe", "pipe", "pipe"],
     });
+    // A spawn that never starts (the missing-`tsx` bug that crash-looped the cluster) emits 'error';
+    // with no listener Node throws it uncaught and kills the whole worker. Capture it and turn it
+    // into a failed outcome instead — one recording must never take the worker down.
+    let spawnError: string | undefined;
+    child.on("error", (e) => (spawnError = (e as Error).message));
+    child.stdin.on("error", () => {}); // a dead child's stdin errors on write; swallow it
     const onAbort = (): void => void child.kill("SIGTERM");
     opts?.signal?.addEventListener("abort", onAbort);
 
-    child.stdin.write(JSON.stringify(input));
-    child.stdin.end();
+    try {
+      child.stdin.write(JSON.stringify(input));
+      child.stdin.end();
+    } catch {
+      /* the child failed to spawn; the error handler above already has the reason */
+    }
 
     let out = "";
     let err = "";
@@ -123,9 +140,13 @@ async function runTalentProcess(
       }
     });
 
-    const code = await new Promise<number>((resolve) => child.on("close", (c) => resolve(c ?? 0)));
+    const code = await new Promise<number>((resolve) => {
+      child.on("close", (c) => resolve(c ?? 0));
+      child.on("error", () => resolve(-1)); // spawn failed to start — 'close' may never fire
+    });
     opts?.signal?.removeEventListener("abort", onAbort);
 
+    if (spawnError) return { status: "failed", reason: `could not start talent ${talent}: ${spawnError}` };
     const trimmed = out.trim();
     if (!trimmed) {
       return { status: "failed", reason: `talent exited ${code} with no outcome — ${err.slice(-400)}` };
