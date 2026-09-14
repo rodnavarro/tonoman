@@ -1395,6 +1395,9 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
       a.cfg.auth_state = state === "ok" ? "ok" : "error";
       console.log(`worker: ${name} auth_state -> ${state}`);
     },
+    // The gate-offered login is how a NEW person first arrives (Celine's path): the `!connect claude`
+    // command hook never fires for them, so register here too — before their first real turn.
+    onLogin: (name, user) => autoRegisterMember(name, user),
   };
 
   const plaudDeps: plaudgate.PlaudGateDeps = {

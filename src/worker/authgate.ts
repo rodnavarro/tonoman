@@ -24,6 +24,11 @@ export interface AuthGateDeps {
   conn(agent: string): SlackConnector | undefined;
   /** Report the OUTCOME back to the registry, so the next turn is not gated. */
   setAuthState(agent: string, state: "ok" | "error"): Promise<void>;
+  /** A person just completed a login through THIS gate — the normal first step for someone new,
+   *  since the gate offers it on its own the moment a turn finds no credential. Optional, best-effort:
+   *  the worker uses it to register the person into the tenant, so their very first chat already
+   *  knows their name (rather than only learning it when they connect Plaud later). */
+  onLogin?(agent: string, user: string): Promise<void>;
 }
 
 /** What the agent says when it cannot answer yet. Names the agent, says what is missing, and gives
@@ -154,6 +159,8 @@ export async function handleInteraction(deps: AuthGateDeps, agent: string, it: S
     // OUTCOME-TRUE: `ok` means the credential file actually changed and the harness reports logged
     // in. Anything else is reported as a failure, however encouraging the login output looked.
     await deps.setAuthState(agent, r.ok ? "ok" : "error").catch(() => {});
+    // The submitter IS the person who just signed in — the modal carries no user of its own.
+    if (r.ok && it.userId) await deps.onLogin?.(agent, it.userId).catch(() => {});
     if (conversation) {
       await conn
         .reply(conversation)
