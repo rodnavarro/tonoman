@@ -1031,6 +1031,50 @@ export async function run(
 
   const activities = makeActivities(deps);
 
+  // Auto-register a Slack person into Tonoman Cloud the moment they connect an integration. The
+  // connect path (Claude/Plaud login) already existed; what was missing was the write that makes a
+  // NEW user real to the tenant — so a genuinely new person was neither RECOGNISED by the agent
+  // (no `agent_principal`, hence "who am I speaking with?") nor VISIBLE in the Hub (no
+  // `account`/`membership`). We resolve their real name (and email, for the Hub) from Slack and let
+  // the registry upsert all three, idempotently.
+  //
+  // Best-effort and awaited (not fire-and-forget): it is one `users.info` call plus one fetch, and
+  // awaiting means the `agent_principal` row exists before the "✅ connected" reply — so the next
+  // 30s roster reload deterministically teaches the agent the name before the first recap lands.
+  // Any failure is logged and swallowed; connecting must never break because registration did.
+  const autoRegisterMember = async (name: string, user: string | undefined): Promise<void> => {
+    if (!user) return;
+    const a = wired.get(name);
+    const guid = a?.cfg.guid;
+    const baseUrl = process.env.TONOMANCLOUD_API_URL;
+    if (!guid || !baseUrl) return;
+    let profileName: string | undefined;
+    let email: string | undefined;
+    try {
+      const conn = a?.conn as SlackConnector | undefined;
+      const info = await conn?.call<{
+        user?: { real_name?: string; profile?: { real_name?: string; display_name?: string; email?: string } };
+      }>("users.info", { user });
+      const p = info?.user;
+      profileName = p?.profile?.real_name || p?.real_name || p?.profile?.display_name || undefined;
+      email = p?.profile?.email || undefined;
+    } catch (e) {
+      console.error(`worker: ${name} users.info failed for ${user}: ${(e as Error).message}`);
+    }
+    try {
+      await fetch(`${baseUrl}/v1/system/agents/${guid}/register-member`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${process.env.TONOMANCLOUD_API_TOKEN ?? ""}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ slackUserId: user, name: profileName, email }),
+      });
+    } catch (e) {
+      console.error(`worker: ${name} register-member failed for ${user}: ${(e as Error).message}`);
+    }
+  };
+
   // In-channel commands. They read and write the same maps the status footer uses, so what
   // `!status` reports is exactly what the footer would have shown.
   const commandDeps: cmds.CommandDeps = {
@@ -1142,6 +1186,9 @@ export async function run(
     connectClaude: async (name, conversation, user) => {
       const a = wired.get(name);
       if (!a) return "I don't know that agent here.";
+      // The moment Rod pointed at: connecting Claude is where a new person first identifies
+      // themselves, so register them into the tenant now (recognises them + puts them in the Hub).
+      await autoRegisterMember(name, user);
       // ask() returns false both when it POSTED a reason and when there was nothing to post, and
       // those need different answers. The second case is exactly this one, checked here so the
       // command never ends in silence.
@@ -1203,6 +1250,8 @@ export async function run(
       const u = flowcfg.plaudPerPerson(wired.get(name)?.cfg.flows?.voice) ? user : undefined;
       const r = await plaudauth.complete(name, pasted, u);
       if (!r.ok) return `That didn't work - ${r.problem}.`;
+      // The `!code plaud <address>` completion path — register the connecting person into the tenant.
+      await autoRegisterMember(name, user);
       // THE SECOND COMPLETION PATH. The dialog is not the only way in — `!connect plaud <code>`
       // lands here — and a fix applied to one of two doors is not a fix. Starting the poll has to
       // happen wherever a credential arrives, not wherever it was convenient to add it.
@@ -1351,7 +1400,13 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
     // `user` arrives already gated by scope from the caller (connectPlaud / the dialog), so these
     // just pass it through — the pending login and its completion share the same scope.
     begin: async (name, user) => (await plaudauth.begin(name, user)).url,
-    complete: (name, pasted, user) => plaudauth.complete(name, pasted, user),
+    // The dialog/button completion path (the one Rod's Broker Test used). Register on success, before
+    // the "✅ connected" reply, so the agent knows the speaker's name by the time the first recap posts.
+    complete: async (name, pasted, user) => {
+      const r = await plaudauth.complete(name, pasted, user);
+      if (r.ok) await autoRegisterMember(name, user);
+      return r;
+    },
     notifyChannel: (name) => voiceCreds.get(name)?.notifyChannel,
     // The half that was missing. Storing the credential was never the end of connecting an account
     // — the flow has to be worked out again and the schedule created, both of which only happened
