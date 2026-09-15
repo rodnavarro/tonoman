@@ -35,6 +35,7 @@ function run(cmd: string, args: string[], opts: { cwd?: string; env?: NodeJS.Pro
 
 import { ApplicationFailure } from "@temporalio/common";
 import * as plaudapi from "./plaudapi";
+import { recordingKey } from "./recordingkey";
 import type { CalEvent } from "./calendar";
 
 export interface PlaudCreds {
@@ -230,16 +231,19 @@ async function isPublished(brainDir: string, rec: Recording, journal?: Journal):
   // stamp is unique to the minute, not to the recording, so a name match alone answered "published?"
   // with "something started that minute" — and two recordings in one minute meant the second was
   // dropped in silence. A page with no id at all predates the field and still counts as filed.
-  const mine = async (file: string): Promise<boolean> => {
-    const owner = await recordingIdOf(file);
-    return owner === undefined || owner === rec.id;
-  };
+  const mine = async (file: string): Promise<boolean> => isSameRecording(await pageIdentity(file), rec);
   if (!journal) {
-    for (const name of [`${rec.stamp}.md`, `${rec.stamp}-${rec.id.slice(0, 8)}.md`]) {
-      const file = path.join(brainDir, "Meetings", name);
-      if (await fs.stat(file).then(() => true).catch(() => false)) {
-        if (await mine(file)) return true;
-      }
+    // Every page of this minute, not two guessed names: the suffix is derived from an id that has
+    // already been renamed under us once, and a page filed under the old suffix is still this
+    // recording's — `isSameRecording` decides that, not the filename.
+    let names: string[];
+    try {
+      names = await fs.readdir(path.join(brainDir, "Meetings"));
+    } catch {
+      return false;
+    }
+    for (const n of names.filter((n) => n.startsWith(rec.stamp) && n.endsWith(".md"))) {
+      if (await mine(path.join(brainDir, "Meetings", n))) return true;
     }
     return false;
   }
@@ -399,7 +403,7 @@ export function chunkCachePathById(cacheDir: string, id: string, index: number, 
   return path.join(cacheDir, id, `of-${total}`, `chunk-${String(index).padStart(3, "0")}.txt`);
 }
 export function chunkCachePath(cacheDir: string, rec: Recording, index: number, total: number): string {
-  return chunkCachePathById(cacheDir, rec.id, index, total);
+  return chunkCachePathById(cacheDir, recordingKey(rec.id), index, total);
 }
 
 /** Text only, never audio. The transcript is going to the second brain anyway, so keeping it for a
@@ -414,7 +418,7 @@ async function cachedChunk(file: string): Promise<string | undefined> {
  *  with no remaining purpose. Best effort — a cache that fails to clear costs disk, not
  *  correctness, and the next attempt would simply reuse it. */
 export async function clearChunkCache(cacheDir: string, rec: Recording): Promise<void> {
-  await fs.rm(path.join(cacheDir, rec.id), { recursive: true, force: true }).catch(() => {});
+  await fs.rm(path.join(cacheDir, recordingKey(rec.id)), { recursive: true, force: true }).catch(() => {});
 }
 
 export async function transcribe(
@@ -433,8 +437,9 @@ export async function transcribe(
   const tempUrl = creds.cliAgent
     ? await plaudapi.audioUrl(creds.cliAgent, rec.id, creds.cliUser)
     : (await plaudGet<{ temp_url: string }>(creds, `/file/temp-url/${rec.id}`)).temp_url;
-  // Everything past resolving that URL is source-agnostic — it is the `transcribe` CAPABILITY.
-  return transcribeAudio(tempUrl, rec.title, rec.id, providers, vocab, onProgress, cacheDir);
+  // Everything past resolving that URL is source-agnostic — it is the `transcribe` CAPABILITY. The
+  // cache is keyed by the recording's KEY so a retry after a rename still finds its chunks.
+  return transcribeAudio(tempUrl, rec.title, recordingKey(rec.id), providers, vocab, onProgress, cacheDir);
 }
 
 /** The provider-routing core of transcription, with NOTHING tied to a source: fetch a ready audio
@@ -666,24 +671,44 @@ export function pathsFor(
   };
 }
 
-/** The `recording_id` a recap page carries in its frontmatter, if it has one.
- *
- *  This is what makes "is this filed?" a question about the RECORDING rather than about the minute it
- *  started in. A page written before this field existed returns undefined and is treated as filed —
- *  conservative on purpose: re-transcribing somebody's existing recap is the expensive mistake, and
- *  every page this pipeline has ever written carries the field. */
-async function recordingIdOf(file: string): Promise<string | undefined> {
+/** What a recap page says about WHICH recording it is: the `recording_id` and the `datetime`
+ *  instant its frontmatter carries. `id` is undefined for a page written before the field existed;
+ *  `startMs` is undefined when the page has no parseable instant. A missing page is `undefined`. */
+export interface PageIdentity {
+  id?: string;
+  startMs?: number;
+}
+async function pageIdentity(file: string): Promise<PageIdentity | undefined> {
   try {
     const head = (await fs.readFile(file, "utf8")).slice(0, 800);
-    return /^recording_id:[ \t]*(\S+)[ \t]*$/m.exec(head)?.[1];
+    const id = /^recording_id:[ \t]*(\S+)[ \t]*$/m.exec(head)?.[1];
+    const dt = /^datetime:[ \t]*(\S+)[ \t]*$/m.exec(head)?.[1];
+    const startMs = dt ? Date.parse(dt) : NaN;
+    return { id, startMs: Number.isFinite(startMs) ? startMs : undefined };
   } catch {
     return undefined;
   }
 }
 
+/** PURE: is the page this recording's?
+ *
+ *  Three ways to say yes, in the order they are trusted. A page with no id predates the field and
+ *  counts as filed — conservative on purpose, because re-transcribing somebody's existing recap is
+ *  the expensive mistake. An id match is compared by KEY, not byte-for-byte: Plaud renamed every id
+ *  under us once (`of_` prefix, 2026-09-15) and byte equality made every recording in every account
+ *  new again. And the INSTANT is the fallback that survives a rename the key does not absorb: two
+ *  recordings do not start on the same millisecond, so a page carrying this recording's `datetime`
+ *  is this recording's page whatever its source calls it today. A missing page is nobody's. */
+export function isSameRecording(page: PageIdentity | undefined, rec: Recording): boolean {
+  if (!page) return false;
+  if (page.id === undefined) return true;
+  if (recordingKey(page.id) === recordingKey(rec.id)) return true;
+  return page.startMs !== undefined && page.startMs === rec.startTime;
+}
+
 /** Where this recording's page ACTUALLY goes, once the checkout has been consulted.
  *
- *  The base name when it is free or already ours; a name suffixed with the recording id when some
+ *  The base name when it is free or already ours; a name suffixed with the recording key when some
  *  OTHER recording got that minute first. Deterministic, so a re-run of the same recording resolves
  *  to the same path and is the no-op it should be. */
 export async function pathsForUnique(
@@ -694,10 +719,10 @@ export async function pathsForUnique(
   slugHint?: string,
 ): Promise<{ page: string; folder: string }> {
   const base = pathsFor(journal, rec, route, slugHint);
-  const owner = await recordingIdOf(path.join(brainDir, base.page));
+  const page = await pageIdentity(path.join(brainDir, base.page));
   // Free, or already this recording's — either way the base name is correct.
-  if (owner === undefined || owner === rec.id) return base;
-  return pathsFor(journal, rec, route, slugHint, rec.id.slice(0, 8));
+  if (page === undefined || isSameRecording(page, rec)) return base;
+  return pathsFor(journal, rec, route, slugHint, recordingKey(rec.id).slice(0, 8));
 }
 
 /** PURE: how much transcript the summariser is given, and WHICH part of it.
@@ -998,7 +1023,8 @@ export function overviewMarkdown(
   const transcript = folder ? `${path.posix.basename(folder)}/Transcript.md` : `./${rec.stamp}/Transcript.md`;
   const head = [
     "---",
-    `recording_id: ${rec.id}`,
+    // The KEY, not the source's id of the day — see recordingkey.ts for the rename that taught this.
+    `recording_id: ${recordingKey(rec.id)}`,
     "source: plaud",
     // WHOSE recap this is — the Slack id of the per-person account it was polled from, the same id
     // that keys the token (`plaud.tokens:<owner>`) and, later, the per-user brain. Absent on the

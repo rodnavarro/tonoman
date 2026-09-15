@@ -32,6 +32,7 @@ import type { Activities } from "./activities";
 // fails the webpack build and the worker never starts, which looks like a hang rather than a bad
 // import. These are pure string functions, which is also what keeps the workflow deterministic.
 import { failureReason, isNotLoggedInError, notLoggedInNotice } from "../turnfailure";
+import { isFinalLaunch, recordingKey, talentGate } from "./recordingkey";
 import { WorkflowExecutionAlreadyStartedError } from "@temporalio/common";
 
 const { runTurn, postNotice } = proxyActivities<Activities>({
@@ -270,13 +271,24 @@ export async function plaudPollWorkflow(input: PollInput): Promise<void> {
     // out over per-member accounts, else the poll's own `notify`. For every tenant that has not gone
     // per-person `rec.notify` is undefined, so this is `input.notify` exactly as before.
     const notify = rec.notify || input.notify;
-    // Say it landed BEFORE the slow part, so the person knows it was seen. Identical on both paths:
-    // the ack is a fact about the poll, not about which runtime files the recap.
-    await sayVerbatim({
-      agent: input.agent,
-      user: notify,
-      text: `I've got a new recording — “${rec.title}”, ${rec.minutes} minute${rec.minutes === 1 ? "" : "s"}. Processing it now; I'll send the highlights shortly.`,
-    }).catch(() => {});
+    // The recording's KEY — what the run record and the workflow id are keyed on. Not the source's id
+    // of the day: Plaud renamed every id once and the checkout-based check above saw a new recording
+    // in each. The durable record is the second, id-proof answer to "have we been here before".
+    const key = recordingKey(rec.id);
+
+    // ONE durable decision per item, before anything is said or spent. The checkout says "not filed"
+    // for a recording that was skipped on purpose (no speech), for one whose page is not in this
+    // checkout yet, and for one that has failed all day; the run record tells those apart. A filed
+    // item is never launched again; one past its launch budget is left for a person; the rest go to
+    // the child, which announces ONLY on the first launch — so a recording is announced once, not
+    // once per relaunch (fourteen times, the day the GPU route was down).
+    const prior = await talentRunStatus({ agent: input.agent, talent: plan.talent.name, itemKey: key });
+    const gate = talentGate(prior);
+    if (gate === "skip-done") continue;
+    if (gate === "skip-given-up") {
+      console.log(`recap: ${input.agent} — “${rec.title}” has failed ${prior?.attempts} launches; leaving it for a person (!talent again)`);
+      continue;
+    }
 
     // Hand this ONE recording to the Talent, as an independent CHILD workflow. Child, not inline, for
     // two reasons: a 112-minute meeting must not hold the poll tick open (and with overlap SKIP,
@@ -290,15 +302,20 @@ export async function plaudPollWorkflow(input: PollInput): Promise<void> {
       await startChild(runTalentWorkflow, {
         // A recording id is only unique within an account, so a per-member run keys its id on the
         // member too — else two members' recordings sharing an id would dedup against each other.
-        // The shared account (no user) keeps the original id, so an in-flight run across a deploy is
-        // still recognised.
-        workflowId: rec.user ? `talent:${input.agent}:${rec.user}:${rec.id}` : `talent:${input.agent}:${rec.id}`,
+        // The shared account (no user) keeps the original shape, so an in-flight run across a deploy
+        // is still recognised.
+        workflowId: rec.user ? `talent:${input.agent}:${rec.user}:${key}` : `talent:${input.agent}:${key}`,
         args: [
           {
             agent: input.agent,
             talent: plan.talent.name,
             version: plan.talent.version,
-            itemKey: rec.id,
+            itemKey: key,
+            // The handle the Talent FETCHES with — the source's current id, which may differ from
+            // the key it is remembered under.
+            recordingId: rec.id,
+            title: rec.title,
+            minutes: rec.minutes,
             notify,
             user: rec.user,
           },
@@ -324,9 +341,16 @@ export interface RunTalentInput {
   agent: string;
   /** Which Talent, by name — the installed voice Talent (the Plaud Talent, `meeting-recap`). */
   talent: string;
-  /** The one item this run is for — a recording id. Every run is exactly ONE item; the fan-out lives
-   *  in the poll, not in the Talent. */
+  /** The one item this run is for — a recording's KEY (`recordingKey`). Every run is exactly ONE
+   *  item; the fan-out lives in the poll, not in the Talent. */
   itemKey: string;
+  /** The id the Talent fetches the recording with — the source's current id, which is not always
+   *  the key it is remembered under. Defaults to `itemKey` for callers that predate the split. */
+  recordingId?: string;
+  /** For the one-time acknowledgement, which this workflow now owns (see below). Absent for an
+   *  on-demand run, which says nothing until it is done. */
+  title?: string;
+  minutes?: number;
   /** The Talent's version, pinned by the caller, for the run record. */
   version: number;
   notify?: string;
@@ -355,12 +379,15 @@ export async function runTalentWorkflow(input: RunTalentInput): Promise<void> {
   // run still IN FLIGHT; this catches one that already FINISHED (a re-tick after retention, or an
   // on-demand re-ask). `force` is the deliberate "recap it again". The read fails OPEN (returns
   // undefined on any error), so this can only skip a genuinely-done item, never block a new one.
-  if (!input.force) {
-    const prior = await talentRunStatus({ agent: input.agent, talent: input.talent, itemKey: input.itemKey });
-    if (prior === "done") {
-      console.log(`recap: ${input.agent} — “${input.itemKey}” already filed (talent_run done); skipping re-run`);
-      return;
-    }
+  const prior = await talentRunStatus({ agent: input.agent, talent: input.talent, itemKey: input.itemKey });
+  const gate = talentGate(prior, input.force);
+  if (gate === "skip-done") {
+    console.log(`recap: ${input.agent} — “${input.itemKey}” already filed (talent_run done); skipping re-run`);
+    return;
+  }
+  if (gate === "skip-given-up") {
+    console.log(`recap: ${input.agent} — “${input.itemKey}” is past its launch budget; not run again`);
+    return;
   }
 
   // The durable record whose absence produced 611 attempts for 4 published recaps. Opened BEFORE the
@@ -368,11 +395,30 @@ export async function runTalentWorkflow(input: RunTalentInput): Promise<void> {
   // the activity: a missing row never stops a recording.
   await openTalentRun({ agent: input.agent, talent: input.talent, itemKey: input.itemKey, version: input.version });
 
+  // Say it landed — ONCE, on the first launch of this item, after the record that will remember it
+  // is open. It used to be said by the poll before every launch, and a recording that was relaunched
+  // fourteen times through an outage was announced fourteen times. A relaunch says nothing: the
+  // person was told the first time and has heard nothing since only because it is not done yet.
+  if (gate === "first" && input.notify && input.title) {
+    const m = input.minutes ?? 0;
+    await sayVerbatim({
+      agent: input.agent,
+      user: input.notify,
+      text: `I've got a new recording — “${input.title}”, ${m} minute${m === 1 ? "" : "s"}. Processing it now; I'll send the highlights shortly.`,
+    }).catch(() => {});
+  }
+
   try {
     // CUT OVER to the self-contained Talent CLI (spawned via the capability plane). `processRecording`
     // remains for a one-line revert: swap `runTalent` back to it and restart the worker. The announce
     // is the Talent's steer, run as a real agent turn inside runTalent — same behaviour as before.
-    await runTalent({ agent: input.agent, notify: input.notify ?? "", item: input.itemKey, user: input.user, talent: input.talent });
+    await runTalent({
+      agent: input.agent,
+      notify: input.notify ?? "",
+      item: input.recordingId ?? input.itemKey,
+      user: input.user,
+      talent: input.talent,
+    });
     void processRecording; // kept importable for the revert; see above
     await closeTalentRun({ agent: input.agent, talent: input.talent, itemKey: input.itemKey, status: "done" });
   } catch (e) {
@@ -385,11 +431,12 @@ export async function runTalentWorkflow(input: RunTalentInput): Promise<void> {
       status: "failed",
       error: failureReason(e).slice(0, 500),
     }).catch(() => {});
-    // The poll already told the person "processing it now; highlights shortly", so a silent failure
-    // here leaves them waiting on a recap that is never coming — the precise silent failure this
-    // whole layer exists to end. Best-effort and once: the child does not retry past its policy, so
-    // this fires when the run finally gives up.
-    if (input.notify) {
+    // The person was told "processing it now; highlights shortly", so a run that gives up for good
+    // owes them a word — the precise silent failure this whole layer exists to end. But ONLY the
+    // launch that spends the last of the budget says it: the poll relaunches a failed item quietly
+    // until then, and one warning per relaunch was the other half of the outage-day noise. A forced
+    // re-run is a person watching; it always reports.
+    if (input.notify && (input.force || isFinalLaunch(prior))) {
       await sayVerbatim({
         agent: input.agent,
         user: input.notify,

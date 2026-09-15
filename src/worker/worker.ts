@@ -41,6 +41,7 @@ import { httpAuthOps } from "../authflow";
 import * as gate from "./authgate";
 import * as secondbrain from "./secondbrain";
 import * as recapFloor from "./recap";
+import { recordingKey } from "./recordingkey";
 import { describe as describeVoice, voiceSettings } from "./flowcfg";
 import * as flowcfg from "./flowcfg";
 import * as inference from "./inference";
@@ -1018,9 +1019,11 @@ export async function run(
             // is to skip an item that is already done, so "can't tell" must mean "go ahead".
             return undefined;
           }
-          const body = (await r.json()) as { status?: string | null };
+          const body = (await r.json()) as { status?: string | null; attempts?: number };
+          // `attempts` counts LAUNCHES (each open bumps it), which is what the poll's give-up budget
+          // is measured in. Absent on an older API → 0, which only ever errs towards trying again.
           return body.status === "running" || body.status === "done" || body.status === "failed"
-            ? body.status
+            ? { status: body.status as "running" | "done" | "failed", attempts: Number(body.attempts ?? 0) }
             : undefined;
         } catch (e) {
           console.error(`worker: ${name} talent_run status ${talentName}/${itemKey} failed: ${String(e)}`);
@@ -1143,12 +1146,15 @@ export async function run(
     runTalent: async (name, talent, item, user, force) => {
       const tdef = getTalent(talent);
       if (!tdef) return { started: false, message: `I don't run a Talent called "${talent}".` };
-      const wfId = user ? `talent:${name}:${user}:${item}` : `talent:${name}:${item}`;
+      // Keyed on the recording's KEY, exactly as the poll keys it, so an on-demand run of an item
+      // the poll knows under a renamed id is the same item — same workflow id, same run record.
+      const key = recordingKey(item);
+      const wfId = user ? `talent:${name}:${user}:${key}` : `talent:${name}:${key}`;
       try {
         await client.workflow.start(runTalentWorkflow, {
           workflowId: wfId,
           taskQueue: o.taskQueue,
-          args: [{ agent: name, talent, itemKey: item, version: tdef.version, notify: user ?? "", user, force }],
+          args: [{ agent: name, talent, itemKey: key, recordingId: item, version: tdef.version, notify: user ?? "", user, force }],
         });
         return {
           started: true,

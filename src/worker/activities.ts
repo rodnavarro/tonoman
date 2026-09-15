@@ -54,7 +54,11 @@ export interface TurnDeps {
      *  lets a re-run skip the transcription + inference it would otherwise re-pay. Best-effort like
      *  the rest — it returns `undefined` on any read failure so the guard fails OPEN (the run
      *  proceeds), never blocking a genuinely-new recording because the registry blinked. */
-    status?(agent: string, talent: string, itemKey: string): Promise<"running" | "done" | "failed" | undefined>;
+    status?(
+      agent: string,
+      talent: string,
+      itemKey: string,
+    ): Promise<{ status: "running" | "done" | "failed"; attempts: number } | undefined>;
   };
   /** Run text as a turn addressed to a person. */
   ask?(agent: string, user: string, text: string): Promise<void>;
@@ -645,7 +649,7 @@ export function makeActivities(deps: TurnDeps) {
       agent: string;
       talent: string;
       itemKey: string;
-    }): Promise<"running" | "done" | "failed" | undefined> {
+    }): Promise<{ status: "running" | "done" | "failed"; attempts: number } | undefined> {
       return (await deps.talentRun?.status?.(input.agent, input.talent, input.itemKey)) ?? undefined;
     },
 

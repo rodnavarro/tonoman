@@ -61,3 +61,46 @@ describe("two recordings that start in the same minute", () => {
     expect(files).toHaveLength(1);
   });
 });
+
+// The Sep-15 case: Plaud renamed every id overnight (`of_` in front of the same hex). A page filed
+// under the old id must still be recognised as this recording's under the new one — the same
+// minute, the same instant, the same meeting — or every recording in every account is new again.
+describe("the source renames its ids", () => {
+  const renamed: Recording = { ...big, id: `of_${big.id}` };
+
+  it("a page filed under the old id is still this recording's under the new one", async () => {
+    const dir = await brain();
+    await publish(dir, big, recapOf("filed under the old id"), "t1", "", undefined).catch(() => {});
+    expect(await unpublished([renamed], dir, 0)).toHaveLength(0);
+    // And the other way round: filed under the new id, asked about with the old one.
+    const dir2 = await brain();
+    await publish(dir2, renamed, recapOf("filed under the new id"), "t1", "", undefined).catch(() => {});
+    expect(await unpublished([big], dir2, 0)).toHaveLength(0);
+  });
+
+  it("the page records the KEY, so a rename never changes what is on disk", async () => {
+    const dir = await brain();
+    await publish(dir, renamed, recapOf("x"), "t1", "", undefined).catch(() => {});
+    const page = await fs.readFile(path.join(dir, "Meetings", "2026-09-10-1400.md"), "utf8");
+    expect(page).toContain(`recording_id: ${big.id}`);
+    expect(page).not.toContain("of_");
+  });
+
+  it("a rename the key cannot absorb is caught by the instant", async () => {
+    const dir = await brain();
+    await publish(dir, big, recapOf("x"), "t1", "", undefined).catch(() => {});
+    const unrecognisable: Recording = { ...big, id: "zz-99999999-completely-different" };
+    expect(await unpublished([unrecognisable], dir, 0)).toHaveLength(0);
+    // ...but a genuinely different recording in the same minute is still new.
+    expect(await unpublished([small], dir, 0)).toHaveLength(1);
+  });
+
+  it("a page filed under a suffix from the old id is still found", async () => {
+    const dir = await brain();
+    await publish(dir, small, recapOf("took the minute"), "t1", "", undefined).catch(() => {});
+    await publish(dir, big, recapOf("suffixed"), "t2", "", undefined).catch(() => {});
+    const names = (await fs.readdir(path.join(dir, "Meetings"))).filter((n) => n.endsWith(".md")).sort();
+    expect(names).toEqual(["2026-09-10-1400-aaaaaaaa.md", "2026-09-10-1400.md"]);
+    expect(await unpublished([renamed], dir, 0)).toHaveLength(0);
+  });
+});

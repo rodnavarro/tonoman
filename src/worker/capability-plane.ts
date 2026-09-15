@@ -8,6 +8,7 @@ import * as recap from "./recap";
 import * as calendar from "./calendar";
 import type { CalEvent } from "./calendar";
 import * as plaudapi from "./plaudapi";
+import { recordingKey } from "./recordingkey";
 import { accountFor, type TurnDeps } from "./activities";
 import type { TalentOutcome } from "../talent-sdk";
 
@@ -214,7 +215,8 @@ export async function startCapabilityPlane(deps: TurnDeps): Promise<CapabilityPl
           const out = await recap.transcribeAudio(
             String(body.audioUrl ?? ""),
             String(body.label ?? run.item),
-            String(body.cacheId ?? run.item),
+            // The cache is keyed by the recording's KEY, whatever the source calls the id today.
+            recordingKey(String(body.cacheId ?? run.item)),
             voice.transcribe,
             typeof body.vocab === "string" ? body.vocab : voice.vocab,
             undefined,
