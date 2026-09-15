@@ -42,6 +42,7 @@ import * as gate from "./authgate";
 import * as secondbrain from "./secondbrain";
 import * as recapFloor from "./recap";
 import { recordingKey } from "./recordingkey";
+import { withAuthRaceRetry } from "./authrace";
 import { describe as describeVoice, voiceSettings } from "./flowcfg";
 import * as flowcfg from "./flowcfg";
 import * as inference from "./inference";
@@ -321,22 +322,27 @@ function newRunnerFor(a: AgentConfig, harnesses: ReturnType<typeof defaultHarnes
  *  existing behaviour, so a shared agent is untouched. Resolved here rather than in the runner
  *  because the runner is harness-agnostic and this dir is Claude Code's. */
 function runClosure(runner: TurnRunner, cfg: AgentConfig): Wired["run"] {
+  // Wrapped HERE, at the one place every harness run of this agent passes through — a person's
+  // turn, a recap's inference, its announcement — because that is exactly the set of processes
+  // that race each other for the agent's one credential file. See authrace.ts.
   return (r: TurnRunReq, signal?: AbortSignal) =>
-    runner.run(
-      {
-        prompt: r.prompt,
-        systemPromptFile: r.systemPromptFile,
-        model: r.model,
-        mediaPaths: r.mediaPaths,
-        sessionId: r.sessionId,
-        sessionNew: r.sessionNew,
-        lean: r.lean,
-        configHome:
-          cfg.inference_mode === "per_user" && r.user
-            ? claudecode.configHomeFor(cfg.name, r.user)
-            : undefined,
-      },
-      signal,
+    withAuthRaceRetry(() =>
+      runner.run(
+        {
+          prompt: r.prompt,
+          systemPromptFile: r.systemPromptFile,
+          model: r.model,
+          mediaPaths: r.mediaPaths,
+          sessionId: r.sessionId,
+          sessionNew: r.sessionNew,
+          lean: r.lean,
+          configHome:
+            cfg.inference_mode === "per_user" && r.user
+              ? claudecode.configHomeFor(cfg.name, r.user)
+              : undefined,
+        },
+        signal,
+      ),
     );
 }
 
