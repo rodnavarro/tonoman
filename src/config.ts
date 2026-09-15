@@ -24,6 +24,20 @@ export interface Telegram {
   media_mount?: string;
 }
 
+/** One agent's Slack connector wiring (A1, channel-slack). Socket Mode, so the agent DIALS OUT
+ * and needs no ingress, no public URL, no TLS certificate and no signing-secret verification —
+ * the same shape as Telegram's long-poll. Both tokens are SECRETS: keep them out of the roster
+ * file (forward via `secrets[]` / env) and set them on the wired connector at gateway-run time. */
+export interface Slack {
+  /** Slack team id (`T…`). Not secret, and needed to build a conversation key for a DM the agent
+   * opens itself (gw-wake) — the agent has no inbound envelope to take one from. */
+  team_id?: string;
+  app_token?: string; // `xapp-…`, scope connections:write — opens the Socket Mode socket
+  bot_token?: string; // `xoxb-…` — every Web API call
+  /** allow-list of Slack user ids (`U…`); empty = accept anyone in the workspace. */
+  allowed_users?: string[];
+}
+
 /** One agent's MS Teams connector wiring (A1, channel-teams). A turn-driven agent
  * reached on Teams instead of Telegram — Tonoman owns the webhook + outbound, the
  * harness is unchanged. `app_password` is a SECRET: keep it out of the roster file
@@ -71,6 +85,15 @@ export interface Workspace {
 export interface AgentConfig {
   guid?: string;
   name: string;
+  /** The name the TENANT gave this agent, as the registry holds it — what it should call itself and
+   *  how people refer to it. Distinct from `name`, which the registry control plane prefixes with the
+   *  tenant (`axiplex-sapien`) to key one worker's many agents. Renaming an agent changes this, and
+   *  the worker carries it into the agent's context so a rename reaches how it introduces itself. */
+  displayName?: string;
+  /** The tenant slug this agent belongs to (`axiplex`, `murphy`). Carried so the worker can render
+   *  a readable label — `${tenant}-${displayName}` — in logs and match TONOMAN_AGENTS, now that
+   *  `name` is the stable guid rather than the tenant-prefixed display name. */
+  tenant?: string;
   role?: string;
   harness?: string;
   container: string;
@@ -103,13 +126,107 @@ export interface AgentConfig {
   /** Channel for a turn-driven agent (channel-teams). Usually inferred from which
    * connector block is present (`telegram` → telegram, `teams` → teams); set explicitly
    * to disambiguate. A service agent owns its own channel (derived "self"). */
-  channel?: "telegram" | "teams";
+  channel?: "telegram" | "teams" | "slack";
   /** Connector wiring for a turn-driven agent (A1). OPTIONAL: a service agent
    * (svc-self-channeled) owns its own channel and needs no Tonoman connector. */
   telegram?: Telegram;
   /** MS Teams connector wiring for a turn-driven agent (channel-teams). Mutually
    * exclusive with `telegram` per agent. */
   teams?: Teams;
+  /** Slack connector wiring for a turn-driven agent (channel-slack). Mutually exclusive
+   * with `telegram` / `teams` per agent. */
+  slack?: Slack;
+  /** What the control plane believes about this agent's inference credential:
+   * `unconfigured` | `ok` | `expired` | `error`.
+   *
+   * A FACT about the agent, not a probe of the filesystem — that distinction is the point. A file
+   * check answers "is there a credential file", which is how an agent can report healthy for weeks
+   * over a credential that expired and carried no refresh token.
+   *
+   * Undefined means "not tracked", which is the file-roster case: a self-hosted deployment keeps
+   * today's behaviour and is never gated. */
+  auth_state?: "unconfigured" | "ok" | "expired" | "error";
+  /** Whether inference is ONE login the whole agent shares (`shared`, the default and every agent
+   * today) or EACH PERSON's own (`per_user`) — a team where everyone brings their own Claude (or
+   * other-provider) subscription and the agent answers each on theirs. When `per_user`, a turn runs
+   * in the speaker's own credential directory (`configHomeFor(agent, user)`) and `!connect claude`
+   * signs THAT person in; `shared` keeps the single per-agent login untouched. Undefined = shared. */
+  inference_mode?: "shared" | "per_user";
+  /** Who this agent recognises, and as whom. A Slack user id resolves to a name the agent can use,
+   * which is how "Hi Celine" happens — from the registry, never from a spoofable display name.
+   * Deliberately unrelated to console access (§7): talking to an agent is not signing in. */
+  principals?: { kind: string; value: string; label: string }[];
+  /** Second-brain sources this agent has been GRANTED (§8). A list, not one repo: the end state
+   * binds an Azure DevOps repo over SSH alongside a GitHub one. Empty when the tool is not granted,
+   * which is what makes revoking it in the console remove the checkout rather than hide a button. */
+  secondbrain?: {
+    id: string;
+    label: string;
+    repo_url: string;
+    branch?: string;
+    subpath?: string;
+    auth_kind?: string;
+    secret_ref?: string | null;
+    read_only?: boolean;
+  }[];
+  /** Settings for the FLOWS this agent runs, as the registry holds them: flow → key → value.
+   *
+   *  Flat keys, on purpose. The registry stores rows and knows nothing about what they mean; the
+   *  runtime that owns a flow is the only thing that should have to understand `journal.path` or
+   *  `route.<id>`. That is what keeps adding a meeting category an INSERT rather than a migration
+   *  here and a redeploy there. */
+  flows?: Record<string, Record<string, string>>;
+  /** What the TENANT is trying to do, in their own words — one row, shared by every agent the
+   *  tenant has. Every recap is measured against it.
+   *
+   *  A lens on ATTENTION, not a topic filter: it exists so a recap can say a meeting cost the
+   *  scarce thing rather than only ever reporting how it helped. Empty is ordinary — every tenant
+   *  is in that state until somebody writes one — and means the recap simply does not judge. */
+  mission?: string;
+  /** IANA timezone for DISPLAY, from the tenant. "America/New_York", never an offset. Empty or
+   *  "UTC" means render in UTC, which is what every recap did before this existed. */
+  timezone?: string;
+  /** Talents GRANTED and enabled for this agent, from the registry — the catalogue row plus the
+   *  attachment's `config` values. A Talent is CODE behind a manifest, not interpreted steps: only
+   *  the grant travels (`name`, its pinned `version`, this agent's `config`), and the worker resolves
+   *  name→implementation from its own built-in registry. The worker knows which built-in Talent is
+   *  the voice pipeline by NAME (`meeting-recap`), not by a wire trigger. */
+  talents?: {
+    name: string;
+    version: number;
+    config?: Record<string, unknown>;
+  }[];
+  /** Outside credentials this agent may use, from the registry (§8). Identified by `(kind, alias)`:
+   *  the KIND is what the platform knows how to talk to, the ALIAS is which one of them this is.
+   *  That is what lets a tenant attach a work calendar and a personal one without either becoming
+   *  a second connector. `secret_ref` names the credential; it is never the credential. */
+  credentials?: {
+    id: string;
+    kind: string;
+    alias: string;
+    label?: string;
+    // The flat account fields carry the SHARED account (the whole-tenant one), which is every
+    // connection today. They keep the existing consumers — the calendar loop, contextNote, the
+    // `!connect` roster patch — working unchanged now that a connection's accounts live in their
+    // own table server-side.
+    external_account?: string;
+    secret_ref?: string;
+    status?: string;
+    expires_at?: string;
+    // 'shared' | 'per_person'. Present so the per-member voice flow can tell "one account for
+    // everyone" from "each member brings their own" without re-deriving it.
+    scope?: string;
+    // Every account implementing this connection. For a shared connection there is one, with
+    // account_id null (and it is also flattened above). For a per-person connection there is one
+    // per member — which the per-member voice flow iterates.
+    accounts?: {
+      account_id?: string | null;
+      external_account?: string;
+      secret_ref?: string;
+      status?: string;
+      expires_at?: string;
+    }[];
+  }[];
   workspace?: Workspace;
   // --- Service-mode (svc-self-channeled / svc-config-env) ----------------------
   /** Service agent: Tonoman boots + lifecycle-manages a long-lived self-channeled server
@@ -168,6 +285,11 @@ export interface Config {
   config_repo?: string;
   health_addr: string;
   agents: AgentConfig[];
+  /** Run turns IN THIS PROCESS's container rather than `podman exec` into a per-agent one
+   *  (local-exec). Set by the registry control plane: under Tonoman Cloud an agent is a row, so
+   *  there is no container to exec into and the pod is the isolation boundary. Self-hosted rosters
+   *  leave it unset and keep the per-agent container model. */
+  local_exec?: boolean;
   stream: StreamConfig;
   expose?: ExposeConfig;
   // legacy single-agent shape (back-compat)
@@ -235,7 +357,7 @@ function applyDefaults(c: Config): void {
     if (!a.name) a.name = "agent";
     // Infer the channel from which connector block is present (channel-teams); a service
     // agent owns its own channel, so leave it unset.
-    if (!a.service && !a.channel) a.channel = a.teams ? "teams" : "telegram";
+    if (!a.service && !a.channel) a.channel = a.slack ? "slack" : a.teams ? "teams" : "telegram";
   }
 }
 
@@ -254,10 +376,13 @@ export function validate(c: Config): void {
     // Teams agent (channel-teams) — teams.app_id + teams.tenant_id (app_password is a
     // secret injected at run time, so it is not required in the roster file).
     if (!a.service) {
-      const ch = a.channel ?? (a.teams ? "teams" : "telegram");
+      const ch = a.channel ?? (a.slack ? "slack" : a.teams ? "teams" : "telegram");
       if (ch === "teams") {
         if (!a.teams?.app_id) missing.push("teams.app_id");
         if (!a.teams?.tenant_id) missing.push("teams.tenant_id");
+      } else if (ch === "slack") {
+        // Both Slack tokens are secrets injected at run time, so the roster carries neither.
+        // Presence is checked where the connector is wired, not here.
       } else if (!a.telegram?.token) {
         missing.push("telegram.token");
       }
@@ -267,7 +392,11 @@ export function validate(c: Config): void {
     const remote = a.harness === "claude-code-http";
     if (remote) {
       if (!a.url) missing.push("url");
-    } else if (!a.container) {
+    } else if (!a.container && !c.local_exec) {
+      // A roster with no container is only valid in local-exec mode, where the POD is the sandbox
+      // and `claude` is spawned as a direct child. That is what a Tonoman Cloud gateway does: an
+      // agent is a row, so there is no per-agent container to exec into. A self-hosted roster still
+      // names one, and still gets the old error if it forgets.
       missing.push("container");
     }
     // Auth backend (backend-config-default): known values only; bedrock needs a region.

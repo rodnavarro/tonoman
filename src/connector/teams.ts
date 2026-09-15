@@ -16,6 +16,7 @@ import { promises as fs } from "node:fs";
 import * as http from "node:http";
 import * as crypto from "node:crypto";
 import * as path from "node:path";
+import { MYSTIC_VERBS, activeLine, compactElapsed, randomMysticVerb, settledLine, type MysticVerb } from "../core/mystic";
 import type { Connector, Envelope, Reply } from "../core/contracts";
 import { Roster, resolveIdentity, refusalNotice } from "../identity";
 
@@ -39,32 +40,11 @@ const STATUS_DELAY_MS = 4_000;
  * fallback if the card's box reads too heavy in the Teams client. */
 const STATUS_TRACE_AS_CARD = true;
 
-/** A whimsical "thinking" verb à la Claude's "Cogitating…/Thought for…" — shown gerund while the
- * turn runs, past-tense in the settled trace. Stored as explicit forms (no fragile -ing/-ed rules). */
-export interface MysticVerb {
-  ing: string; // present (active): "Cogitating"
-  ed: string; // past (settled): "Cogitated"
-}
-const MYSTIC_VERBS: MysticVerb[] = [
-  { ing: "Cogitating", ed: "Cogitated" },
-  { ing: "Ruminating", ed: "Ruminated" },
-  { ing: "Pondering", ed: "Pondered" },
-  { ing: "Percolating", ed: "Percolated" },
-  { ing: "Marinating", ed: "Marinated" },
-  { ing: "Moonwalking", ed: "Moonwalked" },
-  { ing: "Noodling", ed: "Noodled" },
-  { ing: "Conjuring", ed: "Conjured" },
-  { ing: "Finagling", ed: "Finagled" },
-  { ing: "Wrangling", ed: "Wrangled" },
-  { ing: "Mulling", ed: "Mulled" },
-  { ing: "Ideating", ed: "Ideated" },
-  { ing: "Tinkering", ed: "Tinkered" },
-  { ing: "Vibing", ed: "Vibed" },
-  { ing: "Scheming", ed: "Schemed" },
-];
-function randomMysticVerb(): MysticVerb {
-  return MYSTIC_VERBS[Math.floor(Math.random() * MYSTIC_VERBS.length)];
-}
+/** The waiting voice — the verb set and its rendering now live in core/mystic, shared with Slack:
+ * a personality kept in two places becomes two personalities. Re-exported here because the
+ * connector's options and tests speak in these terms. */
+export type { MysticVerb };
+export { MYSTIC_VERBS };
 
 export interface ConnectorOptions {
   appId: string; // the bot's Entra app (client) id — also the inbound token audience
@@ -757,30 +737,13 @@ function workingLabel(elapsedMs: number): string {
 }
 
 /** Active status-trace text (working_cue: "message") — the 🤖 bot marker + the mystic verb in
- * gerund + a compact elapsed that counts exact seconds under a minute (clearly moving) then steps
- * every 10s after (so it re-posts on each step, deduped). Under 1s the count is omitted. */
+ * gerund + a compact elapsed. Shared with the Slack work log via core/mystic. */
 function statusActiveText(verb: MysticVerb, elapsedMs: number): string {
-  const e = compactElapsed(elapsedMs);
-  return e ? `🤖 ${verb.ing}… ${e}` : `🤖 ${verb.ing}…`;
+  return activeLine(verb, elapsedMs);
 }
-/** Exact seconds in the first minute ("5s", "47s") so the cue is visibly moving; after a minute,
- * 10s steps ("1m", "1m10s", "2m30s") so a long wait doesn't churn. */
-function compactElapsed(ms: number): string {
-  if (ms < 1_000) return "";
-  if (ms < 60_000) return `${Math.floor(ms / 1000)}s`;
-  const m = Math.floor(ms / 60_000);
-  const s10 = Math.floor((ms % 60_000) / 10_000) * 10;
-  return s10 ? `${m}m${s10}s` : `${m}m`;
-}
-/** Settled status-trace text — the verb in past tense + total elapsed ("Cogitated for 34 seconds"
- * / "… for 2 minutes"), à la Claude's "Thought for…". */
+/** Settled status-trace text — past tense + total elapsed, à la Claude's "Thought for…". */
 function statusSettledText(verb: MysticVerb, elapsedMs: number): string {
-  if (elapsedMs < 60_000) {
-    const s = Math.max(1, Math.round(elapsedMs / 1000));
-    return `${verb.ed} for ${s} second${s === 1 ? "" : "s"}`;
-  }
-  const m = Math.round(elapsedMs / 60_000);
-  return `${verb.ed} for ${m} minute${m === 1 ? "" : "s"}`;
+  return settledLine(verb, elapsedMs);
 }
 
 /** The status-trace activity (working_cue: "message"). A subtle gray-italic line: by default a

@@ -29,5 +29,13 @@
     "tsx": "^4.19.0",
     "typescript": "^5.7.0",
     "vitest": "^2.1.0"
+  },
+  "dependencies": {
+    "@temporalio/activity": "^1.21.0",
+    "@temporalio/client": "^1.21.0",
+    "@temporalio/common": "^1.21.0",
+    "@temporalio/worker": "^1.21.0",
+    "@temporalio/workflow": "^1.21.0",
+    "ical.js": "^2.2.1"
   }
 }

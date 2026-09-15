@@ -26,6 +26,15 @@ export interface ConsumerOptions {
   // consumer renders exactly as before, so Telegram is byte-for-byte unchanged
   // (teams-consumer-telegram-safe).
   prefixStream?: boolean;
+  // OPT-IN for channels whose markdown renderer COLLAPSES a blank line. Teams turns "\n\n" into a
+  // single break, so the status footer ends up welded to the last line of the answer; the fix is a
+  // zero-width-space paragraph between them.
+  //
+  // Off by default because Slack does NOT collapse, and applying the fix there produces TWO blank
+  // lines where one was wanted — a workaround for one channel quietly becoming a defect in
+  // another. Named for the property that decides it rather than for the channel, so the next
+  // renderer that needs it is a flag rather than an `isTeams`.
+  collapsesBlankLines?: boolean;
 }
 
 export class Consumer implements Streamer {
@@ -182,11 +191,14 @@ export class Consumer implements Streamer {
             // gw-command-statusline: append a display-only footer to the BOTTOM of the
             // finalized message; the RETURNED text stays clean (footer never hits the transcript).
             const foot = footer ? footer(ev.usage) : null;
-            // Separate the answer from the status footer with a VISIBLE blank line. A bare
-            // "\n\n" is collapsed to a single break by Teams' markdown renderer, so we interpose
-            // a zero-width-space paragraph — an empty line that survives collapsing on Teams and
-            // stays invisible on Telegram (gw-command-statusline).
-            const display = foot ? `${deliverText}\n\n​\n\n${foot}` : deliverText;
+            // Separate the answer from the status footer with ONE visible blank line.
+            //
+            // On a renderer that collapses "\n\n" to a single break — Teams — that needs a
+            // zero-width-space paragraph to survive. On one that does not, the same trick renders
+            // TWO blank lines, which is how the footer ended up floating on Slack: a workaround for
+            // one channel had become a defect in another (gw-command-statusline).
+            const gap = this.o.collapsesBlankLines ? "\n\n​\n\n" : "\n\n";
+            const display = foot ? `${deliverText}${gap}${foot}` : deliverText;
             await this.deliverFinal(reply, sent, msgID, display, maxLen, lastSent, prefixStream);
             return final;
           }

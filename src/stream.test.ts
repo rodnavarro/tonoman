@@ -131,8 +131,24 @@ describe("Consumer — liveness heartbeat (gw-stream-heartbeat)", () => {
     const footer = (u?: { inputTokens: number }) => (u ? "📊 footer" : null);
     const final = await consumer.consume(reply, events(), undefined, footer);
     expect(final).toBe("the answer"); // transcript stays clean — footer NOT included
-    // displayed message carries the footer, separated by a visible blank line (ZWSP paragraph
-    // so Teams' markdown doesn't collapse it) — gw-command-statusline
+    // ONE blank line. Slack renders "\n\n" as exactly that, so nothing else is needed — and the
+    // zero-width-space paragraph this used to add unconditionally rendered TWO, which is how the
+    // footer came to float away from the answer (gw-command-statusline).
+    expect(shown[shown.length - 1]).toBe("the answer\n\n📊 footer");
+  });
+
+  it("pads the footer gap only where the renderer collapses blank lines", async () => {
+    // Teams turns "\n\n" into a single break, welding the footer to the last line of the answer.
+    // A zero-width-space paragraph survives that. The flag is named for the PROPERTY rather than
+    // for the channel, so the next renderer that needs it is a flag and not an `isTeams`.
+    const { reply, shown } = recordingReply();
+    const consumer = new Consumer({ cursor: "", editIntervalMs: 0, collapsesBlankLines: true });
+    async function* events(): AsyncGenerator<TurnEvent> {
+      yield { kind: "text", text: "the answer" };
+      yield { kind: "done", final: "the answer", usage: { inputTokens: 1, cacheWriteTokens: 0, cacheReadTokens: 0, outputTokens: 1 } };
+    }
+    const footer = (u?: { inputTokens: number }) => (u ? "📊 footer" : null);
+    await consumer.consume(reply, events(), undefined, footer);
     expect(shown[shown.length - 1]).toBe("the answer\n\n​\n\n📊 footer");
   });
 
