@@ -224,11 +224,22 @@ export async function unpublished(
  *  transcribed and written again, which is the loop that emptied the transcription quota once
  *  already. So the check is "does any route hold a page whose name starts with this stamp". */
 async function isPublished(brainDir: string, rec: Recording, journal?: Journal): Promise<boolean> {
+  // A page whose name matches the stamp is only THIS recording's if its `recording_id` says so. The
+  // stamp is unique to the minute, not to the recording, so a name match alone answered "published?"
+  // with "something started that minute" — and two recordings in one minute meant the second was
+  // dropped in silence. A page with no id at all predates the field and still counts as filed.
+  const mine = async (file: string): Promise<boolean> => {
+    const owner = await recordingIdOf(file);
+    return owner === undefined || owner === rec.id;
+  };
   if (!journal) {
-    return fs
-      .stat(path.join(brainDir, "Meetings", `${rec.stamp}.md`))
-      .then(() => true)
-      .catch(() => false);
+    for (const name of [`${rec.stamp}.md`, `${rec.stamp}-${rec.id.slice(0, 8)}.md`]) {
+      const file = path.join(brainDir, "Meetings", name);
+      if (await fs.stat(file).then(() => true).catch(() => false)) {
+        if (await mine(file)) return true;
+      }
+    }
+    return false;
   }
   const root = path.join(brainDir, journal.path);
   let dirs: string[];
@@ -244,7 +255,11 @@ async function isPublished(brainDir: string, rec: Recording, journal?: Journal):
     } catch {
       continue;
     }
-    if (names.some((n) => n.startsWith(rec.stamp) && n.endsWith(".md"))) return true;
+    // A person may have MOVED a recap to another folder, so every route is searched — but a stamp
+    // match there still has to prove it is this recording before it counts.
+    for (const n of names.filter((n) => n.startsWith(rec.stamp) && n.endsWith(".md"))) {
+      if (await mine(path.join(root, d, n))) return true;
+    }
   }
   return false;
 }
@@ -609,26 +624,69 @@ export function resolveMeeting(candidates: CalEvent[], proposed: string | undefi
   return candidates.find((c) => c.summary.trim().toLowerCase() === want);
 }
 
-/** PURE: where a recording's page and its folder live, given the journal (or the flat default). */
+/** PURE: where a recording's page and its folder live, given the journal (or the flat default).
+ *
+ *  `disambiguator`, when given, is appended to the name. The stamp is only unique to the MINUTE, and
+ *  two recordings genuinely can start in the same one — a 9-hour meeting and a 2-hour meeting 26
+ *  seconds apart, in the case that forced this. Without a suffix both want one filename, and since
+ *  "already published" is answered by looking for that name, filing the first makes the second look
+ *  done: it is skipped in silence, and the longer meeting is the one likely to vanish. */
 export function pathsFor(
   journal: Journal | undefined,
   rec: Recording,
   route: string,
   slugHint?: string,
+  disambiguator?: string,
 ): { page: string; folder: string } {
   // The recording's own title first; when Plaud only gave it a timestamp, a few words from what the
   // meeting was actually about. Naming it after the clock twice helps nobody find it later.
   const slug = slugFor(rec.title) || slugFor(slugHint ?? "");
-  const name = slug ? `${rec.stamp}-${slug}` : rec.stamp;
+  const suffix = disambiguator ? `-${disambiguator}` : "";
+  const name = (slug ? `${rec.stamp}-${slug}` : rec.stamp) + suffix;
   // posix.join, not join: these are paths INSIDE a git repository, and a backslash would be a
   // literal character in a filename rather than a separator the moment anyone runs this on Windows.
   if (!journal) {
-    return { page: path.posix.join("Meetings", `${rec.stamp}.md`), folder: path.posix.join("Meetings", rec.stamp) };
+    const flat = rec.stamp + suffix;
+    return { page: path.posix.join("Meetings", `${flat}.md`), folder: path.posix.join("Meetings", flat) };
   }
   return {
     page: path.posix.join(journal.path, route, `${name}.md`),
     folder: path.posix.join(journal.path, route, name),
   };
+}
+
+/** The `recording_id` a recap page carries in its frontmatter, if it has one.
+ *
+ *  This is what makes "is this filed?" a question about the RECORDING rather than about the minute it
+ *  started in. A page written before this field existed returns undefined and is treated as filed —
+ *  conservative on purpose: re-transcribing somebody's existing recap is the expensive mistake, and
+ *  every page this pipeline has ever written carries the field. */
+async function recordingIdOf(file: string): Promise<string | undefined> {
+  try {
+    const head = (await fs.readFile(file, "utf8")).slice(0, 800);
+    return /^recording_id:[ \t]*(\S+)[ \t]*$/m.exec(head)?.[1];
+  } catch {
+    return undefined;
+  }
+}
+
+/** Where this recording's page ACTUALLY goes, once the checkout has been consulted.
+ *
+ *  The base name when it is free or already ours; a name suffixed with the recording id when some
+ *  OTHER recording got that minute first. Deterministic, so a re-run of the same recording resolves
+ *  to the same path and is the no-op it should be. */
+export async function pathsForUnique(
+  brainDir: string,
+  journal: Journal | undefined,
+  rec: Recording,
+  route: string,
+  slugHint?: string,
+): Promise<{ page: string; folder: string }> {
+  const base = pathsFor(journal, rec, route, slugHint);
+  const owner = await recordingIdOf(path.join(brainDir, base.page));
+  // Free, or already this recording's — either way the base name is correct.
+  if (owner === undefined || owner === rec.id) return base;
+  return pathsFor(journal, rec, route, slugHint, rec.id.slice(0, 8));
 }
 
 /** PURE: how much transcript the summariser is given, and WHICH part of it.
@@ -1004,7 +1062,9 @@ export async function publish(
   owner?: string,
 ): Promise<boolean> {
   const route = resolveRoute(journal, recap.route);
-  const where = pathsFor(journal, rec, route, recap.highlights?.[0] ?? recap.summary);
+  // Resolved against the checkout, not computed blind: if another recording already owns this
+  // minute's name, this one files beside it instead of overwriting it.
+  const where = await pathsForUnique(brainDir, journal, rec, route, recap.highlights?.[0] ?? recap.summary);
   const dir = path.join(brainDir, where.folder);
   await fs.mkdir(dir, { recursive: true });
   await fs.writeFile(

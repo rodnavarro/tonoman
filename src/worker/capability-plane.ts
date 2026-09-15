@@ -258,7 +258,15 @@ export async function startCapabilityPlane(deps: TurnDeps): Promise<CapabilityPl
             run.user,
           );
           const route = recap.resolveRoute(voice.journal, r?.route);
-          const where = recap.pathsFor(voice.journal, rec, route, r?.highlights?.[0] ?? r?.summary);
+          // The same resolution `publish` used, re-run after the write — the page now carries this
+          // recording's id, so it resolves to exactly where it landed, suffix and all.
+          const where = await recap.pathsForUnique(
+            voice.brainDir,
+            voice.journal,
+            rec,
+            route,
+            r?.highlights?.[0] ?? r?.summary,
+          );
           return reply(200, { published, path: where.page, route });
         }
 
