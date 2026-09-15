@@ -9,9 +9,11 @@
 // merits: listing is cheap and safe to retry, processing is neither.
 
 import { execFile } from "node:child_process";
-import { promises as fs } from "node:fs";
+import { createWriteStream, promises as fs } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 
 import { budgetFor, chatWith, transcribeWith, type Provider } from "./inference";
 
@@ -452,19 +454,28 @@ export async function transcribeAudio(
   cacheDir?: string,
 ): Promise<TranscribeResult> {
   const t0 = Date.now();
-  const audio = Buffer.from(await (await fetch(audioUrl)).arrayBuffer());
 
   // A scratch directory per recording, removed whether or not this succeeds. The audio is the
   // customer's meeting; it has no business outliving the transcription.
   const work = await fs.mkdtemp(path.join(os.tmpdir(), "recap-"));
   try {
     const src = path.join(work, "source");
-    await fs.writeFile(src, audio);
+    // STREAMED to disk, never held whole in memory. This was `Buffer.from(await res.arrayBuffer())`,
+    // which pulled the entire file into the heap — and, for a moment, two copies of it — so a
+    // nine-hour recording (~450MB) needed about a gigabyte before the first chunk was even cut.
+    // That is the OOM that killed the worker four times on Celine's backfill, inside a 1Gi limit on
+    // a node with no room to raise it. ffmpeg reads the file from disk regardless; nothing
+    // downstream ever wanted the bytes in RAM. (/tmp is the container's overlay root — node disk,
+    // not a tmpfs — so the bytes genuinely leave memory rather than moving within it.)
+    const res = await fetch(audioUrl);
+    if (!res.ok || !res.body) throw new Error(`audio download failed: ${res.status} ${res.statusText}`);
+    await pipeline(Readable.fromWeb(res.body as import("node:stream/web").ReadableStream), createWriteStream(src));
+    const bytes = (await fs.stat(src)).size;
     const parts = await segments(src, work);
     const durations = await Promise.all(parts.map(probeSeconds));
     const totalSecs = durations.reduce((a: number, b) => a + (b ?? 0), 0);
     console.log(
-      `recap: ${label} — ${(audio.length / 1e6).toFixed(1)}MB in ${parts.length} chunk(s), ` +
+      `recap: ${label} — ${(bytes / 1e6).toFixed(1)}MB in ${parts.length} chunk(s), ` +
         `${Math.round(totalSecs)}s of audio [${durations.map((d) => (d === undefined ? "?" : Math.round(d))).join(", ")}]`,
     );
 
