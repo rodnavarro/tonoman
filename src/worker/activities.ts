@@ -38,8 +38,12 @@ export interface TurnDeps {
    *  through the agent's runner and the `done` text is captured, never posted. This is what the
    *  Talent `infer` capability routes to, so a recap is the agent thinking, on its own brain. The
    *  provider is the agent's harness today (claude-code); codex / an OpenAI subscription plug in at
-   *  this one dispatch point later. */
-  infer?(agent: string, p: { system: string; user: string }): Promise<string>;
+   *  this one dispatch point later.
+   *
+   *  `owner` is the person the item belongs to (a recording's owner). On an agent whose inference is
+   *  per person, the inference runs on THAT person's subscription — the same rule a turn follows for
+   *  its speaker — rather than on the agent's own login. */
+  infer?(agent: string, p: { system: string; user: string }, owner?: string): Promise<string>;
   /** Say something verbatim to a person, opening a DM if needed. */
   say?(agent: string, user: string, text: string): Promise<void>;
   /** The durable record of one item of one Talent run: opened before the run, closed either way.

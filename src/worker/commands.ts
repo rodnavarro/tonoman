@@ -129,6 +129,24 @@ export function parse(text: string): Command | undefined {
   return { name: m[1]!.toLowerCase(), arg: (m[2] ?? "").trim() };
 }
 
+/** PURE: a slash command's line with the app's name taken off — `!sapien-dev-connect plaud` →
+ *  `!connect plaud`.
+ *
+ *  Slack apps register Tonoman's commands as `/<app-name>-<command>`, because Slack resolves a
+ *  command per workspace and two apps' `/connect` collide. The connector turns the slash into
+ *  `!sapien-dev-connect`; this finds the known command it ends with, the LONGEST match so a command
+ *  that ends with another's name (`connections` / `connect`) resolves to itself. The prefix is not
+ *  checked against the agent's name: it only has to route, and Slack only delivers this app's own
+ *  commands to this app. A bare `!connect` (an unprefixed app) passes through unchanged. */
+export function unprefixSlash(line: string, known: readonly string[] = KNOWN): string {
+  const m = /^!(\S+)([\s\S]*)$/.exec(line.trim());
+  if (!m) return line;
+  const word = m[1]!.toLowerCase();
+  if (known.includes(word)) return line;
+  const base = [...known].sort((a, b) => b.length - a.length).find((k) => word.endsWith(`-${k}`));
+  return base ? `!${base}${m[2]}` : line;
+}
+
 /** PURE: the closest command to something somebody typed, or undefined.
  *
  *  Prefix matching in both directions rather than an edit distance: `!connections` should suggest

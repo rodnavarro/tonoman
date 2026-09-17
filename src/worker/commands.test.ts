@@ -1,6 +1,25 @@
 import { describe, expect, it, vi } from "vitest";
-import { parse, run, splitConnector, type CommandDeps, undecorate, CONNECT_KINDS, mergeConnections, canonicalModel } from "./commands";
+import { parse, run, splitConnector, type CommandDeps, undecorate, CONNECT_KINDS, mergeConnections, canonicalModel, unprefixSlash } from "./commands";
 import type { StatusMode } from "../statusline";
+
+describe("unprefixSlash — /<app-name>-<command> routes to the command", () => {
+  it("takes the app's name off", () => {
+    expect(unprefixSlash("!sapien-connect plaud")).toBe("!connect plaud");
+    expect(unprefixSlash("!sapien-dev-status")).toBe("!status");
+    expect(parse(unprefixSlash("!nelly-murphy-s-model opus"))).toEqual({ name: "model", arg: "opus" });
+  });
+
+  it("matches the longest command, so connections is not read as connect", () => {
+    expect(unprefixSlash("!sapien-connections")).toBe("!connections");
+    expect(unprefixSlash("!sapien-dev-connect claude")).toBe("!connect claude");
+  });
+
+  it("leaves a bare command and anything unknown untouched", () => {
+    expect(unprefixSlash("!connect plaud")).toBe("!connect plaud");
+    expect(unprefixSlash("!sapien-dance")).toBe("!sapien-dance");
+    expect(unprefixSlash("hello")).toBe("hello");
+  });
+});
 
 describe("parse", () => {
   it("accepts the ! prefix that actually reaches a Slack app", () => {

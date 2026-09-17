@@ -231,10 +231,15 @@ export async function startCapabilityPlane(deps: TurnDeps): Promise<CapabilityPl
         // large) and routes it through deps.infer. The Talent parses the returned text.
         if (req.method === "POST" && pathname === "/cap/infer") {
           if (!deps.infer) return reply(503, { error: "this runtime has no inference provider" });
-          const text = await deps.infer(run.agent, {
-            system: String(body.system ?? ""),
-            user: recap.budgetTranscript(String(body.user ?? ""), 500_000),
-          });
+          const text = await deps.infer(
+            run.agent,
+            {
+              system: String(body.system ?? ""),
+              user: recap.budgetTranscript(String(body.user ?? ""), 500_000),
+            },
+            // Whose item this is. The token names it, so a Talent cannot choose whose subscription pays.
+            run.user,
+          );
           return reply(200, { text });
         }
 

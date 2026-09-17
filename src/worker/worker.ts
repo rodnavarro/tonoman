@@ -325,8 +325,15 @@ function runClosure(runner: TurnRunner, cfg: AgentConfig): Wired["run"] {
   // Wrapped HERE, at the one place every harness run of this agent passes through — a person's
   // turn, a recap's inference, its announcement — because that is exactly the set of processes
   // that race each other for the agent's one credential file. See authrace.ts.
-  return (r: TurnRunReq, signal?: AbortSignal) =>
-    withAuthRaceRetry(() =>
+  return (r: TurnRunReq, signal?: AbortSignal) => {
+    const perPerson = cfg.inference_mode === "per_user" && !!r.user;
+    // WHOSE subscription this run bills, said once per run. Without it the only way to tell was
+    // which login folder a session file happened to land in — and with shared history, none.
+    console.log(
+      `worker: ${cfg.displayName ?? cfg.name} ${r.lean ? "inference" : "turn"} on ` +
+        `${perPerson ? `${r.user}'s login` : "the agent's login"} (${cfg.inference_mode ?? "shared"})`,
+    );
+    return withAuthRaceRetry(() =>
       runner.run(
         {
           prompt: r.prompt,
@@ -336,14 +343,12 @@ function runClosure(runner: TurnRunner, cfg: AgentConfig): Wired["run"] {
           sessionId: r.sessionId,
           sessionNew: r.sessionNew,
           lean: r.lean,
-          configHome:
-            cfg.inference_mode === "per_user" && r.user
-              ? claudecode.configHomeFor(cfg.name, r.user)
-              : undefined,
+          configHome: perPerson ? claudecode.configHomeFor(cfg.name, r.user) : undefined,
         },
         signal,
       ),
     );
+  };
 }
 
 /** Channels each agent WATCHES for Wave 6's reply-in-thread mode, keyed by agent name. Module-level
@@ -945,12 +950,14 @@ export async function run(
     // systemPromptFile: the identity/persona is for conversation; a recap wants the agent's model,
     // not its voice. Dispatches on the harness the agent runs — claude-code today; a second provider
     // (codex, an OpenAI subscription) slots in here without the Talent ever knowing.
-    infer: async (name: string, p: { system: string; user: string }): Promise<string> => {
+    infer: async (name: string, p: { system: string; user: string }, owner?: string): Promise<string> => {
       const a = wired.get(name);
       if (!a) throw new Error(`infer: ${name} is not a wired agent`);
       let out = "";
-      // lean: no tools, no connectors, one turn — a completion, not an agent session.
-      for await (const ev of a.run({ prompt: `${p.system}\n\n${p.user}`, lean: true })) {
+      // lean: no tools, no connectors, one turn — a completion, not an agent session. `user` is the
+      // item's owner, so a per-person agent summarises a recording on its owner's subscription; the
+      // run closure ignores it for a shared agent.
+      for await (const ev of a.run({ prompt: `${p.system}\n\n${p.user}`, lean: true, user: owner })) {
         // The COMPLETE reply rides the `done` event's `final` (the agent's full answer for memory +
         // render); `text` is only the streaming delta and `err` carries an error — reading `text`
         // here is why the first cut saw "no text" while the model had plainly answered.
@@ -1225,7 +1232,7 @@ export async function run(
       // Per-person agent: sign in the SPEAKER's own subscription (their own credential dir); shared:
       // the agent's one login, and the user is ignored — same offer either way.
       const u = a.cfg.inference_mode === "per_user" ? user : undefined;
-      await gate.ask(authDeps, name, a.cfg.name ?? name, conversation, u).catch((e) => {
+      await gate.ask(authDeps, name, a.cfg.displayName ?? a.cfg.name ?? name, conversation, u).catch((e) => {
         console.error(`worker: ${name} connect claude failed: ${(e as Error).message}`);
         return false;
       });
@@ -1408,6 +1415,9 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
       const a = wired.get(name);
       const api = process.env.TONOMANCLOUD_API_URL;
       if (!a?.cfg.guid || !api) return; // a file roster has no registry to tell
+      // `auth_state` is the AGENT's one login. On a per-person agent a login is one person's, and one
+      // person's failed code marked the whole agent `error` in the Hub while everyone else answered.
+      if (a.cfg.inference_mode === "per_user") return;
       const r = await fetch(`${api}/v1/system/agents/${a.cfg.guid}/auth-state`, {
         method: "POST",
         headers: {
@@ -1462,7 +1472,8 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
     // A slash always parses to a known command (Slack only delivers ones we registered), so it can
     // never fall through to a turn — unlike routing it as an envelope would risk.
     (a.conn as SlackConnector).setSlashHandler?.(async ({ text, conversation, user }) => {
-      const cmd = cmds.parse(text);
+      // `/sapien-connect` arrives as `!sapien-connect`; the app's name comes off before parsing.
+      const cmd = cmds.parse(cmds.unprefixSlash(text));
       if (!cmd) return null;
       return cmds.run(commandDeps, name, conversation, cmd, user).catch((e) => {
         console.error(`worker: ${name} slash ${cmd.name} failed: ${(e as Error).message}`);
@@ -1551,7 +1562,7 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
           const hasOwn = await fsp.access(credFile).then(() => true).catch(() => false);
           if (!hasOwn) {
             const asked = await gate
-              .ask(authDeps, name, a.cfg.name ?? name, env.conversation, env.user)
+              .ask(authDeps, name, a.cfg.displayName ?? a.cfg.name ?? name, env.conversation, env.user)
               .catch((e) => {
                 console.error(`worker: auth prompt failed for ${name}: ${(e as Error).message}`);
                 return false;
@@ -1560,7 +1571,7 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
             continue;
           }
         } else if (a.cfg.auth_state && a.cfg.auth_state !== "ok") {
-          const asked = await gate.ask(authDeps, name, a.cfg.name ?? name, env.conversation).catch((e) => {
+          const asked = await gate.ask(authDeps, name, a.cfg.displayName ?? a.cfg.name ?? name, env.conversation).catch((e) => {
             console.error(`worker: auth prompt failed for ${name}: ${(e as Error).message}`);
             return false;
           });
