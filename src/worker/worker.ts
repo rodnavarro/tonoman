@@ -2027,13 +2027,16 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
       taskQueue: o.taskQueue,
       args: [{ agent: name, notify: recipient, version: agendaBrief.version }] as [AgendaTickInput],
     };
+    // A brief is about the moment it was due. After downtime, a 07:00 brief delivered at 15:00 is noise:
+    // catch up for half an hour, then skip. SKIP overlap, as for the poll.
+    const policies = { overlap: ScheduleOverlapPolicy.SKIP, catchupWindow: "30 minutes" as Duration };
     const when = times.map((t) => `${String(t.hour).padStart(2, "0")}:${String(t.minute).padStart(2, "0")}`).join(", ");
     try {
-      await client.schedule.create({ scheduleId, spec, policies: { overlap: ScheduleOverlapPolicy.SKIP }, action });
+      await client.schedule.create({ scheduleId, spec, policies, action });
       console.log(`worker: ${name} agenda schedule created — ${when} ${timezone}`);
     } catch (e) {
       if (!/already exists/i.test((e as Error).message ?? "")) throw e;
-      await client.schedule.getHandle(scheduleId).update((prev) => ({ ...prev, spec, action }));
+      await client.schedule.getHandle(scheduleId).update((prev) => ({ ...prev, spec, action, policies: { ...prev.policies, ...policies } }));
       console.log(`worker: ${name} agenda schedule updated — ${when} ${timezone}`);
     }
   }
