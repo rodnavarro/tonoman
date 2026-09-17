@@ -52,6 +52,16 @@ describe('agenda-brief run', () => {
     expect(out.steer).not.toContain('Standup');
   });
 
+  it('a late-afternoon time is an end-of-day check, not a midday one', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(at('16:00'));
+    const { c } = ctx([ev('Wrap-up', '16:30', '17:00'), ev('Earlier', '14:00', '14:30')]);
+    const out = await run(c);
+    expect(out.steer).toContain('end-of-day agenda check');
+    expect(out.steer).toContain('Still ahead today (1): 16:30–17:00 Wrap-up');
+    expect(out.summary).toBe('End-of-day brief: 1 meeting(s) left, 0 overlap(s).');
+  });
+
   it('falls back to UTC without a timezone', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(Date.parse('2026-09-17T07:00:00Z'));

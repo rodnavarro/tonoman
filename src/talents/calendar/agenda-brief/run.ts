@@ -12,11 +12,13 @@ export const run: TalentRun = async (ctx) => {
   ctx.progress('reading calendars');
   const events = await ctx.cap.calendarEvents({ from: start, to: end });
   const facts = agendaFacts(events, now, timeZone);
-  // Morning before 11:00 local looks at the whole day; later in the day, only what is left.
-  const midday = localParts(now, timeZone).hour >= 11;
+  // The times are configurable, so the label comes from the local hour, not from which slot fired:
+  // before 11:00 is the morning look at the whole day; after that, only what is left of it.
+  const phase = checkPhase(localParts(now, timeZone).hour);
+  const midday = phase !== "morning";
 
   const steer =
-    `It's time for the ${midday ? 'midday' : 'morning'} agenda check. From their calendars (times ${timeZone}):\n` +
+    `It's time for the ${phase} agenda check. From their calendars (times ${timeZone}):\n` +
     `${describeFacts(facts, timeZone, midday)}\n\n` +
     'Write them a short message: how the ' +
     (midday ? 'rest of the day' : 'day') +
@@ -26,7 +28,14 @@ export const run: TalentRun = async (ctx) => {
 
   return {
     status: 'done',
-    summary: `${midday ? 'Midday' : 'Morning'} brief: ${facts.remaining.length} meeting(s) left, ${facts.overlaps.length} overlap(s).`,
+    summary: `${phase[0]!.toUpperCase()}${phase.slice(1)} brief: ${facts.remaining.length} meeting(s) left, ${facts.overlaps.length} overlap(s).`,
     steer,
   };
 };
+
+/** PURE: which check a brief is, from the local hour it runs at. */
+export function checkPhase(hour: number): "morning" | "midday" | "end-of-day" {
+  if (hour < 11) return "morning";
+  if (hour < 16) return "midday";
+  return "end-of-day";
+}
