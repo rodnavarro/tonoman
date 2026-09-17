@@ -244,6 +244,7 @@ const HELP = [
   "• `!disconnect claude` — sign out of the Claude subscription I answer on",
   "• `!connections` — what this agent is connected to",
   "• `!talent <name> <id> [again]` — run a Talent on one item now, instead of waiting for its schedule (`again` re-runs an already-filed item)",
+  "• `!talent agenda-brief now` — review today's calendar now: what's left, what overlaps, where the free time is",
   "• `!new` — forget this thread and start over",
   "• `!help` — this",
 ].join("\n");

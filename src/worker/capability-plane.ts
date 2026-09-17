@@ -69,6 +69,7 @@ function readJson(req: http.IncomingMessage): Promise<Record<string, unknown>> {
  *  there is one built-in Talent; this becomes the loader's registry when a second arrives. */
 const TALENT_ENTRY: Record<string, string> = {
   "meeting-recap": "src/talents/voice/plaud-and-calendar-meetings/index.ts",
+  "agenda-brief": "src/talents/calendar/agenda-brief/index.ts",
 };
 
 /** Spawn a Talent CLI as a subprocess and collect its outcome. This is the core both the `runTalent`

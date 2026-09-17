@@ -1,4 +1,5 @@
 import type { TalentManifest } from './contract';
+import { agendaBrief } from './agenda-brief';
 import { meetingRecap } from './meeting-recap';
 
 // The built-in Talent registry — the manifests this worker ships with. Pluggable by design: this is
@@ -8,7 +9,7 @@ import { meetingRecap } from './meeting-recap';
 // The run IMPLEMENTATION for a built-in Talent is a worker workflow (the Plaud Talent's is the voice
 // pipeline via runTalentWorkflow). A generic name@version→run dispatch is unnecessary while there is
 // one Talent; it becomes a map the day a second built-in Talent needs its own workflow.
-export const BUILTIN_TALENTS: readonly TalentManifest[] = [meetingRecap];
+export const BUILTIN_TALENTS: readonly TalentManifest[] = [meetingRecap, agendaBrief];
 
 export function getTalent(name: string, version?: number): TalentManifest | undefined {
   return BUILTIN_TALENTS.find((t) => t.name === name && (version === undefined || t.version === version));

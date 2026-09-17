@@ -25,6 +25,7 @@ import {
   proxyActivities,
   setHandler,
   startChild,
+  workflowInfo,
 } from "@temporalio/workflow";
 import type { Activities } from "./activities";
 // From `turnfailure`, NOT from `authflow`. A workflow is bundled into a sandbox with no Node
@@ -448,5 +449,50 @@ export async function runTalentWorkflow(input: RunTalentInput): Promise<void> {
       }).catch(() => {});
     }
     throw e;
+  }
+}
+
+// --- the agenda brief --------------------------------------------------------------------------
+
+export interface AgendaTickInput {
+  agent: string;
+  /** Who the brief is for, and on whose subscription it is written (per-person agents). */
+  notify: string;
+  /** The agenda-brief Talent's version, pinned by the schedule that starts this. */
+  version: number;
+}
+
+/** PURE: the slot a brief belongs to — its scheduled minute, in UTC. One brief per slot: a re-fire of
+ *  the same minute (a schedule catching up after a restart) is the same run, not a second message. */
+export function agendaSlot(startMs: number): string {
+  return new Date(Math.floor(startMs / 60_000) * 60_000).toISOString().slice(0, 16);
+}
+
+/**
+ * One scheduled agenda brief. A time-of-day schedule starts this; it names the slot and hands the run
+ * to `runTalentWorkflow` as a child, so a brief gets exactly what a recap gets — a `talent_run` row,
+ * retries, and the announcement as a real turn in the agent's channel.
+ */
+export async function agendaTickWorkflow(input: AgendaTickInput): Promise<void> {
+  const slot = agendaSlot(workflowInfo().startTime.getTime());
+  const item = `agenda-${slot}`;
+  try {
+    await startChild(runTalentWorkflow, {
+      workflowId: `talent:${input.agent}:agenda-brief:${slot}`,
+      args: [
+        {
+          agent: input.agent,
+          talent: "agenda-brief",
+          version: input.version,
+          itemKey: item,
+          recordingId: item,
+          notify: input.notify,
+          user: input.notify || undefined,
+        },
+      ],
+      parentClosePolicy: ParentClosePolicy.ABANDON,
+    });
+  } catch (e) {
+    if (!(e instanceof WorkflowExecutionAlreadyStartedError)) throw e;
   }
 }

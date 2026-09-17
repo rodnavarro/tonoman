@@ -16,4 +16,6 @@ export type {
   PublishCapability,
   CalendarCandidate,
   CalendarCandidatesCapability,
+  CalendarEvent,
+  CalendarEventsCapability,
 } from './types';

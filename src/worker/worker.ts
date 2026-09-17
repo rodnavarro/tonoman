@@ -53,7 +53,8 @@ import { promises as fsp } from "node:fs";
 import { defaultHarnesses } from "../gateway";
 import { accountsFromUsers, makeActivities, type TurnRunReq, type VoiceConfig } from "./activities";
 import { startCapabilityPlane, type CapabilityPlane } from "./capability-plane";
-import { conversationWorkflow, messageSignal, plaudPollWorkflow, runTalentWorkflow, type Inbound, type PollInput } from "./workflows";
+import { agendaTickWorkflow, conversationWorkflow, messageSignal, plaudPollWorkflow, runTalentWorkflow, type AgendaTickInput, type Inbound, type PollInput } from "./workflows";
+import { agendaBrief, parseAgendaTimes } from "./talents/agenda-brief";
 import { WorkflowExecutionAlreadyStartedError } from "@temporalio/common";
 import { planReload } from "./reload";
 
@@ -1206,6 +1207,8 @@ export async function run(
       if (!tdef) return { started: false, message: `I don't run a Talent called "${talent}".` };
       // Keyed on the recording's KEY, exactly as the poll keys it, so an on-demand run of an item
       // the poll knows under a renamed id is the same item — same workflow id, same run record.
+      // A brief is about NOW, not an item: every ask is its own run, never deduped against the last.
+      if (talent === agendaBrief.name) item = `now-${Date.now()}`;
       const key = recordingKey(item);
       const wfId = user ? `talent:${name}:${user}:${key}` : `talent:${name}:${key}`;
       try {
@@ -1214,6 +1217,7 @@ export async function run(
           taskQueue: o.taskQueue,
           args: [{ agent: name, talent, itemKey: key, recordingId: item, version: tdef.version, notify: user ?? "", user, force }],
         });
+        if (talent === agendaBrief.name) return { started: true, message: "Looking at today's calendar now — the brief follows in a moment." };
         return {
           started: true,
           message: force
@@ -1433,6 +1437,7 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
         await wireVoice(name, a);
         const v = voiceCreds.get(name);
         if (v) await ensureVoiceSchedule(name, v);
+        await ensureAgendaSchedule(name).catch(() => {});
       }
 
       // What it FOUND, not that it succeeded. "Connected" on its own is the claim that has been
@@ -1506,6 +1511,7 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
       // wireVoice says WHY in the log; this says it where the person asking can read it.
       if (!v) return "this agent has no voice flow configured yet, so there is nothing to poll with";
       await ensureVoiceSchedule(name, v);
+      await ensureAgendaSchedule(name).catch(() => {});
       return undefined;
     },
   };
@@ -1735,6 +1741,7 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
         wired.set(key, w);
         pumps.push(startPump(key, w));
         await wireVoice(key, w).catch((e) => console.error(`worker: reload — wireVoice ${key} failed: ${(e as Error).message}`));
+        await ensureAgendaSchedule(key).catch((e) => console.error(`worker: reload — agenda schedule ${key} failed: ${(e as Error).message}`));
         console.log(`worker: reload — added ${agentLabel(cfg2)} (${key})`);
       }
 
@@ -1772,6 +1779,7 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
         // place), and how a newly granted skill or a changed cadence reaches the poll.
         const w = wired.get(d.key);
         if (w) await wireVoice(d.key, w).catch((e) => console.error(`worker: reload — wireVoice ${d.key} failed: ${(e as Error).message}`));
+        await ensureAgendaSchedule(d.key).catch((e) => console.error(`worker: reload — agenda schedule ${d.key} failed: ${(e as Error).message}`));
       }
 
       // Refresh checkouts and context notes against the swapped configs. We hold `busy`, so syncAll's
@@ -1990,7 +1998,48 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
     }
   }
 
+  /** The agenda brief's schedule: time-of-day, in the tenant's timezone, one Temporal schedule per
+   *  agent (`agenda:<guid>`). It exists only while the agent holds the `agenda-brief` grant AND has a
+   *  working flow to read calendars and announce through; otherwise any schedule is removed, so
+   *  revoking the grant actually stops the briefs. Safe to call repeatedly. */
+  async function ensureAgendaSchedule(name: string): Promise<void> {
+    const a = wired.get(name);
+    const scheduleId = `agenda:${a?.cfg.guid ?? name}`;
+    const grant = a?.cfg.talents?.find((t) => t.name === agendaBrief.name);
+    const v = voiceCreds.get(name);
+    const times = grant ? parseAgendaTimes(grant.config?.times) : [];
+    const recipient = v?.notifyUser ?? "";
+    if (!a || !grant || !v || !times.length || (!recipient && !v.notifyChannel)) {
+      try {
+        await client.schedule.getHandle(scheduleId).delete();
+        console.log(`worker: ${name} agenda schedule removed`);
+      } catch {
+        /* never scheduled — the normal case for an agent without the grant */
+      }
+      if (grant && !v) console.log(`worker: ${name} agenda brief not scheduled — no flow to read calendars through`);
+      return;
+    }
+    const timezone = a.cfg.timezone || "UTC";
+    const spec = { calendars: times.map((t) => ({ hour: t.hour, minute: t.minute })), timezone };
+    const action = {
+      type: "startWorkflow" as const,
+      workflowType: agendaTickWorkflow,
+      taskQueue: o.taskQueue,
+      args: [{ agent: name, notify: recipient, version: agendaBrief.version }] as [AgendaTickInput],
+    };
+    const when = times.map((t) => `${String(t.hour).padStart(2, "0")}:${String(t.minute).padStart(2, "0")}`).join(", ");
+    try {
+      await client.schedule.create({ scheduleId, spec, policies: { overlap: ScheduleOverlapPolicy.SKIP }, action });
+      console.log(`worker: ${name} agenda schedule created — ${when} ${timezone}`);
+    } catch (e) {
+      if (!/already exists/i.test((e as Error).message ?? "")) throw e;
+      await client.schedule.getHandle(scheduleId).update((prev) => ({ ...prev, spec, action }));
+      console.log(`worker: ${name} agenda schedule updated — ${when} ${timezone}`);
+    }
+  }
+
   for (const [name, v] of voiceCreds) await ensureVoiceSchedule(name, v);
+  for (const name of wired.keys()) await ensureAgendaSchedule(name).catch((e) => console.error(`worker: ${name} agenda schedule failed — ${(e as Error).message}`));
 
   signal.addEventListener("abort", () => worker.shutdown(), { once: true });
   await Promise.all([serving, ...pumps]);
