@@ -131,6 +131,8 @@ interface SlackEvent {
   text?: string;
   ts?: string;
   thread_ts?: string;
+  /** On a reply in a thread: who posted the message the thread hangs off. */
+  parent_user_id?: string;
   event_ts?: string;
   /** Files attached to THIS message. Only present on a message the agent was addressed in, so this
    *  never picks up a `file_shared` event for something dropped elsewhere in the workspace. */
@@ -309,6 +311,9 @@ export class SlackConnector implements Connector {
         // dispatcher — one code path answers both prefixes.
         if (frame.type === "slash_commands" && frame.payload) {
           const p = frame.payload as unknown as SlashPayload;
+          // Logged on arrival: without it, "the command did nothing" could not be told apart from
+          // "Slack never delivered it", which is a manifest or install problem, not a code one.
+          console.log(`slack: slash ${p.command ?? "?"} from ${p.user_id ?? "?"} in ${p.channel_id ?? "?"}`);
           const key = `slash:${p.trigger_id ?? `${p.command}:${p.channel_id}:${p.user_id}`}`;
           if (this.seen.has(key)) return;
           this.seen.add(key);
@@ -423,7 +428,8 @@ export class SlackConnector implements Connector {
     const watched = !!(e.channel && this.o.watchedChannels?.().has(e.channel));
     const isDm = e.type === "message" && e.channel_type === "im";
     const isWatchedMessage = e.type === "message" && watched;
-    if (e.type !== "app_mention" && !isDm && !isWatchedMessage) return null;
+    const inOwnThread = repliesToOwnThread(e, this.botUserID);
+    if (e.type !== "app_mention" && !isDm && !isWatchedMessage && !inOwnThread) return null;
     // A subtype usually means it is not a plain human message: message_changed, message_deleted,
     // channel_join, bot_message — none of them something to answer. The ONE exception is
     // `file_share`: a person uploading a file (with an optional caption) is a real turn, and it is
@@ -533,6 +539,24 @@ export class SlackConnector implements Connector {
       if (st && st.isFile() && st.mtimeMs < cutoff) await fs.rm(p, { force: true }).catch(() => {});
     }
   }
+}
+
+/** PURE: is this a reply in a thread the AGENT started — a recap it posted, an answer it gave at
+ *  top level? Then it is addressed to the agent without an @mention: a person replying under the
+ *  agent's own message is talking to it, and making them mention it every time was noise. A thread
+ *  somebody else started still needs the mention. Needs the app's `message.channels` (and
+ *  `message.groups`) subscription for Slack to deliver the message at all. */
+export function repliesToOwnThread(
+  e: { type: string; ts?: string; thread_ts?: string; parent_user_id?: string },
+  botUserID: string | undefined,
+): boolean {
+  return (
+    e.type === "message" &&
+    !!botUserID &&
+    !!e.thread_ts &&
+    e.thread_ts !== e.ts &&
+    e.parent_user_id === botUserID
+  );
 }
 
 /** `<team>/<channel>[/<thread_ts>]` — flat, sortable, and parseable without ambiguity, since
