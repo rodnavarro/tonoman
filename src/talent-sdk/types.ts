@@ -19,7 +19,7 @@ export interface CredentialRequirement {
  *  itself — so provider routing (local-gpu), metering (inference) and the git-backed second brain
  *  stay the runtime's, never baked into the Talent. Announcing is deliberately absent: a Talent
  *  reports an outcome, it does not speak. */
-export type CapabilityName = 'transcribe' | 'infer' | 'publish';
+export type CapabilityName = 'transcribe' | 'infer' | 'publish' | 'calendar';
 
 export type ConfigFieldType = 'channel' | 'channel_list' | 'text' | 'toggle';
 
@@ -119,6 +119,8 @@ export interface CalendarCandidate {
   attendees: string[];
   start?: number;
   end?: number;
+  /** Which connected calendar it came from — decides the route when the tenant configured one. */
+  source?: { kind: string; alias: string };
 }
 
 /** Calendar entries around a time window. NOTE (transitional): calendar is declared as a `requires`
@@ -127,6 +129,22 @@ export interface CalendarCandidate {
  *  candidates from the tenant's configured feeds — a stated impurity, like `publish`'s payload. */
 export interface CalendarCandidatesCapability {
   (input: { from: number; to: number }): Promise<CalendarCandidate[]>;
+}
+
+/** One entry from the agent's calendars, for a Talent that reasons about a day rather than a single
+ *  recording (the agenda brief). `source` names which connected calendar it came from. */
+export interface CalendarEvent {
+  summary: string;
+  start: number;
+  end: number;
+  attendees: string[];
+  source: { kind: string; alias: string };
+}
+
+/** Every event in [from, to) across the agent's connected calendars — ICS and Google alike, with the
+ *  tenant's exclusions and cancellations already applied. No padding: the window is the question. */
+export interface CalendarEventsCapability {
+  (input: { from: number; to: number }): Promise<CalendarEvent[]>;
 }
 
 /** Everything a running Talent is handed. It imports this type; the SDK's `runCli` constructs the
@@ -145,6 +163,7 @@ export interface TalentContext {
     publish: PublishCapability;
     /** Transitional — see CalendarCandidatesCapability. */
     calendarCandidates: CalendarCandidatesCapability;
+    calendarEvents: CalendarEventsCapability;
   };
   /** Emit a progress note on the side channel (stderr), so the `runTalent` activity keeps Temporal's
    *  heartbeat alive without the outcome stream having to carry it. */

@@ -39,6 +39,20 @@ async function callCap<T>(method: 'GET' | 'POST', route: string, body?: unknown)
   return json as T;
 }
 
+/** PURE: the Talent's input from what the runtime wrote on stdin.
+ *
+ *  `context` was dropped here: the runtime sent the mission, the journal and its routes, the vocab
+ *  and the tenant's timezone, and the Talent received none of it. Every recap then ran with no
+ *  routing, no alignment and no spelling rules, and filed to `unclassified` whatever it was. */
+export function inputFrom(parsed: Partial<TalentInput>): TalentInput {
+  return {
+    item: String(parsed.item ?? ''),
+    config: (parsed.config as Record<string, unknown>) ?? {},
+    user: parsed.user,
+    ...(parsed.context ? { context: parsed.context } : {}),
+  };
+}
+
 export async function runCli(manifest: TalentManifest, run: TalentRun): Promise<void> {
   const progress = (note: string): void => void process.stderr.write(`@progress ${note}\n`);
   const log = (msg: string): void => void process.stderr.write(`${msg}\n`);
@@ -46,11 +60,7 @@ export async function runCli(manifest: TalentManifest, run: TalentRun): Promise<
   try {
     const rawInput = await readStdin();
     const parsed = (rawInput ? JSON.parse(rawInput) : {}) as Partial<TalentInput>;
-    const input: TalentInput = {
-      item: String(parsed.item ?? ''),
-      config: (parsed.config as Record<string, unknown>) ?? {},
-      user: parsed.user,
-    };
+    const input = inputFrom(parsed);
     const creds: Record<string, unknown> = process.env.TONOMAN_TALENT_CREDS
       ? (JSON.parse(process.env.TONOMAN_TALENT_CREDS) as Record<string, unknown>)
       : {};
@@ -65,6 +75,7 @@ export async function runCli(manifest: TalentManifest, run: TalentRun): Promise<
         infer: (i) => callCap('POST', '/cap/infer', i),
         publish: (p) => callCap('POST', '/cap/publish', p),
         calendarCandidates: (i) => callCap('POST', '/cap/calendar-candidates', i),
+        calendarEvents: (i) => callCap('POST', '/cap/calendar-events', i),
       },
       progress,
       log,

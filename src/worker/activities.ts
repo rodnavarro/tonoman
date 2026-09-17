@@ -46,6 +46,10 @@ export interface TurnDeps {
    *  per person, the inference runs on THAT person's subscription — the same rule a turn follows for
    *  its speaker — rather than on the agent's own login. */
   infer?(agent: string, p: { system: string; user: string }, owner?: string): Promise<string>;
+  /** Read one connected Google calendar for a window, through the registry's token refresh. */
+  googleCalendar?(agent: string, feed: calendar.CalendarFeed, from: number, to: number): Promise<calendar.CalEvent[]>;
+  /** A granted Talent's saved config for this agent (`agent_talent.config`), or `{}`. */
+  talentConfig?(agent: string, talent: string): Record<string, unknown>;
   /** Say something verbatim to a person, opening a DM if needed. */
   say?(agent: string, user: string, text: string): Promise<void>;
   /** The durable record of one item of one Talent run: opened before the run, closed either way.
@@ -219,6 +223,8 @@ export interface VoiceConfig {
   calendars?: calendar.CalendarFeed[];
   /** Titles that are blocks rather than meetings — "Focus Time", "Lunch". From the registry. */
   calendarExclude?: string[];
+  /** Which route a match on each calendar (by alias) files under. From `calendar.route.<alias>`. */
+  calendarRoutes?: Record<string, string>;
   /** How far either side of a recording to look. Generous by default; see calendar.ts. */
   calendarPadMinutes?: number;
   /** The installed voice Talent — its name and version, populated from the roster the worker already

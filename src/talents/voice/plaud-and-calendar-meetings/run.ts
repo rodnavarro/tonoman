@@ -29,6 +29,8 @@ interface Recap {
   meetingReason?: string;
   alignment?: string;
   alignmentReason?: string;
+  participants?: string[];
+  participantsFrom?: 'calendar' | 'transcript';
 }
 
 const ALIGNMENTS = ['advances', 'neutral', 'detracts'] as const;
@@ -150,8 +152,9 @@ function buildRecapPrompt(
     'You summarise a recorded business meeting for a searchable knowledge base.',
     'Be specific and factual. Never invent a name, number, decision or commitment.',
     'If something is unclear in the transcript, leave it out rather than guessing.',
-    'Reply with STRICT JSON only: {"summary": string, "highlights": string[], "decisions": string[], "followups": string[]}.',
+    'Reply with STRICT JSON only: {"summary": string, "highlights": string[], "decisions": string[], "followups": string[], "participants": string[]}.',
     'summary: 2-4 sentences. highlights: at most 5, each one line. decisions/followups may be empty.',
+    'participants: the people who clearly took part, by name as the transcript gives it; empty when nobody is named.',
     routing,
     calendaring,
     aligning,
@@ -186,10 +189,39 @@ function resolveAlignment(proposed: string | undefined): string {
 
 /** The model may only claim a meeting it was shown — a hallucinated name files the recap into a
  *  series it does not belong to. */
-function resolveMeeting(candidates: CalendarCandidate[], proposed: string | undefined): CalendarCandidate | undefined {
-  const want = (proposed ?? '').trim();
+export function resolveMeeting(candidates: CalendarCandidate[], proposed: string | undefined): CalendarCandidate | undefined {
+  // Case- and space-tolerant, like the worker's: the model echoing "api team standup" for
+  // "API Team Standup" is the same meeting, and an exact comparison dropped the match.
+  const want = (proposed ?? '').trim().toLowerCase();
   if (!want) return undefined;
-  return candidates.find((c) => c.summary.trim() === want);
+  return candidates.find((c) => c.summary.trim().toLowerCase() === want);
+}
+
+/** PURE: what a calendar match changes, as the original pipeline did.
+ *
+ *  - The meeting is the entry's own title (a closed set: only an entry the model was shown).
+ *  - Its attendees ARE the participants — the calendar is authoritative, the transcript a guess.
+ *  - Its calendar decides the route when the tenant said so (`calendar.route.<alias>`): a meeting on
+ *    the Foley calendar is a Foley meeting, whatever the model inferred from the talk. */
+export function applyCalendarMatch(
+  recap: Recap,
+  candidates: CalendarCandidate[],
+  calendarRoutes: Record<string, string> = {},
+): Recap {
+  const matched = resolveMeeting(candidates, recap.meeting);
+  const out: Recap = { ...recap, meeting: matched?.summary ?? '' };
+  if (matched && matched.attendees.length) {
+    out.participants = matched.attendees;
+    out.participantsFrom = 'calendar';
+  } else if (out.participants?.length) {
+    out.participantsFrom = 'transcript';
+  }
+  const routed = matched?.source ? calendarRoutes[matched.source.alias] : undefined;
+  if (routed) {
+    out.route = routed;
+    out.routeReason = `on the ${matched!.source!.alias} calendar as “${matched!.summary}”`;
+  }
+  return out;
 }
 
 // --- The run -------------------------------------------------------------------------------------
@@ -216,8 +248,8 @@ export const run: TalentRun = async (ctx) => {
 
   ctx.progress('summarising');
   const prompt = buildRecapPrompt(text, rec.title, journal, candidates, mission, vocab);
-  const recap = parseRecapJson((await ctx.cap.infer(prompt)).text);
-  recap.meeting = resolveMeeting(candidates, recap.meeting)?.summary ?? '';
+  const calendarRoutes = (context?.calendarRoutes as Record<string, string> | undefined) ?? {};
+  const recap = applyCalendarMatch(parseRecapJson((await ctx.cap.infer(prompt)).text), candidates, calendarRoutes);
   recap.alignment = resolveAlignment(recap.alignment);
   if (!recap.alignment) recap.alignmentReason = undefined;
 

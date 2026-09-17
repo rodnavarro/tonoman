@@ -387,6 +387,8 @@ export async function gather(
   opts: {
     exclude?: string[];
     fetcher?: (url: string) => Promise<string>;
+    /** Reads a Google calendar's events for a window. Absent means Google feeds are skipped. */
+    google?: (feed: CalendarFeed, from: number, to: number) => Promise<CalEvent[]>;
     log?: (message: string) => void;
   } = {},
 ): Promise<CalEvent[]> {
@@ -397,6 +399,11 @@ export async function gather(
   // the same provider is how a polling client gets rate-limited.
   for (const f of feeds) {
     try {
+      if (f.kind === "google") {
+        if (!opts.google) continue;
+        out.push(...(await opts.google(f, from, to)));
+        continue;
+      }
       const body = await fetcher(f.url);
       const events = eventsBetween(body, from, to, { kind: f.kind, alias: f.alias });
       out.push(...events);

@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import type { TalentContext } from '../../../talent-sdk';
-import { run } from './run';
+import { run, applyCalendarMatch, resolveMeeting } from './run';
 
 // Proves the Talent's orchestration end-to-end without a subprocess or a real plane: the Plaud
 // client (over a mocked global fetch), the transcribe → calendar → infer → publish sequence, and the
@@ -103,5 +103,39 @@ describe('the Plaud Talent run', () => {
   it('surfaces a recording still being prepared as a retryable failure, not a silent skip', async () => {
     mockPlaud({ id: 'rec1', name: 'x', duration: 2580, presigned_url: undefined });
     await expect(run(ctx())).rejects.toThrow(/being prepared/);
+  });
+});
+
+describe('applyCalendarMatch — what a match changes, as the original pipeline did', () => {
+  const base = { summary: 's', highlights: [], decisions: [], followups: [] };
+  const cands = [
+    { summary: 'API Team Standup', attendees: ['Rod Navarro', 'Chris'], source: { kind: 'ics', alias: 'foley' } },
+    { summary: 'Axiplex weekly', attendees: [], source: { kind: 'google', alias: 'personal' } },
+  ];
+
+  it('matches case-insensitively, like the worker does', () => {
+    expect(resolveMeeting(cands, '  api team standup ')?.summary).toBe('API Team Standup');
+  });
+
+  it("takes the matched entry's attendees as the participants, and its calendar's route", () => {
+    const out = applyCalendarMatch({ ...base, meeting: 'api team standup', route: 'unclassified', participants: ['guess'] }, cands, { foley: 'foley-meetings' });
+    expect(out.meeting).toBe('API Team Standup');
+    expect(out.participants).toEqual(['Rod Navarro', 'Chris']);
+    expect(out.participantsFrom).toBe('calendar');
+    expect(out.route).toBe('foley-meetings');
+    expect(out.routeReason).toContain('foley calendar');
+  });
+
+  it("keeps the model's route and marks its participants as inferred when the calendar says nothing", () => {
+    const out = applyCalendarMatch({ ...base, meeting: 'Axiplex weekly', route: 'axiplex-meetings', participants: ['Rod'] }, cands, { foley: 'foley-meetings' });
+    expect(out.route).toBe('axiplex-meetings');
+    expect(out.participants).toEqual(['Rod']);
+    expect(out.participantsFrom).toBe('transcript');
+  });
+
+  it('refuses a meeting the model was not shown', () => {
+    const out = applyCalendarMatch({ ...base, meeting: 'Made-up sync' }, cands, { foley: 'foley-meetings' });
+    expect(out.meeting).toBe('');
+    expect(out.route).toBeUndefined();
   });
 });

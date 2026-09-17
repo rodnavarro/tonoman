@@ -47,6 +47,7 @@ import { describe as describeVoice, voiceSettings } from "./flowcfg";
 import * as flowcfg from "./flowcfg";
 import * as inference from "./inference";
 import * as calendar from "./calendar";
+import * as googlecal from "./googlecal";
 import { serveWake } from "./wake";
 import { promises as fsp } from "node:fs";
 import { defaultHarnesses } from "../gateway";
@@ -756,9 +757,15 @@ export async function run(
     // because a published feed's link IS its credential.
     const calendars: calendar.CalendarFeed[] = [];
     for (const c of a.cfg.credentials ?? []) {
-      if (c.kind !== "ics") continue; // google and outlook arrive with the OAuth callback
+      if (c.kind !== "ics" && c.kind !== "google") continue; // outlook: connect-only for now
       if (c.status && c.status !== "connected") {
         console.log(`worker: ${name} calendar ${c.kind}/${c.alias} is ${c.status}, skipping`);
+        continue;
+      }
+      // Google has no URL to resolve: its events are read through the registry's token refresh at
+      // the time they are needed (deps.googleCalendar), so the feed only names the connection.
+      if (c.kind === "google") {
+        calendars.push({ kind: "google", alias: c.alias, url: "" });
         continue;
       }
       const url = await registrySecret(a.cfg.guid, c.secret_ref);
@@ -840,6 +847,7 @@ export async function run(
       accounts,
       calendars,
       calendarExclude: (voice.calendarExclude ?? []).filter(Boolean),
+      calendarRoutes: voice.calendarRoutes,
       calendarPadMinutes: voice.calendarPadMinutes,
       brainDir: src.subpath ? path.join(dir, src.subpath) : dir,
       // The state volume, not /tmp: a retry that resumes has to survive a pod restart, and /tmp in
@@ -959,6 +967,34 @@ export async function run(
     // systemPromptFile: the identity/persona is for conversation; a recap wants the agent's model,
     // not its voice. Dispatches on the harness the agent runs — claude-code today; a second provider
     // (codex, an OpenAI subscription) slots in here without the Talent ever knowing.
+    // A Google calendar's events, through the registry: it refreshes the access token with the client
+    // secret this worker never holds, and hands back only the short-lived access token.
+    googleCalendar: async (
+      name: string,
+      feed: calendar.CalendarFeed,
+      from: number,
+      to: number,
+    ): Promise<calendar.CalEvent[]> => {
+      const guid = wired.get(name)?.cfg.guid;
+      const baseUrl = process.env.TONOMANCLOUD_API_URL;
+      if (!guid || !baseUrl) return [];
+      const r = await fetch(
+        `${baseUrl}/v1/system/agents/${guid}/oauth/google/${encodeURIComponent(feed.alias)}/access-token`,
+        {
+          method: "POST",
+          headers: { authorization: `Bearer ${process.env.TONOMANCLOUD_API_TOKEN ?? ""}` },
+          signal: AbortSignal.timeout(20_000),
+        },
+      );
+      const j = (await r.json().catch(() => ({}))) as { accessToken?: string; error?: string };
+      if (!r.ok || !j.accessToken) throw new Error(`google/${feed.alias}: ${j.error ?? `registry answered ${r.status}`}`);
+      return googlecal.eventsFromGoogle(await googlecal.listEvents(j.accessToken, from, to), {
+        kind: feed.kind,
+        alias: feed.alias,
+      });
+    },
+    talentConfig: (name: string, talent: string): Record<string, unknown> =>
+      wired.get(name)?.cfg.talents?.find((t) => t.name === talent)?.config ?? {},
     infer: async (name: string, p: { system: string; user: string }, owner?: string): Promise<string> => {
       const a = wired.get(name);
       if (!a) throw new Error(`infer: ${name} is not a wired agent`);

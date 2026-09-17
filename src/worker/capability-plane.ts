@@ -96,9 +96,19 @@ async function runTalentProcess(
     const input = {
       item: run.item,
       user: run.user,
-      config: {},
+      // The grant's saved config (an agenda brief's times, a recap's output channel). It was always
+      // `{}`, so a Talent could declare config fields and never receive a value.
+      config: deps.talentConfig?.(run.agent, talent) ?? {},
       // The tenant context the recap prompt needs — provided by the runtime, never held by the Talent.
-      context: { mission: voice.mission ?? "", journal: voice.journal, vocab: voice.vocab, timezone: voice.timezone },
+      context: {
+        mission: voice.mission ?? "",
+        journal: voice.journal,
+        vocab: voice.vocab,
+        timezone: voice.timezone,
+        calendarRoutes: voice.calendarRoutes ?? {},
+        // Who the run is on behalf of, for a Talent that addresses someone (the agenda brief).
+        notifyUser: voice.notifyUser,
+      },
     };
     // The production image ships compiled `dist` and omits `tsx` and `src` (`npm ci --omit=dev`), so
     // `tsx src/…/index.ts` cannot run there. Prefer the compiled Talent (`node dist/…/index.js`), and
@@ -272,7 +282,8 @@ export async function startCapabilityPlane(deps: TurnDeps): Promise<CapabilityPl
             voice.journal,
             rec,
             route,
-            r?.highlights?.[0] ?? r?.summary,
+            recap.recapSlugHint(r ?? {}),
+            r?.meeting,
           );
           return reply(200, { published, path: where.page, route });
         }
@@ -286,9 +297,25 @@ export async function startCapabilityPlane(deps: TurnDeps): Promise<CapabilityPl
           const w = calendar.windowFor(Number(body.from ?? 0), Number(body.to ?? 0), voice.calendarPadMinutes);
           const cands = await calendar.gather(voice.calendars, w.from, w.to, {
             exclude: voice.calendarExclude,
+            google: deps.googleCalendar ? (f, a, b) => deps.googleCalendar!(run.agent, f, a, b) : undefined,
             log: (m: string) => console.log(m),
           });
           return reply(200, cands);
+        }
+
+        // calendar events: every entry in [from, to) across the agent's calendars, no padding — for a
+        // Talent that reasons about a day (the agenda brief) rather than one recording.
+        if (req.method === "POST" && pathname === "/cap/calendar-events") {
+          if (!voice.calendars?.length) return reply(200, []);
+          const events = await calendar.gather(voice.calendars, Number(body.from ?? 0), Number(body.to ?? 0), {
+            exclude: voice.calendarExclude,
+            google: deps.googleCalendar ? (f, a, b) => deps.googleCalendar!(run.agent, f, a, b) : undefined,
+            log: (m: string) => console.log(m),
+          });
+          return reply(
+            200,
+            events.map((e) => ({ summary: e.summary, start: e.start, end: e.end, attendees: e.attendees, source: e.source })),
+          );
         }
 
         // credential: a fresh, usable credential for a kind the Talent declared in `requires`. For

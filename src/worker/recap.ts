@@ -266,6 +266,21 @@ async function isPublished(brainDir: string, rec: Recording, journal?: Journal):
     for (const n of names.filter((n) => n.startsWith(rec.stamp) && n.endsWith(".md"))) {
       if (await mine(path.join(root, d, n))) return true;
     }
+    // AND one level down: a recap matched to a calendar entry is filed under its series folder
+    // (`<route>/<Series>/<name>.md`). Missing it here would make every matched recap read as
+    // unpublished, and the poll would transcribe it again every two minutes — the loop that emptied
+    // the transcription quota once already.
+    for (const sub of names) {
+      let inner: string[];
+      try {
+        inner = await fs.readdir(path.join(root, d, sub));
+      } catch {
+        continue; // a file, not a series folder
+      }
+      for (const n of inner.filter((n) => n.startsWith(rec.stamp) && n.endsWith(".md"))) {
+        if (await mine(path.join(root, d, sub, n))) return true;
+      }
+    }
   }
   return false;
 }
@@ -553,6 +568,25 @@ export interface Recap {
   alignment?: string;
   /** One line on why. The verdict without the reason is a score, and nobody trusts a score. */
   alignmentReason?: string;
+  /** Who was in the meeting. */
+  participants?: string[];
+  /** Where `participants` came from: the matched calendar entry's attendees (authoritative), or the
+   *  model's reading of the transcript. The page says which, because the two deserve different trust. */
+  participantsFrom?: "calendar" | "transcript";
+}
+
+/** PURE: the Participants section, saying where the names came from. Empty when there are none. */
+export function participantsSection(recap: Recap): string {
+  const names = (recap.participants ?? []).map((n) => n.trim()).filter(Boolean);
+  if (!names.length) return "";
+  const from = recap.participantsFrom === "calendar" ? "from calendar" : "inferred from transcript";
+  return `
+## Participants
+
+_(${from})_
+
+${names.map((n) => `- ${n}`).join("\n")}
+`;
 }
 
 /** The only verdicts. A closed set, exactly like `route`, and for the same reason: a free-text
@@ -653,6 +687,9 @@ export function pathsFor(
   route: string,
   slugHint?: string,
   disambiguator?: string,
+  /** The calendar entry this recording was matched to. Files it under that series' folder, as the
+   *  original pipeline did: every "API Team Standup" together, not scattered through a route. */
+  series?: string,
 ): { page: string; folder: string } {
   // The recording's own title first; when Plaud only gave it a timestamp, a few words from what the
   // meeting was actually about. Naming it after the clock twice helps nobody find it later.
@@ -665,10 +702,36 @@ export function pathsFor(
     const flat = rec.stamp + suffix;
     return { page: path.posix.join("Meetings", `${flat}.md`), folder: path.posix.join("Meetings", flat) };
   }
+  const seg = seriesSegment(series ?? "");
+  const base = seg ? path.posix.join(journal.path, route, seg) : path.posix.join(journal.path, route);
   return {
-    page: path.posix.join(journal.path, route, `${name}.md`),
-    folder: path.posix.join(journal.path, route, name),
+    page: path.posix.join(base, `${name}.md`),
+    folder: path.posix.join(base, name),
   };
+}
+
+/** PURE: what names a recap's file when the recording's own title is only a timestamp — the matched
+ *  meeting first, then what it was about. Shared by `publish` and the capability plane so the path
+ *  the plane reports is the path that was written. */
+export function recapSlugHint(recap: Pick<Recap, "meeting" | "highlights" | "summary">): string {
+  return recap.meeting || recap.highlights?.[0] || recap.summary || "";
+}
+
+/** PURE: a meeting title as ONE folder name — `API Team Standup` → `API-Team-Standup`.
+ *
+ *  Casing is kept, because it is what a person recognises in the tree. Characters that are path
+ *  separators or illegal in a filename on any of the machines a brain is cloned to are dropped, so a
+ *  title can never become a nested path or an unwritable folder. Empty when nothing usable is left,
+ *  and the caller then files without a series folder rather than inventing one. */
+export function seriesSegment(title: string): string {
+  return (title || "")
+    .normalize("NFKC")
+    .replace(/[\\/:*?"<>|#%\x00-\x1f]+/g, " ")
+    .trim()
+    .replace(/\s+/g, "-")
+    .replace(/^\.+|\.+$/g, "")
+    .slice(0, 80)
+    .replace(/-+$/, "");
 }
 
 /** What a recap page says about WHICH recording it is: the `recording_id` and the `datetime`
@@ -717,12 +780,13 @@ export async function pathsForUnique(
   rec: Recording,
   route: string,
   slugHint?: string,
+  series?: string,
 ): Promise<{ page: string; folder: string }> {
-  const base = pathsFor(journal, rec, route, slugHint);
+  const base = pathsFor(journal, rec, route, slugHint, undefined, series);
   const page = await pageIdentity(path.join(brainDir, base.page));
   // Free, or already this recording's — either way the base name is correct.
   if (page === undefined || isSameRecording(page, rec)) return base;
-  return pathsFor(journal, rec, route, slugHint, recordingKey(rec.id).slice(0, 8));
+  return pathsFor(journal, rec, route, slugHint, recordingKey(rec.id).slice(0, 8), series);
 }
 
 /** PURE: how much transcript the summariser is given, and WHICH part of it.
@@ -938,7 +1002,7 @@ export function calendarSection(recap: Recap, candidates: CalEvent[], timezone =
   const lines = candidates.map((c) => {
     const mark = c.summary.trim().toLowerCase() === chosen ? "**→**" : "·";
     const who = c.attendees.length ? ` — ${c.attendees.slice(0, 4).join(", ")}` : "";
-    return `${mark} \`${span(c.start, c.end)}\` ${c.summary}${who}  <sub>${c.source.kind}/${c.source.alias}</sub>`;
+    return `${mark} \`${span(c.start, c.end, timezone)}\` ${c.summary}${who}  <sub>${c.source.kind}/${c.source.alias}</sub>`;
   });
   const verdict = recap.meeting
     ? `Matched **${recap.meeting}**${recap.meetingReason ? ` — ${recap.meetingReason}` : ""}`
@@ -1061,7 +1125,7 @@ export function overviewMarkdown(
 ## Summary
 
 ${recap.summary}
-
+${participantsSection(recap)}
 ## Highlights
 
 ${bullets(recap.highlights, "none")}
@@ -1100,8 +1164,9 @@ export async function publish(
 ): Promise<boolean> {
   const route = resolveRoute(journal, recap.route);
   // Resolved against the checkout, not computed blind: if another recording already owns this
-  // minute's name, this one files beside it instead of overwriting it.
-  const where = await pathsForUnique(brainDir, journal, rec, route, recap.highlights?.[0] ?? recap.summary);
+  // minute's name, this one files beside it instead of overwriting it. A calendar match names the
+  // file and puts it in that series' folder; the highlights used to win, so a match changed nothing.
+  const where = await pathsForUnique(brainDir, journal, rec, route, recapSlugHint(recap), recap.meeting);
   const dir = path.join(brainDir, where.folder);
   await fs.mkdir(dir, { recursive: true });
   await fs.writeFile(

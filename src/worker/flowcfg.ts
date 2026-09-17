@@ -39,6 +39,9 @@ export interface VoiceSettings {
    *  it needs no timezone at all — see calendar.ts. The old pipeline needed one only because it
    *  searched a LOCAL-DAY window, which is also why it got DST boundaries wrong. */
   calendarExclude: string[];
+  /** `calendar.route.<alias> = <route>`: a meeting matched on that calendar is filed under that route,
+   *  whatever the model guessed — the original pipeline's "the Foley calendar means Foley". */
+  calendarRoutes: Record<string, string>;
   /** How far either side of a recording to look for events. Generous by default: people start
    *  recording after a meeting begins, and this only gathers candidates — the content decides. */
   calendarPadMinutes?: number;
@@ -99,7 +102,14 @@ export function voiceSettings(props: Record<string, string> = {}, env: NodeJS.Pr
     .map((t) => t.trim())
     .filter(Boolean);
 
+  const calendarRoutes = Object.fromEntries(
+    Object.entries(props)
+      .filter(([k, v]) => k.startsWith("calendar.route.") && k.length > "calendar.route.".length && v.trim())
+      .map(([k, v]) => [k.slice("calendar.route.".length), v.trim()]),
+  );
+
   return {
+    calendarRoutes,
     // Default ON: a tenant that configured a voice flow means to run it. Only an explicit "false"
     // turns it off, so a typo cannot silently stop a pipeline somebody is relying on.
     enabled: (p("enabled") ?? "true").toLowerCase() !== "false",
