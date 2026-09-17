@@ -514,6 +514,7 @@ export async function registerBuiltinTalents(): Promise<void> {
           description: t.description,
           requires: t.requires,
           configSchema: t.configSchema,
+          schedule: t.schedule ?? null,
         }),
       });
       if (!r.ok) console.error(`worker: register Talent ${t.name}@${t.version} → ${r.status}`);
@@ -1741,6 +1742,8 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
         wired.set(key, w);
         pumps.push(startPump(key, w));
         await wireVoice(key, w).catch((e) => console.error(`worker: reload — wireVoice ${key} failed: ${(e as Error).message}`));
+        const vAdded = voiceCreds.get(key);
+        if (vAdded) await ensureVoiceSchedule(key, vAdded).catch((e) => console.error(`worker: reload — voice schedule ${key} failed: ${(e as Error).message}`));
         await ensureAgendaSchedule(key).catch((e) => console.error(`worker: reload — agenda schedule ${key} failed: ${(e as Error).message}`));
         console.log(`worker: reload — added ${agentLabel(cfg2)} (${key})`);
       }
@@ -1779,6 +1782,9 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
         // place), and how a newly granted skill or a changed cadence reaches the poll.
         const w = wired.get(d.key);
         if (w) await wireVoice(d.key, w).catch((e) => console.error(`worker: reload — wireVoice ${d.key} failed: ${(e as Error).message}`));
+        // The schedules too, not only the flow: a grant's schedule switch (or cadence) changes here.
+        const vUpdated = voiceCreds.get(d.key);
+        if (vUpdated) await ensureVoiceSchedule(d.key, vUpdated).catch((e) => console.error(`worker: reload — voice schedule ${d.key} failed: ${(e as Error).message}`));
         await ensureAgendaSchedule(d.key).catch((e) => console.error(`worker: reload — agenda schedule ${d.key} failed: ${(e as Error).message}`));
       }
 
@@ -1892,6 +1898,31 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
 
   for (const name of disabledFlows) await pauseVoiceSchedule(name, DISABLED_NOTE);
 
+  /** The note this worker writes when a Talent's schedule is switched off in the registry. OUR pause,
+   *  like the two above, so switching it back on resumes it; a pause with any other note is a person's
+   *  and is left alone. */
+  const SCHEDULE_OFF_NOTE = "the Talent's schedule is switched off";
+
+  /** Whether an agent's grant for a Talent has its schedule on. Absent means on. */
+  function scheduleOn(name: string, talent: string): boolean {
+    return wired.get(name)?.cfg.talents?.find((t) => t.name === talent)?.schedule_enabled !== false;
+  }
+
+  /** Make a Talent's Temporal schedule match its switch: pause it when off, resume it when on but
+   *  only from our own off-pause. On-demand runs (`!talent`) never go through the schedule, so they
+   *  keep working while it is paused. */
+  async function applyScheduleSwitch(name: string, scheduleId: string, on: boolean, what: string): Promise<void> {
+    const h = client.schedule.getHandle(scheduleId);
+    const state = (await h.describe()).state;
+    if (!on && !state.paused) {
+      await h.pause(SCHEDULE_OFF_NOTE);
+      console.log(`worker: ${name} ${what} schedule paused — switched off; on demand only`);
+    } else if (on && state.paused && state.note === SCHEDULE_OFF_NOTE) {
+      await h.unpause("the Talent's schedule was switched back on");
+      console.log(`worker: ${name} ${what} schedule resumed — switched back on`);
+    }
+  }
+
   /** Create, update or resume one agent's poll schedule. Separated from the loop for the same
    *  reason as wireVoice: a flow that becomes ready AFTER boot has to get a schedule then, not at
    *  the next restart. Safe to call repeatedly — "already exists" is the normal answer. */
@@ -1983,12 +2014,13 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
       // so a backlog held back for inspection drained itself the next time the pod came up.
       const state = (await h.describe()).state;
       if (state.paused) {
-        if (state.note === DISABLED_NOTE || state.note === DISCONNECTED_NOTE) {
+        if (scheduleOn(name, meetingRecap.name) && (state.note === DISABLED_NOTE || state.note === DISCONNECTED_NOTE)) {
           // Both are OUR pauses, and we only reach here with live creds in hand — the account is
           // connected and the flow is enabled — so the reason for either pause no longer holds.
           await h.unpause(state.note === DISCONNECTED_NOTE ? "a member reconnected their Plaud account" : "flow_property enabled=true");
           console.log(`worker: ${name} voice schedule resumed`);
-        } else {
+        } else if (state.note !== SCHEDULE_OFF_NOTE) {
+          // The switch's own pause is settled by applyScheduleSwitch below, not reported as a person's.
           console.log(
             `worker: ${name} voice schedule LEFT PAUSED — ${state.note || "paused outside the registry"}`,
           );
@@ -1996,6 +2028,7 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
       }
       console.log(`worker: ${name} voice schedule updated — every ${every}`);
     }
+    await applyScheduleSwitch(name, scheduleId, scheduleOn(name, meetingRecap.name), "voice");
   }
 
   /** The agenda brief's schedule: time-of-day, in the tenant's timezone, one Temporal schedule per
@@ -2039,6 +2072,7 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
       await client.schedule.getHandle(scheduleId).update((prev) => ({ ...prev, spec, action, policies: { ...prev.policies, ...policies } }));
       console.log(`worker: ${name} agenda schedule updated — ${when} ${timezone}`);
     }
+    await applyScheduleSwitch(name, scheduleId, grant.schedule_enabled !== false, "agenda");
   }
 
   for (const [name, v] of voiceCreds) await ensureVoiceSchedule(name, v);

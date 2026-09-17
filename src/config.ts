@@ -195,6 +195,9 @@ export interface AgentConfig {
     name: string;
     version: number;
     config?: Record<string, unknown>;
+    /** False when the Talent's schedule is switched off for this agent: its timer is paused, and
+     *  `!talent` still runs it. Absent means on, as it was before the switch existed. */
+    schedule_enabled?: boolean;
   }[];
   /** Outside credentials this agent may use, from the registry (§8). Identified by `(kind, alias)`:
    *  the KIND is what the platform knows how to talk to, the ALIAS is which one of them this is.

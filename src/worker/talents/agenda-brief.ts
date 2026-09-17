@@ -11,6 +11,7 @@ export const agendaBrief: TalentManifest = {
   description: "Review today's calendar at set times: what's left, what overlaps, and where the free time is.",
   requires: [{ kind: 'calendar' }],
   configSchema: [{ key: 'times', type: 'text', label: 'When to send it (HH:MM, comma-separated, local time)' }],
+  schedule: { kind: 'times', summary: 'Sends a brief at the set times of day' },
 };
 
 /** The times a brief goes out when the grant does not say. */

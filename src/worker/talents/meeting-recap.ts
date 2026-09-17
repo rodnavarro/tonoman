@@ -24,4 +24,5 @@ export const meetingRecap: TalentManifest = {
     // turning it on is gated on a Slack reinstall.
     { key: 'reply_in_thread', type: 'toggle', label: 'Answer questions in-thread in the output channel' },
   ],
+  schedule: { kind: 'interval', summary: 'Checks for new recordings every couple of minutes' },
 };

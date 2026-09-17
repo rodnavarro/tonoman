@@ -80,6 +80,7 @@ export interface RegistryAgent {
     requires?: unknown;
     version: number;
     config?: Record<string, unknown>;
+    scheduleEnabled?: boolean;
   }[];
   secondbrain?: {
     id: string;
@@ -255,6 +256,8 @@ export class RegistryControlPlane implements ControlPlane {
           name: s.name,
           version: s.version,
           config: s.config,
+          // The schedule switch. Mapped like the rest: a field dropped here is a switch that does nothing.
+          schedule_enabled: s.scheduleEnabled,
         })),
         // Present only when the tool is granted — the registry decides, not the runtime.
         secondbrain: (a.secondbrain ?? []).map((s) => ({

@@ -30,6 +30,13 @@ export interface ConfigField {
   required?: boolean;
 }
 
+/** How a Talent runs on its own, if it does. Absent for a Talent that only runs on demand. The Hub
+ *  shows a schedule switch only for a Talent that declares one, and `summary` is the line beside it. */
+export interface TalentSchedule {
+  kind: 'interval' | 'times';
+  summary: string;
+}
+
 /** A Talent's manifest: its identity and its declared, deterministic requirements + config. This is
  *  what registration upserts into the Cloud `talent` registry (git = source of truth). */
 export interface TalentManifest {
@@ -38,4 +45,5 @@ export interface TalentManifest {
   description?: string;
   requires: CredentialRequirement[];
   configSchema: ConfigField[];
+  schedule?: TalentSchedule;
 }

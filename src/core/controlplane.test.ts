@@ -161,6 +161,19 @@ describe("the roster mapping is a WHITELIST, and that cuts both ways", () => {
     const cfg = await plane([{ ...base, flows }]).roster();
     expect(cfg.agents[0]!.flows).toEqual(flows);
   });
+
+  it("carries each Talent grant's schedule switch, which is what pauses its timer", async () => {
+    await withTokens();
+    const talents = [
+      { id: "t1", name: "meeting-recap", version: 2, config: {}, scheduleEnabled: false },
+      { id: "t2", name: "agenda-brief", version: 1, config: { times: "07:00" }, scheduleEnabled: true },
+    ];
+    const cfg = await plane([{ ...base, talents }]).roster();
+    expect(cfg.agents[0]!.talents?.map((t) => [t.name, t.schedule_enabled])).toEqual([
+      ["meeting-recap", false],
+      ["agenda-brief", true],
+    ]);
+  });
 });
 
 describe("RegistryControlPlane — a connection flattens to its shared account, and carries every account", () => {
