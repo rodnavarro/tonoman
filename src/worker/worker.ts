@@ -48,6 +48,7 @@ import * as flowcfg from "./flowcfg";
 import * as inference from "./inference";
 import * as calendar from "./calendar";
 import * as googlecal from "./googlecal";
+import { serialReload } from "./reloadgate";
 import { serveWake } from "./wake";
 import { promises as fsp } from "node:fs";
 import { defaultHarnesses } from "../gateway";
@@ -1793,18 +1794,22 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
       await syncAll().catch(() => {});
     };
 
-    // One reconcile at a time, whether it was the timer or a poke that asked for it. A poke while a
-    // reload is already running is dropped rather than queued — the running one will pick up a write
-    // that landed a moment ago anyway, and two back-to-back reconciles would only fight over `busy`.
-    triggerReload = () => {
-      if (busy) return;
-      busy = true;
-      void doReload()
-        .catch((e) => console.error(`worker: roster reload failed — ${(e as Error).message}`))
-        .finally(() => {
+    // One reconcile at a time, whether it was the timer or a poke that asked for it. A poke during a
+    // reload asks for one more afterwards (reloadgate.ts): a write that lands after the running reload
+    // fetched the roster would otherwise wait for the next timer tick.
+    triggerReload = serialReload(
+      async () => {
+        // A checkout sync holds the same flag; wait for it rather than swap config under a clone.
+        while (busy) await new Promise((r) => setTimeout(r, 250));
+        busy = true;
+        try {
+          await doReload();
+        } finally {
           busy = false;
-        });
-    };
+        }
+      },
+      (e) => console.error(`worker: roster reload failed — ${(e as Error).message}`),
+    );
 
     const reloadTimer = setInterval(() => triggerReload!(), reloadEvery);
     signal.addEventListener("abort", () => clearInterval(reloadTimer), { once: true });
