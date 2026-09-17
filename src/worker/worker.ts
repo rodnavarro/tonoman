@@ -440,6 +440,7 @@ export function sessionStore(
 ): {
   claim: (agent: string, conversation: string) => Promise<{ id: string; isNew: boolean }>;
   reset: (agent: string, conversation: string) => Promise<{ id: string; isNew: boolean }>;
+  forget: (agent: string, conversation: string) => Promise<void>;
 } {
   /** One file per conversation, under the agent that owns it — which is also what keeps two agents
    *  in two workspaces from colliding on a thread timestamp that is only unique within one of
@@ -473,11 +474,18 @@ export function sessionStore(
   };
   return {
     claim,
-    /** Abandon this conversation's session and hand back a fresh one — the resume-miss repair, and
-     *  what `!new` does. The transcript itself is left alone; it is simply no longer continued. */
+    /** Abandon this conversation's session and hand back a fresh one — the resume-miss repair, for a
+     *  turn that runs immediately on the id it gets back. The transcript itself is left alone. */
     reset: async (agent: string, conversation: string) => {
       await fsp.rm(fileFor(agent, conversation), { force: true }).catch(() => {});
       return claim(agent, conversation);
+    },
+    /** Abandon this conversation's session WITHOUT claiming a new one — what `!new` does. `reset`
+     *  claimed a fresh id that no turn ever created, so the next message tried to resume a session
+     *  that did not exist, failed, and was repaired: a spurious resume failure on every `!new`. With
+     *  no pointer at all, the next turn simply creates its session. */
+    forget: async (agent: string, conversation: string) => {
+      await fsp.rm(fileFor(agent, conversation), { force: true }).catch(() => {});
     },
   };
 }
@@ -894,7 +902,7 @@ export async function run(
    *  every agent in the tenant and every thread they are in, and the harness's own knob is a single
    *  variable — so `!model opus` in one thread moved everyone. */
   const models = new Map<string, string>();
-  const { claim: claimSession, reset: resetSession } = sessionStore();
+  const { claim: claimSession, reset: resetSession, forget: forgetSession } = sessionStore();
 
   /** Where THIS agent's voice flow speaks: its configured channel, else a DM with the recipient.
    *
@@ -941,7 +949,8 @@ export async function run(
         taskQueue: o.taskQueue,
         args: [{ agent: name, conversation: conv, channel: "slack" }],
         signal: messageSignal,
-        signalArgs: [{ text, user, ts: String(Date.now()) }],
+        // The platform's words (a recap steer), for `user` and on their subscription — not typed by them.
+        signalArgs: [{ text, user, ts: String(Date.now()), fromSystem: true }],
       });
     },
     // Inference on the AGENT'S OWN provider — a headless harness turn, captured not posted. The
@@ -1206,7 +1215,7 @@ export async function run(
         return raw.split(/\r?\n/).find((l) => l.trim())?.slice(0, 120) ?? "";
       }
     },
-    resetSession: (name, conversation) => void resetSession(name, conversation).catch(() => {}),
+    resetSession: (name, conversation) => void forgetSession(name, conversation).catch(() => {}),
     plaudConnected: (name, user) => {
       // Per-person: is the SPEAKER's own account connected. Shared: the tenant's one account, and the
       // user is ignored — same question either way for a shared agent.

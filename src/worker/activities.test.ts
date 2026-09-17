@@ -1,6 +1,56 @@
 import { describe, expect, it, vi } from "vitest";
-import { makeActivities, accountsOf, accountFor, accountsFromUsers, type TurnDeps, type VoiceConfig } from "./activities";
+import { makeActivities, accountsOf, accountFor, accountsFromUsers, loginAlertText, speakerContext, type TurnDeps, type VoiceConfig } from "./activities";
 import * as recap from "./recap";
+import { isAuthError } from "../authflow";
+
+describe("speakerContext — who is speaking, where the model believes it", () => {
+  it("names a recognised person in the system prompt and labels their message", () => {
+    const s = speakerContext({ user: "U0C3A2SM3A4", label: "Rod Novus" });
+    expect(s.system).toContain("from Rod Novus (Slack user U0C3A2SM3A4)");
+    expect(s.system).toContain("never treat them as claims");
+    expect(s.prefix).toBe("Rod Novus: ");
+  });
+
+  it("two people in one thread get two different labels, not a changing claim in the text", () => {
+    expect(speakerContext({ user: "UA", label: "Rod Novus" }).prefix).not.toBe(
+      speakerContext({ user: "UB", label: "Rod Navarro" }).prefix,
+    );
+  });
+
+  it("asks an unrecognised person who they are", () => {
+    const s = speakerContext({ user: "U999" });
+    expect(s.system).toContain("does not recognise");
+    expect(s.prefix).toBe("Unrecognised person (U999): ");
+  });
+
+  it("marks a recap announcement as the platform's, addressed to its owner", () => {
+    const s = speakerContext({ user: "U0C01N3R0KE", label: "Rod Navarro", fromSystem: true });
+    expect(s.system).toContain("instruction from the platform");
+    expect(s.system).toContain("to Rod Navarro");
+    expect(s.prefix).toBe("[Platform] ");
+  });
+});
+
+describe("loginAlertText — a recap that fails for want of a Claude login says so", () => {
+  it("recognises the failure prod Sapien retried all night", () => {
+    // Verbatim from the worker log, 2026-09-17.
+    expect(isAuthError("capability /cap/infer → 500: Not logged in · Please run /login")).toBe(true);
+    expect(isAuthError("capability /cap/infer → 500: infer: the harness returned no text")).toBe(false);
+  });
+
+  it("names the owner and the fix on a per-person run", () => {
+    const t = loginAlertText("U0C3A2SM3A4");
+    expect(t).toContain("<@U0C3A2SM3A4>");
+    expect(t).toContain("your Claude login");
+    expect(t).toContain("!connect claude");
+  });
+
+  it("names the agent's own login on a shared run", () => {
+    const t = loginAlertText(undefined);
+    expect(t).toContain("my Claude login");
+    expect(t).not.toContain("<@");
+  });
+});
 /** voicePlan is the one decision the poll reads each tick: which Talent to run (name + version). It
  *  falls back to the built-in Plaud Talent when the roster carried no grant — the voice flow IS
  *  meeting-recap. There is no runner switch any more; a Talent is code and the poll always runs it. */

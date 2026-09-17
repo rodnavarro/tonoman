@@ -45,6 +45,7 @@ export const KNOWN = [
   "code",
   "callback",
   "new",
+  "talent",
 ] as const;
 
 /** What starts a command. One character, on purpose.

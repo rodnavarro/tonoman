@@ -52,6 +52,9 @@ export interface Inbound {
   text: string;
   user: string;
   ts: string;
+  /** The platform wrote this, not the person (a recap announcement). `user` is still who it is for,
+   *  and whose subscription pays for it. */
+  fromSystem?: boolean;
   /** Paths to files attached to the message, on the shared volume for the turn to read. Absent for
    *  an ordinary message — every message today — so the turn is unchanged. */
   mediaPaths?: string[];
@@ -114,6 +117,7 @@ export async function conversationWorkflow(input: ConversationInput): Promise<vo
           channel: input.channel,
           text: m.text,
           user: m.user,
+          fromSystem: m.fromSystem,
           mediaPaths: m.mediaPaths,
           afterInterruption: interrupted,
         });

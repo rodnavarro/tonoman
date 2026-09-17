@@ -92,6 +92,15 @@ describe("sessionStore — a thread continues one session", () => {
     expect(await s.claim("nelly", "T1")).toEqual({ id: after.id, isNew: false });
   });
 
+  it("!new forgets without claiming, so the next turn CREATES its session rather than resuming a missing one", async () => {
+    const s = store();
+    const before = await s.claim("nelly", "T1");
+    await s.forget("nelly", "T1");
+    const next = await s.claim("nelly", "T1");
+    expect(next.id).not.toBe(before.id);
+    expect(next.isNew).toBe(true);
+  });
+
   it("answers the turn even when the pointer cannot be written", async () => {
     // An unwritable volume costs memory, which is the behaviour we had yesterday. It must never
     // cost the answer, which is the behaviour we have never had.

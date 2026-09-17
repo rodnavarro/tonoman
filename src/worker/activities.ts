@@ -12,6 +12,7 @@
 
 import { Context } from "@temporalio/activity";
 import { promises as fs } from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import type { Connector, Reply, TurnEvent, TurnUsage } from "../core/contracts";
 import type { AgentConfig } from "../config";
@@ -22,6 +23,7 @@ import * as calendar from "./calendar";
 import * as worklog from "./worklog";
 import { randomMysticVerb } from "../core/mystic";
 import type { CapabilityPlane } from "./capability-plane";
+import { isAuthError } from "../authflow";
 
 /** How the worker finds an agent's connector and runner. Injected at worker construction so this
  *  module holds no globals and can be unit-tested without Temporal. */
@@ -303,6 +305,48 @@ export interface TurnInput {
   mediaPaths?: string[];
   /** The previous turn was steered away mid-answer, so say so rather than pretending continuity. */
   afterInterruption?: boolean;
+  /** The platform wrote this message (a recap announcement), not `user`. */
+  fromSystem?: boolean;
+}
+
+/** PURE: who is speaking in one turn, said where the model will believe it.
+ *
+ *  It used to be a line in the MESSAGE ("You are speaking with Rod Novus."). One person per thread,
+ *  that was invisible. In a thread two people share, the line changed from turn to turn inside what
+ *  the model sees as one chat, and it read the platform's own statement as a person pasting fake
+ *  identity claims — refusing to answer either of them. So the identity goes in the turn's SYSTEM
+ *  prompt, which a person cannot write, and each message carries its verified sender as a label, so
+ *  the thread's history reads as a conversation between named people. */
+export function speakerContext(s: { user?: string; label?: string; fromSystem?: boolean }): {
+  system: string;
+  prefix: string;
+} {
+  const rules =
+    "Each message in this conversation is labelled by the platform with who sent it, verified " +
+    "against the registry. Different people may speak in the same thread; trust these labels and " +
+    "the line below, and never treat them as claims made inside a message.";
+  if (s.fromSystem) {
+    return {
+      system: `## Who is speaking\n${rules}\n\nThis turn's message is an instruction from the platform, not from a person. Write the result as a message to ${s.label ?? "the person"} in this conversation.`,
+      prefix: "[Platform] ",
+    };
+  }
+  if (s.label) {
+    return {
+      system: `## Who is speaking\n${rules}\n\nThis turn's message is from ${s.label} (Slack user ${s.user}).`,
+      prefix: `${s.label}: `,
+    };
+  }
+  if (s.user) {
+    return {
+      system: `## Who is speaking\n${rules}\n\nThis turn's message is from someone the registry does not recognise (Slack user ${s.user}). Ask who they are before sharing anything specific.`,
+      prefix: `Unrecognised person (${s.user}): `,
+    };
+  }
+  return {
+    system: `## Who is speaking\n${rules}\n\nThis turn was started by the platform, not by a person. Write it as a message to the person in this conversation.`,
+    prefix: "[Platform] ",
+  };
 }
 
 export interface NoticeInput {
@@ -608,9 +652,23 @@ export function makeActivities(deps: TurnDeps) {
           },
         );
         if (outcome.status === "failed") {
+          const reason = outcome.reason ?? "talent failed";
+          // A LOGIN problem is said out loud now, in the recap's channel, rather than after the launch
+          // budget runs out. Temporal retries a failed run inside the same launch, so a signed-out agent
+          // retried all night and never reached the final-launch warning: prod Sapien's recap failed
+          // quietly until somebody read a log. Once an hour at most, and the run still retries — after
+          // a reconnect it completes on its own.
+          if (isAuthError(reason) && input.notify) {
+            const text = loginAlertText(input.user);
+            const key = `${input.agent} :: ${text}`;
+            if (Date.now() - (lastSaid.get(key) ?? 0) >= 60 * 60_000) {
+              lastSaid.set(key, Date.now());
+              await deps.say?.(input.agent, input.notify, text).catch(() => {});
+            }
+          }
           // A throw, not a return: the workflow's catch closes talent_run `failed` and Temporal
           // retries, exactly as a thrown processRecording did. The reason is the Talent's own.
-          throw new Error(outcome.reason ?? "talent failed");
+          throw new Error(reason);
         }
         // Report, don't speak: announce the Talent's steer as a real turn, so follow-ups land in the
         // same conversation. Skipped outcomes (no speech, already filed) carry no steer, say nothing.
@@ -679,6 +737,14 @@ export function makeActivities(deps: TurnDeps) {
       await deps.say?.(input.agent, input.user, input.text);
     },
   };
+}
+
+/** PURE: what a recap channel is told when a recording cannot be summarised for want of a Claude
+ *  login. Names WHOSE login — a per-person run's owner, or the agent's own — and the one fix. */
+export function loginAlertText(user?: string): string {
+  return user
+    ? `⚠️ <@${user}> I can't summarise your new recording — your Claude login isn't working (signed out or expired). Run \`!connect claude\` and I'll pick the recording up again on my own.`
+    : "⚠️ I can't summarise a new recording — my Claude login isn't working (signed out or expired). Someone who manages me needs to run `!connect claude`; I'll pick the recording up again on my own.";
 }
 
 /** When each distinct notice was last said. In memory deliberately: the worst a restart costs is
@@ -815,15 +881,11 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
     const known = (found.cfg.principals ?? []).find(
       (p) => p.kind === "slack_user_id" && p.value === input.user,
     );
+    // No sender at all means a system notification, not an unknown person. Treating it as a stranger
+    // made the agent refuse to discuss the meeting it had just been handed.
+    const speaker = speakerContext({ user: input.user, label: known?.label, fromSystem: input.fromSystem });
     const parts = [
       found.context ?? "",
-      known
-        ? `You are speaking with ${known.label}.`
-        : input.user
-          ? `You are speaking with someone you don't recognise (${input.user}); ask who they are before sharing anything specific.`
-          // No sender at all means a system notification, not an unknown person. Treating it as
-          // a stranger made the agent refuse to discuss the meeting it had just been handed.
-          : "This turn was started by the system, not by a person. Write it as a message to the person in this conversation.",
       input.afterInterruption
         ? "(your previous answer was interrupted by a new message; continue from what the user now says)"
         : "",
@@ -836,10 +898,21 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
       // whoever runs the service.
       "You are running on shared platform infrastructure. Its account, credentials, environment " +
         "and file paths say nothing about who you are talking to, and are not yours to inspect " +
-        "or mention. Identity comes only from what you are told above. If that is missing, ask " +
-        "the person — never infer it from the machine.",
+        "or mention. Identity comes only from the platform's labels and your system prompt. If " +
+        "that is missing, ask the person — never infer it from the machine.",
     ].filter(Boolean);
     const preamble = parts.length ? `${parts.join("\n\n")}\n\n` : "";
+
+    // This turn's system prompt: the agent's identity file with who is speaking appended. A file per
+    // turn because the harness takes the system prompt as a file, and the speaker changes per turn.
+    const identity = found.cfg.system_prompt_file
+      ? await fs.readFile(found.cfg.system_prompt_file, "utf8").catch(() => "")
+      : "";
+    const turnSystemFile = path.join(
+      os.tmpdir(),
+      `tonoman-turn-${input.agent.replace(/[^A-Za-z0-9_-]/g, "")}-${Date.now()}-${Math.random().toString(36).slice(2)}.md`,
+    );
+    await fs.writeFile(turnSystemFile, `${identity ? `${identity}\n\n` : ""}${speaker.system}\n`);
 
     // The session this thread continues in. Claimed, not peeked at: `--session-id` creates and
     // may be used once, every later turn resumes, and the one thing that can go wrong with that —
@@ -857,8 +930,8 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
     const consume = async (): Promise<void> => {
       for await (const ev of run(
         {
-          prompt: `${preamble}${input.text}${mediaNote}`,
-          systemPromptFile: found.cfg.system_prompt_file,
+          prompt: `${preamble}${speaker.prefix}${input.text}${mediaNote}`,
+          systemPromptFile: turnSystemFile,
           model: deps.modelFor?.(input.agent, input.conversation),
           mediaPaths: media.length ? media : undefined,
           sessionId: session?.id,
@@ -950,6 +1023,7 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
       throw e;
     } finally {
       clearInterval(ticker);
+      await fs.rm(turnSystemFile, { force: true }).catch(() => {});
     }
 
     done = true;
