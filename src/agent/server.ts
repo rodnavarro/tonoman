@@ -91,8 +91,8 @@ export interface RuntimeOptions {
    * Injectable because the unit tests run on a host without `script`; they substitute a plain
    * redirect, which exercises the stdin/outcome plumbing but not the PTY itself. */
   ptyArgv?: (cmd: string, log: string) => string[];
-  /** how long to let the harness exchange the code + write creds before we judge the outcome;
-   * default 4500ms (a real OAuth exchange). Tests shrink it — a fake login needs no round trip. */
+  /** the LONGEST to wait for the harness to exchange the code and report logged in; default 30s.
+   *  It is polled, not slept: success is reported the moment it is true. Tests shrink it. */
   authSettleMs?: number;
   /** claude binary for the /health version check; default "claude". */
   bin?: string;
@@ -440,9 +440,7 @@ async function handleAuthCode(req: http.IncomingMessage, res: http.ServerRespons
   const before = await credStamp(credFile);
 
   pendingLogin.child.stdin?.write(`${code}\n`);
-  await new Promise((r) => setTimeout(r, opts.authSettleMs ?? 4500)); // exchange the code + write creds
 
-  const after = await credStamp(credFile);
   const statusArgs = opts.statusArgs ?? activeSpec().statusArgs ?? [];
   // The SAME directory the login wrote to. Asked without it, this reads the shared home, reports
   // "loggedIn": false for a login that worked perfectly, and tells the person their code failed —
@@ -450,15 +448,32 @@ async function handleAuthCode(req: http.IncomingMessage, res: http.ServerRespons
   // looking somewhere else entirely.
   const codeAgent = pendingLogin?.agent ?? agentOf(req);
   const codeUser = pendingLogin?.user ?? userOf(req);
-  const status = statusArgs.length
-    ? (
-        await run(
-          statusArgs[0],
-          statusArgs.slice(1),
-          codeAgent ? { CLAUDE_CONFIG_DIR: claudecode.configHomeFor(codeAgent, codeUser) } : undefined,
-        )
-      ).trim()
-    : "";
+  const statusNow = async (): Promise<string> =>
+    statusArgs.length
+      ? (
+          await run(
+            statusArgs[0],
+            statusArgs.slice(1),
+            codeAgent ? { CLAUDE_CONFIG_DIR: claudecode.configHomeFor(codeAgent, codeUser) } : undefined,
+          )
+        ).trim()
+      : "";
+
+  // POLLED, not a fixed sleep. The CLI writes the credential file first and the account state that
+  // `auth status` reads a moment later, so one check 4.5s in reported `loggedIn: false` for logins
+  // that had worked — twice in a row — and people re-did a login that was already done. Wait for the
+  // credential to change AND status to agree, up to the settle limit.
+  const deadline = Date.now() + (opts.authSettleMs ?? 30_000);
+  let after = before;
+  let status = "";
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 250));
+    after = await credStamp(credFile);
+    if (!(after[0] > before[0] || after[1] !== before[1])) continue;
+    status = await statusNow();
+    if (!statusArgs.length || looksLoggedIn(status)) break;
+  }
+  if (!status) status = await statusNow();
   const authLog = opts.authLog ?? DEFAULT_AUTH_LOG;
   const loginTail = (await fs.readFile(authLog, "utf8").catch(() => "")).slice(-400);
 

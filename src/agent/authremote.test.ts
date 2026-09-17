@@ -147,6 +147,67 @@ describe("roster-auth-remote — headless login over the agent's own HTTP runtim
   });
 });
 
+describe("a login whose account state lands after its credential", () => {
+  // The real CLI writes `.credentials.json` first and what `auth status` reads a moment later. A
+  // single check 4.5s in reported `loggedIn: false` for two logins that had worked.
+  let slowDir: string;
+  let slowServer: Server;
+  let slowBase: string;
+
+  beforeAll(async () => {
+    slowDir = sh(await fs.mkdtemp(path.join(os.tmpdir(), "tonoman-authslow-")));
+    const cred = sh(path.join(slowDir, ".credentials.json"));
+    const ready = sh(path.join(slowDir, "account-ready"));
+    const login = sh(path.join(slowDir, "login.sh"));
+    const status = sh(path.join(slowDir, "status.sh"));
+    await fs.writeFile(
+      login,
+      `#!/bin/sh
+echo "${URL_IN_LOGIN}"
+read code
+printf '%s' '{"claudeAiOauth":{"accessToken":"fake"}}' > "${cred}"
+sleep 1
+touch "${ready}"
+echo "Login successful."
+`,
+      { mode: 0o755 },
+    );
+    await fs.writeFile(
+      status,
+      `#!/bin/sh
+if [ -f "${ready}" ]; then echo '{"loggedIn": true}'; else echo '{"loggedIn": false}'; fi
+`,
+      { mode: 0o755 },
+    );
+    slowServer = serveRuntime({
+      port: 0,
+      token: TOKEN,
+      credFile: cred,
+      loginArgs: ["sh", login],
+      statusArgs: ["sh", status],
+      authLog: sh(path.join(slowDir, "auth.log")),
+      authSettleMs: 8000,
+      ptyArgv: (cmd, log) => ["sh", "-c", `${cmd} > ${log} 2>&1`],
+    });
+    await new Promise((r) => slowServer.once("listening", r));
+    const addr = slowServer.address();
+    slowBase = `http://127.0.0.1:${typeof addr === "object" && addr ? addr.port : 0}`;
+  });
+
+  afterAll(async () => {
+    slowServer.close();
+    await fs.rm(slowDir, { recursive: true, force: true });
+  });
+
+  it("waits for status to agree instead of reporting a working login as failed", async () => {
+    const auth = httpAuthOps(slowBase, TOKEN);
+    await auth.startHeadless();
+    const r = await auth.submitCode(GOOD_CODE);
+    expect(r.ok).toBe(true);
+    expect(r.status).toContain('"loggedIn": true');
+  }, 15_000);
+});
+
 describe("transportFailure", () => {
   it("digs the code out of a bare fetch failure", () => {
     const e = Object.assign(new TypeError("fetch failed"), {

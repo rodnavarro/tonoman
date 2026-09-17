@@ -155,7 +155,25 @@ export async function handleInteraction(deps: AuthGateDeps, agent: string, it: S
     const code = firstInputValue(it.values);
     if (!code) return "empty code";
 
-    const r = await ops.submitCode(code);
+    let r: Awaited<ReturnType<typeof ops.submitCode>>;
+    try {
+      r = await ops.submitCode(code);
+    } catch (e) {
+      // Said to the person, not only logged. A code submitted after the login already finished got a
+      // 409 and silence, so it read as still broken when it had in fact worked the first time.
+      const why = String((e as Error)?.message ?? e);
+      if (conversation) {
+        await conn
+          .reply(conversation)
+          .send(
+            /409|no login in progress/i.test(why)
+              ? "There's no login waiting for that code — an earlier one may already have worked. Send me a message: if I answer, you're connected; if I ask again, start a new login."
+              : `⚠️ I couldn't submit that code — ${why.slice(0, 150)}`,
+          )
+          .catch(() => {});
+      }
+      return `code not submitted — ${why.slice(0, 120)}`;
+    }
     // OUTCOME-TRUE: `ok` means the credential file actually changed and the harness reports logged
     // in. Anything else is reported as a failure, however encouraging the login output looked.
     await deps.setAuthState(agent, r.ok ? "ok" : "error").catch(() => {});
