@@ -5,8 +5,65 @@
 // answered, and billed, on whoever had authenticated most recently. Celine's assistant has to run
 // on Celine's subscription and Rod's on Rod's; this function is where that becomes true.
 
-import { describe, expect, it } from "vitest";
-import { CONFIG_HOME, configHomeFor, localEnv } from "./claudecode";
+import { promises as fsp } from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
+import { CONFIG_HOME, configHomeFor, localEnv, shareConversationHistory } from "./claudecode";
+
+describe("shareConversationHistory — the conversation is the agent's, the subscription the person's", () => {
+  const roots: string[] = [];
+  afterEach(async () => {
+    for (const r of roots.splice(0)) await fsp.rm(r, { recursive: true, force: true });
+  });
+  const tree = async () => {
+    const root = await fsp.mkdtemp(path.join(os.tmpdir(), "share-history-"));
+    roots.push(root);
+    const agent = path.join(root, "agents", "sapien");
+    return { agent, userA: path.join(agent, "users", "UA"), userB: path.join(agent, "users", "UB") };
+  };
+  const write = async (file: string, text: string) => {
+    await fsp.mkdir(path.dirname(file), { recursive: true });
+    await fsp.writeFile(file, text);
+  };
+
+  it("a session one person started is readable through the other person's login", async () => {
+    const { agent, userA, userB } = await tree();
+    await shareConversationHistory(userA);
+    await shareConversationHistory(userB);
+    await write(path.join(userA, "projects", "-opt-tonoman", "s1.jsonl"), "from A");
+    expect(await fsp.readFile(path.join(userB, "projects", "-opt-tonoman", "s1.jsonl"), "utf8")).toBe("from A");
+    expect(await fsp.readFile(path.join(agent, "projects", "-opt-tonoman", "s1.jsonl"), "utf8")).toBe("from A");
+  });
+
+  it("moves a person's existing transcripts into the agent's history instead of losing them", async () => {
+    const { agent, userA } = await tree();
+    await write(path.join(userA, "projects", "-opt-tonoman", "old.jsonl"), "earlier");
+    await shareConversationHistory(userA);
+    expect(await fsp.readFile(path.join(agent, "projects", "-opt-tonoman", "old.jsonl"), "utf8")).toBe("earlier");
+    expect((await fsp.lstat(path.join(userA, "projects"))).isSymbolicLink()).toBe(true);
+  });
+
+  it("never overwrites the agent's copy: a clash is kept aside, not deleted", async () => {
+    const { agent, userA } = await tree();
+    await write(path.join(agent, "projects", "-opt-tonoman", "same.jsonl"), "agent's");
+    await write(path.join(userA, "projects", "-opt-tonoman", "same.jsonl"), "person's");
+    await shareConversationHistory(userA);
+    expect(await fsp.readFile(path.join(agent, "projects", "-opt-tonoman", "same.jsonl"), "utf8")).toBe("agent's");
+    const kept = (await fsp.readdir(userA)).find((n) => n.startsWith("projects.unshared-"));
+    expect(kept).toBeDefined();
+    expect(await fsp.readFile(path.join(userA, kept!, "-opt-tonoman", "same.jsonl"), "utf8")).toBe("person's");
+  });
+
+  it("is idempotent, and leaves a home that is not a per-person login alone", async () => {
+    const { agent, userA } = await tree();
+    await shareConversationHistory(userA);
+    await shareConversationHistory(userA);
+    expect((await fsp.lstat(path.join(userA, "projects"))).isSymbolicLink()).toBe(true);
+    await shareConversationHistory(agent);
+    expect(await fsp.lstat(path.join(agent, "projects")).then((s) => s.isSymbolicLink())).toBe(false);
+  });
+});
 
 describe("configHomeFor", () => {
   it("gives each agent its own directory", () => {

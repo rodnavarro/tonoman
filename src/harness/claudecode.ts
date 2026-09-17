@@ -11,6 +11,8 @@
 // object split across stdout chunks is never mis-parsed.
 
 import { spawn } from "node:child_process";
+import { promises as fsp } from "node:fs";
+import * as path from "node:path";
 import * as readline from "node:readline";
 import type { TurnEvent, TurnRequest, TurnRunner } from "../core/contracts";
 import type { Spec, RunnerParams, EphemeralParams } from "../harness";
@@ -66,6 +68,62 @@ export function configHomeFor(
   if (!user) return agentHome;
   const safeUser = user.replace(/[^A-Za-z0-9_-]/g, "");
   return `${agentHome}/users/${safeUser || "_invalid"}`;
+}
+
+/** Make a per-person login share its AGENT's conversation history.
+ *
+ *  Claude Code keeps a session's transcript under `<CLAUDE_CONFIG_DIR>/projects`, so with per-person
+ *  logins each person's turns resumed only the sessions THEY had started. A thread two people talk
+ *  in has one session id, and whoever did not start it failed to resume — the worker then started a
+ *  fresh session and the agent forgot the thread, back and forth between them. The conversation is
+ *  the agent's; only the subscription paying for a turn is the person's.
+ *
+ *  So a person's `projects` is a symlink to the agent's. A person who already has transcripts has
+ *  them moved in first; anything whose name is already taken at the agent level is kept aside as
+ *  `projects.unshared-<time>`, never deleted. Idempotent and cheap: one lstat once shared.
+ *  A home that is not `<agent>/users/<user>` is left alone. */
+export async function shareConversationHistory(userHome: string): Promise<void> {
+  if (path.basename(path.dirname(userHome)) !== "users") return;
+  const agentProjects = path.join(path.dirname(path.dirname(userHome)), "projects");
+  const userProjects = path.join(userHome, "projects");
+  const st = await fsp.lstat(userProjects).catch(() => undefined);
+  if (st?.isSymbolicLink()) return;
+  await fsp.mkdir(agentProjects, { recursive: true });
+  if (st?.isDirectory()) {
+    await moveMissing(userProjects, agentProjects);
+    const left = await fsp.readdir(userProjects);
+    if (left.length) await fsp.rename(userProjects, `${userProjects}.unshared-${Date.now()}`);
+    else await fsp.rmdir(userProjects);
+  }
+  await fsp.mkdir(userHome, { recursive: true });
+  // Relative on Linux (the pod), so the link holds wherever the volume is mounted. Windows cannot
+  // create a directory symlink without privileges, so it gets a junction, which must be absolute.
+  const link =
+    process.platform === "win32"
+      ? fsp.symlink(agentProjects, userProjects, "junction")
+      : fsp.symlink(path.join("..", "..", "projects"), userProjects, "dir");
+  await link.catch((e: NodeJS.ErrnoException) => {
+    // Two turns for the same person can race here; the other one already made it.
+    if (e.code !== "EEXIST") throw e;
+  });
+}
+
+/** Move every entry of `from` into `to` that `to` does not already have, merging directories. */
+async function moveMissing(from: string, to: string): Promise<void> {
+  for (const name of await fsp.readdir(from)) {
+    const src = path.join(from, name);
+    const dst = path.join(to, name);
+    const there = await fsp.lstat(dst).catch(() => undefined);
+    if (!there) {
+      await fsp.rename(src, dst);
+      continue;
+    }
+    const here = await fsp.lstat(src);
+    if (here.isDirectory() && there.isDirectory()) {
+      await moveMissing(src, dst);
+      if ((await fsp.readdir(src)).length === 0) await fsp.rmdir(src);
+    }
+  }
 }
 
 /** Where the per-agent identity dir (AGENTS.md/persona) bind-mounts READ-ONLY; the
@@ -139,15 +197,6 @@ export function localEnv(
   return env;
 }
 
-/** Every built-in Claude Code tool, disallowed for a LEAN inference turn so a recap is a pure
- *  completion — no tool is offered and no tool schema sits in the context. Connectors/MCP are a
- *  separate axis, already excluded by `--strict-mcp-config`. Kept deliberately broad: a tool that
- *  does not exist is a harmless no-op in `--disallowedTools`, an extra one that slips through is not. */
-const LEAN_DISALLOWED = [
-  "Bash", "BashOutput", "KillShell", "Read", "Write", "Edit", "MultiEdit", "NotebookEdit",
-  "NotebookRead", "Glob", "Grep", "LS", "WebFetch", "WebSearch", "Task", "TodoWrite", "ExitPlanMode",
-];
-
 export class Runner implements TurnRunner {
   // The model is mutable so `/model` can switch it (gw-command-model). podmanArgs reads
   // it per turn, so a change takes effect on the NEXT turn — a turn already spawned keeps
@@ -205,12 +254,15 @@ export class Runner implements TurnRunner {
       // belong to the tenant rather than to whoever logged in.
       ...(this.o.allowAmbientMcp ? [] : ["--strict-mcp-config"]),
     ];
-    // Drop tools this agent never uses, so their schemas leave the context floor (claude-code-only).
-    // A LEAN turn (Talent `infer`) disallows EVERY built-in — the agent reasons on its subscription
-    // and nothing else, and no tool schema sits in context. Connectors are already out (strict-mcp).
-    const disallowed = req.lean ? LEAN_DISALLOWED : (this.o.disallowedTools ?? []);
-    if (disallowed.length) {
-      args.push("--disallowedTools", disallowed.join(","));
+    // A LEAN turn (Talent `infer`) has NO tools: `--tools ""` offers none, whatever the CLI adds
+    // next. It was a hand-kept denylist, and the CLI grew tools the list did not name — with a
+    // one-turn cap, a single stray `ToolSearch` call spent the turn and the recap came back empty,
+    // six times on one meeting. Connectors are already out (strict-mcp).
+    if (req.lean) {
+      args.push("--tools", "");
+    } else if (this.o.disallowedTools?.length) {
+      // Drop tools this agent never uses, so their schemas leave the context floor (claude-code-only).
+      args.push("--disallowedTools", this.o.disallowedTools.join(","));
     }
     if (req.systemPromptFile) args.push("--append-system-prompt-file", req.systemPromptFile);
     // Per-TURN model first, then the process-wide knob. The knob is right for a single-agent
@@ -275,6 +327,13 @@ export class Runner implements TurnRunner {
       // agent runs inference per person, so the speaker's own login answers. Unset (every agent
       // today) keeps the one shared per-agent login.
       const env = localEnv(process.env, this.o.backend, req.configHome ?? this.o.configHome ?? CONFIG_HOME);
+      if (req.configHome) {
+        // Best-effort: failing to share costs the thread's memory on a speaker change, which is not
+        // worth failing the turn over. Said out loud so it is not a mystery when it happens.
+        await shareConversationHistory(req.configHome).catch((e: Error) =>
+          console.error(`claudecode: could not share conversation history for ${req.configHome}: ${e.message}`),
+        );
+      }
       child = spawn(bin, this.localArgs(req), { windowsHide: true, env });
     } else {
       const podman = this.o.podman ?? "podman";
