@@ -367,6 +367,12 @@ let pendingLogin: {
   harness: HarnessKind;
   credFile: string;
   credBefore: [number, number];
+  /** The child has EXITED, but its record is kept. `codex login --device-auth` exits the moment it
+   *  succeeds, so dropping the record on exit would throw away the one thing that makes the next
+   *  /auth/pending poll honest: the credential's baseline. Without it the poll falls back to status
+   *  alone, and a stale-but-valid auth.json sitting on disk answers "yes" for a login that never
+   *  happened. Kept until the poll reads it, or until another login supersedes it. */
+  exited?: boolean;
 } | null = null;
 
 /** The credential's (mtime, size) — the OUTCOME signal for a login. 0/0 when absent. */
@@ -444,7 +450,13 @@ async function handleAuthLogin(req: http.IncomingMessage, res: http.ServerRespon
   const authLog = opts.authLog ?? DEFAULT_AUTH_LOG;
   await fs.rm(authLog, { force: true }).catch(() => {});
 
-  const argv = (opts.ptyArgv ?? DEFAULT_PTY)(loginArgs.join(" "), authLog);
+  // DEVICE AUTH NEEDS NO PTY. `codex login --device-auth` prints its URL and code straight to a
+  // plain pipe (verified against codex-cli 0.154), so the transcript is captured by redirecting the
+  // child's own stdout — no `script`, and no guessing how the CLI renders under a TTY it thinks a
+  // person is watching. Claude's login IS a TUI and still gets the PTY, which is what `script` was
+  // brought in for. `ptyArgv` is honoured either way, because that is what the tests inject.
+  const argv = opts.ptyArgv ? opts.ptyArgv(loginArgs.join(" "), authLog) : deviceAuth ? loginArgs : DEFAULT_PTY(loginArgs.join(" "), authLog);
+  const logFd = !opts.ptyArgv && deviceAuth ? await fs.open(authLog, "a") : undefined;
   // The login writes wherever the harness's config-home env points, so this is the line that
   // decides whose subscription an agent ends up running on. Without it every login in the pool
   // lands in one directory and the last person to sign in owns every agent. WHICH variable that
@@ -453,19 +465,26 @@ async function handleAuthLogin(req: http.IncomingMessage, res: http.ServerRespon
   const user = userOf(req);
   const overlay = homeEnv(h, who, user);
   const child = spawn(argv[0], argv.slice(1), {
-    stdio: ["pipe", "ignore", "ignore"],
+    // Device auth writes its own transcript; the PTY path has `script` write it instead.
+    stdio: logFd ? ["pipe", logFd.fd, logFd.fd] : ["pipe", "ignore", "ignore"],
     env: overlay ? { ...process.env, ...overlay } : process.env,
   });
+  // Ours to close once the child holds its own descriptor.
+  await logFd?.close().catch(() => {});
   // The BASELINE, taken before the login can have written anything. Device auth completes with no
   // further request from us, so without this snapshot /auth/pending has nothing to compare against
   // and would bless a pre-existing credential as a login that just happened.
   const credFile = credFileFor(opts, h, who, user);
   pendingLogin = { child, agent: who, user, harness: h, credFile, credBefore: await credStamp(credFile) };
+  // A spawn that never started has no baseline worth keeping — it wrote nothing.
   child.on("error", () => {
     if (pendingLogin?.child === child) pendingLogin = null;
   });
+  // An exit is NOT the end of the record. Device auth exits ON SUCCESS, and the poll that has not
+  // asked yet still needs the baseline to tell that success apart from a credential that was
+  // already there. See `exited` above.
   child.on("exit", () => {
-    if (pendingLogin?.child === child) pendingLogin = null;
+    if (pendingLogin?.child === child) pendingLogin.exited = true;
   });
 
   const deadline = Date.now() + 25_000;
@@ -490,6 +509,8 @@ async function handleAuthLogin(req: http.IncomingMessage, res: http.ServerRespon
     }
     // Bail on: timeout, the login exiting, or the spawn failing outright (the "error" handler
     // clears pendingLogin) — never spin for 25s on a login that was never going to speak.
+    // Bail on: timeout, the login exiting before it spoke, or the spawn failing outright. A login
+    // that exited WITHOUT printing its URL has nothing to offer either way, so the record goes too.
     if (Date.now() > deadline || child.exitCode !== null || pendingLogin?.child !== child) {
       child.kill();
       pendingLogin = null;
@@ -581,7 +602,13 @@ async function handleAuthCode(req: http.IncomingMessage, res: http.ServerRespons
   // the authority on what it is, not a follow-up request that may say anything.
   const h = pendingLogin?.harness ?? harnessOf(req);
   const credFile = credFileFor(opts, h, pendingLogin?.agent ?? agentOf(req), pendingLogin?.user ?? userOf(req));
-  const before = pendingLogin?.credBefore ?? (await credStamp(credFile));
+  // Taken NOW, not at login time, and deliberately: this flow's window is the few seconds between
+  // the person pasting a code and the CLI writing the credential. Widening it to the whole login
+  // would let a routine background token refresh count as "the credential changed", and bless a
+  // wrong code on an agent that happened to already be signed in. (Device auth cannot do it this
+  // way — nothing comes back through us to mark the start of that window — which is exactly why
+  // /auth/pending carries its own baseline from /auth/login instead.)
+  const before = await credStamp(credFile);
 
   pendingLogin.child.stdin?.write(`${code}\n`);
 

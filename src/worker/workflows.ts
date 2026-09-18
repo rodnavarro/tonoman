@@ -36,7 +36,7 @@ import { failureReason, isNotLoggedInError, notLoggedInNotice } from "../turnfai
 import { isFinalLaunch, recordingKey, talentGate } from "./recordingkey";
 import { WorkflowExecutionAlreadyStartedError } from "@temporalio/common";
 
-const { runTurn, postNotice, noteAuthFailure } = proxyActivities<Activities>({
+const { runTurn, postNotice } = proxyActivities<Activities>({
   // A turn is a person waiting on an LLM: minutes, not seconds. The heartbeat is what makes a dead
   // worker detectable in seconds anyway, so the long timeout costs nothing in responsiveness.
   startToCloseTimeout: "20 minutes",
@@ -146,17 +146,20 @@ export async function conversationWorkflow(input: ConversationInput): Promise<vo
       const why = failureReason(e);
       // A credential problem is RECORDED as well as explained (W3): the Hub's picture of who can
       // answer is otherwise only ever updated by a login, so a subscription that lapses mid-week
-      // reads as healthy until somebody happens to try signing in again. `noteAuthFailure` writes it
-      // against whoever the credential belongs to and hands back a notice naming this agent's own
-      // provider. It never throws; the fallback is only for a worker with no registry behind it.
-      const text = isNotLoggedInError(why)
-        ? await noteAuthFailure({ agent: input.agent, user: m.user, reason: why }).catch(() => notLoggedInNotice())
-        : `⚠️ I hit an error and couldn't finish that — ${why.slice(0, 200)}`;
+      // reads as healthy until somebody happens to try signing in again.
+      //
+      // Carried ON the notice rather than as a second activity call, deliberately. This workflow can
+      // be mid-history when the deploy lands, and an extra command in its sequence is a replay
+      // non-determinism failure for every conversation that reaches this line. `authFailure` costs
+      // nothing on the wire and lets the activity — which is the half that holds the roster — both
+      // record the outcome and write a notice naming THIS agent's provider.
+      const authFailure = isNotLoggedInError(why);
       await postNotice({
         agent: input.agent,
         conversation: input.conversation,
         channel: input.channel,
-        text,
+        text: authFailure ? notLoggedInNotice() : `⚠️ I hit an error and couldn't finish that — ${why.slice(0, 200)}`,
+        authFailure: authFailure ? { user: m.user, reason: why } : undefined,
       }).catch(() => {});
     } finally {
       inFlight = undefined;

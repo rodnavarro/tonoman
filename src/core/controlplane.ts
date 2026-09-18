@@ -22,6 +22,7 @@
 import { promises as fs } from "node:fs";
 import * as path from "node:path";
 import type { AgentConfig, Config } from "../config";
+import { parseMountRef, parseRef, registrySecretPath } from "./secretref";
 import { load as loadFile } from "../config";
 
 export interface ControlPlane {
@@ -147,20 +148,52 @@ export class RegistryControlPlane implements ControlPlane {
     return this.o.identityDir ?? "/root/.tonoman/identity";
   }
 
-  /** Resolve `<secret>:<key>` from the mounted secret tree. Returns "" when the ref is absent or
-   *  unreadable — the caller decides whether that is fatal, because a missing bot token should
-   *  disable ONE agent, never stop the gateway serving the others. */
-  private async resolveRef(ref: string | null | undefined): Promise<string> {
-    if (!ref) return "";
-    const i = ref.indexOf(":");
-    if (i < 0) return "";
-    const secret = ref.slice(0, i);
-    const key = ref.slice(i + 1);
-    // Refuse anything that could climb out of the mount: a ref comes from the database, and the
-    // database is edited through a web form.
-    if (!/^[A-Za-z0-9._-]+$/.test(secret) || !/^[A-Za-z0-9._-]+$/.test(key)) return "";
+  /** Resolve a credential ref, in either scheme (see core/secretref.ts):
+   *
+   *    `<secret>:<key>`   a mounted Kubernetes secret — the original contract, unchanged.
+   *    `registry:<ref>`   a row in the registry's own `secret` table, read back over the same
+   *                       system-token API this roster came from and decrypted on the far side.
+   *
+   *  The second is how a Slack bot token and app-level token pasted into the Hub reach a running
+   *  gateway: the API stores them encrypted and puts `registry:…` on the channel row. This is the
+   *  half of that path that matters, because THESE are the refs it names — `botTokenRef` and
+   *  `appTokenRef` are resolved here, while the roster is built, not by the worker's resolver.
+   *
+   *  Returns "" when the ref is absent or unreadable, whichever scheme — the caller decides whether
+   *  that is fatal, because a missing bot token should disable ONE agent, never stop the gateway
+   *  serving the others. */
+  private async resolveRef(ref: string | null | undefined, guid?: string): Promise<string> {
+    const p = parseRef(ref);
+    if (!p) return "";
+
+    if (p.kind === "registry") {
+      // Scoped to the agent that owns it: a secret belongs to a tenant, and asking for one without
+      // saying whose is the cross-tenant read the scoping exists to prevent. No guid, no request.
+      if (!guid) return "";
+      try {
+        const f = this.o.fetchImpl ?? fetch;
+        const r = await f(`${this.o.baseUrl.replace(/[/]+$/, "")}${registrySecretPath(guid, p.ref)}`, {
+          headers: { authorization: `Bearer ${this.o.token}` },
+        });
+        // 404 is "nothing stored yet", which reads the same as an unmounted file and is the honest
+        // answer for both. Anything else is worth a line: a 500 here means the row is unreadable,
+        // and treating that as "no token" would skip an agent for the wrong reason.
+        if (r.status === 404) return "";
+        if (!r.ok) {
+          console.error(`registry: secret ${p.ref} for ${guid} returned HTTP ${r.status}`);
+          return "";
+        }
+        return ((await r.json()) as { value?: string }).value ?? "";
+      } catch (e) {
+        console.error(`registry: secret ${p.ref} for ${guid} failed — ${(e as Error).message}`);
+        return "";
+      }
+    }
+
+    const m = parseMountRef(p.ref);
+    if (!m) return ""; // refuses anything that could climb out of the mount
     try {
-      return (await fs.readFile(path.join(this.secretsDir, secret, key), "utf8")).trim();
+      return (await fs.readFile(path.join(this.secretsDir, m.secret, m.key), "utf8")).trim();
     } catch {
       return "";
     }
@@ -203,8 +236,8 @@ export class RegistryControlPlane implements ControlPlane {
         continue;
       }
       const [botToken, appToken] = await Promise.all([
-        this.resolveRef(a.botTokenRef),
-        this.resolveRef(a.appTokenRef),
+        this.resolveRef(a.botTokenRef, a.guid),
+        this.resolveRef(a.appTokenRef, a.guid),
       ]);
       if (!botToken || !appToken) {
         // One agent's missing credential must not take the whole gateway down with it.

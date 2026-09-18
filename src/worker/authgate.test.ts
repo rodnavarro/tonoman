@@ -96,7 +96,22 @@ describe("ask() — the flow is decided by what the runtime started (W2)", () =>
     expect(f.posts[0].text).toContain("JLEP-DT273");
   });
 
-  it("with nobody to address privately it still says it, rather than saying nothing", async () => {
+  it("on a SHARED agent the code still goes to the person who asked, not to the channel", async () => {
+    // The trap: `user` means WHOSE LOGIN, and on a shared agent it is deliberately undefined — the
+    // login is the agent's. Keying the private message off it sent every one-time code to the whole
+    // channel, on every agent there is today. The speaker is a separate argument for that reason.
+    const f = fakeConn();
+    const ops: AuthOps = {
+      startHeadless: async () => ({ url: "https://auth.openai.com/codex/device", code: "C0DE" }),
+      submitCode: async () => ({ ok: false, status: "", loginTail: "" }),
+      pending: async () => ({ done: false, loggedIn: false, status: "" }),
+    };
+    const d = deps({ ops, provider: "codex", conn: f.conn });
+    expect(await ask(d, "a", "nelly", "c1", undefined, "U-speaker")).toBe(true);
+    expect(f.posts[0]).toMatchObject({ kind: "ephemeral", user: "U-speaker" });
+  });
+
+  it("with nobody to address at all it still says it, rather than saying nothing", async () => {
     const f = fakeConn();
     const ops: AuthOps = {
       startHeadless: async () => ({ url: "https://auth.openai.com/codex/device", code: "C0DE" }),
@@ -105,6 +120,20 @@ describe("ask() — the flow is decided by what the runtime started (W2)", () =>
     };
     expect(await ask(deps({ ops, provider: "codex", conn: f.conn }), "a", "nelly", "c1")).toBe(true);
     expect(f.posts[0].kind).toBe("reply");
+  });
+
+  it("falls back to an ordinary post when Slack refuses the ephemeral", async () => {
+    // `chat.postEphemeral` fails for somebody not in the channel. Swallowing that would drop the
+    // code silently, which is worse than a channel post the person can at least act on.
+    const f = fakeConn();
+    f.conn.postEphemeral = (async () => false) as typeof f.conn.postEphemeral;
+    const ops: AuthOps = {
+      startHeadless: async () => ({ url: "https://auth.openai.com/codex/device", code: "C0DE" }),
+      submitCode: async () => ({ ok: false, status: "", loginTail: "" }),
+      pending: async () => ({ done: false, loggedIn: false, status: "" }),
+    };
+    await ask(deps({ ops, provider: "codex", conn: f.conn }), "a", "nelly", "c1", undefined, "U-speaker");
+    expect(f.posts.map((p) => p.kind)).toEqual(["reply"]);
   });
 
   it("no code means the Claude flow, unchanged: blocks with a button", async () => {
@@ -176,7 +205,7 @@ describe("watchDeviceLogin — the outcome is reported, in order (W2/W3)", () =>
       },
       onLogin: async () => void order.push("register"),
     };
-    await watchDeviceLogin(d, "a", "c1", ops, "U1", true, { pollMs: 1, timeoutMs: 1000 });
+    await watchDeviceLogin(d, "a", "c1", ops, "U1", true, { pollMs: 1, timeoutMs: 1000 }, "U1");
     // The per-person auth-state route only UPDATES an existing principal and 404s for a new one —
     // so registering second would silently lose the very first login of every new teammate.
     expect(order).toEqual(["register", "state"]);

@@ -189,7 +189,14 @@ export async function ask(
   agent: string,
   agentLabel: string,
   conversation: string,
+  /** WHOSE login this is — set only on a per-person agent, where it picks the credential directory.
+   *  On a shared agent the login belongs to the agent and this is undefined. */
   user?: string,
+  /** WHO is being spoken to. A DIFFERENT question, and conflating the two is how a one-time device
+   *  code ends up in a channel: on a shared agent `user` is undefined by design, so keying the
+   *  private message off it sent every code to everyone. The speaker is always the right audience —
+   *  they asked, and on a shared agent they are signing the agent in on the team's behalf. */
+  audience: string | undefined = user,
 ): Promise<boolean> {
   const ops = deps.ops(agent, user);
   const conn = deps.conn(agent);
@@ -213,11 +220,11 @@ export async function ask(
     // PRIVATELY: a one-time code is theirs and nobody else's, and a channel keeps it in history and
     // in the workspace export. `postEphemeral` needs a person to address, and Slack refuses it in
     // some conversations — so an ordinary post is the fallback rather than silence.
-    const sentPrivately = user ? await conn.postEphemeral(conversation, user, text) : false;
+    const sentPrivately = audience ? await conn.postEphemeral(conversation, audience, text) : false;
     if (!sentPrivately) await conn.reply(conversation).send(text).catch(() => {});
     // The wait runs on its own: `ask` is called from the ingress loop, which must not block for ten
     // minutes on one person's sign-in.
-    void watchDeviceLogin(deps, agent, conversation, ops, user, sentPrivately);
+    void watchDeviceLogin(deps, agent, conversation, ops, user, sentPrivately, {}, audience);
     return true;
   }
 
@@ -236,9 +243,13 @@ export async function watchDeviceLogin(
   agent: string,
   conversation: string,
   ops: AuthOps,
+  /** WHOSE login (per-person agents only) — what the outcome is recorded against. */
   user?: string,
   privately = false,
   o: Parameters<typeof awaitDeviceLogin>[1] = {},
+  /** WHO to tell. Defaults to the login's owner, which on a shared agent is nobody — so the caller
+   *  passes the speaker. See `ask`. */
+  audience: string | undefined = user,
 ): Promise<void> {
   const conn = deps.conn(agent);
   const r = await awaitDeviceLogin(ops, o);
@@ -253,7 +264,7 @@ export async function watchDeviceLogin(
     : r.timedOut
       ? "⏳ I didn't see that sign-in go through. The code may have expired — say `!connect codex` and I'll start a fresh one."
       : `⚠️ That sign-in didn't complete. ${String(r.status).replace(/\s+/g, " ").slice(0, 200)}`;
-  const sent = privately && user ? await conn.postEphemeral(conversation, user, text) : false;
+  const sent = privately && audience ? await conn.postEphemeral(conversation, audience, text) : false;
   if (!sent) await conn.reply(conversation).send(text).catch(() => {});
 }
 

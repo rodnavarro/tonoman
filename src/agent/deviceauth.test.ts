@@ -116,6 +116,39 @@ describe("GET /auth/pending — OUTCOME-TRUE, polled (W2)", () => {
     expect(r.status).toBe("Logged in using ChatGPT");
   });
 
+  it("stays honest after the login CHILD has exited — which is what success looks like", async () => {
+    // `codex login --device-auth` exits the moment it succeeds. Dropping the pending record on exit
+    // would throw away the credential baseline, and the next poll would fall back to status alone —
+    // so a stale-but-valid auth.json would answer "yes" for a login that never happened.
+    const dir = await scratch();
+    const statusFile = path.join(dir, "st");
+    const credFile = path.join(dir, "auth.json");
+    await fs.writeFile(credFile, '{"tokens":{"access_token":"stale"}}');
+    await fs.writeFile(statusFile, "Logged in using ChatGPT");
+    // A login that writes the transcript and then EXITS, without touching the credential.
+    const login = path.join(dir, "exiting-login.js");
+    await fs.writeFile(login, `require("fs").writeFileSync(process.argv[2], ${JSON.stringify(DEVICE_OUTPUT)});`);
+    const status = path.join(dir, "status.js");
+    await fs.writeFile(status, `process.stdout.write(require("fs").readFileSync(${JSON.stringify(statusFile)},"utf8"));`);
+    const authLog = path.join(dir, "auth.log");
+    server = serveRuntime({
+      port: 0,
+      token: TOKEN,
+      authLog,
+      credFile,
+      loginArgs: [process.execPath, login, authLog],
+      statusArgs: [process.execPath, status],
+      ptyArgv: (cmd) => cmd.split(" "),
+    });
+    await new Promise((r) => server!.on("listening", r));
+    const port = (server!.address() as AddressInfo).port;
+    const ops = httpAuthOps(`http://127.0.0.1:${port}`, TOKEN, undefined, undefined, "codex");
+    await ops.startHeadless();
+    const r = await ops.pending!();
+    expect(r.loggedIn).toBe(true); // the CLI says yes, off a credential that was already there...
+    expect(r.done).toBe(false); // ...and the baseline survived the exit, so we do not claim it
+  });
+
   it("a PRE-EXISTING credential is not a login: status alone never makes it done", async () => {
     // The whole reason the baseline is snapshotted at /auth/login. Without it, an agent that was
     // signed in yesterday would report every abandoned login as a success.

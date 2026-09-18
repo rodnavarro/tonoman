@@ -386,6 +386,11 @@ export interface NoticeInput {
   conversation: string;
   channel: string;
   text: string;
+  /** Set when the turn failed for want of an inference credential (W3). The activity records the
+   *  outcome against whoever the credential belongs to and rewrites `text` to name this agent's own
+   *  provider — both need the roster, which the workflow does not have. Carried here rather than as
+   *  a second activity call so an in-flight conversation's command sequence does not change. */
+  authFailure?: { user?: string; reason: string };
 }
 
 /** Slack rate-limits an edit to roughly one call per second per channel, and a burst 429s the whole
@@ -447,26 +452,23 @@ export function makeActivities(deps: TurnDeps) {
     },
 
 
-    /** A turn failed because there is no usable inference credential (W3).
-     *
-     *  Two things happen here and both need the roster, which is why they are one activity rather
-     *  than a pure function in the workflow: the outcome is RECORDED against whoever the credential
-     *  belongs to (the speaker on a per-person agent, the agent otherwise), and the notice is
-     *  written naming THIS agent's provider — it used to say `!connect claude` unconditionally,
-     *  which on a codex agent is an instruction to sign in to an account it does not use.
-     *
-     *  Returns the text rather than posting it, so the workflow keeps its single posting path.
-     *  Never throws: the turn has already failed, and a second failure here would replace the
-     *  explanation the person is owed with nothing at all. */
-    async noteAuthFailure(input: { agent: string; user?: string; reason: string }): Promise<string> {
-      const label = deps.providerLabel?.(input.agent) ?? "Claude";
-      await deps
-        .reportAuthState?.(input.agent, authFailureState(input.reason), input.user)
-        .catch((e) => console.error(`activities: ${input.agent} auth-state report failed: ${String(e)}`));
-      return notLoggedInNotice(`!connect ${label.toLowerCase()}`);
-    },
-
     async postNotice(input: NoticeInput): Promise<void> {
+      // A turn that failed for want of an inference credential (W3). Two things happen here and both
+      // need the ROSTER, which the workflow does not have: the outcome is recorded against whoever
+      // the credential belongs to (the speaker on a per-person agent, the agent otherwise), and the
+      // notice is rewritten to name THIS agent's provider — the workflow's text says
+      // `!connect claude`, which on a codex agent sends somebody to an account it does not use.
+      //
+      // Both are best-effort and neither can stop the notice being posted: the turn has already
+      // failed, and the person is owed an explanation more than the Hub is owed a row.
+      let text = input.text;
+      if (input.authFailure) {
+        const label = deps.providerLabel?.(input.agent) ?? "Claude";
+        text = notLoggedInNotice(`!connect ${label.toLowerCase()}`);
+        await deps
+          .reportAuthState?.(input.agent, authFailureState(input.authFailure.reason), input.authFailure.user)
+          .catch((e) => console.error(`activities: ${input.agent} auth-state report failed: ${String(e)}`));
+      }
       const found = deps.agent(input.agent);
       if (!found) return;
       const reply = found.conn.reply(input.conversation);
@@ -478,7 +480,7 @@ export function makeActivities(deps: TurnDeps) {
       //
       // Best-effort and before the message: an unclearable cue is the part that traps them.
       await reply.settle?.().catch(() => {});
-      await reply.send(input.text);
+      await reply.send(text);
     },
 
     // --- the voice flow -------------------------------------------------------------------------

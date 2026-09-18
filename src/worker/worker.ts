@@ -53,6 +53,7 @@ import { serialReload } from "./reloadgate";
 import { serveWake } from "./wake";
 import { promises as fsp } from "node:fs";
 import { defaultHarnesses } from "../gateway";
+import { parseMountRef, parseRef, registrySecretPath } from "../core/secretref";
 import { harnessForProvider, providerAccountLabel, providerLabel, type HarnessKind, type InferenceProvider } from "../harness";
 import { accountsFromUsers, makeActivities, type TurnRunReq, type VoiceConfig } from "./activities";
 import { startCapabilityPlane, type CapabilityPlane } from "./capability-plane";
@@ -88,26 +89,6 @@ export function workerOptionsFrom(env: NodeJS.ProcessEnv): WorkerOptions {
   };
 }
 
-/** PURE: which scheme a credential ref names, and what is left after it.
- *
- *  Split out and exported because the two schemes are one character apart in appearance and a world
- *  apart in effect, and getting the precedence wrong is SILENT: `registry:slack.bot-token` satisfies
- *  the mounted-secret grammar perfectly well, so read the old way it would look for a file at
- *  `<secrets-dir>/registry/slack.bot-token`, not find one, and return "" — an agent that "has no
- *  token" while its token sits encrypted in the registry. So the prefix is checked FIRST. */
-export function parseRef(ref: string | null | undefined): { kind: "registry" | "mount"; ref: string } | undefined {
-  const t = (ref ?? "").trim();
-  if (!t) return undefined;
-  // `registry:<ref>` — the ref is a row in the registry's `secret` table, and the whole rest of the
-  // string is its name. No character class here on purpose: the API owns that namespace and the
-  // value is URL-encoded into a path rather than joined onto a filesystem one.
-  if (t.startsWith("registry:")) {
-    const name = t.slice("registry:".length);
-    return name ? { kind: "registry", ref: name } : undefined;
-  }
-  return { kind: "mount", ref: t };
-}
-
 /** Resolve a credential ref. TWO SCHEMES, and which one is in play is the ref's own business:
  *
  *   `<secret>:<key>`   a MOUNTED Kubernetes secret — the original contract, unchanged.
@@ -135,14 +116,11 @@ export async function resolveRef(
   if (!p) return "";
   if (p.kind === "registry") return registrySecret(guid, p.ref, fetchImpl);
 
-  const i = p.ref.indexOf(":");
-  if (i < 0) return "";
-  const secret = p.ref.slice(0, i);
-  const key = p.ref.slice(i + 1);
-  if (!/^[A-Za-z0-9._-]+$/.test(secret) || !/^[A-Za-z0-9._-]+$/.test(key)) return "";
+  const m = parseMountRef(p.ref);
+  if (!m) return ""; // refuses anything that could climb out of the mount
   const dir = process.env.TONOMAN_SECRETS_DIR ?? "/etc/tonoman/secrets";
   try {
-    return (await fsp.readFile(path.join(dir, secret, key), "utf8")).trim();
+    return (await fsp.readFile(path.join(dir, m.secret, m.key), "utf8")).trim();
   } catch {
     return "";
   }
@@ -256,10 +234,9 @@ export async function registrySecret(
   const baseUrl = process.env.TONOMANCLOUD_API_URL;
   if (!baseUrl || !guid || !ref) return "";
   try {
-    const r = await (fetchImpl ?? fetch)(
-      `${baseUrl.replace(/[/]+$/, "")}/v1/system/agents/${guid}/secrets/${encodeURIComponent(ref)}`,
-      { headers: { authorization: `Bearer ${process.env.TONOMANCLOUD_API_TOKEN ?? ""}` } },
-    );
+    const r = await (fetchImpl ?? fetch)(`${baseUrl.replace(/[/]+$/, "")}${registrySecretPath(guid, ref)}`, {
+      headers: { authorization: `Bearer ${process.env.TONOMANCLOUD_API_TOKEN ?? ""}` },
+    });
     // 404 is "not connected", which is a state rather than a failure. Anything else is worth a line
     // — a 500 here means the KEK is wrong or the row is unreadable, and silently treating that as
     // "no calendar" would hide a real fault behind a plausible absence.
@@ -1486,7 +1463,7 @@ export async function run(
       // Per-person agent: sign in the SPEAKER's own subscription (their own credential dir); shared:
       // the agent's one login, and the user is ignored — same offer either way.
       const u = a.cfg.inference_mode === "per_user" ? user : undefined;
-      await gate.ask(authDeps, name, a.cfg.displayName ?? a.cfg.name ?? name, conversation, u).catch((e) => {
+      await gate.ask(authDeps, name, a.cfg.displayName ?? a.cfg.name ?? name, conversation, u, user).catch((e) => {
         console.error(`worker: ${name} connect claude failed: ${(e as Error).message}`);
         return false;
       });
@@ -1862,10 +1839,12 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
             continue;
           }
         } else if (a.cfg.auth_state && a.cfg.auth_state !== "ok") {
-          const asked = await gate.ask(authDeps, name, a.cfg.displayName ?? a.cfg.name ?? name, env.conversation).catch((e) => {
-            console.error(`worker: auth prompt failed for ${name}: ${(e as Error).message}`);
-            return false;
-          });
+          const asked = await gate
+            .ask(authDeps, name, a.cfg.displayName ?? a.cfg.name ?? name, env.conversation, undefined, env.user)
+            .catch((e) => {
+              console.error(`worker: auth prompt failed for ${name}: ${(e as Error).message}`);
+              return false;
+            });
           if (asked) console.log(`worker: ${name} asked for an inference login (auth_state=${a.cfg.auth_state})`);
           continue;
         }

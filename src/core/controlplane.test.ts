@@ -250,3 +250,76 @@ describe("RegistryControlPlane — a connection flattens to its shared account, 
     expect(c.accounts).toEqual([]);
   });
 });
+
+// W7 — a Slack token pasted into the Hub reaches a running gateway.
+//
+// This is the half of that path that matters: `botTokenRef` and `appTokenRef` are resolved HERE,
+// while the roster is built, not by the worker's resolver. A `registry:` ref left unhandled here
+// resolves to "" and the agent is skipped for "missing bot token" — the failure looks like a
+// misconfigured cluster secret and is in fact a scheme nobody taught this function about.
+describe("RegistryControlPlane — credential refs, in either scheme (W7)", () => {
+  /** A plane whose roster is `agents` and whose secret reads go through a recorder. */
+  function planeWithSecrets(agents: RegistryAgent[], secrets: Record<string, string>) {
+    const calls: { url: string; auth?: string }[] = [];
+    const fetchImpl = (async (url: string, init?: RequestInit) => {
+      const u = String(url);
+      if (u.endsWith("/v1/system/roster")) {
+        return { ok: true, status: 200, json: async () => ({ agents }) } as unknown as Response;
+      }
+      calls.push({ url: u, auth: (init?.headers as Record<string, string> | undefined)?.authorization });
+      const hit = Object.entries(secrets).find(([ref]) => u.endsWith(encodeURIComponent(ref)));
+      if (!hit) return { ok: false, status: 404, json: async () => ({}) } as unknown as Response;
+      return { ok: true, status: 200, json: async () => ({ value: hit[1] }) } as unknown as Response;
+    }) as unknown as typeof fetch;
+    const p = new RegistryControlPlane({
+      baseUrl: "http://api.invalid",
+      token: "sys-token",
+      secretsDir: path.join(dir, "secrets"),
+      identityDir: path.join(dir, "identity"),
+      stateRoot: dir,
+      fetchImpl,
+    });
+    return { plane: p, calls };
+  }
+
+  const hubAgent: RegistryAgent = {
+    ...base,
+    botTokenRef: "registry:slack.bot-token",
+    appTokenRef: "registry:slack.app-token",
+  };
+
+  it("resolves registry refs over the API, scoped to the agent that owns them", async () => {
+    const s = planeWithSecrets([hubAgent], {
+      "slack.bot-token": "xoxb-from-the-hub",
+      "slack.app-token": "xapp-from-the-hub",
+    });
+    const cfg = await s.plane.roster();
+    expect(cfg.agents[0].slack).toMatchObject({ bot_token: "xoxb-from-the-hub", app_token: "xapp-from-the-hub" });
+    for (const c of s.calls) {
+      expect(c.url).toContain("/v1/system/agents/g1/secrets/");
+      expect(c.auth).toBe("Bearer sys-token");
+    }
+  });
+
+  it("does NOT read a registry ref off the filesystem, however legal it looks as a mount ref", async () => {
+    await putSecret("registry", "slack.bot-token", "WRONG-from-the-filesystem");
+    const s = planeWithSecrets([hubAgent], { "slack.bot-token": "right", "slack.app-token": "right-app" });
+    const cfg = await s.plane.roster();
+    expect(cfg.agents[0].slack?.bot_token).toBe("right");
+  });
+
+  it("skips the agent — loudly, not fatally — when the Hub has stored nothing yet", async () => {
+    const s = planeWithSecrets([hubAgent], {}); // every lookup 404s
+    const cfg = await s.plane.roster();
+    expect(cfg.agents).toEqual([]);
+  });
+
+  it("leaves the mounted scheme exactly as it was", async () => {
+    await putSecret("acme-slack", "SLACK_BOT_TOKEN", "xoxb-mounted");
+    await putSecret("acme-slack", "SLACK_APP_TOKEN", "xapp-mounted");
+    const s = planeWithSecrets([{ ...base, appTokenRef: "acme-slack:SLACK_APP_TOKEN" }], {});
+    const cfg = await s.plane.roster();
+    expect(cfg.agents[0].slack).toMatchObject({ bot_token: "xoxb-mounted", app_token: "xapp-mounted" });
+    expect(s.calls).toEqual([]); // no secret was fetched: a mount ref never asks the API
+  });
+});
