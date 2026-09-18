@@ -175,7 +175,16 @@ export interface CommandDeps {
   /** Run a Talent on ONE item now, out of band from its schedule — the on-demand, tool-like trigger.
    *  Shares the poll's per-item workflow id, so an on-demand run and a scheduled one never
    *  double-process the same item. Absent on a deployment with no Talent runtime behind it. */
-  runTalent?(agent: string, talent: string, item: string, user?: string, force?: boolean): Promise<{ started: boolean; message: string }>;
+  runTalent?(
+    agent: string,
+    talent: string,
+    item: string,
+    user?: string,
+    force?: boolean,
+    /** WHAT started this run, and who asked. `!talent` is a `command`; the Hub's run-now button is
+     *  `hub` and supplies its own `requestedBy`. Recorded on the run, never interpreted here. */
+    o?: { trigger?: "schedule" | "command" | "hub"; requestedBy?: string },
+  ): Promise<{ started: boolean; message: string; workflowId?: string }>;
   /** Start a three-legged login and return the URL to put in front of the person, or a problem to
    *  show them. The registry owns the flow — it holds the client secret and the pending state; the
    *  worker only carries the answer into the channel. */

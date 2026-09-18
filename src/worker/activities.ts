@@ -70,8 +70,22 @@ export interface TurnDeps {
    *  the worker holds no connection string. It asks the registry, over the same system-token API it
    *  already uses for the roster. */
   talentRun?: {
-    open(agent: string, talent: string, itemKey: string, version: number): Promise<void>;
-    close(agent: string, talent: string, itemKey: string, status: "done" | "failed", error?: string): Promise<void>;
+    open(
+      agent: string,
+      talent: string,
+      itemKey: string,
+      version: number,
+      o?: { trigger?: "schedule" | "command" | "hub"; requestedBy?: string },
+    ): Promise<void>;
+    close(
+      agent: string,
+      talent: string,
+      itemKey: string,
+      status: "done" | "failed",
+      error?: string,
+      /** What the run produced: the announcement text, and where the output can be read. */
+      result?: { summary: string; links?: { label: string; url: string }[] },
+    ): Promise<void>;
     /** The durable status of one item, for the recording-level idempotency guard: a prior `done`
      *  lets a re-run skip the transcription + inference it would otherwise re-pay. Best-effort like
      *  the rest — it returns `undefined` on any read failure so the guard fails OPEN (the run
@@ -667,7 +681,13 @@ export function makeActivities(deps: TurnDeps) {
      *  activity announces it (a real agent turn, from the Talent's `steer`) and lets a failure
      *  surface as a throw so Temporal retries and the `talent_run` record closes `failed`. The work
      *  itself is a subprocess, so its progress drives the heartbeat and a cancel kills the child. */
-    async runTalent(input: { agent: string; item: string; notify?: string; user?: string; talent?: string }): Promise<{ status: string }> {
+    async runTalent(input: {
+      agent: string;
+      item: string;
+      notify?: string;
+      user?: string;
+      talent?: string;
+    }): Promise<{ status: string; summary?: string; links?: { label: string; url: string }[] }> {
       const plane = deps.talentPlane;
       if (!plane) throw new Error("runTalent: the capability plane is not running");
       const ctx = Context.current();
@@ -712,7 +732,15 @@ export function makeActivities(deps: TurnDeps) {
         if (outcome.status === "done" && outcome.steer) {
           await deps.ask?.(input.agent, input.notify ?? "", outcome.steer);
         }
-        return { status: outcome.status };
+        // The announcement text travels BACK OUT so the run record can hold it (W4). `steer` is what
+        // the person was actually told; `summary` is the Talent's own one-liner and the fallback.
+        // Capped here rather than at the registry, because a 2000-char field is a contract and a
+        // 40kB transcript arriving at it is a 413 nobody will connect to a recap.
+        return {
+          status: outcome.status,
+          summary: (outcome.steer ?? outcome.summary ?? "").slice(0, 2000) || undefined,
+          links: outcome.links,
+        };
       } finally {
         clearInterval(beat);
       }
@@ -724,8 +752,18 @@ export function makeActivities(deps: TurnDeps) {
      *  yet" and "failing every two minutes for ten hours" were the same state, because the only
      *  durable fact was whether a file existed in a git checkout — a check that can answer "is it
      *  done" and can never answer "is it being worked on, or failing". */
-    async openTalentRun(input: { agent: string; talent: string; itemKey: string; version: number }): Promise<void> {
-      await deps.talentRun?.open(input.agent, input.talent, input.itemKey, input.version);
+    async openTalentRun(input: {
+      agent: string;
+      talent: string;
+      itemKey: string;
+      version: number;
+      trigger?: "schedule" | "command" | "hub";
+      requestedBy?: string;
+    }): Promise<void> {
+      await deps.talentRun?.open(input.agent, input.talent, input.itemKey, input.version, {
+        trigger: input.trigger,
+        requestedBy: input.requestedBy,
+      });
     },
 
     /** Close it, either way. The FAILED case is the one that matters: it is what makes "this
@@ -736,8 +774,16 @@ export function makeActivities(deps: TurnDeps) {
       itemKey: string;
       status: "done" | "failed";
       error?: string;
+      result?: { summary: string; links?: { label: string; url: string }[] };
     }): Promise<void> {
-      await deps.talentRun?.close(input.agent, input.talent, input.itemKey, input.status, input.error);
+      await deps.talentRun?.close(
+        input.agent,
+        input.talent,
+        input.itemKey,
+        input.status,
+        input.error,
+        input.result,
+      );
     },
 
     /** The recording-level idempotency guard, read before a run spends anything. Returns the durable

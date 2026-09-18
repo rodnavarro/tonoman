@@ -1118,7 +1118,13 @@ export async function run(
     // the row is simply missing. Dedup does not depend on it (the git checkout still answers "already
     // published"); this makes a failing run visible, which nothing did before.
     talentRun: {
-      open: async (name: string, talentName: string, itemKey: string, version: number) => {
+      open: async (
+        name: string,
+        talentName: string,
+        itemKey: string,
+        version: number,
+        o?: { trigger?: "schedule" | "command" | "hub"; requestedBy?: string },
+      ) => {
         const baseUrl = process.env.TONOMANCLOUD_API_URL;
         const guid = wired.get(name)?.cfg.guid;
         if (!baseUrl || !guid) return; // a file roster has no registry to record into
@@ -1129,7 +1135,16 @@ export async function run(
               authorization: `Bearer ${process.env.TONOMANCLOUD_API_TOKEN ?? ""}`,
               "content-type": "application/json",
             },
-            body: JSON.stringify({ talent: talentName, itemKey, version }),
+            // `trigger` and `requestedBy` are what make "why did this run, and who asked" answerable
+            // after the fact — a Talent failing on its schedule and one a person keeps re-running by
+            // hand are very different situations that used to leave identical rows.
+            body: JSON.stringify({
+              talent: talentName,
+              itemKey,
+              version,
+              trigger: o?.trigger ?? "schedule",
+              ...(o?.requestedBy ? { requestedBy: o.requestedBy } : {}),
+            }),
           });
           if (!r.ok) console.error(`worker: ${name} talent_run open ${talentName}/${itemKey} → ${r.status}`);
         } catch (e) {
@@ -1142,6 +1157,7 @@ export async function run(
         itemKey: string,
         status: "done" | "failed",
         error?: string,
+        result?: { summary: string; links?: { label: string; url: string }[] },
       ) => {
         const baseUrl = process.env.TONOMANCLOUD_API_URL;
         const guid = wired.get(name)?.cfg.guid;
@@ -1153,7 +1169,18 @@ export async function run(
               authorization: `Bearer ${process.env.TONOMANCLOUD_API_TOKEN ?? ""}`,
               "content-type": "application/json",
             },
-            body: JSON.stringify({ talent: talentName, itemKey, status, error }),
+            // `result` is WHAT the run produced, not just that it finished. Trimmed to 2000 chars at
+            // the activity that produced it; trimmed again here because this is the last place before
+            // the wire and a field length is a contract, not a hope.
+            body: JSON.stringify({
+              talent: talentName,
+              itemKey,
+              status,
+              error,
+              ...(result?.summary
+                ? { result: { summary: result.summary.slice(0, 2000), ...(result.links?.length ? { links: result.links } : {}) } }
+                : {}),
+            }),
           });
           if (!r.ok) console.error(`worker: ${name} talent_run close ${talentName}/${itemKey} → ${r.status}`);
         } catch (e) {
@@ -1305,7 +1332,7 @@ export async function run(
     // On-demand: start the SAME per-item workflow the poll starts, so an on-demand run and a
     // scheduled one dedup against each other (the deterministic id). AlreadyStarted is the normal
     // answer for an item in flight or already done — reported, not an error.
-    runTalent: async (name, talent, item, user, force) => {
+    runTalent: async (name, talent, item, user, force, how) => {
       const tdef = getTalent(talent);
       if (!tdef) return { started: false, message: `I don't run a Talent called "${talent}".` };
       // Keyed on the recording's KEY, exactly as the poll keys it, so an on-demand run of an item
@@ -1318,18 +1345,38 @@ export async function run(
         await client.workflow.start(runTalentWorkflow, {
           workflowId: wfId,
           taskQueue: o.taskQueue,
-          args: [{ agent: name, talent, itemKey: key, recordingId: item, version: tdef.version, notify: user ?? "", user, force }],
+          args: [
+            {
+              agent: name,
+              talent,
+              itemKey: key,
+              recordingId: item,
+              version: tdef.version,
+              notify: user ?? "",
+              user,
+              force,
+              // `command` is the default because the two callers of this function are `!talent` and
+              // the Hub endpoint; a schedule starts the workflow directly and says so itself.
+              trigger: how?.trigger ?? "command",
+              requestedBy: how?.requestedBy,
+            },
+          ],
         });
-        if (talent === agendaBrief.name) return { started: true, message: "Looking at today's calendar now — the brief follows in a moment." };
+        // The workflow id goes back to the caller (W4): it is the one handle the Hub can use to
+        // follow the run it just started, and it was being computed here and thrown away.
+        if (talent === agendaBrief.name) {
+          return { started: true, message: "Looking at today's calendar now — the brief follows in a moment.", workflowId: wfId };
+        }
         return {
           started: true,
+          workflowId: wfId,
           message: force
             ? `Re-running *${talent}* on \`${item}\` now — a fresh recap, even though it was already filed.`
             : `Running *${talent}* on \`${item}\` now — I'll post the recap when it's done.`,
         };
       } catch (e) {
         if (e instanceof WorkflowExecutionAlreadyStartedError) {
-          return { started: false, message: `\`${item}\` is already being processed (or was already done).` };
+          return { started: false, workflowId: wfId, message: `\`${item}\` is already being processed (or was already done).` };
         }
         throw e;
       }
@@ -1967,6 +2014,29 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
       token: wakeToken,
       deps: {
         has: (name) => wired.has(name),
+        // The Hub names an agent by its registry GUID. On a registry roster that IS the worker's own
+        // key (`cfg.name` is the guid), so the common case is a straight hit — but a file roster has
+        // no guid at all, and a person reading a log will type the tenant-prefixed display name. All
+        // three resolve here, once, so the endpoint can answer a clean 404 for an agent this worker
+        // genuinely does not serve rather than start a workflow nothing will pick up.
+        resolveAgent: (nameOrGuid) => {
+          if (wired.has(nameOrGuid)) return nameOrGuid;
+          const want = nameOrGuid.toLowerCase();
+          for (const [key, w] of wired) {
+            if (
+              (w.cfg.guid ?? "").toLowerCase() === want ||
+              (w.cfg.displayName ?? "").toLowerCase() === want ||
+              agentLabel(w.cfg).toLowerCase() === want
+            ) {
+              return key;
+            }
+          }
+          return undefined;
+        },
+        // The SAME function `!talent` calls, so a run started from the Hub and one typed in Slack
+        // are one mechanism — same per-item workflow id, same dedup, same `talent_run` row.
+        runTalent: (name, talent, item, user, force, how) =>
+          commandDeps.runTalent!(name, talent, item, user, force, how),
         // Present only when reload is enabled; the wake endpoint answers 404 otherwise, so the API
         // learns "reload off" rather than silently believing a poke landed.
         reload: triggerReload,

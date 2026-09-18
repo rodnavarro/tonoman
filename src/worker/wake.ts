@@ -30,6 +30,30 @@ export interface WakeRequest {
   verbatim?: boolean;
 }
 
+/** What the Hub asks for when somebody presses "run now" on a Talent (W4).
+ *
+ *  It is the SAME run `!talent` starts and the same run a schedule starts — one per-item workflow,
+ *  one `talent_run` row, one dedup id — differing only in `trigger`, which is what makes "who asked
+ *  for this" answerable afterwards. A second mechanism would have meant a second thing to keep in
+ *  step with the first, which is how the poll and the on-demand path came to disagree once already. */
+export interface TalentRunRequest {
+  /** The agent, as the REGISTRY names it: its guid. (The worker's own local name is accepted too —
+   *  on a registry roster they are the same string, and on a file roster there is no guid at all.) */
+  agent: string;
+  /** Which Talent, by name. */
+  talent: string;
+  /** The one item to run it on — a recording id, or whatever that Talent's items are keyed by. */
+  item: string;
+  /** WHO the run is for: a Slack user id. It decides who is told, and — on an agent where everybody
+   *  brings their own subscription — whose login pays for the inference. */
+  user: string;
+  /** Re-run an item that is already filed, instead of the run being a no-op. */
+  force?: boolean;
+  /** WHO asked, as an opaque account id from the Hub. Recorded on the run, never interpreted here:
+   *  this worker has no user table and should not pretend to. */
+  requestedBy?: string;
+}
+
 export interface WakeDeps {
   /** Open (or reuse) a DM with a user and return the conversation key. */
   dmFor(agent: string, userId: string): Promise<string | undefined>;
@@ -45,6 +69,21 @@ export interface WakeDeps {
   ask(agent: string, conversation: string, text: string, user?: string): Promise<void>;
   /** Whether this agent exists in the roster. */
   has(agent: string): boolean;
+  /** The worker's own key for an agent the CALLER named — a registry guid from the Hub, or a local
+   *  name. Undefined when it serves no such agent, which is what makes the endpoint answer 404
+   *  rather than quietly starting nothing. Optional: a deployment without it falls back to `has`. */
+  resolveAgent?(nameOrGuid: string): string | undefined;
+  /** Start a Talent on one item now (W4). The same function `!talent` calls, so the two triggers
+   *  cannot drift apart. `started: false` is the normal answer for an item already in flight or
+   *  already done — reported, not an error. */
+  runTalent?(
+    agent: string,
+    talent: string,
+    item: string,
+    user?: string,
+    force?: boolean,
+    o?: { trigger?: "schedule" | "command" | "hub"; requestedBy?: string },
+  ): Promise<{ started: boolean; message: string; workflowId?: string }>;
   /** Re-fetch the roster and apply the difference NOW, instead of waiting for the next poll tick.
    *  Optional: a worker with reload disabled (no reloadRoster, or ROSTER_RELOAD_SECONDS=0) does not
    *  offer it, and `POST /api/reload` answers 404 there. The Hub's API pokes this after a write so an
@@ -62,6 +101,36 @@ export function parseWake(body: unknown): { ok: true; req: WakeRequest } | { ok:
   return {
     ok: true,
     req: { agent: b.agent, user: b.user, conversation: b.conversation, text: b.text, verbatim: b.verbatim === true },
+  };
+}
+
+/** PURE: validate a talent-run body, returning the request or the reason it is not one. Unit-tested
+ *  for the same reason `parseWake` is: another system calls this, and an error that does not say
+ *  what is wrong turns a typo into an afternoon. Every field is checked by NAME, so a caller that
+ *  sends `talentName` is told which field is missing rather than getting a run of `undefined`. */
+export function parseTalentRun(body: unknown): { ok: true; req: TalentRunRequest } | { ok: false; error: string } {
+  const b = (body ?? {}) as Record<string, unknown>;
+  const str = (k: string): string => (typeof b[k] === "string" ? (b[k] as string).trim() : "");
+  for (const k of ["agent", "talent", "item", "user"]) {
+    if (!str(k)) return { ok: false, error: `${k} is required` };
+  }
+  // `force` and `requestedBy` are the only optional fields, and a wrong TYPE on either is a caller
+  // bug worth naming: `force: "true"` silently doing nothing is the kind of thing that gets
+  // rediscovered a week later as "the re-run button doesn't work".
+  if (b.force !== undefined && typeof b.force !== "boolean") return { ok: false, error: "force must be a boolean" };
+  if (b.requestedBy !== undefined && typeof b.requestedBy !== "string") {
+    return { ok: false, error: "requestedBy must be a string" };
+  }
+  return {
+    ok: true,
+    req: {
+      agent: str("agent"),
+      talent: str("talent"),
+      item: str("item"),
+      user: str("user"),
+      force: b.force === true,
+      requestedBy: str("requestedBy") || undefined,
+    },
   };
 }
 
@@ -84,7 +153,8 @@ export function serveWake(o: WakeServerOptions, signal: AbortSignal): boolean {
     };
 
     const route = (req.url ?? "").split("?")[0];
-    if (req.method !== "POST" || (route !== "/api/wake" && route !== "/api/reload")) {
+    const ROUTES = ["/api/wake", "/api/reload", "/api/talent-run"];
+    if (req.method !== "POST" || !ROUTES.includes(route)) {
       return send(404, { error: "not found" });
     }
     if (req.headers.authorization !== `Bearer ${o.token}`) {
@@ -114,6 +184,39 @@ export function serveWake(o: WakeServerOptions, signal: AbortSignal): boolean {
       } catch {
         return send(400, { error: "invalid json" });
       }
+
+      // Run a Talent on one item, asked for from the Hub (W4). UNLIKE /api/wake this answers with
+      // the outcome rather than 202-and-then: the caller is a person who just pressed a button and
+      // is owed "started" or "already running" now, and starting a workflow is a fast call — it is
+      // the RUN that is slow, and that is Temporal's to carry, not this connection's.
+      if (route === "/api/talent-run") {
+        if (!o.deps.runTalent) return send(404, { error: "this worker cannot run a Talent on demand" });
+        const t = parseTalentRun(parsed);
+        if (!t.ok) return send(400, { error: t.error });
+        // The Hub names an agent by its registry guid; this worker keys its own map by whatever the
+        // roster called it. Resolving rather than assuming is what lets the endpoint answer a clean
+        // 404 for an agent this worker does not serve, instead of starting a workflow for a name
+        // nothing will ever pick up.
+        const key = o.deps.resolveAgent?.(t.req.agent) ?? (o.deps.has(t.req.agent) ? t.req.agent : undefined);
+        if (!key) return send(404, { error: `no such agent "${t.req.agent}"` });
+        void (async () => {
+          try {
+            const r = await o.deps.runTalent!(key, t.req.talent, t.req.item, t.req.user, t.req.force, {
+              trigger: "hub",
+              requestedBy: t.req.requestedBy,
+            });
+            // 409, not 200-with-a-flag: "already running or already done" is a conflict with the
+            // state of that item, and a caller that only reads the status code should not read it
+            // as a fresh run. The message says which, in words.
+            send(r.started ? 200 : 409, { started: r.started, message: r.message, workflowId: r.workflowId });
+          } catch (e) {
+            console.error(`talent-run: ${key} ${t.req.talent} failed to start: ${(e as Error).message}`);
+            send(500, { started: false, message: `couldn't start it — ${(e as Error).message.slice(0, 200)}` });
+          }
+        })();
+        return;
+      }
+
       const v = parseWake(parsed);
       if (!v.ok) return send(400, { error: v.error });
       const { agent, user, conversation, text, verbatim } = v.req;

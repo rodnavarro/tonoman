@@ -78,6 +78,14 @@ export interface TalentOutcome {
   steer?: string;
   /** Why a run was skipped or failed — recorded, not announced. */
   reason?: string;
+  /** Where the run's output can be READ, when the Talent knows: the filed page, the calendar it
+   *  wrote to. Recorded on the `talent_run` so the Hub can link to it from the run list.
+   *
+   *  Only the Talent can answer this. The runtime files by PATH (a git checkout, a directory in a
+   *  second brain) and has no idea what that path is called on the web — deriving a URL from it here
+   *  would be a guess, and a link that 404s is worse than no link. Optional, and no built-in Talent
+   *  supplies one yet. */
+  links?: { label: string; url: string }[];
 }
 
 // --- The capability plane, as the Talent sees it -------------------------------------------------

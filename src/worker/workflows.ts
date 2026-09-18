@@ -372,6 +372,14 @@ export interface RunTalentInput {
    *  sets this (a filed recording should stay filed); the on-demand `!talent <name> <id> again`
    *  does, for the deliberate "recap that one again" — a fresh run, a fresh announcement. */
   force?: boolean;
+  /** WHAT started this run: its own schedule, somebody typing `!talent`, or a button in the Hub.
+   *  Recorded on the `talent_run` row, because "why did this run" is otherwise unanswerable after
+   *  the fact — and the three have very different implications when one of them is failing.
+   *  Defaults to `schedule`, which is the caller that does not pass it. */
+  trigger?: "schedule" | "command" | "hub";
+  /** WHO asked, when a person did — an opaque account id from the Hub. Passed through and recorded,
+   *  never interpreted: this worker has no user table and should not pretend to. */
+  requestedBy?: string;
 }
 
 /**
@@ -404,7 +412,14 @@ export async function runTalentWorkflow(input: RunTalentInput): Promise<void> {
   // The durable record whose absence produced 611 attempts for 4 published recaps. Opened BEFORE the
   // run, so "being worked on" is a state that exists at all — which it never was. Best-effort inside
   // the activity: a missing row never stops a recording.
-  await openTalentRun({ agent: input.agent, talent: input.talent, itemKey: input.itemKey, version: input.version });
+  await openTalentRun({
+    agent: input.agent,
+    talent: input.talent,
+    itemKey: input.itemKey,
+    version: input.version,
+    trigger: input.trigger ?? "schedule",
+    requestedBy: input.requestedBy,
+  });
 
   // Say it landed — ONCE, on the first launch of this item, after the record that will remember it
   // is open. It used to be said by the poll before every launch, and a recording that was relaunched
@@ -423,7 +438,7 @@ export async function runTalentWorkflow(input: RunTalentInput): Promise<void> {
     // CUT OVER to the self-contained Talent CLI (spawned via the capability plane). `processRecording`
     // remains for a one-line revert: swap `runTalent` back to it and restart the worker. The announce
     // is the Talent's steer, run as a real agent turn inside runTalent — same behaviour as before.
-    await runTalent({
+    const outcome = await runTalent({
       agent: input.agent,
       notify: input.notify ?? "",
       item: input.recordingId ?? input.itemKey,
@@ -431,7 +446,16 @@ export async function runTalentWorkflow(input: RunTalentInput): Promise<void> {
       talent: input.talent,
     });
     void processRecording; // kept importable for the revert; see above
-    await closeTalentRun({ agent: input.agent, talent: input.talent, itemKey: input.itemKey, status: "done" });
+    // WHAT the run produced, recorded alongside the fact that it finished (W4). The run list used to
+    // say only "done", which answers "did it work" and not "what did it say" — so the only way to
+    // see what a Talent actually produced was to go and find the Slack message it produced it in.
+    await closeTalentRun({
+      agent: input.agent,
+      talent: input.talent,
+      itemKey: input.itemKey,
+      status: "done",
+      result: outcome?.summary ? { summary: outcome.summary, links: outcome.links } : undefined,
+    });
   } catch (e) {
     // Recorded, then rethrown. Temporal owns the retry; this record owns the ANSWER to "is this
     // failing, or has nobody looked at it yet".

@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { Context } from "@temporalio/activity";
 import { makeActivities, accountsOf, accountFor, accountsFromUsers, loginAlertText, speakerContext, type TurnDeps, type VoiceConfig } from "./activities";
 import * as recap from "./recap";
 import { isAuthError } from "../authflow";
@@ -193,5 +194,80 @@ describe("findNewRecordings — the shared account makes the same calls as befor
       list.mockRestore();
       unpub.mockRestore();
     }
+  });
+});
+
+// W4 — a run record that says WHY it ran and WHAT it produced.
+describe("talent_run records carry the trigger, who asked, and the result", () => {
+  function spyDeps() {
+    const opens: unknown[][] = [];
+    const closes: unknown[][] = [];
+    const deps = {
+      talentRun: {
+        open: async (...a: unknown[]) => void opens.push(a),
+        close: async (...a: unknown[]) => void closes.push(a),
+      },
+    } as unknown as TurnDeps;
+    return { opens, closes, acts: makeActivities(deps) };
+  }
+
+  it("openTalentRun passes the trigger and requestedBy straight through", async () => {
+    const s = spyDeps();
+    await s.acts.openTalentRun({
+      agent: "a",
+      talent: "meeting-recap",
+      itemKey: "k",
+      version: 2,
+      trigger: "hub",
+      requestedBy: "acct_7",
+    });
+    expect(s.opens[0]).toEqual(["a", "meeting-recap", "k", 2, { trigger: "hub", requestedBy: "acct_7" }]);
+  });
+
+  it("closeTalentRun carries what the run produced, not just that it finished", async () => {
+    const s = spyDeps();
+    const result = { summary: "Filed the Foley call", links: [{ label: "Recap", url: "https://x.test/r" }] };
+    await s.acts.closeTalentRun({ agent: "a", talent: "t", itemKey: "k", status: "done", result });
+    expect(s.closes[0]).toEqual(["a", "t", "k", "done", undefined, result]);
+  });
+
+  it("a failed run still closes with its reason and no result", async () => {
+    const s = spyDeps();
+    await s.acts.closeTalentRun({ agent: "a", talent: "t", itemKey: "k", status: "failed", error: "nope" });
+    expect(s.closes[0]).toEqual(["a", "t", "k", "failed", "nope", undefined]);
+  });
+
+  /** `runTalent` heartbeats, so it needs an activity context. Stubbed rather than mocked at module
+   *  level, so the rest of this file keeps the real one. */
+  function withActivityContext(): void {
+    vi.spyOn(Context, "current").mockReturnValue({
+      heartbeat: () => {},
+      cancellationSignal: new AbortController().signal,
+    } as unknown as ReturnType<typeof Context.current>);
+  }
+
+  it("runTalent hands the announcement back, trimmed to 2000 chars", async () => {
+    withActivityContext();
+    // Trimmed HERE rather than at the registry: a field length is a contract, and a 40kB transcript
+    // arriving at a 2000-char column is a 413 nobody would connect to a recap.
+    const long = "x".repeat(5000);
+    const deps = {
+      talentPlane: { spawn: async () => ({ status: "done", steer: long, summary: "short" }) },
+      ask: async () => {},
+    } as unknown as TurnDeps;
+    const acts = makeActivities(deps);
+    const r = await acts.runTalent({ agent: "a", item: "i", notify: "U1" });
+    expect(r.status).toBe("done");
+    expect(r.summary).toHaveLength(2000);
+  });
+
+  it("falls back to the Talent's own summary when there was nothing to announce", async () => {
+    withActivityContext();
+    const deps = {
+      talentPlane: { spawn: async () => ({ status: "skipped", summary: "already filed" }) },
+      ask: async () => {},
+    } as unknown as TurnDeps;
+    const r = await makeActivities(deps).runTalent({ agent: "a", item: "i" });
+    expect(r).toMatchObject({ status: "skipped", summary: "already filed" });
   });
 });
