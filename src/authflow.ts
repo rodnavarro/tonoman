@@ -19,11 +19,7 @@ const LOG = "/tmp/tonoman-auth.log";
  * wraps the URL across lines and the "Paste code here" prompt can concatenate onto the end,
  * so we strip escapes, join, regex the claude URL, and trim at the prompt. Unit-tested. */
 export function extractAuthUrl(raw: string): string | undefined {
-  const t = raw
-    .replace(/\x1b\][^\x07]*\x07/g, "") // OSC
-    .replace(/\x1b[@-Z\\-_]/g, "") // single-char escapes
-    .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "") // CSI (cursor moves, colors)
-    .replace(/\r/g, "");
+  const t = stripControl(raw);
   const joined = t.replace(/\n/g, "");
   const m = joined.match(/https:\/\/[a-z.]*claude\.com\/[A-Za-z0-9%._~:/?#[\]@!$&()*+,;=-]+/);
   if (!m) return undefined;
@@ -33,9 +29,66 @@ export function extractAuthUrl(raw: string): string | undefined {
   return url;
 }
 
-/** Whether an `auth status` output reports a logged-in session (harness-agnostic-ish). */
+/** Whether an `auth status` output reports a logged-in session (harness-agnostic-ish).
+ *
+ *  THE NEGATION IS CHECKED FIRST, and that is not a nicety. `codex login status` prints exactly
+ *  `Not logged in` when it is not — which the positive `\blogged in\b` match reads as a yes. So a
+ *  codex agent with an empty credential home would report "signed in", `/auth/status` would answer
+ *  `loggedIn: true`, and the one thing this function exists to decide comes out backwards. Claude's
+ *  JSON form (`"loggedIn": false`) never reached the prose branch, which is why it went unnoticed.
+ *
+ *  Observed strings (codex-cli 0.154): `Not logged in` / `Logged in using ChatGPT`. */
 export function looksLoggedIn(statusOut: string): boolean {
-  return /"loggedIn"\s*:\s*true/i.test(statusOut) || /\blogged in\b/i.test(stripAnsi(statusOut));
+  const t = stripAnsi(statusOut || "");
+  if (/"loggedIn"\s*:\s*false/i.test(t)) return false;
+  if (/\bnot (logged|signed) ?in\b/i.test(t)) return false;
+  return /"loggedIn"\s*:\s*true/i.test(t) || /\b(logged|signed) in\b/i.test(t);
+}
+
+/** PURE: the verification URL AND the one-time code out of a `codex login --device-auth`
+ *  transcript — the codex counterpart of `extractAuthUrl`.
+ *
+ *  Device auth is a different shape from Claude's paste-the-code flow: the CLI prints a URL and a
+ *  short code, the person enters the code on OpenAI's page, and the CLI POLLS until the exchange
+ *  completes. Nothing comes back through us, so there is no `/auth/code` step — only these two
+ *  strings to put in front of somebody, and then waiting.
+ *
+ *  The code is anchored on its LABEL ("one-time code"), not on its shape: `JLEP-DT273` is one
+ *  observation, "the line after the label" is the structure. Verbatim output (codex-cli 0.154,
+ *  captured from a PLAIN PIPE — device auth needs no PTY, though the PTY path captures the same
+ *  bytes with colour escapes around them):
+ *
+ *      1. Open this link in your browser and sign in to your account
+ *         https://auth.openai.com/codex/device
+ *
+ *      2. Enter this one-time code (expires in 15 minutes)
+ *         JLEP-DT273
+ */
+export function extractDeviceAuth(raw: string): { url: string; code: string } | undefined {
+  const t = stripControl(raw);
+  const lines = t.split("\n").map((l) => l.trim());
+  // The URL sits alone on its own line. A narrow PTY can still wrap it, so the continuation lines
+  // are glued back on — but only while they are BARE tokens (no spaces, not a new numbered step,
+  // not a second URL). Joining the whole transcript the way the Claude extractor does would run
+  // "…/device" straight into the "2." of the next step, since both are legal URL characters.
+  let url: string | undefined;
+  const at0 = lines.findIndex((l) => /^https:\/\/\S+$/.test(l));
+  if (at0 >= 0) {
+    url = lines[at0];
+    for (let i = at0 + 1; i < lines.length; i++) {
+      const l = lines[i];
+      if (!l || /\s/.test(l) || /^\d+\./.test(l) || /^https:\/\//.test(l)) break;
+      url += l;
+    }
+  }
+  if (!url) return undefined;
+  // The code: the first non-empty line AFTER the label. Taken this way round so a change to the
+  // code's alphabet or length costs nothing, and no stray token in the banner is mistaken for it.
+  const at = lines.findIndex((l) => /one-?time code/i.test(l));
+  if (at < 0) return undefined;
+  const code = lines.slice(at + 1).find((l) => l.length > 0);
+  if (!code || /\s/.test(code)) return undefined;
+  return { url, code };
 }
 
 /** PURE: does a turn error look like a harness AUTH failure (vs any other error)? Matched on
@@ -86,6 +139,16 @@ export function turnErrorNotice(agentName: string, msg: string): string {
 
 function stripAnsi(s: string): string {
   return s.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "").replace(/\r/g, "");
+}
+
+/** Every escape a PTY transcript carries — OSC, single-char, CSI — plus carriage returns. Shared by
+ *  both extractors so one harness's transcript is cleaned exactly like the other's. */
+function stripControl(raw: string): string {
+  return raw
+    .replace(/\x1b\][^\x07]*\x07/g, "") // OSC
+    .replace(/\x1b[@-Z\\-_]/g, "") // single-char escapes
+    .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "") // CSI (cursor moves, colors)
+    .replace(/\r/g, "");
 }
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 const shq = (s: string): string => "'" + s.replace(/'/g, "'\\''") + "'";
