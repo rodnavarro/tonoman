@@ -7,7 +7,7 @@
 // is a fact about a person, and it belongs on that person's row.
 
 import { describe, it, expect } from "vitest";
-import { postAuthState, postMemberAuthState, syncPrincipalAuthStates, type PrincipalScanAgent } from "./worker";
+import { postAuthState, postMemberAuthState, principalUserIds, syncPrincipalAuthStates, type PrincipalScanAgent } from "./worker";
 import { authFailureState, isNotLoggedInError, notLoggedInNotice } from "../turnfailure";
 
 /** A fetch that records the call and answers with whatever the test wants. */
@@ -274,5 +274,21 @@ describe("postMemberAuthState — upsert, not update (W3b)", () => {
     // No name, no email: this scan knows nothing about the person except their credential, and
     // sending blanks would overwrite a profile the tenant already has.
     expect(f.calls[0].body).toEqual({ slackUserId: "U1", authState: "ok", authProvider: "codex" });
+  });
+});
+
+describe("principalUserIds — the roster kind the boot scan reads", () => {
+  it("includes slack_user_id (what the roster actually sends), slack, and unkinded", () => {
+    expect(
+      principalUserIds([
+        { kind: "slack_user_id", value: "U1" },
+        { kind: "slack", value: "U2" },
+        { value: "U3" },
+      ]),
+    ).toEqual(["U1", "U2", "U3"]);
+  });
+  it("excludes other kinds and empty values", () => {
+    expect(principalUserIds([{ kind: "email", value: "x@y" }, { kind: "slack_user_id", value: "" }])).toEqual([]);
+    expect(principalUserIds(undefined)).toEqual([]);
   });
 });

@@ -327,6 +327,17 @@ export async function postMemberAuthState(o: {
   }
 }
 
+/** The Slack user ids among an agent's roster principals. The roster's Slack principals carry kind
+ *  `slack_user_id`; a few older paths use `slack` or leave it unset. PURE and exported precisely
+ *  because the scan that reads it was silently empty for a whole release when this filter looked for
+ *  the wrong kind. */
+export function principalUserIds(principals: { kind?: string; value: string }[] | undefined): string[] {
+  return (principals ?? [])
+    .filter((p) => p.kind === "slack_user_id" || p.kind === "slack" || !p.kind)
+    .map((p) => p.value)
+    .filter(Boolean);
+}
+
 /** One agent, as the per-person auth-state scan needs to see it. */
 export interface PrincipalScanAgent {
   name: string;
@@ -1812,7 +1823,7 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
         provider: providerOf(a.cfg),
         // The registry's own list of who this agent recognises — the same rows the badge is drawn
         // from, so the scan can only ever correct a row that already exists.
-        principals: (a.cfg.principals ?? []).filter((p) => p.kind === "slack" || !p.kind).map((p) => p.value),
+        principals: principalUserIds(a.cfg.principals),
       });
     }
     const n = await syncPrincipalAuthStates({
