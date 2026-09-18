@@ -7,7 +7,7 @@
 // is a fact about a person, and it belongs on that person's row.
 
 import { describe, it, expect } from "vitest";
-import { postAuthState } from "./worker";
+import { postAuthState, postMemberAuthState, syncPrincipalAuthStates, type PrincipalScanAgent } from "./worker";
 import { authFailureState, isNotLoggedInError, notLoggedInNotice } from "../turnfailure";
 
 /** A fetch that records the call and answers with whatever the test wants. */
@@ -128,5 +128,151 @@ describe("notLoggedInNotice — the fix it names is the one that works (W2/W3)",
 
   it("still does not say 'try again', which is the one thing guaranteed not to work", () => {
     expect(notLoggedInNotice()).not.toMatch(/try again/i);
+  });
+});
+
+// W3b — the Hub's per-person badge, made true on day one.
+describe("syncPrincipalAuthStates — stating what is already visible (W3b)", () => {
+  type Rep = { guid: string; user: string; state: string; provider: string };
+
+  function scan(
+    agents: PrincipalScanAgent[],
+    o: {
+      dirs?: string[];
+      status?: Record<string, string>;
+      reportFails?: string[];
+      statusThrows?: string[];
+    } = {},
+  ) {
+    const reports: Rep[] = [];
+    const logs: string[] = [];
+    const asked: string[] = [];
+    return {
+      reports,
+      logs,
+      asked,
+      run: () =>
+        syncPrincipalAuthStates({
+          agents,
+          hasLoginDir: async (_a, user) => (o.dirs ?? agents.flatMap((a) => a.principals)).includes(user),
+          authStatus: async (_a, user) => {
+            asked.push(user);
+            if (o.statusThrows?.includes(user)) throw new Error("runtime unreachable");
+            return o.status?.[user] ?? "Not logged in";
+          },
+          report: async (guid, user, state, provider) => {
+            if (o.reportFails?.includes(user)) throw new Error("register-member 500");
+            reports.push({ guid, user, state, provider });
+          },
+          log: (s) => logs.push(s),
+        }),
+    };
+  }
+
+  const perUser: PrincipalScanAgent = {
+    name: "g-1",
+    guid: "g-1",
+    inferenceMode: "per_user",
+    provider: "claude",
+    principals: ["U1", "U2"],
+  };
+
+  it("reports ok for a person whose harness says they are signed in", async () => {
+    const s = scan([perUser], { status: { U1: '{"loggedIn":true,"email":"a@b.com"}', U2: "Not logged in" } });
+    expect(await s.run()).toBe(2);
+    expect(s.reports).toEqual([
+      { guid: "g-1", user: "U1", state: "ok", provider: "claude" },
+      { guid: "g-1", user: "U2", state: "unconfigured", provider: "claude" },
+    ]);
+  });
+
+  it("reads codex's own wording the right way round", async () => {
+    // "Not logged in" contains "logged in". Judged naively, this scan would replace a correct
+    // `unconfigured` with a confident, wrong `ok` for every codex principal in the tenant.
+    const codex: PrincipalScanAgent = { ...perUser, provider: "codex", principals: ["U1", "U2"] };
+    const s = scan([codex], { status: { U1: "Logged in using ChatGPT", U2: "Not logged in" } });
+    await s.run();
+    expect(s.reports.map((r) => r.state)).toEqual(["ok", "unconfigured"]);
+    expect(s.reports.every((r) => r.provider === "codex")).toBe(true);
+  });
+
+  it("skips a person with no credential directory rather than asserting unconfigured", async () => {
+    // The row may already say something truer than a filesystem check can. This scan exists to fix
+    // wrong answers, not to add confident new ones.
+    const s = scan([perUser], { dirs: ["U1"], status: { U1: '{"loggedIn":true}' } });
+    expect(await s.run()).toBe(1);
+    expect(s.reports.map((r) => r.user)).toEqual(["U1"]);
+    expect(s.asked).toEqual(["U1"]); // and does not spend a runtime call on the other
+  });
+
+  it("leaves a SHARED agent alone — it has no per-person credentials to report on", async () => {
+    const shared: PrincipalScanAgent = { ...perUser, inferenceMode: "shared" };
+    const s = scan([shared]);
+    expect(await s.run()).toBe(0);
+    expect(s.asked).toEqual([]);
+  });
+
+  it("skips an agent with no guid — a file roster has no registry to tell", async () => {
+    const s = scan([{ ...perUser, guid: undefined }]);
+    expect(await s.run()).toBe(0);
+  });
+
+  it("one unreachable runtime does not silence the rest", async () => {
+    const s = scan([perUser], { statusThrows: ["U1"], status: { U2: '{"loggedIn":true}' } });
+    expect(await s.run()).toBe(1);
+    expect(s.reports.map((r) => r.user)).toEqual(["U2"]);
+    expect(s.logs.join(" ")).toContain("U1");
+  });
+
+  it("one failed report does not silence the rest either", async () => {
+    const s = scan([perUser], { reportFails: ["U1"], status: { U1: '{"loggedIn":true}', U2: '{"loggedIn":true}' } });
+    expect(await s.run()).toBe(1);
+    expect(s.reports.map((r) => r.user)).toEqual(["U2"]);
+  });
+
+  it("never throws into its caller — it runs at wire time and must not block an agent", async () => {
+    await expect(
+      syncPrincipalAuthStates({
+        agents: [perUser],
+        hasLoginDir: async () => true,
+        authStatus: async () => '{"loggedIn":true}',
+        report: async () => {
+          throw new Error("boom");
+        },
+      }),
+    ).resolves.toBe(0);
+  });
+});
+
+describe("postMemberAuthState — upsert, not update (W3b)", () => {
+  function recorder2() {
+    const calls: { url: string; auth?: string; body: unknown }[] = [];
+    const impl = (async (url: string, init?: RequestInit) => {
+      calls.push({
+        url: String(url),
+        auth: (init?.headers as Record<string, string> | undefined)?.authorization,
+        body: JSON.parse(String(init?.body ?? "{}")),
+      });
+      return { ok: true, status: 200 } as Response;
+    }) as unknown as typeof fetch;
+    return { calls, impl };
+  }
+
+  it("goes to register-member, which upserts — the principals route 404s for a newcomer", async () => {
+    const f = recorder2();
+    await postMemberAuthState({
+      api: "https://api.test",
+      token: "sys-token",
+      guid: "g-1",
+      user: "U1",
+      state: "ok",
+      provider: "codex",
+      fetchImpl: f.impl,
+    });
+    expect(f.calls[0].url).toBe("https://api.test/v1/system/agents/g-1/register-member");
+    expect(f.calls[0].auth).toBe("Bearer sys-token");
+    // No name, no email: this scan knows nothing about the person except their credential, and
+    // sending blanks would overwrite a profile the tenant already has.
+    expect(f.calls[0].body).toEqual({ slackUserId: "U1", authState: "ok", authProvider: "codex" });
   });
 });

@@ -422,6 +422,10 @@ export async function runTalentWorkflow(input: RunTalentInput): Promise<void> {
     version: input.version,
     trigger: input.trigger ?? "schedule",
     requestedBy: input.requestedBy,
+    // WHO the run is FOR, which is a different person from `requestedBy` whenever somebody presses
+    // run-now on a teammate's recording. `user` is the member whose account the item came from;
+    // `notify` is the fallback for a run keyed to whoever is being told (the agenda brief).
+    forUser: input.user || input.notify || undefined,
   });
 
   // Say it landed — ONCE, on the first launch of this item, after the record that will remember it

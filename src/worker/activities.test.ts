@@ -226,8 +226,33 @@ describe("talent_run records carry the trigger, who asked, and the result", () =
       version: 2,
       trigger: "hub",
       requestedBy: "acct_7",
+      forUser: "U-owner",
     });
-    expect(s.opens[0]).toEqual(["a", "meeting-recap", "k", 2, { trigger: "hub", requestedBy: "acct_7" }]);
+    expect(s.opens[0]).toEqual([
+      "a",
+      "meeting-recap",
+      "k",
+      2,
+      { trigger: "hub", requestedBy: "acct_7", forUser: "U-owner" },
+    ]);
+  });
+
+  it("who the run is FOR is a different person from who asked for it", async () => {
+    // The Hub renders "for <name>", and the moment somebody presses run-now on a teammate's
+    // recording the two diverge. Folding them into one field would have made that unreadable.
+    const s = spyDeps();
+    await s.acts.openTalentRun({
+      agent: "a",
+      talent: "meeting-recap",
+      itemKey: "k",
+      version: 3,
+      trigger: "hub",
+      requestedBy: "acct_admin",
+      forUser: "U-teammate",
+    });
+    const o = s.opens[0][4] as { requestedBy: string; forUser: string };
+    expect(o.requestedBy).toBe("acct_admin");
+    expect(o.forUser).toBe("U-teammate");
   });
 
   it("closeTalentRun carries what the run produced, not just that it finished", async () => {

@@ -75,7 +75,7 @@ export interface TurnDeps {
       talent: string,
       itemKey: string,
       version: number,
-      o?: { trigger?: "schedule" | "command" | "hub"; requestedBy?: string },
+      o?: { trigger?: "schedule" | "command" | "hub"; requestedBy?: string; forUser?: string },
     ): Promise<void>;
     close(
       agent: string,
@@ -761,10 +761,12 @@ export function makeActivities(deps: TurnDeps) {
       version: number;
       trigger?: "schedule" | "command" | "hub";
       requestedBy?: string;
+      forUser?: string;
     }): Promise<void> {
       await deps.talentRun?.open(input.agent, input.talent, input.itemKey, input.version, {
         trigger: input.trigger,
         requestedBy: input.requestedBy,
+        forUser: input.forUser,
       });
     },
 

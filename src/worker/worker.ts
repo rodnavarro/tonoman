@@ -297,6 +297,95 @@ export async function postAuthState(o: {
   }
 }
 
+/** Tell the registry what one PERSON's inference credential is worth, through `register-member`
+ *  (W3b).
+ *
+ *  A different route from `postAuthState`'s principal one, and deliberately: that one UPDATES a
+ *  principal the tenant already knows and 404s for anybody else, which is exactly wrong for a scan
+ *  that runs before anyone has logged in through this build. `register-member` upserts, and takes
+ *  the auth state alongside the profile — so this needs no name or email and does not touch either.
+ *
+ *  Never throws. It runs at wire time and must not be able to stop an agent being served. */
+export async function postMemberAuthState(o: {
+  api: string;
+  token: string;
+  guid: string;
+  user: string;
+  state: "ok" | "error" | "expired" | "unconfigured";
+  provider: "claude" | "codex";
+  fetchImpl?: typeof fetch;
+}): Promise<{ ok: boolean; status?: number; error?: string }> {
+  try {
+    const r = await (o.fetchImpl ?? fetch)(`${o.api.replace(/[/]+$/, "")}/v1/system/agents/${o.guid}/register-member`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${o.token}` },
+      body: JSON.stringify({ slackUserId: o.user, authState: o.state, authProvider: o.provider }),
+    });
+    return { ok: r.ok, status: r.status };
+  } catch (e) {
+    return { ok: false, error: (e as Error).message };
+  }
+}
+
+/** One agent, as the per-person auth-state scan needs to see it. */
+export interface PrincipalScanAgent {
+  name: string;
+  guid?: string;
+  /** `per_user` is the only mode with per-person credentials to report on. */
+  inferenceMode?: string;
+  provider: "claude" | "codex";
+  /** Slack user ids the registry says this agent recognises. */
+  principals: string[];
+}
+
+/** Make the Hub's per-person picture TRUE on day one (W3b).
+ *
+ *  `agent_principal.auth_state` was only ever written by a login OUTCOME, so an agent migrated to
+ *  per-person inference showed every teammate as `unconfigured` — including people who had signed
+ *  in perfectly well and were being answered every day. The Hub's per-user badge lied and its Run
+ *  button was dead for all of them, until each person happened to sign in again, which nobody had
+ *  any reason to do.
+ *
+ *  So the worker states what it can already see: for each principal with a credential directory, it
+ *  asks the harness (in THAT person's config dir, through the same `/auth/status` a turn would use)
+ *  and reports the answer. A person with no directory is SKIPPED rather than reported
+ *  `unconfigured` — the row may already say something truer than a filesystem check can, and this
+ *  scan exists to fix wrong answers, not to add confident new ones.
+ *
+ *  Injected deps throughout, so the decision this makes is testable without a roster, a runtime or
+ *  a registry. Best-effort per principal: one unreachable runtime must not silence the rest. */
+export async function syncPrincipalAuthStates(o: {
+  agents: PrincipalScanAgent[];
+  /** Does this person have a credential directory for this agent's provider at all? */
+  hasLoginDir(agent: string, user: string): Promise<boolean>;
+  /** What the harness reports in THAT person's config dir. */
+  authStatus(agent: string, user: string): Promise<string>;
+  report(guid: string, user: string, state: "ok" | "unconfigured", provider: "claude" | "codex"): Promise<void>;
+  log?: (s: string) => void;
+}): Promise<number> {
+  let reported = 0;
+  for (const a of o.agents) {
+    if (a.inferenceMode !== "per_user" || !a.guid) continue;
+    for (const user of a.principals) {
+      if (!user) continue;
+      try {
+        if (!(await o.hasLoginDir(a.name, user))) continue;
+        // `looksLoggedIn` is the ONE place that judgement is made — which matters more than usual
+        // here, since `codex login status` prints "Not logged in" and a naive check reads that as a
+        // yes, turning this scan from a correction into a fresh set of wrong answers.
+        const state = looksLoggedIn(await o.authStatus(a.name, user)) ? "ok" : "unconfigured";
+        await o.report(a.guid, user, state, a.provider);
+        reported++;
+        o.log?.(`worker: ${a.name} auth_state[${user}] seeded -> ${state} (${a.provider})`);
+      } catch (e) {
+        // One person, one agent. A runtime that is briefly unreachable must not stop the scan.
+        o.log?.(`worker: ${a.name} could not seed auth_state for ${user} — ${(e as Error).message}`);
+      }
+    }
+  }
+  return reported;
+}
+
 /** Tools withheld from every turn this worker runs.
  *
  *  The default is not empty, deliberately. The pod is the sandbox AND it holds the credential that
@@ -1149,7 +1238,7 @@ export async function run(
         talentName: string,
         itemKey: string,
         version: number,
-        o?: { trigger?: "schedule" | "command" | "hub"; requestedBy?: string },
+        o?: { trigger?: "schedule" | "command" | "hub"; requestedBy?: string; forUser?: string },
       ) => {
         const baseUrl = process.env.TONOMANCLOUD_API_URL;
         const guid = wired.get(name)?.cfg.guid;
@@ -1170,6 +1259,9 @@ export async function run(
               version,
               trigger: o?.trigger ?? "schedule",
               ...(o?.requestedBy ? { requestedBy: o.requestedBy } : {}),
+              // WHO it is for, which the Hub renders as "for <name>" — and which is a different
+              // person from `requestedBy` the moment somebody runs a teammate's recording.
+              ...(o?.forUser ? { forUser: o.forUser } : {}),
             }),
           });
           if (!r.ok) console.error(`worker: ${name} talent_run open ${talentName}/${itemKey} → ${r.status}`);
@@ -1703,6 +1795,51 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
     console.log(`worker: ${name} auth_state -> ${state} (${provider})`);
   };
 
+  /** The wire-time seed of every per-person auth state (W3b), bound to this worker's live roster.
+   *  Fire-and-forget by contract: it asks the runtime once per principal and must never be able to
+   *  delay — let alone block — an agent being wired and answering. */
+  const seedPrincipalAuthStates = async (only?: Set<string>): Promise<void> => {
+    const api = process.env.TONOMANCLOUD_API_URL;
+    if (!api) return; // a file roster has no registry to tell
+    const token = process.env.TONOMANCLOUD_API_TOKEN ?? "";
+    const agents: PrincipalScanAgent[] = [];
+    for (const [name, a] of wired) {
+      if (only && !only.has(name)) continue;
+      agents.push({
+        name,
+        guid: a.cfg.guid,
+        inferenceMode: a.cfg.inference_mode,
+        provider: providerOf(a.cfg),
+        // The registry's own list of who this agent recognises — the same rows the badge is drawn
+        // from, so the scan can only ever correct a row that already exists.
+        principals: (a.cfg.principals ?? []).filter((p) => p.kind === "slack" || !p.kind).map((p) => p.value),
+      });
+    }
+    const n = await syncPrincipalAuthStates({
+      agents,
+      hasLoginDir: async (name, user) => {
+        const a = wired.get(name);
+        if (!a) return false;
+        return fsp
+          .access(credFileOf(a.cfg, user))
+          .then(() => true)
+          .catch(() => false);
+      },
+      // The SAME `/auth/status` a turn's gate would use, so this reports what the agent would
+      // actually find rather than a second opinion about the filesystem.
+      authStatus: async (name, user) => (await authDeps.ops(name, user)?.status?.()) ?? "",
+      report: async (guid, user, state, provider) => {
+        const r = await postMemberAuthState({ api, token, guid, user, state, provider });
+        if (!r.ok) throw new Error(r.error ?? `register-member returned HTTP ${r.status}`);
+      },
+      log: (s) => console.log(s),
+    }).catch((e) => {
+      console.error(`worker: seeding per-person auth states failed — ${(e as Error).message}`);
+      return 0;
+    });
+    if (n) console.log(`worker: seeded ${n} per-person auth state(s)`);
+  };
+
   const plaudDeps: plaudgate.PlaudGateDeps = {
     conn: (name) => wired.get(name)?.conn as SlackConnector | undefined,
     // `user` arrives already gated by scope from the caller (connectPlaud / the dialog), so these
@@ -2009,6 +2146,13 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
       // Refresh checkouts and context notes against the swapped configs. We hold `busy`, so syncAll's
       // own timer is not also running; call its body directly.
       await syncAll().catch(() => {});
+
+      // An agent that JUST became per-person (or just arrived) has a Hub badge saying `unconfigured`
+      // for people who are signed in perfectly well, until each of them happens to log in again.
+      // Seed them now — but only for the agents this reload actually touched, so a 30-second timer
+      // does not become a 30-second scan of every principal in the tenant.
+      const touched = new Set([...plan.added, ...plan.updated.map((d) => d.key)]);
+      if (touched.size) void seedPrincipalAuthStates(touched);
     };
 
     // One reconcile at a time, whether it was the timer or a poke that asked for it. A poke during a
@@ -2035,6 +2179,11 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
 
   // gw-wake: a system can start the conversation. This is what lets the voice flow say "I've got
   // your meeting" without anybody asking — the beat the whole pipeline exists to produce.
+  // W3b: say what is already true about each person's login, before anybody has to log in again.
+  // Fire-and-forget: it asks the runtime once per principal, and an agent must be answering long
+  // before that finishes.
+  void seedPrincipalAuthStates();
+
   const wakeToken = process.env.TONOMAN_WAKE_TOKEN ?? "";
   const wakeServing = serveWake(
     {
