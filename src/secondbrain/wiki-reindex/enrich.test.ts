@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { pageExcerpt, parseEnrichment, enrichPages, type EnrichDeps } from './enrich';
+import { pageExcerpt, parseEnrichment, firstJsonObject, enrichPages, type EnrichDeps } from './enrich';
 import { inferChat, ollamaProvider } from './llm';
 
 describe('pageExcerpt', () => {
@@ -25,6 +25,13 @@ describe('parseEnrichment — defensive against how models actually reply', () =
   });
   it('drops surrounding quotes on a plain answer', () => {
     expect(parseEnrichment('"Just a quote."').summary).toBe('Just a quote.');
+  });
+  it('takes only the FIRST object when a model prints two', () => {
+    expect(parseEnrichment('Result: {"summary":"Good","tags":["a"]} {"extra":1}')).toEqual({ summary: 'Good', tags: ['a'] });
+  });
+  it('firstJsonObject ignores braces inside strings', () => {
+    expect(firstJsonObject('{"s":"has } brace"} tail')).toBe('{"s":"has } brace"}');
+    expect(firstJsonObject('no json here')).toBeUndefined();
   });
 });
 

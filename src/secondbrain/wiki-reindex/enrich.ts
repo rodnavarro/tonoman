@@ -19,6 +19,33 @@ export interface Enriched {
   tags: string[];
 }
 
+/** The FIRST balanced `{…}` object in some text, or undefined. A naive first-brace to last-brace
+ *  slice spans two objects when a model prints `{…} {…}` and then fails to parse; this returns just
+ *  the first, ignoring braces inside strings. */
+export function firstJsonObject(text: string): string | undefined {
+  const start = text.indexOf('{');
+  if (start < 0) return undefined;
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  for (let i = start; i < text.length; i++) {
+    const c = text[i]!;
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === '\\') esc = true;
+      else if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') inStr = true;
+    else if (c === '{') depth++;
+    else if (c === '}') {
+      depth--;
+      if (depth === 0) return text.slice(start, i + 1);
+    }
+  }
+  return undefined;
+}
+
 const SYSTEM =
   'You summarise a wiki page for an index. Reply with STRICT JSON only: ' +
   '{"summary": "<one sentence, <=160 chars, plain>", "tags": ["<=5 short lowercase tags"]}. ' +
@@ -37,11 +64,10 @@ export function pageExcerpt(id: string, md: string, limit = 1500): string {
  *  answer becomes the summary with no tags rather than an error. */
 export function parseEnrichment(raw: string): { summary: string; tags: string[] } {
   const text = raw.trim();
-  const jsonStart = text.indexOf('{');
-  const jsonEnd = text.lastIndexOf('}');
-  if (jsonStart >= 0 && jsonEnd > jsonStart) {
+  const obj = firstJsonObject(text);
+  if (obj) {
     try {
-      const o = JSON.parse(text.slice(jsonStart, jsonEnd + 1)) as { summary?: unknown; tags?: unknown };
+      const o = JSON.parse(obj) as { summary?: unknown; tags?: unknown };
       const summary = typeof o.summary === 'string' ? o.summary.trim().slice(0, 200) : '';
       const tags = Array.isArray(o.tags)
         ? o.tags.filter((t): t is string => typeof t === 'string').map((t) => t.trim().toLowerCase()).filter(Boolean).slice(0, 5)

@@ -22,18 +22,24 @@ function git(repo: string, args: string[]): string {
 
 /** Every `<path>.md` in the repo with its byte size, and every `.order` file's path — from one
  *  `git ls-tree` against HEAD, so the case-colliding working tree is never touched. */
+/** The reindexer's own output — excluded from the reads, or a second run would treat index.md and
+ *  log.md as source pages and let the generated index become a hub. */
+const OUT_DIR = '.tonoman/';
+
 export function readTree(repo: string): { pages: { path: string; size: number }[]; orderPaths: string[] } {
-  const out = git(repo, ['ls-tree', '-r', '-l', 'HEAD']);
+  // `-z` (NUL-terminated) so a path with a newline, a tab, a quote or a non-ASCII character is NOT
+  // git-quoted and mangled — the wiki has all of these. Each record is `<mode> <type> <sha> <size>\t<path>`.
+  const out = git(repo, ['ls-tree', '-r', '-l', '-z', 'HEAD']);
   const pages: { path: string; size: number }[] = [];
   const orderPaths: string[] = [];
-  for (const line of out.split('\n')) {
-    if (!line) continue;
-    // <mode> <type> <sha> <size>\t<path>
-    const tab = line.indexOf('\t');
+  for (const rec of out.split('\0')) {
+    if (!rec) continue;
+    const tab = rec.indexOf('\t');
     if (tab < 0) continue;
-    const meta = line.slice(0, tab).split(/\s+/);
+    const meta = rec.slice(0, tab).split(/\s+/);
     const size = Number(meta[3]) || 0;
-    const p = line.slice(tab + 1);
+    const p = rec.slice(tab + 1);
+    if (p.startsWith(OUT_DIR)) continue; // never index our own output
     if (/\.md$/i.test(p)) pages.push({ path: p, size });
     else if (/(^|\/)\.order$/.test(p)) orderPaths.push(p);
   }
@@ -64,21 +70,28 @@ export function readOrders(repo: string, orderPaths: string[]): { folder: string
 /** Content markdown per page id, gathered so graph.ts can pull the links. Uses `git grep` WITH file
  *  names to attribute each matching line to its page, then concatenates the lines of each page — far
  *  cheaper than reading every page in full, and enough for link extraction. */
-export function readLinkContent(repo: string): Map<string, string> {
+export function readLinkContent(repo: string, knownIds: Set<string>): Map<string, string> {
   const byPage = new Map<string, string[]>();
   let out = '';
   try {
-    out = git(repo, ['grep', '-I', '--no-color', '-e', '](/', 'HEAD', '--', '*.md']);
+    // `-z` NUL-terminates lines; `--null` (which -z implies here) puts a NUL between the
+    // `HEAD:<path>` header and the matched content, so a path containing a literal colon does not
+    // fool a `:` split. Header and content are then split on that first NUL.
+    out = git(repo, ['grep', '-I', '-z', '--no-color', '-e', '](/', 'HEAD', '--', '*.md']);
   } catch {
     return new Map();
   }
-  for (const line of out.split('\n')) {
-    if (!line) continue;
-    // HEAD:<path>:<content>
-    const m = /^HEAD:(.*?):(.*)$/.exec(line);
-    if (!m) continue;
-    const id = m[1]!.replace(/\.md$/i, '');
-    (byPage.get(id) ?? byPage.set(id, []).get(id)!).push(m[2]!);
+  for (const rec of out.split('\n')) {
+    if (!rec) continue;
+    const nul = rec.indexOf('\0');
+    if (nul < 0) continue;
+    const header = rec.slice(0, nul); // HEAD:<path>
+    const content = rec.slice(nul + 1);
+    const pathPart = header.replace(/^HEAD:/, '');
+    if (pathPart.startsWith(OUT_DIR)) continue;
+    const id = pathPart.replace(/\.md$/i, '');
+    if (!knownIds.has(id)) continue; // only real pages; a mis-parse is dropped, not misattributed
+    (byPage.get(id) ?? byPage.set(id, []).get(id)!).push(content);
   }
   const content = new Map<string, string>();
   for (const [id, lines] of byPage) content.set(id, lines.join('\n'));
@@ -102,7 +115,8 @@ export async function reindex(
   const { pages, orderPaths } = readTree(repo);
   const filtered = opts.only ? pages.filter((p) => p.path.startsWith(opts.only!)) : pages;
   const orders = readOrders(repo, orderPaths);
-  const content = readLinkContent(repo);
+  const knownIds = new Set(filtered.map((p) => p.path.replace(/\.md$/i, '')));
+  const content = readLinkContent(repo, knownIds);
   const graph = buildGraph(filtered, orders, content);
   const stats = graphStats(graph);
 
@@ -200,8 +214,10 @@ if (process.argv[1] && /reindex\.(ts|mjs|js)$/.test(process.argv[1])) {
       console.log(`reindex: ${JSON.stringify(r.stats)} · enriched ${r.enriched}`);
       if (process.argv.includes('--commit')) {
         try {
+          // Stage AND commit only .tonoman — a bare `git commit` would sweep in anything else the
+          // caller had already staged in the wiki checkout.
           git(repo, ['add', '.tonoman']);
-          git(repo, ['commit', '-m', `reindex: ${r.stats.nodes} pages, ${r.stats.links} links, ${r.enriched} enriched`]);
+          git(repo, ['commit', '-m', `reindex: ${r.stats.nodes} pages, ${r.stats.links} links, ${r.enriched} enriched`, '--', '.tonoman']);
           console.log('reindex: committed .tonoman/');
         } catch (e) {
           console.log(`reindex: nothing to commit or commit failed — ${(e as Error).message.split('\n')[0]}`);

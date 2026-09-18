@@ -218,6 +218,11 @@
   const OTHER = "#4b6470";
 
   const $ = (id) => document.getElementById(id);
+  // Wiki names are untrusted text. force-graph renders nodeLabel as HTML, so escape there; the DOM
+  // uses textContent everywhere else. And a stray `%` that is not a valid escape would throw and
+  // blank the page, so decode defensively.
+  const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  const decode = (s) => { try { return decodeURIComponent(s); } catch { return s; } };
 
   function topFolder(id) {
     const i = id.indexOf("/");
@@ -230,7 +235,6 @@
     .catch((err) => { $("loading").textContent = "Could not load graph.json (" + err.message + ")."; });
 
   function boot(data) {
-    $("loading").remove();
     const nodesById = new Map(data.nodes.map((n) => [n.id, n]));
 
     // Colour the busiest folders; the long tail shares one muted hue.
@@ -263,8 +267,15 @@
     for (const f of topFolders) {
       const row = document.createElement("div");
       row.className = "legend-row";
-      row.innerHTML = `<span class="dot" style="background:${folderColor.get(f)}"></span>` +
-        `<span>${decodeURIComponent(f).replace(/-/g, " ")}</span><span class="n">${folderCount.get(f)}</span>`;
+      const dot = document.createElement("span");
+      dot.className = "dot";
+      dot.style.background = folderColor.get(f);
+      const name = document.createElement("span");
+      name.textContent = decode(f).replace(/-/g, " ");
+      const n = document.createElement("span");
+      n.className = "n";
+      n.textContent = folderCount.get(f);
+      row.append(dot, name, n);
       legend.appendChild(row);
     }
 
@@ -299,7 +310,7 @@
         if (state.hover) return state.hover === n.id || neighbors.get(state.hover)?.has(n.id) ? base : "#22323c";
         return base;
       })
-      .nodeLabel((n) => `${n.label} · ${n.degree} links`)
+      .nodeLabel((n) => `${esc(n.label)} · ${n.degree} links`)
       .linkColor((l) => {
         const on = state.hover && (idOf(l.source) === state.hover || idOf(l.target) === state.hover);
         if (l.kind === "link") return on ? "#8fd0e4" : "rgba(95,176,201,0.30)";
@@ -325,7 +336,7 @@
       $("d-label").textContent = n.label;
       $("d-path").textContent = "/" + id;
       $("d-degree").textContent = n.degree;
-      $("d-folder").textContent = decodeURIComponent(topFolder(id)).replace(/-/g, " ").slice(0, 22) || "root";
+      $("d-folder").textContent = decode(topFolder(id)).replace(/-/g, " ").slice(0, 22) || "root";
       $("d-open").href = wikiUrl(id);
       const box = $("d-neigh");
       box.innerHTML = "";
@@ -362,5 +373,6 @@
     let fit = setTimeout(() => Graph.zoomToFit(600, 60), 1400);
     window.addEventListener("resize", () => { Graph.width(window.innerWidth); Graph.height(window.innerHeight); });
     Graph.width(window.innerWidth).height(window.innerHeight);
+    $("loading")?.remove(); // last: a throw during setup leaves the loading state to carry the error
   }
 </script>

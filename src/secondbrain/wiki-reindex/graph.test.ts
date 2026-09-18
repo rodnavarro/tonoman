@@ -52,6 +52,9 @@ describe('resolveLink — against the pages that exist', () => {
     expect(resolveLink('/::Journals::/Note', ids)).toBe('%3A%3AJournals%3A%3A/Note');
     expect(resolveLink('/%3A%3AJournals%3A%3A/Note', ids)).toBe('%3A%3AJournals%3A%3A/Note');
   });
+  it('matches regardless of percent-escape hex case', () => {
+    expect(resolveLink('/%3a%3aJournals%3a%3a/Note', ids)).toBe('%3A%3AJournals%3A%3A/Note');
+  });
   it('returns undefined for a dangling link', () => {
     expect(resolveLink('/Folder/Gone', ids)).toBeUndefined();
   });
