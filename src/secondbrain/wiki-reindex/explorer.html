@@ -1,0 +1,366 @@
+<title>Second Brain Graph</title>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link
+  rel="stylesheet"
+  href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
+/>
+<style>
+  /* One committed dark world — a knowledge graph reads best on a night ground, like the tool it
+     echoes. Every colour is a token painted explicitly, so the page holds on any host ground. */
+  :root {
+    --ground: #0d1b26;
+    --ground-2: #0a151d;
+    --panel: #12242f;
+    --panel-2: #17303c;
+    --line: #22414f;
+    --line-soft: #1a333f;
+    --text: #e8f0f4;
+    --subtle: #b7ccd4;
+    --muted: #7f97a2;
+    --accent: #5fb0c9;
+    --accent-dim: #2f5063;
+    --gold: #d8a657;
+    --font-ui: "Instrument Sans", ui-sans-serif, system-ui, sans-serif;
+    --font-mono: "JetBrains Mono", ui-monospace, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background: var(--ground);
+    color: var(--text);
+    font-family: var(--font-ui);
+    overflow: hidden;
+  }
+  #graph { position: fixed; inset: 0; }
+  #graph canvas { display: block; }
+
+  /* The control card — floats over the canvas top-left, clears the safe area. */
+  .panel {
+    position: fixed;
+    top: calc(env(safe-area-inset-top, 0px) + 14px);
+    left: 14px;
+    width: min(310px, calc(100vw - 28px));
+    background: color-mix(in srgb, var(--panel) 92%, transparent);
+    backdrop-filter: blur(8px);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 16px 16px 14px;
+    z-index: 5;
+    max-height: calc(100% - 28px - env(safe-area-inset-top, 0px));
+    overflow: auto;
+  }
+  .brand { display: flex; align-items: baseline; gap: 8px; }
+  .brand h1 {
+    font-size: 1.02rem;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+    margin: 0;
+    text-wrap: balance;
+  }
+  .brand .env {
+    font-family: var(--font-mono);
+    font-size: 0.62rem;
+    color: var(--muted);
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    padding: 1px 7px;
+  }
+  .sub { color: var(--muted); font-size: 0.74rem; margin: 5px 0 13px; line-height: 1.45; }
+
+  .search {
+    width: 100%;
+    background: var(--ground-2);
+    border: 1px solid var(--line);
+    border-radius: 9px;
+    color: var(--text);
+    font-family: var(--font-ui);
+    font-size: 0.86rem;
+    padding: 9px 11px;
+    outline: none;
+  }
+  .search:focus-visible { border-color: var(--accent); outline: 2px solid color-mix(in srgb, var(--accent) 45%, transparent); outline-offset: 1px; }
+  .search::placeholder { color: var(--muted); }
+
+  .stats { display: flex; gap: 6px; margin: 12px 0 4px; }
+  .stat {
+    flex: 1;
+    background: var(--ground-2);
+    border: 1px solid var(--line-soft);
+    border-radius: 9px;
+    padding: 8px 9px;
+    text-align: left;
+  }
+  .stat b { display: block; font-family: var(--font-mono); font-size: 1.02rem; font-weight: 500; font-variant-numeric: tabular-nums; }
+  .stat span { display: block; font-size: 0.62rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; margin-top: 2px; }
+
+  .toggles { display: grid; gap: 2px; margin: 13px 0 4px; }
+  .toggle { display: flex; align-items: center; gap: 9px; padding: 6px 4px; cursor: pointer; border-radius: 7px; }
+  .toggle:hover { background: var(--panel-2); }
+  .toggle input { accent-color: var(--accent); width: 15px; height: 15px; }
+  .toggle span { font-size: 0.82rem; color: var(--subtle); }
+  .toggle .count { margin-left: auto; font-family: var(--font-mono); font-size: 0.68rem; color: var(--muted); }
+
+  .legend { margin-top: 12px; border-top: 1px solid var(--line-soft); padding-top: 11px; }
+  .legend h2 { font-size: 0.6rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin: 0 0 7px; }
+  .legend-row { display: flex; align-items: center; gap: 8px; padding: 2px 0; font-size: 0.76rem; color: var(--subtle); }
+  .dot { width: 9px; height: 9px; border-radius: 50%; flex: none; }
+  .legend-row .n { margin-left: auto; font-family: var(--font-mono); font-size: 0.66rem; color: var(--muted); }
+
+  /* The detail panel on node click — bottom-left, the page's identity and its neighbours. */
+  .detail {
+    position: fixed;
+    left: 14px;
+    bottom: calc(env(safe-area-inset-bottom, 0px) + 14px);
+    width: min(340px, calc(100vw - 28px));
+    background: color-mix(in srgb, var(--panel) 94%, transparent);
+    backdrop-filter: blur(8px);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 15px 16px;
+    z-index: 5;
+    display: none;
+  }
+  .detail.on { display: block; }
+  .detail .close { position: absolute; top: 10px; right: 12px; background: none; border: none; color: var(--muted); font-size: 1.1rem; cursor: pointer; line-height: 1; }
+  .detail .close:hover { color: var(--text); }
+  .detail h3 { margin: 0 8px 3px 0; font-size: 0.98rem; font-weight: 600; text-wrap: balance; }
+  .detail .path { font-family: var(--font-mono); font-size: 0.66rem; color: var(--muted); word-break: break-all; margin-bottom: 10px; }
+  .detail .meta { display: flex; gap: 14px; margin-bottom: 11px; }
+  .detail .meta div b { font-family: var(--font-mono); font-size: 0.92rem; font-weight: 500; }
+  .detail .meta div span { display: block; font-size: 0.6rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+  .neigh h4 { font-size: 0.58rem; text-transform: uppercase; letter-spacing: 0.07em; color: var(--muted); margin: 0 0 5px; }
+  .neigh .items { display: flex; flex-wrap: wrap; gap: 5px; max-height: 108px; overflow: auto; }
+  .chip {
+    font-size: 0.72rem;
+    background: var(--ground-2);
+    border: 1px solid var(--line);
+    border-radius: 7px;
+    padding: 3px 8px;
+    cursor: pointer;
+    color: var(--subtle);
+  }
+  .chip:hover { border-color: var(--accent); color: var(--text); }
+  .open {
+    display: inline-flex; align-items: center; gap: 6px;
+    margin-top: 12px; font-size: 0.8rem; font-weight: 600;
+    color: var(--ground); background: var(--accent);
+    border-radius: 8px; padding: 7px 12px; text-decoration: none;
+  }
+  .open:hover { background: color-mix(in srgb, var(--accent) 85%, white); }
+
+  .hint { position: fixed; right: 14px; bottom: calc(env(safe-area-inset-bottom, 0px) + 14px); font-size: 0.68rem; color: var(--muted); z-index: 4; text-align: right; }
+  .loading { position: fixed; inset: 0; display: grid; place-items: center; color: var(--muted); font-size: 0.9rem; z-index: 8; }
+  @media (max-width: 560px) {
+    .panel { width: calc(100vw - 20px); left: 10px; }
+    .detail { width: calc(100vw - 20px); left: 10px; }
+    .hint { display: none; }
+  }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+
+<div id="graph"></div>
+<div class="loading" id="loading">Loading the graph…</div>
+
+<aside class="panel">
+  <div class="brand">
+    <h1>Second Brain</h1>
+    <span class="env" id="env">wiki graph</span>
+  </div>
+  <p class="sub" id="sub">The tenant wiki as a graph — pages are nodes, hierarchy and cross-references are edges.</p>
+  <input class="search" id="search" type="search" placeholder="Search pages…" autocomplete="off" spellcheck="false" />
+  <div class="stats">
+    <div class="stat"><b id="s-pages">—</b><span>pages</span></div>
+    <div class="stat"><b id="s-links">—</b><span>cross-links</span></div>
+    <div class="stat"><b id="s-orphans">—</b><span>orphans</span></div>
+  </div>
+  <div class="toggles">
+    <label class="toggle"><input type="checkbox" id="t-hier" checked /><span>Hierarchy edges</span><span class="count" id="c-hier"></span></label>
+    <label class="toggle"><input type="checkbox" id="t-link" checked /><span>Cross-link edges</span><span class="count" id="c-link"></span></label>
+    <label class="toggle"><input type="checkbox" id="t-orphan" /><span>Show orphans</span><span class="count" id="c-orphan"></span></label>
+    <label class="toggle"><input type="checkbox" id="t-stub" /><span>Show folder stubs</span><span class="count" id="c-stub"></span></label>
+  </div>
+  <div class="legend">
+    <h2>Top folders</h2>
+    <div id="legend"></div>
+  </div>
+</aside>
+
+<section class="detail" id="detail">
+  <button class="close" id="detail-close" aria-label="Close">×</button>
+  <h3 id="d-label"></h3>
+  <div class="path" id="d-path"></div>
+  <div class="meta">
+    <div><b id="d-degree">0</b><span>connections</span></div>
+    <div><b id="d-folder">—</b><span>folder</span></div>
+  </div>
+  <div class="neigh">
+    <h4>Linked pages</h4>
+    <div class="items" id="d-neigh"></div>
+  </div>
+  <a class="open" id="d-open" target="_blank" rel="noreferrer">Open in the wiki →</a>
+</section>
+
+<div class="hint">Scroll to zoom · drag to pan · click a node</div>
+
+<script src="https://cdn.jsdelivr.net/npm/force-graph@1.51.4/dist/force-graph.min.js"></script>
+<script>
+  // Where the wiki lives, for the "Open in the wiki" deep link (Azure DevOps wiki page URL).
+  const WIKI_BASE = "https://dev.azure.com/axiplex/wiki-p/_wiki/wikis/secondbrain-dev";
+  const wikiUrl = (id) => `${WIKI_BASE}?pagePath=${encodeURIComponent("/" + id)}`;
+
+  // A calm categorical palette for the busiest top-level folders — analogous blues/teals with a few
+  // warm accents, so hue reads as "area" without turning the canvas into confetti.
+  const PALETTE = ["#5fb0c9", "#7fb8a6", "#d8a657", "#c98b8b", "#9a8fc9", "#6fa3d8", "#c9a15f", "#7fc9b0", "#b98fc9", "#89a1ac"];
+  const OTHER = "#4b6470";
+
+  const $ = (id) => document.getElementById(id);
+
+  function topFolder(id) {
+    const i = id.indexOf("/");
+    return i < 0 ? id : id.slice(0, i);
+  }
+
+  fetch("./graph.json")
+    .then((r) => { if (!r.ok) throw new Error("no graph.json"); return r.json(); })
+    .then((data) => boot(data))
+    .catch((err) => { $("loading").textContent = "Could not load graph.json (" + err.message + ")."; });
+
+  function boot(data) {
+    $("loading").remove();
+    const nodesById = new Map(data.nodes.map((n) => [n.id, n]));
+
+    // Colour the busiest folders; the long tail shares one muted hue.
+    const folderCount = new Map();
+    for (const n of data.nodes) {
+      const f = topFolder(n.id);
+      folderCount.set(f, (folderCount.get(f) || 0) + 1);
+    }
+    const topFolders = [...folderCount.entries()].sort((a, b) => b[1] - a[1]).slice(0, 9).map((e) => e[0]);
+    const folderColor = new Map(topFolders.map((f, i) => [f, PALETTE[i % PALETTE.length]]));
+    const colorOf = (id) => folderColor.get(topFolder(id)) || OTHER;
+
+    // Neighbour sets, for hover highlighting and the detail panel.
+    const neighbors = new Map(data.nodes.map((n) => [n.id, new Set()]));
+    for (const e of data.edges) {
+      neighbors.get(e.source)?.add(e.target);
+      neighbors.get(e.target)?.add(e.source);
+    }
+
+    // Stats + legend + toggle counts.
+    const st = data.stats || {};
+    $("s-pages").textContent = (st.nodes ?? data.nodes.length).toLocaleString();
+    $("s-links").textContent = (st.links ?? 0).toLocaleString();
+    $("s-orphans").textContent = (st.orphans ?? 0).toLocaleString();
+    $("c-hier").textContent = (st.hierarchy ?? 0).toLocaleString();
+    $("c-link").textContent = (st.links ?? 0).toLocaleString();
+    $("c-orphan").textContent = (st.orphans ?? 0).toLocaleString();
+    $("c-stub").textContent = (st.stubs ?? 0).toLocaleString();
+    const legend = $("legend");
+    for (const f of topFolders) {
+      const row = document.createElement("div");
+      row.className = "legend-row";
+      row.innerHTML = `<span class="dot" style="background:${folderColor.get(f)}"></span>` +
+        `<span>${decodeURIComponent(f).replace(/-/g, " ")}</span><span class="n">${folderCount.get(f)}</span>`;
+      legend.appendChild(row);
+    }
+
+    const state = { hier: true, link: true, orphan: false, stub: false, q: "", focus: null, hover: null };
+
+    // Build the force-graph node/link sets for the current filters. force-graph mutates node objects
+    // with x/y, so we keep ONE object per id and reuse it, or the layout resets on every toggle.
+    const nodeObj = new Map(data.nodes.map((n) => [n.id, { id: n.id, label: n.label, folder: topFolder(n.id), stub: n.stub, degree: n.degree }]));
+    function currentData() {
+      const showNode = (n) => {
+        if (n.stub && !state.stub) return false;
+        if (n.degree === 0 && !state.orphan) return false;
+        return true;
+      };
+      const nodes = data.nodes.filter(showNode).map((n) => nodeObj.get(n.id));
+      const visible = new Set(nodes.map((n) => n.id));
+      const links = data.edges
+        .filter((e) => (e.kind === "hierarchy" ? state.hier : state.link))
+        .filter((e) => visible.has(e.source) && visible.has(e.target))
+        .map((e) => ({ source: e.source, target: e.target, kind: e.kind }));
+      return { nodes, links };
+    }
+
+    const el = document.getElementById("graph");
+    const Graph = ForceGraph()(el)
+      .backgroundColor("#0d1b26")
+      .nodeRelSize(3)
+      .nodeVal((n) => 1 + Math.sqrt(n.degree))
+      .nodeColor((n) => {
+        const base = n.stub ? "#3a5462" : colorOf(n.id);
+        if (state.q && n.label.toLowerCase().includes(state.q)) return "#ffd98a";
+        if (state.hover) return state.hover === n.id || neighbors.get(state.hover)?.has(n.id) ? base : "#22323c";
+        return base;
+      })
+      .nodeLabel((n) => `${n.label} · ${n.degree} links`)
+      .linkColor((l) => {
+        const on = state.hover && (idOf(l.source) === state.hover || idOf(l.target) === state.hover);
+        if (l.kind === "link") return on ? "#8fd0e4" : "rgba(95,176,201,0.30)";
+        return on ? "#6a90a2" : "rgba(45,80,99,0.35)";
+      })
+      .linkWidth((l) => (l.kind === "link" ? 1.1 : 0.5))
+      .linkDirectionalParticles(0)
+      .onNodeHover((n) => { state.hover = n ? n.id : null; el.style.cursor = n ? "pointer" : "default"; })
+      .onNodeClick((n) => { focusNode(n.id); Graph.centerAt(n.x, n.y, 600); Graph.zoom(Math.max(Graph.zoom(), 3), 600); })
+      .onBackgroundClick(() => { $("detail").classList.remove("on"); });
+
+    // A gentle charge so hubs breathe and the tree opens up.
+    Graph.d3Force("charge").strength(-42);
+    Graph.d3Force("link").distance((l) => (l.kind === "link" ? 40 : 24));
+
+    function idOf(x) { return typeof x === "object" ? x.id : x; }
+    function apply() { Graph.graphData(currentData()); }
+    apply();
+
+    function focusNode(id) {
+      const n = nodesById.get(id);
+      if (!n) return;
+      $("d-label").textContent = n.label;
+      $("d-path").textContent = "/" + id;
+      $("d-degree").textContent = n.degree;
+      $("d-folder").textContent = decodeURIComponent(topFolder(id)).replace(/-/g, " ").slice(0, 22) || "root";
+      $("d-open").href = wikiUrl(id);
+      const box = $("d-neigh");
+      box.innerHTML = "";
+      const ns = [...(neighbors.get(id) || [])].sort((a, b) => (nodesById.get(b)?.degree || 0) - (nodesById.get(a)?.degree || 0)).slice(0, 24);
+      if (!ns.length) box.innerHTML = '<span style="color:var(--muted);font-size:.72rem">No links.</span>';
+      for (const nb of ns) {
+        const c = document.createElement("button");
+        c.className = "chip";
+        c.textContent = nodesById.get(nb)?.label || nb;
+        c.onclick = () => {
+          const target = nodeObj.get(nb);
+          focusNode(nb);
+          if (target && target.x != null) { Graph.centerAt(target.x, target.y, 500); Graph.zoom(Math.max(Graph.zoom(), 3), 500); }
+        };
+        box.appendChild(c);
+      }
+      $("detail").classList.add("on");
+    }
+
+    // Controls.
+    $("search").addEventListener("input", (e) => {
+      state.q = e.target.value.trim().toLowerCase();
+      Graph.nodeColor(Graph.nodeColor()); // nudge a repaint
+      if (state.q) {
+        const hit = data.nodes.filter((n) => n.label.toLowerCase().includes(state.q)).sort((a, b) => b.degree - a.degree)[0];
+        if (hit) { const o = nodeObj.get(hit.id); if (o && o.x != null) { Graph.centerAt(o.x, o.y, 500); Graph.zoom(4, 500); } focusNode(hit.id); }
+      }
+    });
+    const bind = (id, key) => $(id).addEventListener("change", (e) => { state[key] = e.target.checked; apply(); });
+    bind("t-hier", "hier"); bind("t-link", "link"); bind("t-orphan", "orphan"); bind("t-stub", "stub");
+    $("detail-close").onclick = () => $("detail").classList.remove("on");
+
+    // Fit once settled.
+    let fit = setTimeout(() => Graph.zoomToFit(600, 60), 1400);
+    window.addEventListener("resize", () => { Graph.width(window.innerWidth); Graph.height(window.innerHeight); });
+    Graph.width(window.innerWidth).height(window.innerHeight);
+  }
+</script>
