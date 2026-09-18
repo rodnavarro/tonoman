@@ -229,6 +229,50 @@ async function registrySecret(guid: string | undefined, ref: string | undefined)
   }
 }
 
+/** POST one inference-credential outcome to the registry (W3).
+ *
+ *  TWO ROUTES, because they answer two different questions. A shared agent has one login and one
+ *  `auth_state`, on the agent row. A per-person agent's login belongs to a PERSON — and writing one
+ *  person's outcome to the agent row marked the whole agent `error` in the Hub while everybody else
+ *  went on answering perfectly. So `user` picks the principal route and the agent row is left alone.
+ *
+ *  Split out and exported so the routing and the body are testable without a worker, a roster or a
+ *  Temporal client: the shape of this request is a contract with the Cloud API, and a contract that
+ *  only a running system can check is one nobody checks.
+ *
+ *  Never throws. Both callers are places where throwing would make something worse: a login gate
+ *  that has just succeeded, and the tail of a turn that has already failed. `ok` and `status` are
+ *  returned instead, so the caller can log what happened — a 404 on the principal route means the
+ *  person is not registered with the tenant yet, which is information, not a fault. */
+export async function postAuthState(o: {
+  api: string;
+  token: string;
+  guid: string;
+  state: "ok" | "error" | "expired" | "unconfigured";
+  provider: "claude" | "codex";
+  /** The Slack user id whose own login this was — the per-person route. Absent = the agent's. */
+  user?: string;
+  fetchImpl?: typeof fetch;
+}): Promise<{ ok: boolean; status?: number; route: string; error?: string }> {
+  const base = o.api.replace(/[/]+$/, "");
+  const route = o.user
+    ? `${base}/v1/system/agents/${o.guid}/principals/${encodeURIComponent(o.user)}/auth-state`
+    : `${base}/v1/system/agents/${o.guid}/auth-state`;
+  try {
+    const r = await (o.fetchImpl ?? fetch)(route, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${o.token}`,
+      },
+      body: JSON.stringify({ authState: o.state, provider: o.provider }),
+    });
+    return { ok: r.ok, status: r.status, route };
+  } catch (e) {
+    return { ok: false, route, error: (e as Error).message };
+  }
+}
+
 /** Tools withheld from every turn this worker runs.
  *
  *  The default is not empty, deliberately. The pod is the sandbox AND it holds the credential that
@@ -1039,6 +1083,13 @@ export async function run(
         alias: feed.alias,
       });
     },
+    // W3: what a failed turn learned about the credential, recorded where it belongs — the speaker's
+    // own row on a per-person agent, the agent's otherwise. Best-effort by contract.
+    reportAuthState: (name: string, state: "ok" | "error" | "expired" | "unconfigured", user?: string) =>
+      reportAuthState(name, state, user).catch((e) =>
+        console.error(`worker: ${name} auth-state report failed — ${(e as Error).message}`),
+      ),
+    providerLabel: (name: string): string => providerLabel(providerOf(wired.get(name)?.cfg)),
     talentConfig: (name: string, talent: string): Record<string, unknown> =>
       wired.get(name)?.cfg.talents?.find((t) => t.name === talent)?.config ?? {},
     infer: async (name: string, p: { system: string; user: string }, owner?: string): Promise<string> => {
@@ -1164,7 +1215,14 @@ export async function run(
   // awaiting means the `agent_principal` row exists before the "✅ connected" reply — so the next
   // 30s roster reload deterministically teaches the agent the name before the first recap lands.
   // Any failure is logged and swallowed; connecting must never break because registration did.
-  const autoRegisterMember = async (name: string, user: string | undefined): Promise<void> => {
+  const autoRegisterMember = async (
+    name: string,
+    user: string | undefined,
+    /** The login outcome that brought them here, when there is one. The register-member route takes
+     *  it alongside the profile, so a first-time sign-in is one call rather than a register followed
+     *  by a per-principal update that would have 404'd a moment earlier. */
+    auth?: { authState: "ok" | "error" | "expired" | "unconfigured"; authProvider: string },
+  ): Promise<void> => {
     if (!user) return;
     const a = wired.get(name);
     const guid = a?.cfg.guid;
@@ -1192,7 +1250,7 @@ export async function run(
           authorization: `Bearer ${process.env.TONOMANCLOUD_API_TOKEN ?? ""}`,
           "content-type": "application/json",
         },
-        body: JSON.stringify({ slackUserId: user, name: profileName, email }),
+        body: JSON.stringify({ slackUserId: user, name: profileName, email, ...(auth ?? {}) }),
       });
     } catch (e) {
       console.error(`worker: ${name} register-member failed for ${user}: ${(e as Error).message}`);
@@ -1518,30 +1576,58 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
     },
     conn: (name) => wired.get(name)?.conn as SlackConnector | undefined,
     provider: (name) => providerOf(wired.get(name)?.cfg),
-    setAuthState: async (name, state) => {
-      const a = wired.get(name);
-      const api = process.env.TONOMANCLOUD_API_URL;
-      if (!a?.cfg.guid || !api) return; // a file roster has no registry to tell
-      // `auth_state` is the AGENT's one login. On a per-person agent a login is one person's, and one
-      // person's failed code marked the whole agent `error` in the Hub while everyone else answered.
-      if (a.cfg.inference_mode === "per_user") return;
-      const r = await fetch(`${api}/v1/system/agents/${a.cfg.guid}/auth-state`, {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          authorization: `Bearer ${process.env.TONOMANCLOUD_API_TOKEN ?? ""}`,
-        },
-        body: JSON.stringify({ authState: state }),
-      });
-      if (!r.ok) throw new Error(`auth-state ${r.status}`);
-      // Reflect it locally too, so the very next message is not gated again while the roster
-      // cache is still warm.
-      a.cfg.auth_state = state === "ok" ? "ok" : "error";
-      console.log(`worker: ${name} auth_state -> ${state}`);
-    },
+    setAuthState: (name, state, user) => reportAuthState(name, state, user),
     // The gate-offered login is how a NEW person first arrives (Celine's path): the `!connect claude`
     // command hook never fires for them, so register here too — before their first real turn.
-    onLogin: (name, user) => autoRegisterMember(name, user),
+    // Seeded with the outcome: the row is created (or refreshed) ALREADY carrying the auth state,
+    // so the per-principal update that follows is a confirmation rather than the only chance.
+    onLogin: (name, user) =>
+      autoRegisterMember(name, user, { authState: "ok", authProvider: providerOf(wired.get(name)?.cfg) }),
+  };
+
+  /** Tell the registry what this agent's — or this PERSON's — inference credential is now worth.
+   *
+   *  TWO ROUTES, because they answer two different questions. A shared agent has one login and one
+   *  `auth_state`; a per-person agent's login belongs to a person, and writing one person's outcome
+   *  to the agent row marked the whole agent `error` in the Hub while everybody else went on
+   *  answering perfectly. So the per-person case reports against the PRINCIPAL instead, and the
+   *  agent row is left alone.
+   *
+   *  The per-person route is BEST-EFFORT and never throws: it is called from a login gate and from
+   *  the tail of a failed turn, and neither of those should acquire a new way to fail because the
+   *  Hub is briefly unreachable. (The agent-level route keeps throwing — its one caller catches, and
+   *  the gate wants to know.) It also only ever UPDATES a principal the tenant already knows, and
+   *  answers 404 for somebody it does not — which is why every caller registers the person first. */
+  const reportAuthState = async (
+    name: string,
+    state: "ok" | "error" | "expired" | "unconfigured",
+    user?: string,
+  ): Promise<void> => {
+    const a = wired.get(name);
+    const api = process.env.TONOMANCLOUD_API_URL;
+    if (!a?.cfg.guid || !api) return; // a file roster has no registry to tell
+    const provider = providerOf(a.cfg);
+
+    const token = process.env.TONOMANCLOUD_API_TOKEN ?? "";
+
+    if (a.cfg.inference_mode === "per_user") {
+      // Nobody to attribute it to: a per-person outcome with no person is not an agent-level fact,
+      // and writing it as one is the bug this branch exists to prevent.
+      if (!user) return;
+      const r = await postAuthState({ api, token, guid: a.cfg.guid, state, provider, user });
+      // 404 is "this person is not registered with the tenant yet", which is information rather than
+      // a fault — still said out loud, because it means a login outcome went unrecorded.
+      if (!r.ok) console.error(`worker: ${name} auth-state for ${user} -> ${state} ${r.error ?? `returned HTTP ${r.status}`}`);
+      else console.log(`worker: ${name} auth_state[${user}] -> ${state} (${provider})`);
+      return;
+    }
+
+    const r = await postAuthState({ api, token, guid: a.cfg.guid, state, provider });
+    if (!r.ok) throw new Error(`auth-state ${r.error ?? r.status}`);
+    // Reflect it locally too, so the very next message is not gated again while the roster
+    // cache is still warm.
+    a.cfg.auth_state = state === "ok" ? "ok" : state === "expired" ? "expired" : "error";
+    console.log(`worker: ${name} auth_state -> ${state} (${provider})`);
   };
 
   const plaudDeps: plaudgate.PlaudGateDeps = {

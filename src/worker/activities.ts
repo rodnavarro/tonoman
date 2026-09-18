@@ -24,6 +24,7 @@ import * as worklog from "./worklog";
 import { randomMysticVerb } from "../core/mystic";
 import type { CapabilityPlane } from "./capability-plane";
 import { isAuthError } from "../authflow";
+import { authFailureState, notLoggedInNotice } from "../turnfailure";
 
 /** How the worker finds an agent's connector and runner. Injected at worker construction so this
  *  module holds no globals and can be unit-tested without Temporal. */
@@ -52,6 +53,17 @@ export interface TurnDeps {
   talentConfig?(agent: string, talent: string): Record<string, unknown>;
   /** Say something verbatim to a person, opening a DM if needed. */
   say?(agent: string, user: string, text: string): Promise<void>;
+  /** Record what this agent's — or this PERSON's — inference credential is now worth (W3). Called
+   *  from a login outcome and from the tail of a turn that failed for want of one. Best-effort by
+   *  contract: it must never become a new way for a turn to fail. */
+  reportAuthState?(
+    agent: string,
+    state: "ok" | "error" | "expired" | "unconfigured",
+    user?: string,
+  ): Promise<void>;
+  /** How this agent's provider is named to a person ("Claude" / "Codex"), for a notice that has to
+   *  tell somebody which login to start. */
+  providerLabel?(agent: string): string;
   /** The durable record of one item of one Talent run: opened before the run, closed either way.
    *
    *  Behind a hook rather than a direct database call for the same reason everything else here is:
@@ -420,6 +432,25 @@ export function makeActivities(deps: TurnDeps) {
       return serialize(`${input.agent}/${input.conversation}`, () => oneTurn(deps, input));
     },
 
+
+    /** A turn failed because there is no usable inference credential (W3).
+     *
+     *  Two things happen here and both need the roster, which is why they are one activity rather
+     *  than a pure function in the workflow: the outcome is RECORDED against whoever the credential
+     *  belongs to (the speaker on a per-person agent, the agent otherwise), and the notice is
+     *  written naming THIS agent's provider — it used to say `!connect claude` unconditionally,
+     *  which on a codex agent is an instruction to sign in to an account it does not use.
+     *
+     *  Returns the text rather than posting it, so the workflow keeps its single posting path.
+     *  Never throws: the turn has already failed, and a second failure here would replace the
+     *  explanation the person is owed with nothing at all. */
+    async noteAuthFailure(input: { agent: string; user?: string; reason: string }): Promise<string> {
+      const label = deps.providerLabel?.(input.agent) ?? "Claude";
+      await deps
+        .reportAuthState?.(input.agent, authFailureState(input.reason), input.user)
+        .catch((e) => console.error(`activities: ${input.agent} auth-state report failed: ${String(e)}`));
+      return notLoggedInNotice(`!connect ${label.toLowerCase()}`);
+    },
 
     async postNotice(input: NoticeInput): Promise<void> {
       const found = deps.agent(input.agent);

@@ -38,12 +38,25 @@ export function isNotLoggedInError(msg: string): boolean {
 
 /** What to say when there is no inference credential. Names the fix, because there is exactly one
  *  and the person cannot guess it — and deliberately does NOT say "try again", which is the one
- *  thing guaranteed not to work. */
-export function notLoggedInNotice(): string {
+ *  thing guaranteed not to work.
+ *
+ *  `connect` is the command for THIS agent's provider. It was hard-coded to `!connect claude`, which
+ *  on a codex agent is an instruction to sign in to an account it does not use — and the person
+ *  following it would have been told the login worked. */
+export function notLoggedInNotice(connect = "!connect claude"): string {
   return (
     "⚠️ I can't answer — I'm not signed in to an inference provider right now.\n" +
-    "Send `!connect claude` and I'll walk you through it."
+    `Send \`${connect}\` and I'll walk you through it.`
   );
+}
+
+/** PURE: what a not-logged-in turn failure says about the credential's STATE, in the registry's own
+ *  vocabulary. Only two of the four are reachable from a turn: a credential that worked and stopped
+ *  is `expired`, anything else auth-shaped is `error`. `unconfigured` and `ok` are facts a login
+ *  outcome establishes, not ones a failure can. Deliberately narrow — guessing `expired` for a
+ *  transport fault would tell the Hub a subscription lapsed when nothing of the sort happened. */
+export function authFailureState(msg: string): "expired" | "error" {
+  return /expired|could not be refreshed|invalid_grant/i.test(msg || "") ? "expired" : "error";
 }
 
 /** Temporal's own wrapper messages. An activity that throws reaches the workflow as an
