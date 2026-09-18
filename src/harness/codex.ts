@@ -41,6 +41,28 @@ export const CONFIG_HOME = "/root/.codex";
  * the stdin prompt as a system preamble (see identityPreamble). */
 export const IDENTITY_HOME = "/root/agent";
 
+/** WHOSE ChatGPT subscription a codex turn runs on — the exact counterpart of claudecode's
+ * `configHomeFor`, applied through CODEX_HOME instead of CLAUDE_CONFIG_DIR.
+ *
+ * One runtime serves every agent a pool has, and a subscription belongs to a person, so the config
+ * home has to say whose it is or the second login replaces the first. Same three cases, same
+ * sanitisation, and the same rule for a name that was GIVEN but sanitises away: it gets a directory
+ * of its own that is nobody's and works for nothing, rather than falling back to the pool's shared
+ * credential. Both the agent name and the user id arrive over the wire and decide a filesystem
+ * path, which is the whole reason the sanitisation is here and not at the caller. */
+export function configHomeFor(
+  agent: string | undefined,
+  user?: string,
+  root: string = CONFIG_HOME,
+): string {
+  if (!agent) return root;
+  const safe = agent.replace(/[^A-Za-z0-9_-]/g, "");
+  const agentHome = `${root}/agents/${safe || "_invalid"}`;
+  if (!user) return agentHome;
+  const safeUser = user.replace(/[^A-Za-z0-9_-]/g, "");
+  return `${agentHome}/users/${safeUser || "_invalid"}`;
+}
+
 /** Best-effort context window for the gpt-5.6 codex tiers, for the statusline context %.
  * Not reported per-turn by codex; overridable via CODEX_CONTEXT_WINDOW. An estimate, not a
  * hard fact — correct it without a rebuild by setting the env. */
@@ -81,13 +103,17 @@ export interface RunnerOptions {
   // Local-exec mode (k8s split): spawn `codex` as a DIRECT child in this same pod — no
   // `podman exec`. The pod is the isolation boundary. Used by src/agent/server.ts.
   local?: boolean;
+  // WHOSE ChatGPT subscription this runner answers on (local-exec): the CODEX_HOME a turn runs
+  // with, from `configHomeFor(agent, user)`. Default: the pool's shared CONFIG_HOME, which is
+  // every agent that has not asked for its own. A per-turn `req.configHome` overrides it.
+  configHome?: string;
 }
 
 /** Build the child env for a local-exec codex turn: point CODEX_HOME at the config volume and
  * drop OPENAI_API_KEY so the ChatGPT-subscription OAuth resolves (an API key must never outrank
  * the sub — mirrors claudecode dropping ANTHROPIC_API_KEY). Pure + testable. */
-export function localEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { ...base, CODEX_HOME: CONFIG_HOME };
+export function localEnv(base: NodeJS.ProcessEnv, configHome: string = CONFIG_HOME): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...base, CODEX_HOME: configHome };
   delete env.OPENAI_API_KEY;
   return env;
 }
@@ -153,7 +179,12 @@ export class Runner implements TurnRunner {
     const bin = this.o.bin ?? "codex";
     let child;
     if (this.o.local) {
-      child = spawn(bin, this.localArgs(), { windowsHide: true, env: localEnv(process.env) });
+      // `req.configHome` overrides the runner's per-agent default for THIS turn only — set when
+      // the agent runs inference per person, so the speaker's own login answers.
+      child = spawn(bin, this.localArgs(), {
+        windowsHide: true,
+        env: localEnv(process.env, req.configHome ?? this.o.configHome ?? CONFIG_HOME),
+      });
     } else {
       const podman = this.o.podman ?? "podman";
       child = spawn(podman, this.podmanArgs(), { windowsHide: true });
@@ -455,7 +486,16 @@ export function spec(): Spec {
     configHome: CONFIG_HOME,
     identityHome: IDENTITY_HOME,
     runEnv: { CODEX_HOME: CONFIG_HOME },
-    newRunner: (p: RunnerParams) => new Runner({ container: p.container, model: p.model, maxTurns: p.maxTurns }),
+    // No container configured means THIS pod is the sandbox (local-exec), exactly as claudecode
+    // reads it — an agent is a row in Tonoman Cloud, not a container to exec into.
+    newRunner: (p: RunnerParams) =>
+      new Runner({
+        container: p.container,
+        local: !p.container,
+        model: p.model,
+        maxTurns: p.maxTurns,
+        configHome: configHomeFor(p.agent),
+      }),
     newEphemeralRunner: (p: EphemeralParams) =>
       new Runner({ container: p.volumesFrom, model: p.model }),
     // Headless login = codex device-auth (prints an OpenAI verification URL + user code); the

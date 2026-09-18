@@ -360,8 +360,19 @@ async function runAuth(cfgPath: string, env: string | undefined, args: string[])
   // `tonoman auth login <agent> --headless` — print the OAuth URL; no local browser/TTY needed.
   // Works for a local (podman) agent AND one across the k8s split (roster-auth-remote).
   if (action === "login" && headless) {
-    const url = await resolveAuthOps(cfg, agent).startHeadless();
-    process.stdout.write(`Open this URL to authenticate "${agent}" (any device — e.g. your phone):\n\n  ${url}\n\nSign in with the account this agent should own, authorize, then finish with:\n  tonoman auth code ${agent} <CODE>\n`);
+    const started = await resolveAuthOps(cfg, agent).startHeadless();
+    // A device-auth harness (codex) answers with a code as well, and there is no `auth code` step
+    // for it: the code goes on the PROVIDER's page and the CLI exchanges it itself. Printing the
+    // Claude instructions for that flow would tell the operator to run a command that does nothing.
+    if (started.code) {
+      process.stdout.write(
+        `Open this URL to authenticate "${agent}" (any device — e.g. your phone):\n\n  ${started.url}\n\n` +
+          `Enter this one-time code on that page:\n\n  ${started.code}\n\n` +
+          `Sign in with the account this agent should own. The login finishes on its own — nothing to paste back.\n`,
+      );
+      return;
+    }
+    process.stdout.write(`Open this URL to authenticate "${agent}" (any device — e.g. your phone):\n\n  ${started.url}\n\nSign in with the account this agent should own, authorize, then finish with:\n  tonoman auth code ${agent} <CODE>\n`);
     return;
   }
   await gateway.auth(action, agent, cfg);

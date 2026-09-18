@@ -87,7 +87,12 @@ export function planReload(oldCfgs: AgentConfig[], newCfgs: AgentConfig[]): Relo
       // The run closure captures `inference_mode` (it decides per turn whether to use the speaker's
       // own credential), so a change to it has to remake the closure — a plain cfg swap would leave
       // the old mode answering. Treated like `max_turns`: rebuild the runner, keep the connector.
-      (prev.inference_mode ?? "shared") !== (next.inference_mode ?? "shared");
+      (prev.inference_mode ?? "shared") !== (next.inference_mode ?? "shared") ||
+      // The PROVIDER is baked into the runner at construction (it decides which CLI answers) and
+      // captured by the run closure (it decides which credential tree a per-person turn reads), so
+      // switching an agent from Claude to Codex in the Hub has to remake both. Without this the
+      // roster would say codex while the agent kept answering on Claude until the next restart.
+      (prev.inference_provider ?? "claude") !== (next.inference_provider ?? "claude");
 
     updated.push({ key, rebuildConn, rebuildRunner });
   }

@@ -24,6 +24,7 @@ import { SlackConnector } from "../connector/slack";
 import * as cmds from "./commands";
 import * as plaudcli from "./plaudcli";
 import * as claudecode from "../harness/claudecode";
+import * as codexharness from "../harness/codex";
 import * as plaudauth from "./plaudauth";
 import * as tokenstore from "./tokenstore";
 import * as plaudgate from "./plaudgate";
@@ -37,7 +38,7 @@ import {
   type StatusMode,
   type UsageWindow,
 } from "../statusline";
-import { httpAuthOps } from "../authflow";
+import { httpAuthOps, looksLoggedIn } from "../authflow";
 import * as gate from "./authgate";
 import * as secondbrain from "./secondbrain";
 import * as recapFloor from "./recap";
@@ -52,6 +53,7 @@ import { serialReload } from "./reloadgate";
 import { serveWake } from "./wake";
 import { promises as fsp } from "node:fs";
 import { defaultHarnesses } from "../gateway";
+import { harnessForProvider, providerAccountLabel, providerLabel, type HarnessKind, type InferenceProvider } from "../harness";
 import { accountsFromUsers, makeActivities, type TurnRunReq, type VoiceConfig } from "./activities";
 import { startCapabilityPlane, type CapabilityPlane } from "./capability-plane";
 import { agendaTickWorkflow, conversationWorkflow, messageSignal, plaudPollWorkflow, runTalentWorkflow, type AgendaTickInput, type Inbound, type PollInput } from "./workflows";
@@ -292,11 +294,45 @@ export function agentsAllowed(names: string | undefined): Set<string> {
   );
 }
 
+/** WHICH provider answers this agent's turns (W1). The roster's word, defaulted to claude so every
+ *  agent that predates the field is untouched. */
+export function providerOf(a: AgentConfig | undefined): InferenceProvider {
+  return a?.inference_provider === "codex" ? "codex" : "claude";
+}
+
+/** The harness kind that provider runs on — the word sent to the agent runtime on every call. */
+export function harnessOf(a: AgentConfig | undefined): HarnessKind {
+  return harnessForProvider(a?.inference_provider);
+}
+
+/** WHOSE credential directory a turn of this agent runs in, for a given speaker. The DIRECTORY
+ *  differs per provider (`/root/.claude/...` vs `/root/.codex/...`) and so does the env var that
+ *  points a child at it — resolving it here, once, is what keeps a codex per-person login from
+ *  being written into Claude's tree and then reported as a success. */
+export function configHomeOf(a: AgentConfig, user?: string): string {
+  return providerOf(a) === "codex"
+    ? codexharness.configHomeFor(a.name, user)
+    : claudecode.configHomeFor(a.name, user);
+}
+
+/** The credential file a login for this agent writes — the per-person gate's file check. */
+export function credFileOf(a: AgentConfig, user?: string): string {
+  return providerOf(a) === "codex"
+    ? path.join(configHomeOf(a, user), "auth.json")
+    : path.join(configHomeOf(a, user), ".credentials.json");
+}
+
 /** Build a new runner for one agent. Split out because live reload rebuilds a runner in place — when
  *  `max_turns` or the runtime `url` changes, both of which the harness bakes in at construction — while
  *  keeping the agent's connector, so no socket reconnects. */
 function newRunnerFor(a: AgentConfig, harnesses: ReturnType<typeof defaultHarnesses>): TurnRunner | null {
-  const spec = harnesses.lookup(a.harness ?? "claude-code");
+  // `harness` is the TRANSPORT (how this gateway reaches the agent: local exec, podman, HTTP);
+  // `inference_provider` is WHO ANSWERS. They are different questions, and only the second one is
+  // set in the Hub. A codex agent on the default local transport therefore has to be routed to the
+  // codex runner here — the roster still says "claude-code", because that is its transport.
+  const configured = a.harness ?? "claude-code";
+  const kind = configured === "claude-code" ? harnessOf(a) : configured;
+  const spec = harnesses.lookup(kind);
   if (!spec?.newRunner) return null;
   // No container: the pod is the sandbox (an agent is a row, not a container).
   //
@@ -312,6 +348,9 @@ function newRunnerFor(a: AgentConfig, harnesses: ReturnType<typeof defaultHarnes
     maxTurns: a.max_turns,
     url: a.url,
     disallowedTools: disallowedTools(),
+    // Carried for the REMOTE transport, whose runtime holds both CLIs and both credentials: a turn
+    // that does not say which provider it means runs on the pod's env default.
+    harness: harnessOf(a),
   });
 }
 
@@ -334,7 +373,8 @@ function runClosure(runner: TurnRunner, cfg: AgentConfig): Wired["run"] {
     // which login folder a session file happened to land in — and with shared history, none.
     console.log(
       `worker: ${cfg.displayName ?? cfg.name} ${r.lean ? "inference" : "turn"} on ` +
-        `${perPerson ? `${r.user}'s login` : "the agent's login"} (${cfg.inference_mode ?? "shared"})`,
+        `${perPerson ? `${r.user}'s login` : "the agent's login"} ` +
+        `(${cfg.inference_mode ?? "shared"}, ${providerOf(cfg)})`,
     );
     return withAuthRaceRetry(() =>
       runner.run(
@@ -346,7 +386,10 @@ function runClosure(runner: TurnRunner, cfg: AgentConfig): Wired["run"] {
           sessionId: r.sessionId,
           sessionNew: r.sessionNew,
           lean: r.lean,
-          configHome: perPerson ? claudecode.configHomeFor(cfg.name, r.user) : undefined,
+          // The PROVIDER's own tree, not Claude's. A codex per-person login lives under
+          // /root/.codex/agents/<agent>/users/<user>, and pointing a codex turn at Claude's
+          // directory would find no credential there and fail while the login sat right beside it.
+          configHome: perPerson ? configHomeOf(cfg, r.user) : undefined,
         },
         signal,
       ),
@@ -1240,6 +1283,7 @@ export async function run(
     // Which Claude account this agent is signed in as. Straight from `claude auth status` in the
     // agent's own credential directory, trimmed to its first line — the point is to make "whose
     // subscription is this?" answerable from Slack, which it has never been.
+    inferenceProvider: (name) => providerLabel(providerOf(wired.get(name)?.cfg)),
     claudeAccount: async (name, user) => {
       // `claude auth status` answers in JSON — { loggedIn, email, subscriptionType, ... } — so the
       // first line of it is "{". Parsed, not scanned: reading this as text printed a lone brace
@@ -1253,8 +1297,13 @@ export async function run(
         if (!j.loggedIn) return "not signed in";
         return [j.email, j.subscriptionType && `(${j.subscriptionType})`].filter(Boolean).join(" ") || "signed in";
       } catch {
-        // A harness that answers in prose rather than JSON still gets to say something.
-        return raw.split(/\r?\n/).find((l) => l.trim())?.slice(0, 120) ?? "";
+        // A harness that answers in PROSE rather than JSON still gets to say something. codex is
+        // one: `codex login status` prints "Logged in using ChatGPT" or "Not logged in", and the
+        // second has to read as not-signed-in here or `!connections` lists an account that is not
+        // there. `looksLoggedIn` is the one place that judgement is made.
+        const line = raw.split(/\r?\n/).find((l) => l.trim())?.trim() ?? "";
+        if (!line) return "";
+        return looksLoggedIn(line) ? line.slice(0, 120) : "not signed in";
       }
     },
     resetSession: (name, conversation) => void forgetSession(name, conversation).catch(() => {}),
@@ -1279,7 +1328,7 @@ export async function run(
       // ask() returns false both when it POSTED a reason and when there was nothing to post, and
       // those need different answers. The second case is exactly this one, checked here so the
       // command never ends in silence.
-      if (!authDeps.ops(name)) return "I can't start a Claude login on this deployment.";
+      if (!authDeps.ops(name)) return `I can't start a ${providerLabel(providerOf(a.cfg))} login on this deployment.`;
       // Per-person agent: sign in the SPEAKER's own subscription (their own credential dir); shared:
       // the agent's one login, and the user is ignored — same offer either way.
       const u = a.cfg.inference_mode === "per_user" ? user : undefined;
@@ -1306,13 +1355,13 @@ export async function run(
       // per-person agent only the SPEAKER's own dir, so one teammate signing out never touches
       // another's.
       const a = wired.get(name);
-      const u = a?.cfg.inference_mode === "per_user" ? user : undefined;
-      const dir = claudecode.configHomeFor(name, u);
-      await fsp.rm(path.join(dir, ".credentials.json"), { force: true }).catch(() => {});
+      if (!a) return "I don't know that agent here.";
+      const u = a.cfg.inference_mode === "per_user" ? user : undefined;
+      await fsp.rm(credFileOf(a.cfg, u), { force: true }).catch(() => {});
       // So the gate offers a login on the very next message rather than after a restart. On a
       // per-person agent the gate is per-speaker (a file check), so there is no shared flag to flip.
-      if (a && a.cfg.inference_mode !== "per_user") a.cfg.auth_state = "unconfigured";
-      return "🔓 Signed out of Claude. Send me anything and I'll offer you a fresh login.";
+      if (a.cfg.inference_mode !== "per_user") a.cfg.auth_state = "unconfigured";
+      return `🔓 Signed out of ${providerLabel(providerOf(a.cfg))}. Send me anything and I'll offer you a fresh login.`;
     },
     disconnectPlaud: async (name, user) => {
       // Per-person: forget only the SPEAKER's own account, so one teammate signing out never touches
@@ -1460,9 +1509,15 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
     // agent in the pool shares one Claude subscription and the last person to sign in owns them.
     // `user`, when the caller passes it (a per-person agent), lands the login in the speaker's own
     // dir under the agent — so two teammates on one agent sign into their own subscriptions.
-    ops: (name, user) =>
-      wired.has(name) ? httpAuthOps(authBase, process.env.AGENT_RUNTIME_TOKEN, name, user) : undefined,
+    ops: (name, user) => {
+      const a = wired.get(name);
+      // `harness` says WHICH provider's login this is. One runtime holds both CLIs and both
+      // credential stores, so an unqualified call signs the person into whichever the pod's
+      // TONOMAN_HARNESS names — the wrong account, reported as a success.
+      return a ? httpAuthOps(authBase, process.env.AGENT_RUNTIME_TOKEN, name, user, harnessOf(a.cfg)) : undefined;
+    },
     conn: (name) => wired.get(name)?.conn as SlackConnector | undefined,
+    provider: (name) => providerOf(wired.get(name)?.cfg),
     setAuthState: async (name, state) => {
       const a = wired.get(name);
       const api = process.env.TONOMANCLOUD_API_URL;
@@ -1611,7 +1666,8 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
         // here) a file check is the right gate: it is a fact about a person, not a probe standing in
         // for the registry's word about the agent.
         if (a.cfg.inference_mode === "per_user") {
-          const credFile = path.join(claudecode.configHomeFor(name, env.user), ".credentials.json");
+          // The provider's own credential file (`auth.json` for codex), in the provider's own tree.
+          const credFile = credFileOf(a.cfg, env.user);
           const hasOwn = await fsp.access(credFile).then(() => true).catch(() => false);
           if (!hasOwn) {
             const asked = await gate

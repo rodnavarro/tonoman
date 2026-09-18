@@ -18,7 +18,7 @@
 
 import { promises as fs } from "node:fs";
 import * as path from "node:path";
-import type { Spec, RunnerParams } from "../harness";
+import type { HarnessKind, Spec, RunnerParams } from "../harness";
 import type { TurnEvent, TurnRequest, TurnRunner } from "../core/contracts";
 import { IMAGE, CONFIG_HOME, IDENTITY_HOME } from "./claudecode";
 import type { BackendMode } from "./claudecode";
@@ -41,6 +41,14 @@ export interface HttpRunnerOptions {
   token?: string;
   /** injectable transport for tests; defaults to global fetch. */
   fetch?: typeof fetch;
+  /** WHICH provider's CLI the runtime should run this turn on ("claude-code" | "codex"). The pod
+   * holds both CLIs and both credentials, so a turn that does not say lands on the pod's env
+   * default (TONOMAN_HARNESS) — which for a codex agent is the wrong account and the wrong bill. */
+  harness?: HarnessKind;
+  /** WHOSE credential directory the turn runs under, when the agent runs inference per person.
+   * The gateway resolves it (it knows the provider AND the speaker); the runtime applies it
+   * through that harness's own env var. Unset = the agent's one shared login. */
+  configHome?: string;
 }
 
 function clip(s: string, n = 200): string {
@@ -160,6 +168,12 @@ export class HttpRunner implements TurnRunner {
       model: this.model,
       maxTurns: this.o.maxTurns,
       backend: this.backend, // snapshot the backend into the body (backend-switch-live)
+      // WHICH provider answers (W1). Snapshotted per turn like the model: the runtime honours it
+      // over its own TONOMAN_HARNESS default, so one pod serves a claude agent and a codex one.
+      harness: this.o.harness,
+      // WHOSE login answers, when the agent runs inference per person. The gateway picked the
+      // directory because only it knows both the provider and the speaker.
+      configHome: req.configHome,
       sessionId: req.sessionId,
       sessionNew: req.sessionNew,
       media: media.length ? media : undefined,
@@ -216,6 +230,13 @@ export function spec(): Spec {
     identityHome: IDENTITY_HOME,
     remote: true, // gateway skips podman lifecycle/broker; health probes HTTP (see gateway gating)
     newRunner: (p: RunnerParams) =>
-      new HttpRunner({ url: p.url ?? "", model: p.model, maxTurns: p.maxTurns, backend: p.backend, token: process.env.AGENT_RUNTIME_TOKEN }),
+      new HttpRunner({
+        url: p.url ?? "",
+        model: p.model,
+        maxTurns: p.maxTurns,
+        backend: p.backend,
+        harness: p.harness,
+        token: process.env.AGENT_RUNTIME_TOKEN,
+      }),
   };
 }

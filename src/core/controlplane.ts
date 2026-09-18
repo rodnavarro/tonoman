@@ -56,6 +56,9 @@ export interface RegistryAgent {
   identity?: string | null;
   authState?: string | null;
   inferenceMode?: string | null;
+  /** WHICH provider answers a turn: `claude` (a Claude subscription) or `codex` (a ChatGPT one).
+   *  Separate from `inferenceMode`, which is about WHOSE login, not whose model. Absent = claude. */
+  inferenceProvider?: string | null;
   credentialSecretRef?: string | null;
   channel: string;
   teamId: string;
@@ -238,6 +241,10 @@ export class RegistryControlPlane implements ControlPlane {
         // Shared unless the registry says per-person, so an agent with no opinion (and every
         // file-roster agent) keeps the single shared login.
         inference_mode: a.inferenceMode === "per_user" ? "per_user" : "shared",
+        // Claude unless the registry says codex, so an agent with no opinion (and every file-roster
+        // agent) keeps answering exactly as it does today. Same whitelist hazard as everything else
+        // here: dropped from this map, a provider set in the Hub would silently do nothing.
+        inference_provider: a.inferenceProvider === "codex" ? "codex" : "claude",
         principals: a.principals ?? [],
         flows: a.flows ?? {},
         // Mapped EXPLICITLY, like everything else here. This mapping is a whitelist by design — the

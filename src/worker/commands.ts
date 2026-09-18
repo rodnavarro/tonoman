@@ -192,12 +192,16 @@ export interface CommandDeps {
   lastUsage(conversation: string): TurnUsage | undefined;
   /** Account headroom (5h / 7d). Fetched from the agent's own runtime; [] when unavailable. */
   windows(agent: string): Promise<UsageWindow[]>;
-  /** Which Claude account THIS agent runs on. Empty when the deployment cannot say.
+  /** Which inference account THIS agent runs on. Empty when the deployment cannot say.
    *
    *  Worth a line in `!status` because it is otherwise unknowable from the outside: two agents
    *  answering identically may be spending two different people's subscriptions, or the same one
    *  twice, and nothing in a reply distinguishes those. */
   claudeAccount?(agent: string, user?: string): Promise<string>;
+  /** WHICH provider this agent answers on, named for a person ("Claude" / "Codex"). The account
+   *  line above says WHOSE; without this it does not say whose WHAT — and an agent quietly moved to
+   *  the other provider reads identically to one that was not. */
+  inferenceProvider?(agent: string): string;
   /** Which model THIS conversation runs. Scoped to the conversation, never to the process: one
    *  worker serves every thread in the tenant, so a process-wide knob meant one person's `!model`
    *  changed the model under everybody else mid-conversation. */
@@ -239,9 +243,9 @@ const HELP = [
   "• `!connect google` / `!connect outlook` — add a calendar, so I know which meeting a recording was",
   "• `!connect ics` — add a calendar by its published address, when the account itself is blocked",
   "•  …add a name to keep more than one: `!connect google work`",
-  "• `!connect claude` — sign in to the Claude subscription I answer on",
+  "• `!connect claude` / `!connect codex` — sign in to the subscription I answer on",
   "• `!disconnect plaud` — forget it again",
-  "• `!disconnect claude` — sign out of the Claude subscription I answer on",
+  "• `!disconnect claude` / `!disconnect codex` — sign out of the subscription I answer on",
   "• `!connections` — what this agent is connected to",
   "• `!talent <name> <id> [again]` — run a Talent on one item now, instead of waiting for its schedule (`again` re-runs an already-filed item)",
   "• `!talent agenda-brief now` — review today's calendar now: what's left, what overlaps, where the free time is",
@@ -301,10 +305,11 @@ async function gatherLegacy(deps: CommandDeps, agent: string, user?: string): Pr
   // On a per-person agent this is the SPEAKER's own subscription.
   const account = await deps.claudeAccount?.(agent, user).catch(() => "");
   if (account && !/^not signed in/i.test(account)) {
+    const provider = deps.inferenceProvider?.(agent) ?? "Claude";
     out.push({
-      kind: "claude",
+      kind: provider.toLowerCase(),
       alias: "default",
-      label: "Claude subscription",
+      label: `${provider} subscription`,
       status: "connected",
       externalAccount: account,
     });
@@ -329,7 +334,12 @@ export function splitConnector(arg: string): { which: string; rest: string } {
  *  contradicts itself in one line, reached by following the instruction the agent had just given.
  *  The dispatch below is checked against this list, so the two cannot drift apart again without a
  *  test failing. */
-export const CONNECT_KINDS = ["claude", "plaud", "google", "outlook", "ics"] as const;
+export const CONNECT_KINDS = ["claude", "codex", "plaud", "google", "outlook", "ics"] as const;
+
+/** The inference providers, as a person names them. Both reach the SAME gate — which one an agent
+ *  actually runs on is the roster's business, not the typist's, so `!connect codex` on a Claude
+ *  agent starts a Claude login rather than refusing over a word. */
+export const INFERENCE_KINDS = ["claude", "codex"] as const;
 
 /** The refusal names what is available HERE - `!code` takes only plaud, `!disconnect` takes two -
  *  rather than reciting one global list in a context where most of it is wrong. */
@@ -375,11 +385,11 @@ export async function run(
     case "logout": {
       const { which } = splitConnector(cmd.arg);
       if (!which) return "Which one? `!disconnect plaud` or `!disconnect claude`.";
-      if (which === "claude") {
-        if (!deps.disconnectClaude) return "I have no way to sign out of Claude on this deployment.";
+      if ((INFERENCE_KINDS as readonly string[]).includes(which)) {
+        if (!deps.disconnectClaude) return "I have no way to sign out of an inference provider on this deployment.";
         return deps.disconnectClaude(agent, user);
       }
-      if (which !== "plaud") return unknownConnector(which, ["plaud", "claude"]);
+      if (which !== "plaud") return unknownConnector(which, ["plaud", ...INFERENCE_KINDS]);
       if (!deps.disconnectPlaud) return "I have no way to disconnect an account on this deployment.";
       return deps.disconnectPlaud(agent, user);
     }
@@ -392,8 +402,8 @@ export async function run(
       // The subscription this agent ANSWERS on, as opposed to an outside account it reads. Listed
       // with the others because that is not a distinction a person has any reason to know - and
       // `!disconnect claude` has always existed, so the missing half read as a broken command.
-      if (which === "claude") {
-        if (!deps.connectClaude) return "I have no way to sign in to Claude on this deployment.";
+      if ((INFERENCE_KINDS as readonly string[]).includes(which)) {
+        if (!deps.connectClaude) return "I have no way to sign in to an inference provider on this deployment.";
         return deps.connectClaude(agent, conversation, user);
       }
 
@@ -444,7 +454,8 @@ export async function run(
     case "usage": {
       const windows = await deps.windows(agent).catch(() => [] as UsageWindow[]);
       const account = (await deps.claudeAccount?.(agent, user).catch(() => "")) ?? "";
-      const who = account ? `🔑 Claude account: ${account}` : "";
+      const provider = deps.inferenceProvider?.(agent) ?? "Claude";
+      const who = account ? `🔑 ${provider} account: ${account}` : `🔑 Inference provider: ${provider}`;
       const u = deps.lastUsage(conversation);
       // Account headroom is always answerable; per-turn numbers only after a turn has run here.
       const body =

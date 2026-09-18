@@ -510,3 +510,61 @@ describe("!talent — on-demand run, with `again` to bypass the idempotency guar
     expect(runTalent).not.toHaveBeenCalled();
   });
 });
+
+// W1/W2 — two providers, so a command that says "Claude" has to say which one it means.
+describe("!status and !connections name the agent's own provider", () => {
+  const base = {
+    getMode: () => "compact" as StatusMode,
+    setMode: () => {},
+    lastUsage: () => undefined,
+    windows: async () => [],
+    getModel: () => undefined,
+    setModel: () => {},
+    connectClaude: async () => "",
+    disconnectClaude: async () => "signed out",
+    connections: async () => [],
+    plaudConnected: async () => false,
+  };
+
+  it("a codex agent's !status says Codex, not Claude", async () => {
+    const d = {
+      ...base,
+      claudeAccount: async () => "rod@rodnavarro.com (plus)",
+      inferenceProvider: () => "Codex",
+    } as unknown as CommandDeps;
+    const out = (await run(d, "a", "c", { name: "status", arg: "" })) ?? "";
+    expect(out).toContain("Codex account: rod@rodnavarro.com (plus)");
+    expect(out).not.toContain("Claude account");
+  });
+
+  it("with no account readable it still says WHICH provider — the question is otherwise unanswerable", async () => {
+    const d = { ...base, claudeAccount: async () => "", inferenceProvider: () => "Codex" } as unknown as CommandDeps;
+    const out = (await run(d, "a", "c", { name: "status", arg: "" })) ?? "";
+    expect(out).toContain("Inference provider: Codex");
+  });
+
+  it("an agent with no provider opinion still reads as Claude, exactly as before", async () => {
+    const d = { ...base, claudeAccount: async () => "x@y.com" } as unknown as CommandDeps;
+    expect((await run(d, "a", "c", { name: "status", arg: "" })) ?? "").toContain("Claude account: x@y.com");
+  });
+
+  it("!connections lists the subscription under the provider that actually answers", async () => {
+    const d = {
+      ...base,
+      claudeAccount: async () => "rod@rodnavarro.com",
+      inferenceProvider: () => "Codex",
+    } as unknown as CommandDeps;
+    const out = (await run(d, "a", "c", { name: "connections", arg: "" })) ?? "";
+    expect(out).toContain("Codex subscription");
+    expect(out).toContain("codex/default");
+  });
+
+  it("`!disconnect codex` signs out of inference, rather than being refused over a word", async () => {
+    // Which provider an agent runs on is the roster's business, not the typist's: refusing
+    // `!disconnect codex` on a Claude agent would be a correction nobody can act on.
+    let called = 0;
+    const d = { ...base, disconnectClaude: async () => { called++; return "signed out"; } } as unknown as CommandDeps;
+    expect(await run(d, "a", "c", { name: "disconnect", arg: "codex" })).toBe("signed out");
+    expect(called).toBe(1);
+  });
+});

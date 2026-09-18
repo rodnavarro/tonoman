@@ -89,7 +89,7 @@ const ops = (): ReturnType<typeof httpAuthOps> => httpAuthOps(base, TOKEN);
 
 describe("roster-auth-remote — headless login over the agent's own HTTP runtime", () => {
   it("URL out, code in: the operator gets the OAuth URL and the code completes the login", async () => {
-    const url = await ops().startHeadless();
+    const { url } = await ops().startHeadless();
     expect(url).toBe(URL_IN_LOGIN);
 
     // the credential does not exist until the code lands — the login is genuinely pending
@@ -132,7 +132,7 @@ describe("roster-auth-remote — headless login over the agent's own HTTP runtim
 
   it("a second login supersedes a pending one (the stale PKCE verifier is dead anyway)", async () => {
     await ops().startHeadless();
-    const url = await ops().startHeadless(); // must not hang or 409
+    const { url } = await ops().startHeadless(); // must not hang or 409
     expect(url).toBe(URL_IN_LOGIN);
   });
 

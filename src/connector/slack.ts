@@ -416,6 +416,32 @@ export class SlackConnector implements Connector {
     return res.ts ?? "";
   }
 
+  /** Post a message only THIS person can see (`chat.postEphemeral`). For something that is theirs
+   *  and nobody else's — a sign-in link and a one-time device code — in the conversation they asked
+   *  in, rather than in a channel where it stays in history and in the workspace export.
+   *
+   *  Returns false when Slack refused it (an ephemeral post needs the person to be IN the channel,
+   *  and there is no ephemeral in a DM the bot opened), so the caller can fall back to an ordinary
+   *  post rather than leave somebody staring at nothing.
+   *
+   *  A thread_ts is passed through when there is one, so the message lands where the conversation
+   *  is — Slack anchors an ephemeral to the thread exactly as it does a real reply. */
+  async postEphemeral(conversation: string, user: string, text: string, blocks?: unknown[]): Promise<boolean> {
+    const t = parseConversation(conversation);
+    try {
+      await this.call("chat.postEphemeral", {
+        channel: t.channel,
+        user,
+        text,
+        ...(blocks ? { blocks } : {}),
+        ...(t.threadTs ? { thread_ts: t.threadTs } : {}),
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   /** Turns a Slack event into a neutral envelope, or null to ignore it.
    *
    *  We answer three things: an `app_mention` (someone said @nelly), a `message` in a DM, and — when

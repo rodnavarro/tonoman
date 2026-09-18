@@ -11,6 +11,7 @@
 // URL extractor is pure (ANSI-stripped) so it's unit-tested without a container.
 
 import { execFile } from "node:child_process";
+import type { HarnessKind } from "./harness";
 
 const FIFO = "/tmp/tonoman-auth.fifo";
 const LOG = "/tmp/tonoman-auth.log";
@@ -196,19 +197,30 @@ async function credMtime(container: string, file?: string): Promise<number> {
  * reach the sandbox differs. The CLI talks to this, so `tonoman auth login --headless` reads the
  * same for both — the split stops being the operator's problem. */
 export interface AuthOps {
-  /** start the harness login in the agent's sandbox and return the OAuth URL */
-  startHeadless(): Promise<string>;
+  /** Start the harness login in the agent's sandbox and return what the person has to act on.
+   *
+   *  `code` is set ONLY by a device-auth harness (codex). The two flows run opposite directions:
+   *  Claude prints a URL and expects a code BACK from the person (`submitCode`); codex prints a URL
+   *  AND a code and expects the person to enter OUR code on the provider's page while the CLI
+   *  polls. So a `code` here means "show them this, then wait" — never "ask them for one". */
+  startHeadless(): Promise<{ url: string; code?: string }>;
   /** deliver the code; ok is OUTCOME-TRUE (the credential file actually changed) */
   submitCode(code: string): Promise<{ ok: boolean; status: string; loginTail: string }>;
   /** optional: what the harness reports about the credential in use — which account, which plan.
    *  Optional because not every transport can ask; callers show what they get and nothing more. */
   status?(): Promise<string>;
+  /** Device auth only: has the login this `startHeadless` began actually completed? Polled, because
+   *  nothing comes back through us to tell us. Judged the same way `submitCode` judges a pasted
+   *  code — OUTCOME-TRUE, the credential file moved AND the harness agrees. */
+  pending?(): Promise<{ done: boolean; loggedIn: boolean; status: string }>;
 }
 
 /** LOCAL agents: drive the login through `podman exec` (the original roster-auth-headless path). */
 export function podmanAuthOps(container: string, loginArgs: string[], statusArgs: string[], credFile?: string): AuthOps {
   return {
-    startHeadless: () => startHeadless(container, loginArgs),
+    // No `code`: the podman path drives the Claude paste-a-code flow only. A device-auth harness
+    // reaches its runtime over HTTP, which is where the second string is read.
+    startHeadless: async () => ({ url: await startHeadless(container, loginArgs) }),
     submitCode: (code) => submitCode(container, statusArgs, code, credFile),
   };
 }
@@ -250,7 +262,17 @@ export function transportFailure(e: unknown, base: string): string {
  * credential store, so it runs the PTY dance itself (same reason /usage lives agent-side).
  * We send only the CODE, never a command: the login argv comes from the agent's harness spec,
  * so this can never become a remote-exec primitive. */
-export function httpAuthOps(baseUrl: string, token?: string, agent?: string, user?: string): AuthOps {
+export function httpAuthOps(
+  baseUrl: string,
+  token?: string,
+  agent?: string,
+  user?: string,
+  /** WHICH provider's login this is (W1). One runtime holds both CLIs and both credential stores,
+   *  so an unqualified call runs whatever the pod's TONOMAN_HARNESS happens to say — which for an
+   *  agent configured the other way signs the person into the wrong account and then reports it as
+   *  a success. Rides the QUERY STRING for the same reason `agent` does: the runtime reads the URL. */
+  harness?: HarnessKind,
+): AuthOps {
   const base = baseUrl.replace(/\/$/, "");
   const headers: Record<string, string> = { "content-type": "application/json" };
   if (token) headers["authorization"] = `Bearer ${token}`;
@@ -293,15 +315,23 @@ export function httpAuthOps(baseUrl: string, token?: string, agent?: string, use
   const params = new URLSearchParams();
   if (agent) params.set("agent", agent);
   if (user) params.set("user", user);
+  if (harness) params.set("harness", harness);
   const q = params.toString() ? `?${params.toString()}` : "";
-  const who = { ...(agent ? { agent } : {}), ...(user ? { user } : {}) };
+  const who = { ...(agent ? { agent } : {}), ...(user ? { user } : {}), ...(harness ? { harness } : {}) };
 
   return {
-    async startHeadless(): Promise<string> {
+    async startHeadless(): Promise<{ url: string; code?: string }> {
       const r = await call(`/auth/login${q}`, who);
       const url = typeof r.url === "string" ? r.url : "";
       if (!url) throw new Error("auth: the agent runtime started a login but produced no URL");
-      return url;
+      // Device auth answers with both; the paste-a-code flow answers with a URL alone.
+      const code = typeof r.code === "string" && r.code ? r.code : undefined;
+      return { url, code };
+    },
+    /** Device auth (codex): has the login finished on the provider's side yet? */
+    async pending(): Promise<{ done: boolean; loggedIn: boolean; status: string }> {
+      const r = await call(`/auth/pending${q}`);
+      return { done: r.done === true, loggedIn: r.loggedIn === true, status: String(r.status ?? "") };
     },
     /** What the harness reports for THIS agent (and person, if per-user): which account, which plan. */
     async status(): Promise<string> {

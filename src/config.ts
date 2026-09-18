@@ -152,6 +152,15 @@ export interface AgentConfig {
    * in the speaker's own credential directory (`configHomeFor(agent, user)`) and `!connect claude`
    * signs THAT person in; `shared` keeps the single per-agent login untouched. Undefined = shared. */
   inference_mode?: "shared" | "per_user";
+  /** WHICH inference provider answers this agent's turns: `claude` (a Claude subscription, the
+   * default and every agent before this) or `codex` (a ChatGPT subscription, driven through the
+   * codex CLI). Orthogonal to `inference_mode`, which decides WHOSE login rather than whose model.
+   *
+   * It picks the harness a turn runs on, the credential store a login writes
+   * (`CLAUDE_CONFIG_DIR` vs `CODEX_HOME`), the login flow (`!connect claude` vs `!connect codex`)
+   * and what the runtime is told on every call (`harness: 'claude-code' | 'codex'`). Undefined =
+   * claude, so a roster that has never heard of this field is unchanged. */
+  inference_provider?: "claude" | "codex";
   /** Who this agent recognises, and as whom. A Slack user id resolves to a name the agent can use,
    * which is how "Hi Celine" happens — from the registry, never from a spoofable display name.
    * Deliberately unrelated to console access (§7): talking to an agent is not signing in. */
