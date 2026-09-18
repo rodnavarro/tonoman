@@ -88,16 +88,57 @@ export function workerOptionsFrom(env: NodeJS.ProcessEnv): WorkerOptions {
   };
 }
 
-/** Resolve `<secret>:<key>` from the mounted secret tree — the same contract the control plane
- *  uses. Returns "" when absent; the caller decides whether that is fatal. A ref comes from a
- *  database edited through a web form, so anything that could climb out of the mount is refused
- *  rather than read. */
-async function resolveRef(ref: string | null | undefined): Promise<string> {
-  if (!ref) return "";
-  const i = ref.indexOf(":");
+/** PURE: which scheme a credential ref names, and what is left after it.
+ *
+ *  Split out and exported because the two schemes are one character apart in appearance and a world
+ *  apart in effect, and getting the precedence wrong is SILENT: `registry:slack.bot-token` satisfies
+ *  the mounted-secret grammar perfectly well, so read the old way it would look for a file at
+ *  `<secrets-dir>/registry/slack.bot-token`, not find one, and return "" — an agent that "has no
+ *  token" while its token sits encrypted in the registry. So the prefix is checked FIRST. */
+export function parseRef(ref: string | null | undefined): { kind: "registry" | "mount"; ref: string } | undefined {
+  const t = (ref ?? "").trim();
+  if (!t) return undefined;
+  // `registry:<ref>` — the ref is a row in the registry's `secret` table, and the whole rest of the
+  // string is its name. No character class here on purpose: the API owns that namespace and the
+  // value is URL-encoded into a path rather than joined onto a filesystem one.
+  if (t.startsWith("registry:")) {
+    const name = t.slice("registry:".length);
+    return name ? { kind: "registry", ref: name } : undefined;
+  }
+  return { kind: "mount", ref: t };
+}
+
+/** Resolve a credential ref. TWO SCHEMES, and which one is in play is the ref's own business:
+ *
+ *   `<secret>:<key>`   a MOUNTED Kubernetes secret — the original contract, unchanged.
+ *   `registry:<ref>`   a row in the registry's `secret` table, fetched over the system-token API
+ *                      and decrypted on the far side, so this worker never holds the key.
+ *
+ *  The second is how a Slack bot token pasted into the Hub reaches a running worker: the API stores
+ *  it encrypted and puts a `registry:…` ref on the channel row. A mounted path cannot serve that —
+ *  a path is a property of the POD, and one pod serves every tenant it has agents for, so a
+ *  self-service token would mean a redeploy and a secret in a cluster manifest.
+ *
+ *  Returns "" when absent, whichever scheme: the caller decides whether that is fatal, and a 404
+ *  (nothing stored yet) reads the same as an unmounted file, which is the honest answer for both.
+ *  A ref comes from a database edited through a web form, so anything that could climb out of the
+ *  mount is still refused rather than read. */
+export async function resolveRef(
+  ref: string | null | undefined,
+  /** The agent the ref belongs to. The registry scheme is scoped per agent — a secret is a
+   *  tenant's, and reading one without saying whose would be the cross-tenant read this whole
+   *  arrangement exists to prevent. A `registry:` ref with no guid resolves to "". */
+  guid?: string,
+  fetchImpl?: typeof fetch,
+): Promise<string> {
+  const p = parseRef(ref);
+  if (!p) return "";
+  if (p.kind === "registry") return registrySecret(guid, p.ref, fetchImpl);
+
+  const i = p.ref.indexOf(":");
   if (i < 0) return "";
-  const secret = ref.slice(0, i);
-  const key = ref.slice(i + 1);
+  const secret = p.ref.slice(0, i);
+  const key = p.ref.slice(i + 1);
   if (!/^[A-Za-z0-9._-]+$/.test(secret) || !/^[A-Za-z0-9._-]+$/.test(key)) return "";
   const dir = process.env.TONOMAN_SECRETS_DIR ?? "/etc/tonoman/secrets";
   try {
@@ -116,10 +157,10 @@ const trimSlash = (u: string): string => u.replace(/[/]+$/, "");
  *  A row whose `key_ref` is named but resolves to nothing is DROPPED, not sent unauthenticated. An
  *  unmounted secret is a deployment fault, and turning it into a 401 from Groq spends an attempt to
  *  produce a message that blames the wrong thing. */
-async function providersFrom(specs: flowcfg.ProviderSpec[], who: string): Promise<inference.Provider[]> {
+async function providersFrom(specs: flowcfg.ProviderSpec[], who: string, guid?: string): Promise<inference.Provider[]> {
   const out: inference.Provider[] = [];
   for (const sp of specs) {
-    const apiKey = sp.keyRef ? await resolveRef(sp.keyRef) : "";
+    const apiKey = sp.keyRef ? await resolveRef(sp.keyRef, guid) : "";
     if (sp.keyRef && !apiKey) {
       console.log(`worker: ${who} provider ${sp.name} skipped — ${sp.keyRef} is empty or unmounted`);
       continue;
@@ -206,13 +247,19 @@ function envSummarize(env: NodeJS.ProcessEnv): inference.Provider[] {
  * Empty rather than throwing. A connection whose credential cannot be read is one calendar that
  * will not match, and the recap still has to be filed.
  */
-async function registrySecret(guid: string | undefined, ref: string | undefined): Promise<string> {
+export async function registrySecret(
+  guid: string | undefined,
+  ref: string | undefined,
+  /** Injectable transport, so the request this makes is testable without a registry. */
+  fetchImpl?: typeof fetch,
+): Promise<string> {
   const baseUrl = process.env.TONOMANCLOUD_API_URL;
   if (!baseUrl || !guid || !ref) return "";
   try {
-    const r = await fetch(`${baseUrl}/v1/system/agents/${guid}/secrets/${encodeURIComponent(ref)}`, {
-      headers: { authorization: `Bearer ${process.env.TONOMANCLOUD_API_TOKEN ?? ""}` },
-    });
+    const r = await (fetchImpl ?? fetch)(
+      `${baseUrl.replace(/[/]+$/, "")}/v1/system/agents/${guid}/secrets/${encodeURIComponent(ref)}`,
+      { headers: { authorization: `Bearer ${process.env.TONOMANCLOUD_API_TOKEN ?? ""}` } },
+    );
     // 404 is "not connected", which is a state rather than a failure. Anything else is worth a line
     // — a 500 here means the KEK is wrong or the row is unreadable, and silently treating that as
     // "no calendar" would hide a real fault behind a plausible absence.
@@ -668,7 +715,9 @@ export async function run(
       const ready = await secondbrain
         .sync(sources, {
           root: path.join(process.env.TONOMAN_STATE_ROOT ?? "/root/.tonoman", "secondbrain", name),
-          resolveRef,
+          // Bound to THIS agent, because a `registry:` ref is scoped to the agent that owns it —
+          // resolving one without saying whose is the cross-tenant read the scheme exists to avoid.
+          resolveRef: (ref) => resolveRef(ref, a.cfg.guid),
           // Quiet on the timer: one line per source per minute is noise, and a failure still logs.
           log: (s) => {
             if (!a.context || /failed/.test(s)) console.log(s);
@@ -789,7 +838,7 @@ export async function run(
       }
       console.log(`worker: ${name} voice flow (per-person) — ${members.length} member account(s) connected`);
     } else {
-      tokenJson = await resolveRef(voice.credentialRef);
+      tokenJson = await resolveRef(voice.credentialRef, a.cfg.guid);
       // Either credential counts. An agent that connected its own account through !connect needs no
       // mounted secret at all — which is the whole point of the connect flow, and the state every
       // tenant should end up in.
@@ -810,9 +859,9 @@ export async function run(
     const rowTranscribe = flowcfg.providerSpecs(rows, "transcribe");
     const rowSummarize = flowcfg.providerSpecs(rows, "summarize");
     const transcribe = rowTranscribe.length
-      ? await providersFrom(rowTranscribe, name)
+      ? await providersFrom(rowTranscribe, name, a.cfg.guid)
       : envTranscribe(process.env);
-    const summarize = rowSummarize.length ? await providersFrom(rowSummarize, name) : envSummarize(process.env);
+    const summarize = rowSummarize.length ? await providersFrom(rowSummarize, name, a.cfg.guid) : envSummarize(process.env);
     if (transcribe.length === 0 || !src) {
       console.log(
         `worker: ${name} has no voice flow (needs a transcription provider — transcribe.* rows or GROQ_API_KEY — and a second-brain source)`,
@@ -866,7 +915,7 @@ export async function run(
       calendars.push({ kind: c.kind, alias: c.alias, url });
     }
 
-    const token = await resolveRef(src.secret_ref);
+    const token = await resolveRef(src.secret_ref, a.cfg.guid);
     const pushUrl = token ? src.repo_url.replace("https://", `https://x-access-token:${token}@`) : src.repo_url;
     const dir = path.join(process.env.TONOMAN_STATE_ROOT ?? "/root/.tonoman", "secondbrain", name, src.id);
     // The installed Talent that drives the voice flow, if any — the built-in Plaud reference Talent,
