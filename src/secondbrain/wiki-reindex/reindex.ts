@@ -104,6 +104,29 @@ export interface ReindexResult {
   enriched: number;
 }
 
+/** Publish a built graph to Tonoman Cloud so the Hub's Second brain view can render it. System
+ *  token, one row per tenant. Best-effort — a reindex still writes .tonoman whether or not the Hub
+ *  is reachable. */
+export async function publishGraph(
+  api: string,
+  token: string,
+  tenant: string,
+  payload: { graph: Graph; stats: ReturnType<typeof graphStats>; generatedAt: string },
+  fetchImpl: typeof fetch = fetch,
+): Promise<{ ok: boolean; status: number; error?: string }> {
+  try {
+    const r = await fetchImpl(`${api.replace(/[/]+$/, '')}/v1/system/tenants/${encodeURIComponent(tenant)}/second-brain/graph`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+      body: JSON.stringify(payload),
+    });
+    if (!r.ok) return { ok: false, status: r.status, error: (await r.text().catch(() => '')).slice(0, 200) };
+    return { ok: true, status: r.status };
+  } catch (e) {
+    return { ok: false, status: 0, error: (e as Error).message };
+  }
+}
+
 /** Build the graph and the index files, write them under `<repo>/.tonoman/`. Returns the graph and
  *  stats for the log and the report. `enrich` > 0 asks the LLM to summarise that many of the busiest
  *  pages into the index (bounded, because a local model on a small GPU is slow). */
@@ -212,9 +235,20 @@ if (process.argv[1] && /reindex\.(ts|mjs|js)$/.test(process.argv[1])) {
   const enrich = enrichIdx >= 0 ? Number(process.argv[enrichIdx + 1]) || 0 : 0;
   const only = onlyIdx >= 0 ? process.argv[onlyIdx + 1] : undefined;
   const provider = enrich > 0 ? ollamaProvider() : undefined;
+  const generatedAt = new Date().toISOString();
   reindex(repo, { enrich, only, provider })
-    .then((r) => {
+    .then(async (r) => {
       console.log(`reindex: ${JSON.stringify(r.stats)} · enriched ${r.enriched}`);
+      // --publish <tenant> (or SECONDBRAIN_TENANT) pushes the graph to Tonoman Cloud for the Hub's
+      // Second brain view. The API base + token come from the env the worker already carries.
+      const pubIdx = process.argv.indexOf('--publish');
+      const tenant = pubIdx >= 0 ? process.argv[pubIdx + 1] : process.env.SECONDBRAIN_TENANT;
+      if (tenant) {
+        const api = process.env.SECONDBRAIN_API_URL ?? process.env.TONOMANCLOUD_API_URL ?? 'http://localhost:18080';
+        const token = process.env.SECONDBRAIN_API_TOKEN ?? process.env.TONOMANCLOUD_API_TOKEN ?? process.env.SYSTEM_TOKEN ?? '';
+        const res = await publishGraph(api, token, tenant, { graph: r.graph, stats: r.stats, generatedAt });
+        console.log(res.ok ? `reindex: published graph to ${tenant} (${api})` : `reindex: publish failed — ${res.status} ${res.error ?? ''}`);
+      }
       if (process.argv.includes('--commit')) {
         try {
           // Stage AND commit only .tonoman — a bare `git commit` would sweep in anything else the
