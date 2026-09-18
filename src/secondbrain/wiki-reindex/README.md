@@ -52,6 +52,10 @@ infra branch, not merged — see the report).
 
 ## Notes
 
+- **Opening the explorer:** `explorer.html` fetches `./graph.json` beside it, so it must be *served*
+  over http(s) (the ADO wiki's attachment host, a static server, or the Hub) — double-clicking it
+  from disk (`file://`) is blocked by the browser and it shows "Could not load graph.json".
+
 - **GPU:** `gemma4:latest` (9.6 GB) does not fit an 8 GB card while the whisper server is resident,
   so the dev enrichment ran on `gemma2:2b`. On a card with headroom (or when whisper is not loaded)
   set `SECONDBRAIN_LLM_MODEL=gemma4:latest`.

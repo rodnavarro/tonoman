@@ -283,7 +283,7 @@
 
     // Build the force-graph node/link sets for the current filters. force-graph mutates node objects
     // with x/y, so we keep ONE object per id and reuse it, or the layout resets on every toggle.
-    const nodeObj = new Map(data.nodes.map((n) => [n.id, { id: n.id, label: n.label, folder: topFolder(n.id), stub: n.stub, degree: n.degree }]));
+    const nodeObj = new Map(data.nodes.map((n) => [n.id, { id: n.id, label: n.label, ql: String(n.label).toLowerCase(), folder: topFolder(n.id), stub: n.stub, degree: n.degree }]));
     function currentData() {
       const showNode = (n) => {
         if (n.stub && !state.stub) return false;
@@ -306,7 +306,7 @@
       .nodeVal((n) => 1 + Math.sqrt(n.degree))
       .nodeColor((n) => {
         const base = n.stub ? "#3a5462" : colorOf(n.id);
-        if (state.q && n.label.toLowerCase().includes(state.q)) return "#ffd98a";
+        if (state.q && (n.ql || String(n.label).toLowerCase()).includes(state.q)) return "#ffd98a";
         if (state.hover) return state.hover === n.id || neighbors.get(state.hover)?.has(n.id) ? base : "#22323c";
         return base;
       })

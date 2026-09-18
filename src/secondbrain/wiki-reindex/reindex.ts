@@ -168,7 +168,10 @@ function renderIndex(
   summaries: Map<string, { summary: string; tags: string[] }>,
   when: Date,
 ): string {
-  const link = (id: string, label: string) => `[${label}](/${id})`;
+  // The href keeps the encoded id (safe); the DISPLAY label is decoded, so a `]`, `(` or
+  // newline in it could malform the Markdown link — neutralise those in the visible text only.
+  const safeLabel = (l: string) => l.replace(/\s+/g, ' ').replace(/[[\](){}]/g, ' ').trim();
+  const link = (id: string, label: string) => `[${safeLabel(label)}](/${id})`;
   const lines: string[] = [
     '# Second brain — index',
     '',
