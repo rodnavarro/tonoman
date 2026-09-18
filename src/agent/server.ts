@@ -463,6 +463,8 @@ async function handleAuthLogin(req: http.IncomingMessage, res: http.ServerRespon
   // is differs by harness (CLAUDE_CONFIG_DIR / CODEX_HOME) — see homeEnv.
   const who = agentOf(req);
   const user = userOf(req);
+  // codex refuses a missing CODEX_HOME; make sure the per-person home exists before the login runs.
+  if (h === "codex" && who) codex.ensureCodexHome(homeFor(h, who, user));
   const overlay = homeEnv(h, who, user);
   const child = spawn(argv[0], argv.slice(1), {
     // Device auth writes its own transcript; the PTY path has `script` write it instead.

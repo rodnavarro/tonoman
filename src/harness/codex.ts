@@ -113,9 +113,23 @@ export interface RunnerOptions {
  * drop OPENAI_API_KEY so the ChatGPT-subscription OAuth resolves (an API key must never outrank
  * the sub — mirrors claudecode dropping ANTHROPIC_API_KEY). Pure + testable. */
 export function localEnv(base: NodeJS.ProcessEnv, configHome: string = CONFIG_HOME): NodeJS.ProcessEnv {
+  // codex REFUSES to start when CODEX_HOME does not exist ("path does not exist"), where claude
+  // would create its config dir. So the home is ensured here, at the one place every codex child's
+  // CODEX_HOME is set — a login, a turn, a status check all pass through localEnv or homeEnv.
+  ensureCodexHome(configHome);
   const env: NodeJS.ProcessEnv = { ...base, CODEX_HOME: configHome };
   delete env.OPENAI_API_KEY;
   return env;
+}
+
+/** Create a codex config home if it is missing. Idempotent, best-effort — a permission error is
+ *  left for codex itself to report rather than thrown from an env builder. */
+export function ensureCodexHome(home: string): void {
+  try {
+    fs.mkdirSync(home, { recursive: true });
+  } catch {
+    /* codex will report a real problem; a mkdir race or EEXIST is not one */
+  }
 }
 
 /** Read the identity/persona file and format it as a system preamble prepended to the prompt
