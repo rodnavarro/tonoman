@@ -61,4 +61,7 @@ infra branch, not merged — see the report).
   set `SECONDBRAIN_LLM_MODEL=gemma4:latest`.
 - **Bounded enrichment:** a local model is slow, so `--enrich N` covers the busiest *content* pages
   (stubs are skipped). A full-corpus pass belongs in a background job.
+- **Known limits:** a link whose path contains a literal `)` is truncated by the Markdown-link regex
+  (harmless in practice — ADO percent-encodes parens in paths); `SECONDBRAIN_LLM_CTX` is best-effort
+  (ollama's `/v1` ignores it — set the context in a Modelfile).
 - The graph is deterministic and fast (~13 s for 4,400 pages); the LLM only writes the index prose.

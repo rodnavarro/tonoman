@@ -11,8 +11,9 @@ export interface LlmProvider {
   model: string;
   /** Bearer key when the endpoint needs one (LiteLLM master key); ollama needs none. */
   key?: string;
-  /** Context window to ask for. An 8 GB card running a 9.6 GB model offloads to CPU, so a modest
-   *  window keeps a call from crawling. */
+  /** Context window to ask for, BEST-EFFORT: ollama's OpenAI-compatible `/v1` endpoint ignores
+   *  `options.num_ctx` (set it in a Modelfile instead), and LiteLLM drops unknown params. Kept
+   *  because a native-ollama or vLLM backend may honour it; do not rely on it to bound context. */
   numCtx?: number;
   /** Per-call timeout. A local model is slow; better a clean skip than a hung reindex. */
   timeoutMs?: number;
