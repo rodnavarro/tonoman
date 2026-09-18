@@ -3,6 +3,7 @@ import { Context } from "@temporalio/activity";
 import { makeActivities, accountsOf, accountFor, accountsFromUsers, loginAlertText, speakerContext, type TurnDeps, type VoiceConfig } from "./activities";
 import * as recap from "./recap";
 import { isAuthError } from "../authflow";
+import { meetingRecap } from "./talents/meeting-recap";
 
 describe("speakerContext — who is speaking, where the model believes it", () => {
   it("names a recognised person in the system prompt and labels their message", () => {
@@ -65,7 +66,12 @@ function depsWithVoice(v: Partial<VoiceConfig> | undefined): TurnDeps {
 describe("voicePlan — which Talent the poll runs", () => {
   it("falls back to the built-in Plaud Talent when the agent has no voice config at all", async () => {
     const acts = makeActivities(depsWithVoice(undefined));
-    expect(await acts.voicePlan({ agent: "nelly" })).toEqual({ talent: { name: "meeting-recap", version: 2 } });
+    // Read off the manifest, not written out: the number is the Talent's business and changes when
+    // its declared requirements do, and pinning the literal here made a version bump look like a
+    // broken fallback. What this test is about is WHICH Talent, and that it is pinned at all.
+    expect(await acts.voicePlan({ agent: "nelly" })).toEqual({
+      talent: { name: "meeting-recap", version: meetingRecap.version },
+    });
   });
 
   it("returns the installed Talent, pinned to its version, from the grant", async () => {
