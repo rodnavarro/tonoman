@@ -191,6 +191,35 @@ describe("reading", () => {
   });
 });
 
+describe("reading a big brain cheaply", () => {
+  it("BRAIN-READS-LITTLE on a brain of hundreds of pages, the newest pages under a folder come back in one small call, newest first", async () => {
+    const files: Record<string, string> = { "index.md": "# Big\n", "Research/AI/old.md": "# Old\n" };
+    for (let i = 0; i < 800; i++) files[`Notes/p${i}.md`] = `# Page ${i}\n${"words ".repeat(40)}\n`;
+    const big = brain({ id: "b-big", name: "Big", slug: "big", mode: "write", repoUrl: path.join(tmp, "big.git") });
+    execFileSync("git", ["init", "-q", "--bare", "-b", "main", big.repoUrl!]);
+    await seed(big.repoUrl!, "", files, tmp);
+    reachOf[ANA] = [big];
+    const { token } = broker.startTurn({ agentGuid: "echo", slackUserId: ANA, who: "Ana" });
+    for (const name of ["a", "b", "c"]) {
+      const w = await call(token, "write", { brain: "Big", path: `Research/AI/${name}.md`, content: `# ${name}\n`, note: name });
+      expect(w.status).toBe(200);
+    }
+    const folder = await call(token, "pages", { brain: "Big", folder: "Research/AI" });
+    expect(folder.status).toBe(200);
+    const order = folder.text.split("\n").map((l) => /Research\/AI\/(\w+)\.md/.exec(l)?.[1]).filter(Boolean);
+    expect(order).toEqual(["c", "b", "a", "old"]);
+    expect(folder.text).toMatch(/\d{4}-\d{2}-\d{2}/);
+    expect(Buffer.byteLength(folder.text)).toBeLessThan(2_000);
+    // The whole brain: bounded, and it says how much it left out.
+    const all = await call(token, "pages", { brain: "Big" });
+    expect(all.text.split("\n").filter((l) => /\.md/.test(l)).length).toBeLessThanOrEqual(40);
+    expect(all.text).toMatch(/and \d+ more/);
+    expect(Buffer.byteLength(all.text)).toBeLessThan(6_000);
+    const list = await call(token, "list");
+    expect(Buffer.byteLength(list.text)).toBeLessThan(12_000);
+  }, 60_000);
+});
+
 describe("writing", () => {
   it("BRAIN-REMEMBER a write to a brain the person can write to is saved, and the reply says where", async () => {
     const { token } = broker.startTurn({ agentGuid: "echo", slackUserId: ANA, who: "Ana" });
@@ -239,7 +268,7 @@ describe("naming a brain", () => {
 });
 
 describe("the harness side", () => {
-  it("BRAIN-EVERY-AGENT the MCP server a harness starts lists the four tools and answers a call", async () => {
+  it("BRAIN-EVERY-AGENT the MCP server a harness starts lists the brain tools and answers a call", async () => {
     const { mcp } = broker.startTurn({ agentGuid: "echo", slackUserId: ANA, who: "Ana" });
     const child = spawn(mcp.command, mcp.args, { env: { ...process.env, ...mcp.env }, stdio: ["pipe", "pipe", "inherit"] });
     const lines: Record<string, unknown>[] = [];
@@ -262,7 +291,7 @@ describe("the harness side", () => {
     ask({ id: 2, method: "tools/list" });
     ask({ id: 3, method: "tools/call", params: { name: "brain_search", arguments: { query: "Jev" } } });
     expect((await answer(1)).result.serverInfo).toMatchObject({ name: "tonoman-brain" });
-    expect(((await answer(2)).result.tools as { name: string }[]).map((t) => t.name)).toEqual(["brain_list", "brain_search", "brain_read", "brain_write"]);
+    expect(((await answer(2)).result.tools as { name: string }[]).map((t) => t.name)).toEqual(["brain_list", "brain_pages", "brain_search", "brain_read", "brain_write"]);
     const found = (await answer(3)).result as { content: { text: string }[]; isError: boolean };
     expect(found.isError).toBe(false);
     expect(found.content[0].text).toContain("AI/typesafe-ai.md");

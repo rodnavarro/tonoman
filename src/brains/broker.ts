@@ -192,6 +192,20 @@ export function createBroker(o: BrokerOptions) {
       return { status: 200, text: charge(t, parts.join("\n\n")) };
     },
 
+    async pages(t, reach, body) {
+      const b = pickBrain(reach.brains, body.brain);
+      if (!b) return { status: 404, text: `No brain called "${String(body.brain ?? "")}" is within reach.` };
+      await mark(t, [b.id]);
+      if (b.state !== "active" || !b.repoUrl) return { status: 404, text: `${b.name} is empty so far.` };
+      await first(t, reach.tenant, b);
+      const folder = typeof body.folder === "string" ? body.folder.trim() : "";
+      const r = await o.store.pages(refOf(reach.tenant, b), folder, 40);
+      const where = folder ? `${b.name} — ${folder}` : b.name;
+      if (!r.pages.length) return { status: 200, text: `No pages in ${where}.` };
+      const more = r.total > r.pages.length ? `\n…and ${r.total - r.pages.length} more; name a folder to narrow it.` : "";
+      return { status: 200, text: charge(t, `## ${where} (${r.total} pages, newest change first)\n${r.pages.map((p) => `${p.day} ${p.path}`).join("\n")}${more}`) };
+    },
+
     async search(t, reach, body) {
       const q = typeof body.query === "string" ? body.query : "";
       if (!q.trim()) return { status: 400, text: "query is required" };
@@ -367,6 +381,7 @@ export const mcpShimSource = String.raw`"use strict";
 const URL_ = process.env.TONOMAN_BRAIN_URL, TOKEN = process.env.TONOMAN_BRAIN_TOKEN;
 const tools = [
   { name: "brain_list", description: "List the brains this person can reach — whose each is, read or write — with the start of each brain's index.md. Call this first, before searching or writing.", inputSchema: { type: "object", properties: {} } },
+  { name: "brain_pages", description: "List the pages of one brain, or of one folder in it, newest change first, with the day each last changed (at most 40, and how many there are). Use it to find the newest pages on a topic, or what a folder holds, instead of guessing paths.", inputSchema: { type: "object", properties: { brain: { type: "string" }, folder: { type: "string", description: "A folder in the brain, e.g. Research/AI (optional: the whole brain)." } }, required: ["brain"] } },
   { name: "brain_search", description: "Search the brains for lines containing all the given words (case-insensitive). Optionally limit to one brain by name.", inputSchema: { type: "object", properties: { query: { type: "string" }, brain: { type: "string", description: "A brain's name or id (optional)." } }, required: ["query"] } },
   { name: "brain_read", description: "Read one page of a brain. Returns its revision: pass that back to brain_write when you edit the page, so someone else's change made meanwhile is merged rather than lost.", inputSchema: { type: "object", properties: { brain: { type: "string" }, path: { type: "string", description: "Relative page path, e.g. AI/typesafe-ai.md" } }, required: ["brain", "path"] } },
   { name: "brain_write", description: "Create or replace one page of a brain the person can write to, and commit it. To edit an existing page, brain_read it first and pass its revision. Confirms only once it is saved; if it is not saved, say so. Also add the page to the brain's index.md or to the hub page for its topic.", inputSchema: { type: "object", properties: { brain: { type: "string" }, path: { type: "string" }, content: { type: "string", description: "The whole page, in Markdown." }, note: { type: "string", description: "One line for the brain's log: what this is." }, revision: { type: "string", description: "The revision brain_read returned, when editing." } }, required: ["brain", "path", "content", "note"] } },

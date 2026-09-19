@@ -639,7 +639,45 @@ export function createStore(o: StoreOptions) {
     await journal(id, { status, ...(detail ? { detail } : {}) });
   }
 
-  return { read, list, search, write, writeFiles, withCheckout, interrupted, settle, cleanup, refresh, dirOf, fetchNow, head };
+  /** The pages under a folder, newest change first, with the day each last changed — at most
+   *  `limit` of them, and how many there are in all (BRAIN-READS-LITTLE). What a question like "the
+   *  newest page on X" needs, in one small call instead of guessing paths. */
+  async function pages(b: BrainRef, folder = "", limit = 40): Promise<{ pages: { path: string; day: string }[]; total: number }> {
+    const dir = await fresh(b);
+    if (!(await hasRemoteBranch(dir, b))) return { pages: [], total: 0 };
+    const sub = (b.subpath ?? "").replace(/^\/+|\/+$/g, "");
+    const inBrain = (folder ?? "").replace(/^\/+|\/+$/g, "");
+    if (inBrain.split("/").some((seg) => seg === "..")) return { pages: [], total: 0 };
+    const spec = [sub, inBrain].filter(Boolean).join("/");
+    const strip = (x: string) => (sub && x.startsWith(`${sub}/`) ? x.slice(sub.length + 1) : x);
+    const isPage = (x: string) => /\.md$/i.test(x) && !isRefreshPath(x) && x.toLowerCase() !== "log.md";
+    const tree = await git(["ls-tree", "-r", "--name-only", "-z", remoteRef(b), ...(spec ? ["--", spec] : [])], dir);
+    if (tree.code !== 0) return { pages: [], total: 0 };
+    const present = new Set(tree.out.split("\0").filter(Boolean).map(strip).filter(isPage));
+    // Newest first: walk history on that folder until every page on show has its day.
+    const logArgs = ["log", "-n", "4000", "--no-renames", "--format=%x01%cs", "--name-only", remoteRef(b)];
+    if (spec) logArgs.push("--", spec);
+    const log = await git(logArgs, dir);
+    const out: { path: string; day: string }[] = [];
+    const seen = new Set<string>();
+    let day = "";
+    for (const raw of log.out.split("\n")) {
+      if (out.length >= limit) break;
+      const line = raw.trim();
+      if (!line) continue;
+      if (line.startsWith("\x01")) {
+        day = line.slice(1);
+        continue;
+      }
+      const rel = strip(line);
+      if (!present.has(rel) || seen.has(rel)) continue;
+      seen.add(rel);
+      out.push({ path: rel, day });
+    }
+    return { pages: out, total: present.size };
+  }
+
+  return { read, list, pages, search, write, writeFiles, withCheckout, interrupted, settle, cleanup, refresh, dirOf, fetchNow, head };
 }
 
 export type BrainStore = ReturnType<typeof createStore>;
