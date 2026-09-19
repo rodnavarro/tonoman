@@ -1937,8 +1937,8 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
     // command hook never fires for them, so register here too — before their first real turn.
     // Seeded with the outcome: the row is created (or refreshed) ALREADY carrying the auth state,
     // so the per-principal update that follows is a confirmation rather than the only chance.
-    onLogin: (name, user) =>
-      autoRegisterMember(name, user, { authState: "ok", authProvider: providerOf(wired.get(name)?.cfg) }),
+    onLogin: (name, user, loginProvider) =>
+      autoRegisterMember(name, user, gate.registrationAfterLogin(loginProvider, providerOf(wired.get(name)?.cfg))),
   };
 
   /** Tell the registry what this agent's — or this PERSON's — inference credential is now worth.

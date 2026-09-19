@@ -43,7 +43,18 @@ export interface AuthGateDeps {
    *  since the gate offers it on its own the moment a turn finds no credential. Optional, best-effort:
    *  the worker uses it to register the person into the tenant, so their very first chat already
    *  knows their name (rather than only learning it when they connect Plaud later). */
-  onLogin?(agent: string, user: string): Promise<void>;
+  onLogin?(agent: string, user: string, provider: InferenceProvider): Promise<void>;
+}
+
+/** PURE: what registering a person after a login may say about their sign-in. A login on the
+ *  provider the agent uses now registers them already signed in; one on a provider the agent was
+ *  switched away from registers them, but says nothing about their sign-in on the new provider
+ *  (INFER-SWITCH-COUNTS-CURRENT). */
+export function registrationAfterLogin(
+  loginProvider: InferenceProvider,
+  current: InferenceProvider,
+): { authState: "ok"; authProvider: InferenceProvider } | undefined {
+  return loginProvider === current ? { authState: "ok", authProvider: current } : undefined;
 }
 
 /** PURE: does a login outcome for `forProvider` count for an agent now on `current`? An outcome for
@@ -111,7 +122,9 @@ export function codeModal(agent: string, conversation: string, provider: Inferen
   return {
     type: "modal",
     callback_id: CONNECT_ACTION,
-    private_metadata: JSON.stringify({ agent, conversation }),
+    // The provider this login is FOR travels with the modal: if the agent is switched before the code
+    // is pasted, the outcome is still this provider's (INFER-SWITCH-COUNTS-CURRENT).
+    private_metadata: JSON.stringify({ agent, conversation, provider }),
     title: { type: "plain_text", text: `Connect ${providerLabel(provider)}` },
     submit: { type: "plain_text", text: "Connect" },
     close: { type: "plain_text", text: "Cancel" },
@@ -266,7 +279,7 @@ export async function watchDeviceLogin(
   // Registered BEFORE the state is reported: the per-person auth-state row only UPDATES a principal
   // the tenant already knows, and answers 404 for somebody signing in for the first time — which is
   // precisely the person this gate exists for.
-  if (r.ok && user) await deps.onLogin?.(agent, user).catch(() => {});
+  if (r.ok && user) await deps.onLogin?.(agent, user, provider).catch(() => {});
   await deps.setAuthState(agent, r.ok ? "ok" : "error", user, provider).catch(() => {});
   if (!conn) return;
   const text = r.ok
@@ -330,8 +343,11 @@ export async function handleInteraction(deps: AuthGateDeps, agent: string, it: S
     // answers 404 when the tenant has never heard of the person — which is exactly the case here,
     // since connecting is how somebody new first identifies themselves. Register first, report after.
     // The submitter IS the person who just signed in — the modal carries no user of its own.
-    if (r.ok && it.userId) await deps.onLogin?.(agent, it.userId).catch(() => {});
-    await deps.setAuthState(agent, r.ok ? "ok" : "error", it.userId, deps.provider?.(agent) ?? "claude").catch(() => {});
+    // Whose login it was: the provider the modal was opened for, not whatever the agent runs on now.
+    const loginProvider: InferenceProvider =
+      meta.provider === "codex" || meta.provider === "claude" ? meta.provider : deps.provider?.(agent) ?? "claude";
+    if (r.ok && it.userId) await deps.onLogin?.(agent, it.userId, loginProvider).catch(() => {});
+    await deps.setAuthState(agent, r.ok ? "ok" : "error", it.userId, loginProvider).catch(() => {});
     if (conversation) {
       await conn
         .reply(conversation)

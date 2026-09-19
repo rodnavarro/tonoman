@@ -8,7 +8,7 @@ import * as path from "node:path";
 import { threadModels } from "./threadmodels";
 import { sessionKeyOf } from "./activities";
 import { sessionStore } from "./worker";
-import { watchDeviceLogin, outcomeIsCurrent } from "./authgate";
+import { watchDeviceLogin, outcomeIsCurrent, handleInteraction, codeModal, registrationAfterLogin } from "./authgate";
 
 const THREAD = "T1/C1/1.0";
 
@@ -70,12 +70,14 @@ describe("switching an agent's provider", () => {
         return { done: true, loggedIn: true, status: "ok" };
       },
     };
+    const registered: { user: string; provider?: string }[] = [];
     const run = watchDeviceLogin(
       {
         ops: () => undefined,
         conn: () => undefined,
         provider: () => provider,
         setAuthState: async (_a, state, _u, p) => void reported.push({ state, provider: p }),
+        onLogin: async (_a, user, p) => void registered.push({ user, provider: p }),
       },
       "lumen",
       "c1",
@@ -88,6 +90,37 @@ describe("switching an agent's provider", () => {
     finish();
     await run;
     expect(reported).toEqual([{ state: "ok", provider: "claude" }]);
+    // Registration carries the login's own provider too, never the one the agent was switched to.
+    expect(registered).toEqual([{ user: "UANA", provider: "claude" }]);
+  });
+
+  it("INFER-SWITCH-COUNTS-CURRENT a pasted Claude code submitted after the switch to Codex registers and reports Claude's login, not Codex's", async () => {
+    let provider: "claude" | "codex" = "claude";
+    const modal = codeModal("lumen", "c1", provider); // opened while the agent was still on Claude
+    provider = "codex"; // the Hub switches it before the code is pasted
+    const reported: { state: string; provider?: string }[] = [];
+    const registered: { user: string; provider?: string }[] = [];
+    const conn = { reply: () => ({ send: async () => "m" }) };
+    await handleInteraction(
+      {
+        ops: () => ({ submitCode: async () => ({ ok: true, status: "ok", loginTail: "" }) }) as never,
+        conn: () => conn as never,
+        provider: () => provider,
+        setAuthState: async (_a, state, _u, p) => void reported.push({ state, provider: p }),
+        onLogin: async (_a, user, p) => void registered.push({ user, provider: p }),
+      },
+      "lumen",
+      { kind: "view_submission", callbackId: "tonoman_connect_inference", privateMetadata: modal.private_metadata as string, userId: "UANA", values: { code: { value: { value: "abc" } } } } as never,
+    );
+    expect(reported).toEqual([{ state: "ok", provider: "claude" }]);
+    expect(registered).toEqual([{ user: "UANA", provider: "claude" }]);
+  });
+
+  it("INFER-SWITCH-COUNTS-CURRENT registering someone after a login on the old provider never marks them signed in on the new one", () => {
+    // Their Claude login worked: they are registered, and their Codex state is left as it was.
+    expect(registrationAfterLogin("claude", "codex")).toBeUndefined();
+    // A login on the provider the agent uses now is registered already signed in, as before.
+    expect(registrationAfterLogin("codex", "codex")).toEqual({ authState: "ok", authProvider: "codex" });
   });
 
   it("INFER-SWITCH-COUNTS-CURRENT an outcome for the provider an agent no longer uses never changes its badge", () => {
