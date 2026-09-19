@@ -178,7 +178,7 @@ describe("a restart", () => {
     require("node:fs").writeFileSync(path.join(dir, f), JSON.stringify({ ...e, status: "committed" }));
     const found = await storeAt("w1").interrupted();
     expect(found).toHaveLength(1);
-    expect(found[0].landed).toBe(true);
+    expect(found[0].landed).toBe("yes");
     expect(remoteLog()).toContain(`Tonoman-Op: ${found[0].id}`);
   });
 
@@ -188,7 +188,7 @@ describe("a restart", () => {
     const entry = { status: "pending", brain, path: "q.md", content: "q\n", note: "n", who: "Ana", notify: { slackUserId: "UANA" } };
     require("node:fs").writeFileSync(path.join(dir, "op-1.json"), JSON.stringify(entry));
     const found = await storeAt("w1").interrupted();
-    expect(found).toEqual([{ id: "op-1", entry: expect.objectContaining({ content: "q\n", notify: { slackUserId: "UANA" } }), landed: false }]);
+    expect(found).toEqual([{ id: "op-1", entry: expect.objectContaining({ content: "q\n", notify: { slackUserId: "UANA" } }), landed: "no" }]);
   });
 });
 

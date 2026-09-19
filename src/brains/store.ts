@@ -54,7 +54,7 @@ export interface SearchHit {
 
 export type WriteResult =
   | { ok: true; path: string; sha: string; merged: boolean }
-  | { ok: false; reason: "conflict" | "push-failed" | "bad-path"; detail: string; pendingId?: string };
+  | { ok: false; reason: "conflict" | "push-failed" | "bad-path" | "not-allowed"; detail: string; pendingId?: string };
 
 export interface WriteRequest {
   brain: BrainRef;
@@ -68,6 +68,8 @@ export interface WriteRequest {
   who: string;
   /** Anything recovery needs to tell the person the outcome later. Opaque to the store. */
   notify?: Record<string, unknown>;
+  /** Asked immediately before every push: may this person still write here? (BRAIN-GRANT-TIMING) */
+  authorize?: () => Promise<boolean>;
 }
 
 interface GitResult {
@@ -162,7 +164,14 @@ export function createStore(o: StoreOptions) {
   async function ensureClone(b: BrainRef, token: string): Promise<string> {
     const dir = dirOf(b);
     const exists = await fs.stat(path.join(dir, ".git")).then(() => true, () => false);
-    if (exists) return dir;
+    if (exists) {
+      const current = (await git(["remote", "get-url", "origin"], dir)).out.trim();
+      if (current === b.repoUrl) return dir;
+      // The brain was repointed (a second-brain source moved): this clone is another repo's now. Its
+      // pending writes are in the journal, not in the clone, so it is simply made again.
+      await fs.rm(dir, { recursive: true, force: true });
+      lastFetch.delete(b.id);
+    }
     await fs.mkdir(path.dirname(dir), { recursive: true, mode: 0o700 });
     const r = await git(["clone", "--no-checkout", "--branch", branchOf(b), b.repoUrl, dir], undefined, undefined, token);
     if (r.code !== 0) {
@@ -193,6 +202,26 @@ export function createStore(o: StoreOptions) {
     const at = lastFetch.get(b.id) ?? 0;
     if (Date.now() - at < fetchEvery) return dirOf(b);
     return serial(b, () => fetchNow(b));
+  }
+
+  /** Fetch now, whatever the cache says: a turn's first look at a brain sees the latest push. */
+  async function refresh(b: BrainRef): Promise<void> {
+    await serial(b, () => fetchNow(b));
+  }
+
+  /** PURE-ish: is every part of this path an ordinary file or folder in the tree — no symlink, no
+   *  submodule? A write must never be steered outside the brain by a link somebody committed. */
+  async function plainPath(dir: string, rev: string, rel: string): Promise<boolean> {
+    const parts = rel.split("/");
+    for (let i = 1; i <= parts.length; i++) {
+      const r = await git(["ls-tree", "-z", rev, "--", parts.slice(0, i).join("/")], dir);
+      if (r.code !== 0) return false;
+      const entry = r.out.split("\0").find(Boolean);
+      if (!entry) return true; // nothing there from here down: a new path
+      const mode = entry.split(" ")[0];
+      if (mode === "120000" || mode === "160000") return false;
+    }
+    return true;
   }
 
   async function hasRemoteBranch(dir: string, b: BrainRef): Promise<boolean> {
@@ -244,16 +273,23 @@ export function createStore(o: StoreOptions) {
     args.push(remoteRef(b));
     if (sub) args.push("--", sub);
     const r = await git(args, dir);
-    if (r.code !== 0) return []; // 1 = no match
+    if (r.code === 1) return []; // no match
+    if (r.code !== 0) throw new Error("the search could not be run");
+    // Records are <rev>:<path>\0<line>\0<text>\n, and a path may itself hold a newline, so they are
+    // read field by field rather than split on newlines.
     const hits: SearchHit[] = [];
-    for (const rec of r.out.split("\n")) {
-      if (!rec) continue;
-      // <rev>:<path>\0<line>\0<text>
-      const [pathPart, lineNo, ...rest] = rec.split("\0");
-      const pth = pathPart.replace(`${remoteRef(b)}:`, "");
+    const out = r.out;
+    const prefix = `${remoteRef(b)}:`;
+    let i = 0;
+    while (i < out.length && hits.length < limit) {
+      const a = out.indexOf("\0", i);
+      const c = a < 0 ? -1 : out.indexOf("\0", a + 1);
+      const e = c < 0 ? -1 : out.indexOf("\n", c + 1);
+      if (a < 0 || c < 0) break;
+      const pth = out.slice(i, a).replace(prefix, "");
       const rel = sub && pth.startsWith(`${sub}/`) ? pth.slice(sub.length + 1) : pth;
-      hits.push({ path: rel, line: Number(lineNo), text: rest.join("\0").slice(0, 300) });
-      if (hits.length >= limit) break;
+      hits.push({ path: rel, line: Number(out.slice(a + 1, c)), text: out.slice(c + 1, e < 0 ? out.length : e).slice(0, 300) });
+      i = e < 0 ? out.length : e + 1;
     }
     return hits;
   }
@@ -282,6 +318,11 @@ export function createStore(o: StoreOptions) {
     const add = await git(["worktree", "add", "--detach", wt, remoteRef(b)], dir);
     if (add.code !== 0) return { ok: false, reason: "push-failed", detail: redact(add.out, token).slice(0, 300) };
     try {
+      // First, before anything else looks at the path: no link or submodule anywhere along it.
+      const logRel = safePagePath("log.md", b.subpath)!;
+      if (!(await plainPath(dir, remoteRef(b), rel)) || !(await plainPath(dir, remoteRef(b), logRel))) {
+        return { ok: false, reason: "bad-path", detail: "that page sits behind a link in the brain, so it cannot be written" };
+      }
       const target = path.join(wt, rel);
       const current = tipExists ? await blobOf(dir, remoteRef(b), rel) : null;
       let content = req.content;
@@ -309,10 +350,15 @@ export function createStore(o: StoreOptions) {
         }
       }
       await fs.mkdir(path.dirname(target), { recursive: true });
+      // Belt and braces for the checks above: what is written must resolve inside this worktree.
+      const root = await fs.realpath(wt);
+      const inside = async (f: string) => (await fs.realpath(path.dirname(f))).startsWith(root);
+      if (!(await inside(target))) return { ok: false, reason: "bad-path", detail: "that page resolves outside the brain" };
       await fs.writeFile(target, content);
-      const logFile = path.join(wt, safePagePath("log.md", b.subpath)!);
+      const logFile = path.join(wt, logRel);
       const prior = await fs.readFile(logFile, "utf8").catch(() => "# Log\n\n");
       await fs.mkdir(path.dirname(logFile), { recursive: true });
+      if (!(await inside(logFile))) return { ok: false, reason: "bad-path", detail: "the brain's log resolves outside the brain" };
       await fs.writeFile(logFile, prior + (prior.endsWith("\n") ? "" : "\n") + logLine(now(), req.path, req.note, req.who));
       await git(["add", "-A", "--", rel, path.relative(wt, logFile).replace(/\\/g, "/")], wt);
       const msg = `${req.note.replace(/\s+/g, " ").trim().slice(0, 72) || `Update ${req.path}`}\n\nFor: ${req.who}\nTonoman-Op: ${opId}\n`;
@@ -322,6 +368,10 @@ export function createStore(o: StoreOptions) {
       }
       const sha = (await git(["rev-parse", "HEAD"], wt)).out.trim();
       await journal(opId, { status: "committed", sha });
+      // The last moment to stop: may this person still write here? (BRAIN-GRANT-TIMING)
+      if (req.authorize && !(await req.authorize().catch(() => false))) {
+        return { ok: false, reason: "not-allowed", detail: "access to this brain changed while writing, so nothing was saved" };
+      }
       const p = await git(["push", "--porcelain", "origin", `HEAD:refs/heads/${branchOf(b)}`], wt, undefined, token);
       if (p.code !== 0) {
         if (/\[rejected\]|non-fast-forward|fetch first|failed to push some refs/.test(p.out)) return "retry";
@@ -338,7 +388,8 @@ export function createStore(o: StoreOptions) {
 
   async function write(req: WriteRequest): Promise<WriteResult> {
     const rel = safePagePath(req.path, req.brain.subpath);
-    if (!rel || /(^|\/)log\.md$/i.test(req.path.replace(/\\/g, "/"))) {
+    const bare = safePagePath(req.path);
+    if (!rel || !bare || bare.toLowerCase() === "log.md") {
       return { ok: false, reason: "bad-path", detail: "that page name is not allowed" };
     }
     const opId = randomUUID();
@@ -361,7 +412,7 @@ export function createStore(o: StoreOptions) {
           r = { ok: false, reason: "push-failed", detail: (e as Error).message.slice(0, 300) };
         }
         if (r === "retry") continue;
-        await journal(opId, r.ok ? { status: "pushed", sha: r.sha } : { status: r.reason === "conflict" ? "conflict" : "failed", detail: r.detail });
+        await journal(opId, r.ok ? { status: "pushed", sha: r.sha } : { status: r.reason === "conflict" ? "conflict" : r.reason === "not-allowed" ? "abandoned" : "failed", detail: r.detail });
         if (r.ok) log(`brains: ${req.brain.id} ${req.path} pushed ${r.sha.slice(0, 8)}${r.merged ? " (merged)" : ""}`);
         return r;
       }
@@ -373,27 +424,44 @@ export function createStore(o: StoreOptions) {
   /** Writes a restart interrupted. Each is either found already on the remote (its op id is in the
    *  history) or not; the caller decides whether to redo it (after re-checking the person's grant)
    *  and whom to tell. Nothing is redone here. */
-  async function interrupted(): Promise<{ id: string; entry: Record<string, unknown>; landed: boolean }[]> {
+  async function interrupted(): Promise<{ id: string; entry: Record<string, unknown>; landed: "yes" | "no" | "unknown" }[]> {
     const dir = journalDir();
     const names = await fs.readdir(dir).catch(() => [] as string[]);
-    const out: { id: string; entry: Record<string, unknown>; landed: boolean }[] = [];
+    const out: { id: string; entry: Record<string, unknown>; landed: "yes" | "no" | "unknown" }[] = [];
     for (const n of names) {
       if (!n.endsWith(".json")) continue;
       const entry = JSON.parse(await fs.readFile(path.join(dir, n), "utf8")) as Record<string, unknown>;
       if (entry.status !== "pending" && entry.status !== "committed") continue;
       const id = n.slice(0, -5);
       const b = entry.brain as BrainRef;
-      let landed = false;
+      // The whole history, by the op id in the commit message. An unreachable remote is "unknown",
+      // never "not landed": redoing a write that did land would say it twice.
+      let landed: "yes" | "no" | "unknown" = "unknown";
       try {
         const d = await serial(b, () => fetchNow(b));
-        const g = await git(["log", "-n", "200", "--format=%B", remoteRef(b)], d);
-        landed = g.out.includes(`Tonoman-Op: ${id}`);
+        const g = await git(["log", remoteRef(b), "--fixed-strings", `--grep=Tonoman-Op: ${id}`, "--format=%H", "-n", "1"], d);
+        if (g.code === 0) landed = g.out.trim() ? "yes" : "no";
       } catch {
-        /* unreachable remote: not landed as far as we can tell */
+        /* unreachable: unknown */
       }
       out.push({ id, entry, landed });
     }
     return out;
+  }
+
+  /** Worktrees a crash left behind, in every clone. */
+  async function cleanup(): Promise<void> {
+    const tenants = await fs.readdir(o.root).catch(() => [] as string[]);
+    for (const t of tenants) {
+      if (t.startsWith("_")) continue;
+      for (const id of await fs.readdir(path.join(o.root, t)).catch(() => [] as string[])) {
+        const dir = path.join(o.root, t, id);
+        for (const e of await fs.readdir(dir).catch(() => [] as string[])) {
+          if (e.startsWith(".tonoman-wt-")) await fs.rm(path.join(dir, e), { recursive: true, force: true });
+        }
+        await git(["worktree", "prune"], dir);
+      }
+    }
   }
 
   /** Close a journal entry after recovery decided what happened. */
@@ -401,7 +469,7 @@ export function createStore(o: StoreOptions) {
     await journal(id, { status, ...(detail ? { detail } : {}) });
   }
 
-  return { read, list, search, write, interrupted, settle, dirOf, fetchNow };
+  return { read, list, search, write, interrupted, settle, cleanup, refresh, dirOf, fetchNow };
 }
 
 export type BrainStore = ReturnType<typeof createStore>;

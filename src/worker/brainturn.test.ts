@@ -18,11 +18,17 @@ let claimed: string[];
 
 interface Scenario {
   audience: Audience;
+  /** The audience when it is counted again, just before posting. Defaults to `audience`. */
+  audienceAtEnd?: Audience;
+  /** The model fails with this message instead of answering. */
+  fails?: string;
   /** Brains the fake agent "uses" during the turn. */
   uses: string[];
   answer: string;
   /** What the registry says every member can read. */
   readable?: string[];
+  /** Or: what it says, given who the members are. */
+  readableFor?: (members: string[], ids: string[]) => string[];
   /** What the speaker reaches at the start and at the end. */
   reachAtStart?: Record<string, string>;
   reachAtEnd?: Record<string, string>;
@@ -30,12 +36,13 @@ interface Scenario {
 }
 
 function build(sc: Scenario, provenanceStore = new Map<string, string[]>()) {
-  let reachCalls = 0;
-  const tokens = new Map<string, { used: string[] }>();
+  let finished = false;
+  let audienceCalls = 0;
+  const tokens = new Map<string, { used: string[]; key: string }>();
   const brains: TurnBrains = {
-    start: (_agent, user) => {
+    start: (_agent, user, _who, key) => {
       const token = `t-${user}-${tokens.size}`;
-      tokens.set(token, { used: [] });
+      tokens.set(token, { used: [], key });
       return { token, mcp: { name: "brain", command: "node", args: ["shim"], env: { TONOMAN_BRAIN_TOKEN: token } } };
     },
     end: (token) => {
@@ -45,13 +52,13 @@ function build(sc: Scenario, provenanceStore = new Map<string, string[]>()) {
     },
     provenance: async (_a, key) => provenanceStore.get(key) ?? [],
     remember: async (_a, key, used) => void provenanceStore.set(key, [...new Set([...(provenanceStore.get(key) ?? []), ...used])]),
-    audience: async () => sc.audience,
+    audience: async () => (audienceCalls++ === 0 ? sc.audience : sc.audienceAtEnd ?? sc.audience),
     reach: async () => {
-      reachCalls++;
-      const r = reachCalls === 1 ? sc.reachAtStart : sc.reachAtEnd ?? sc.reachAtStart;
+      // Before the model has finished, the speaker reaches `reachAtStart`; after, `reachAtEnd`.
+      const r = finished ? sc.reachAtEnd ?? sc.reachAtStart : sc.reachAtStart;
       return new Map(Object.entries(r ?? { "b-ana": "Ana's brain", "b-eng": "Engineering" }));
     },
-    readableByAll: async () => sc.readable ?? [],
+    readableByAll: async (_a, ids, members) => (sc.readableFor ? sc.readableFor(members, ids) : sc.readable ?? []),
     dm: async (user, _u, text) => {
       if (sc.dmWorks === false) return false;
       dms.push({ user: _u, text });
@@ -79,12 +86,19 @@ function build(sc: Scenario, provenanceStore = new Map<string, string[]>()) {
     requests.push(req);
     const token = req.mcpServers?.[0]?.env.TONOMAN_BRAIN_TOKEN;
     yield { kind: "tool", tool: "mcp__brain__brain_read", text: "Ana's brain · AI/jev.md" } as TurnEvent;
-    if (token) tokens.get(token)!.used.push(...sc.uses);
+    if (token) {
+      // As the real broker does: each use is recorded with the session the moment it happens.
+      const t = tokens.get(token)!;
+      t.used.push(...sc.uses);
+      if (sc.uses.length) await brains.remember("echo", t.key, sc.uses);
+    }
+    if (sc.fails) throw new Error(sc.fails);
     // Slow enough that a streaming turn would have shown partial text.
     for (const word of sc.answer.split(" ")) {
       yield { kind: "text", text: `${word} ` } as TurnEvent;
       await new Promise((r) => setTimeout(r, 5));
     }
+    finished = true;
     yield { kind: "done", final: sc.answer } as TurnEvent;
   };
   const acts = makeActivities({
@@ -97,6 +111,10 @@ function build(sc: Scenario, provenanceStore = new Map<string, string[]>()) {
     claimSession: async (_agent: string, key: string) => {
       claimed.push(key);
       return { id: `s-${key}`, isNew: true };
+    },
+    resetSession: async (_agent: string, key: string) => {
+      claimed.push(`reset:${key}`);
+      return { id: `s2-${key}`, isNew: true };
     },
   } as never);
   return { acts, provenanceStore };
@@ -215,5 +233,42 @@ describe("the turn's tools and folder", () => {
     });
     await acts.runTurn(turn("T/C1/1"));
     expect(JSON.stringify([...posted, ...dms])).not.toContain("secret plan");
+  });
+});
+
+describe("found in review", () => {
+  it("BRAIN-GRANT-TIMING a history that drew on a brain the person no longer reaches is not resumed", async () => {
+    const store = new Map([[sessionKeyOf("T/D1", "UANA"), ["b-gone"]]]);
+    const { acts } = build({ audience: { kind: "self" }, uses: [], answer: "hi", reachAtStart: { "b-ana": "Ana's brain" } }, store);
+    await acts.runTurn(turn("T/D1"));
+    expect(claimed).toEqual(["reset:T/D1#UANA"]);
+    expect(requests[0].prompt).toMatch(/conversation was restarted because the person's access to a brain changed/);
+  });
+
+  it("BRAIN-PRIVATE-DELIVERY a held turn that fails says nothing of what it had read", async () => {
+    const { acts } = build({ audience: { kind: "public" }, uses: ["b-ana"], answer: "x", fails: "tool said: Jev is TypeSafe's secret model" });
+    await expect(acts.runTurn(turn("T/C1/1"))).rejects.toThrow(/^The answer could not be finished/);
+    expect(JSON.stringify(posted)).not.toContain("secret model");
+  });
+
+  it("BRAIN-AUDIENCE the audience is counted again just before posting: someone who joined meanwhile sends it private", async () => {
+    const { acts } = build({
+      audience: { kind: "members", members: ["UANA"], name: "eng" },
+      audienceAtEnd: { kind: "members", members: ["UANA", "UNEW"], name: "eng" },
+      uses: ["b-ana"],
+      answer: "private words",
+      // Ana alone can read her brain; the newcomer cannot.
+      readableFor: (members, ids) => (members.includes("UNEW") ? [] : ids),
+    });
+    await acts.runTurn(turn("T/G1/1"));
+    expect(dms).toHaveLength(1);
+    expect(inThread()).toEqual([THREAD_NOTE]);
+  });
+
+  it("BRAIN-GRANT-TIMING even in the speaker's own DM, an answer drawing on a brain they lost mid-turn is withheld", async () => {
+    const { acts } = build({ audience: { kind: "self" }, uses: ["b-eng"], answer: "Engineering's secret plan.", reachAtStart: { "b-eng": "Engineering" }, reachAtEnd: {} });
+    await acts.runTurn(turn("T/D1"));
+    expect(inThread().at(-1)).toMatch(/can't share that answer/);
+    expect(inThread().at(-1)).not.toContain("secret plan");
   });
 });

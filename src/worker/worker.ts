@@ -41,7 +41,8 @@ import {
 import { httpAuthOps, looksLoggedIn } from "../authflow";
 import * as gate from "./authgate";
 import * as secondbrain from "./secondbrain";
-import { createStore } from "../brains/store";
+import { createStore, type BrainStore } from "../brains/store";
+import { recoverWrites } from "../brains/recover";
 import { createBroker, type Broker } from "../brains/broker";
 import { registryClient } from "../brains/registry";
 import { adoProvisioner } from "../brains/ado";
@@ -424,7 +425,7 @@ function disallowedTools(): string[] {
 // --- Brains (docs/definition/objects/brain.md in Tonoman Cloud) -------------------------------------
 
 /** The brain store and tool, when this worker has a registry to ask. Off with TONOMAN_BRAINS=off. */
-async function startBrains(): Promise<{ registry: ReturnType<typeof registryClient>; broker: Broker } | undefined> {
+async function startBrains(): Promise<{ registry: ReturnType<typeof registryClient>; broker: Broker; store: BrainStore } | undefined> {
   const base = process.env.TONOMANCLOUD_API_URL;
   if (!base || process.env.TONOMAN_BRAINS === "off") return undefined;
   const registry = registryClient(base, process.env.TONOMANCLOUD_API_TOKEN ?? "");
@@ -439,7 +440,7 @@ async function startBrains(): Promise<{ registry: ReturnType<typeof registryClie
   const broker = createBroker({ store, registry, provisioner, scratch: path.join(root, "_scratch") });
   await broker.start();
   console.log(`worker: brains on — ${provisioner ? `new brains go to Azure DevOps ${org}/${project}` : "no git host configured, so no new brains can be created"}`);
-  return { registry, broker };
+  return { registry, broker, store };
 }
 
 /** One wired agent: the roster row, its channel, its harness, and the second-brain note the turn
@@ -1203,12 +1204,16 @@ export async function run(
   };
 
   /** What a conversation turn needs from the brains, bound to this worker's agents. */
-  const turnBrains = (b: { registry: ReturnType<typeof registryClient>; broker: Broker }): TurnBrains => ({
-    start: (agent, user, who) => {
+  /** What a conversation turn needs from the brains, bound to this worker's agents. With no brain
+   *  service (it failed to start), turns still run FAIL-CLOSED: no brain tool, but a history that drew
+   *  on a brain is still held and routed as if nobody else could read it. */
+  const turnBrains = (b?: { registry: ReturnType<typeof registryClient>; broker: Broker }): TurnBrains => ({
+    start: (agent, user, who, key) => {
       const g = wired.get(agent)?.cfg.guid;
-      return g ? b.broker.startTurn({ agentGuid: g, slackUserId: user, who }) : undefined;
+      // Each use is saved with the session the moment it happens (BRAIN-USED-DECIDES).
+      return b && g ? b.broker.startTurn({ agentGuid: g, slackUserId: user, who }, { onUse: (id) => remember(agent, key, [id]) }) : undefined;
     },
-    end: (token) => b.broker.endTurn(token).used,
+    end: (token) => (b ? b.broker.endTurn(token).used : []),
     provenance: (agent, key) => provenance(agent, key),
     remember: (agent, key, used) => remember(agent, key, used),
     audience: async (agent, conversation, user) => {
@@ -1217,13 +1222,13 @@ export async function run(
     },
     reach: async (agent, user) => {
       const g = wired.get(agent)?.cfg.guid;
-      if (!g) return null;
+      if (!b || !g) return null;
       const r = await b.registry.reach(g, user);
       return new Map(r.brains.map((x) => [x.id, x.name]));
     },
     readableByAll: async (agent, ids, members) => {
       const g = wired.get(agent)?.cfg.guid;
-      return g ? b.registry.readableByAll(g, ids, members) : null;
+      return b && g ? b.registry.readableByAll(g, ids, members) : null;
     },
     dm: async (agent, user, text) => {
       const a = wired.get(agent);
@@ -1233,6 +1238,22 @@ export async function run(
       return true;
     },
   });
+
+  // Finish the writes a restart interrupted, telling each person privately (BRAIN-WRITE-SURVIVES-RESTART).
+  if (brainsSys) {
+    const b = brainsSys;
+    void recoverWrites({
+      store: b.store,
+      registry: b.registry,
+      tell: async (agentGuid, user, text) => {
+        const name = [...wired.entries()].find(([, w]) => w.cfg.guid === agentGuid)?.[0];
+        const conv = name ? await dmFor(name, user) : undefined;
+        if (!name || !conv) return false;
+        await wired.get(name)!.conn.reply(conv).send(text);
+        return true;
+      },
+    }).catch((e: Error) => console.error(`worker: brain write recovery failed — ${e.message}`));
+  }
 
   const deps = {
     agent: (name: string) => wired.get(name),
@@ -1246,7 +1267,7 @@ export async function run(
     modelFor: (agent: string, conversation: string) => models.get(conversation) ?? wired.get(agent)?.cfg.model,
     claimSession,
     resetSession,
-    brains: brainsSys ? turnBrains(brainsSys) : undefined,
+    brains: turnBrains(brainsSys),
     footer: async (name: string, conversation: string, u: TurnUsage | undefined): Promise<string | null> => {
       const mode = modeFor(conversation);
       if (mode === "none" || !u) return null;

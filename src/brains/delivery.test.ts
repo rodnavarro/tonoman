@@ -43,6 +43,19 @@ describe("who will see it", () => {
     expect((await audienceOf(slack({}, [], "conversations.info").call, "G1", "UANA", "UBOT")).kind).toBe("unknown");
   });
 
+  it("BRAIN-AUDIENCE a channel shared with another workspace cannot be counted", async () => {
+    for (const flag of ["is_ext_shared", "is_shared", "is_org_shared"]) {
+      const s = slack({ channel: { is_private: true, [flag]: true } }, [{ members: ["UANA"] }]);
+      expect((await audienceOf(s.call, "G1", "UANA", "UBOT")).kind).toBe("unknown");
+    }
+  });
+
+  it("BRAIN-AUDIENCE a member list that leaves out the person asking is not trusted", async () => {
+    const s = slack({ channel: { is_private: true } }, [{ members: ["UBEN"] }]);
+    expect((await audienceOf(s.call, "G1", "UANA", "UBOT")).kind).toBe("unknown");
+    expect((await audienceOf(slack({ channel: { is_private: true } }, [{}]).call, "G1", "UANA", "UBOT")).kind).toBe("unknown");
+  });
+
   it("BRAIN-AUDIENCE another person's DM is never treated as the speaker's", async () => {
     expect((await audienceOf(slack({ channel: { is_im: true, user: "UBEN" } }).call, "D2", "UANA", "UBOT")).kind).toBe("unknown");
   });
@@ -81,9 +94,20 @@ describe("where it goes", () => {
 });
 
 describe("the repo's name", () => {
-  it("BRAIN-REPO-ON-FIRST-USE a repo is named brain-<tenant>-<brain>, with the environment's suffix", () => {
-    expect(repoName("axiplex", "rod-3f9a1c", "dev")).toBe("brain-axiplex-rod-3f9a1c-dev");
-    expect(repoName("Test A", "Eng Notes!", "")).toBe("brain-test-a-eng-notes");
+  it("BRAIN-REPO-ON-FIRST-USE a repo is named for the tenant, the brain and its id, with the environment's suffix", () => {
+    expect(repoName("axiplex", "rod-3f9a1c", "dev", "0a1b2c3d-4e5f-6789-abcd-ef0123456789")).toBe("brain-axiplex-rod-3f9a1c-0a1b2c3d4e5f-dev");
+    expect(repoName("Test A", "Eng Notes!", "", "0a1b2c3d-4e5f-6789-abcd-ef0123456789")).toBe("brain-test-a-eng-notes-0a1b2c3d4e5f");
+  });
+
+  it("BRAIN-REPO-ON-FIRST-USE two brains never get the same repo, however long their names", () => {
+    const tenant = "a-tenant-with-a-very-long-slug-indeed-xx";
+    const a = repoName(tenant, "same-person-name-is-long-111111", "dev", "11111111-0000-0000-0000-000000000000");
+    const b = repoName(tenant, "same-person-name-is-long-222222", "dev", "22222222-0000-0000-0000-000000000000");
+    expect(a).not.toBe(b);
+    for (const n of [a, b]) {
+      expect(n.length).toBeLessThanOrEqual(64);
+      expect(n.endsWith("-dev")).toBe(true);
+    }
     expect(plainRemote("https://axiplex@dev.azure.com/axiplex/p/_git/r")).toBe("https://dev.azure.com/axiplex/p/_git/r");
   });
 });

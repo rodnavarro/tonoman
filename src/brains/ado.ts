@@ -15,10 +15,17 @@ export interface AdoOptions {
   fetchImpl?: typeof fetch;
 }
 
-/** PURE: the repo name for a brain. Lowercase, dashes, within ADO's limits. */
-export function repoName(tenant: string, slug: string, suffix = ""): string {
-  const clean = (s: string) => s.toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "");
-  return `brain-${clean(tenant)}-${clean(slug)}${clean(suffix) ? `-${clean(suffix)}` : ""}`.slice(0, 64);
+/** PURE: the repo name for a brain: `brain-<tenant>-<slug>-<id>-<suffix>`, within ADO's 64 characters.
+ *  The brain's own id and the environment suffix are never cut — only the readable parts shorten — so
+ *  two brains can never be given, or adopt, the same repo. */
+export function repoName(tenant: string, slug: string, suffix: string, brainId: string): string {
+  const clean = (x: string) => x.toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "");
+  const id = brainId.replace(/[^0-9a-f]/gi, "").slice(0, 12).toLowerCase();
+  const tail = `-${id}${clean(suffix) ? `-${clean(suffix)}` : ""}`;
+  const room = 64 - "brain-".length - tail.length - 1;
+  const t = clean(tenant).slice(0, Math.max(4, Math.floor(room / 2)));
+  const sl = clean(slug).slice(0, Math.max(4, room - t.length));
+  return `brain-${t}-${sl}${tail}`.replace(/-+/g, "-");
 }
 
 /** PURE: the clone URL without the username ADO puts in `remoteUrl`, so no identity is stored. */
@@ -62,7 +69,7 @@ export function adoProvisioner(o: AdoOptions): Provisioner {
   return {
     token: () => o.pat(),
     async create(tenant: string, b: Reachable) {
-      const name = repoName(tenant, b.slug, o.suffix);
+      const name = repoName(tenant, b.slug, o.suffix ?? "", b.id);
       const found = await existing(name);
       if (found) return { repoUrl: plainRemote(found), repoName: name };
       const r = await f(`${base}/${encodeURIComponent(o.project)}/_apis/git/repositories?api-version=7.1`, {

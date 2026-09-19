@@ -67,8 +67,18 @@ export interface McpServerSpec {
 
 interface Turn extends TurnSpec {
   used: Set<string>;
+  /** Brains this turn has fetched fresh already: its first look at each is the latest push. */
+  fetched: Set<string>;
   bytes: number;
   expiresAt: number;
+  /** Saves what the turn used, durably, before the broker hands anything back. */
+  onUse?: (brainId: string) => Promise<void>;
+}
+
+export interface TurnHooks {
+  /** Called — and awaited — the first time a turn uses each brain, before any of it is returned. If
+   *  it fails, nothing is returned: a use that is not on record could later be repeated in public. */
+  onUse?: (brainId: string) => Promise<void>;
 }
 
 export interface BrokerOptions {
@@ -136,6 +146,22 @@ export function createBroker(o: BrokerOptions) {
     return { ...b, state: "active", repoUrl: made.repoUrl, repoName: made.repoName };
   }
 
+  /** Record that a turn used these brains, durably, BEFORE anything of them is returned. */
+  async function mark(t: Turn, ids: string[]): Promise<void> {
+    for (const id of ids) {
+      if (t.used.has(id)) continue;
+      if (t.onUse) await t.onUse(id);
+      t.used.add(id);
+    }
+  }
+
+  /** A turn's first look at a brain fetches it fresh; later looks in the same turn use that fetch. */
+  async function first(t: Turn, tenant: string, b: Reachable): Promise<void> {
+    if (t.fetched.has(b.id) || b.state !== "active" || !b.repoUrl) return;
+    await o.store.refresh(refOf(tenant, b));
+    t.fetched.add(b.id);
+  }
+
   function charge(t: Turn, text: string): string {
     const r = withinBudget(text, budget - t.bytes);
     t.bytes += Buffer.byteLength(r.text);
@@ -148,11 +174,14 @@ export function createBroker(o: BrokerOptions) {
     async list(t, reach) {
       if (!reach.speaker.member) return { status: 200, text: "This person is not a member of the tenant, so they reach no brains." };
       if (reach.brains.length === 0) return { status: 200, text: "This person reaches no brains." };
+      // Every brain named here counts as used, even an empty one: its name and whose it is are
+      // things the audience may not be allowed to know.
+      await mark(t, reach.brains.map((b) => b.id));
       const parts: string[] = [];
       for (const b of reach.brains) {
         parts.push(`## ${describe(b)}\nid: ${b.id}`);
         if (b.state !== "active" || !b.repoUrl) continue;
-        t.used.add(b.id); // the index is content: mark before it is returned
+        await first(t, reach.tenant, b).catch(() => {});
         const idx = await o.store.read(refOf(reach.tenant, b), "index.md").catch(() => null);
         if (idx) parts.push(`index.md (start):\n${idx.content.slice(0, INDEX_HEAD_BYTES)}`);
       }
@@ -165,24 +194,35 @@ export function createBroker(o: BrokerOptions) {
       const pool = body.brain ? [pickBrain(reach.brains, body.brain)].filter(Boolean) as Reachable[] : reach.brains;
       if (body.brain && pool.length === 0) return { status: 404, text: `No brain called "${body.brain}" is within reach.` };
       const out: string[] = [];
+      const failed: string[] = [];
       let total = 0;
       for (const b of pool) {
         if (b.state !== "active" || !b.repoUrl) continue;
-        const hits = await o.store.search(refOf(reach.tenant, b), q, 40 - total).catch(() => []);
+        let hits: Awaited<ReturnType<typeof o.store.search>>;
+        try {
+          await first(t, reach.tenant, b);
+          hits = await o.store.search(refOf(reach.tenant, b), q, 40 - total);
+        } catch {
+          failed.push(b.name);
+          await mark(t, [b.id]);
+          continue;
+        }
         if (!hits.length) continue;
-        t.used.add(b.id);
+        await mark(t, [b.id]);
         total += hits.length;
         out.push(`## ${b.name}\n${hits.map((h) => `${h.path}:${h.line}: ${h.text}`).join("\n")}`);
         if (total >= 40) break;
       }
-      return { status: 200, text: charge(t, out.length ? out.join("\n\n") : `Nothing found for "${q}".`) };
+      const missed = failed.length ? `\n\nCould not search ${failed.join(", ")} just now — say so rather than guessing.` : "";
+      return { status: 200, text: charge(t, (out.length ? out.join("\n\n") : `Nothing found for "${q}".`) + missed) };
     },
 
     async read(t, reach, body) {
       const b = pickBrain(reach.brains, body.brain);
       if (!b) return { status: 404, text: `No brain called "${String(body.brain ?? "")}" is within reach.` };
+      await mark(t, [b.id]);
       if (b.state !== "active" || !b.repoUrl) return { status: 404, text: `${b.name} is empty so far.` };
-      t.used.add(b.id);
+      await first(t, reach.tenant, b);
       const page = await o.store.read(refOf(reach.tenant, b), String(body.path ?? ""));
       if (!page) return { status: 404, text: `There is no page "${String(body.path ?? "")}" in ${b.name}.` };
       return { status: 200, text: charge(t, `revision: ${page.blob}\n\n${page.content}`) };
@@ -192,7 +232,9 @@ export function createBroker(o: BrokerOptions) {
       let b = pickBrain(reach.brains, body.brain);
       if (!b) return { status: 404, text: `No brain called "${String(body.brain ?? "")}" is within reach.` };
       if (b.mode !== "write") {
-        const writable = reach.brains.filter((x) => x.mode === "write").map((x) => x.name);
+        const writableBrains = reach.brains.filter((x) => x.mode === "write");
+        await mark(t, [b.id, ...writableBrains.map((x) => x.id)]);
+        const writable = writableBrains.map((x) => x.name);
         return {
           status: 403,
           text: `${b.name} is read only for this person.${writable.length ? ` They can write to: ${writable.join(", ")}.` : " They cannot write to any brain."}`,
@@ -202,7 +244,7 @@ export function createBroker(o: BrokerOptions) {
       const note = typeof body.note === "string" ? body.note : "";
       if (!content.trim()) return { status: 400, text: "content is required" };
       if (Buffer.byteLength(content) > 200_000) return { status: 400, text: "that page is too large to write in one go" };
-      t.used.add(b.id);
+      await mark(t, [b.id]);
       if (b.state === "not_created") {
         if (!b.own) return { status: 409, text: `${b.name} has not been set up yet; only its owner's first note creates it.` };
         try {
@@ -220,9 +262,16 @@ export function createBroker(o: BrokerOptions) {
         note,
         who: t.who,
         notify: { agentGuid: t.agentGuid, slackUserId: t.slackUserId },
+        // Asked right before the push: is this turn still open, and may the person still write here?
+        authorize: async () => {
+          if (![...turns.values()].includes(t)) return false;
+          const now = await o.registry.reach(t.agentGuid, t.slackUserId);
+          return now.brains.some((x) => x.id === b!.id && x.mode === "write");
+        },
       });
       if (r.ok) return { status: 200, text: `Saved to ${b.name}: ${r.path}${r.merged ? " (merged with a change someone else made meanwhile)" : ""}.` };
       if (r.reason === "bad-path") return { status: 400, text: "That page name is not allowed. Use a relative path like `Topic/page.md` (not log.md)." };
+      if (r.reason === "not-allowed") return { status: 403, text: `Not saved: ${r.detail}.` };
       if (r.reason === "conflict") return { status: 409, text: `Not saved: ${r.detail}. Read the page again and redo the edit. (Kept as ${r.pendingId}.)` };
       return { status: 502, text: `Not saved: ${r.detail}.` };
     },
@@ -252,6 +301,8 @@ export function createBroker(o: BrokerOptions) {
         // Fresh every call: the speaker's reach at this moment, not at the start of the turn.
         const reach = await o.registry.reach(t.agentGuid, t.slackUserId);
         const r = await h(t, reach, body);
+        // The turn may have ended while this call ran: nothing goes back to a finished turn.
+        if (![...turns.values()].includes(t)) return send(401, "this turn's brain access has ended");
         send(r.status, r.text);
       } catch (e) {
         log(`brains: ${name} failed — ${(e as Error).message}`);
@@ -272,9 +323,9 @@ export function createBroker(o: BrokerOptions) {
       return baseUrl;
     },
     /** Open a turn's access. Returns the MCP server the harness should start. */
-    startTurn(spec: TurnSpec): { token: string; mcp: McpServerSpec } {
+    startTurn(spec: TurnSpec, hooks: TurnHooks = {}): { token: string; mcp: McpServerSpec } {
       const token = randomBytes(24).toString("hex");
-      turns.set(token, { ...spec, used: new Set(), bytes: 0, expiresAt: Date.now() + 2 * 60 * 60 * 1000 });
+      turns.set(token, { ...spec, used: new Set(), fetched: new Set(), bytes: 0, expiresAt: Date.now() + 2 * 60 * 60 * 1000, onUse: hooks.onUse });
       return {
         token,
         mcp: {

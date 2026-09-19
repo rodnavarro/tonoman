@@ -54,6 +54,10 @@ interface ConvInfo {
     is_private?: boolean;
     is_channel?: boolean;
     is_group?: boolean;
+    is_ext_shared?: boolean;
+    is_shared?: boolean;
+    is_org_shared?: boolean;
+    is_pending_ext_shared?: boolean;
     user?: string;
   };
 }
@@ -69,6 +73,9 @@ export async function audienceOf(call: Call, channel: string, speaker: string, b
   const c = info.channel ?? {};
   const name = c.name;
   if (c.is_im) return c.user === speaker ? { kind: "self" } : { kind: "unknown", why: "someone else's DM", name };
+  // Shared with another workspace (Slack Connect, or across an org): the other side may see it
+  // differently — public there, say — and its members are not ours to count.
+  if (c.is_ext_shared || c.is_shared || c.is_org_shared || c.is_pending_ext_shared) return { kind: "unknown", why: "shared with another workspace", name };
   if (!c.is_mpim && !c.is_private) return { kind: "public", name };
   const members: string[] = [];
   let cursor = "";
@@ -79,9 +86,15 @@ export async function audienceOf(call: Call, channel: string, speaker: string, b
     } catch (e) {
       return { kind: "unknown", why: (e as Error).message, name };
     }
-    members.push(...(r.members ?? []));
+    if (!Array.isArray(r.members)) return { kind: "unknown", why: "Slack gave no member list", name };
+    members.push(...r.members);
     cursor = r.response_metadata?.next_cursor ?? "";
-    if (!cursor) return { kind: "members", members: members.filter((m) => m !== botUserId), name };
+    if (!cursor) {
+      const people = members.filter((m) => m !== botUserId);
+      // The person asking must be in the list; if not, the list is not what we think it is.
+      if (!people.includes(speaker)) return { kind: "unknown", why: "the member list does not include the speaker", name };
+      return { kind: "members", members: people, name };
+    }
   }
   return { kind: "unknown", why: "too many members to count", name };
 }

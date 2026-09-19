@@ -91,6 +91,20 @@ describe("what a turn can reach", () => {
     expect((await call(token, "read", { brain: "Ana's brain", path: "index.md" })).status).toBe(200);
   });
 
+  it("BRAIN-GRANT-TIMING a revoke that lands between the permission check and the push stops the push", async () => {
+    const { token } = broker.startTurn({ agentGuid: "echo", slackUserId: ANA, who: "Ana" });
+    let calls = 0;
+    const original = reachOf[ANA];
+    // The first reach (the call's own check) still allows writing; by the check before the push it does not.
+    Object.defineProperty(reachOf, ANA, { configurable: true, get: () => (++calls <= 1 ? original : [anaPersonal]) });
+    const r = await call(token, "write", { brain: "Engineering", path: "late.md", content: "late\n", note: "late" });
+    expect(r.status).toBe(403);
+    expect(r.text).toMatch(/Not saved/);
+    Object.defineProperty(reachOf, ANA, { configurable: true, writable: true, value: original });
+    const back = await call(token, "read", { brain: "Engineering", path: "late.md" });
+    expect(back.status).toBe(404);
+  });
+
   it("BRAIN-GRANT-TIMING a revoke during a turn stops the very next read and write", async () => {
     const { token } = broker.startTurn({ agentGuid: "echo", slackUserId: ANA, who: "Ana" });
     expect((await call(token, "read", { brain: "Engineering", path: "AI/typesafe-ai.md" })).status).toBe(200);
@@ -113,12 +127,29 @@ describe("what a turn can reach", () => {
 });
 
 describe("what a turn used", () => {
-  it("BRAIN-USED-DECIDES listing counts every brain whose index was shown; an empty brain counts for nothing", async () => {
+  it("BRAIN-USED-DECIDES listing counts every brain it names, even an empty one: a name is something to know", async () => {
     const { token } = broker.startTurn({ agentGuid: "echo", slackUserId: BEN, who: "Ben" });
     const r = await call(token, "list");
     expect(r.text).toContain("Engineering");
     expect(r.text).toContain("empty so far");
-    expect(broker.endTurn(token).used).toEqual(["b-eng"]);
+    expect(broker.endTurn(token).used.sort()).toEqual(["b-ben", "b-eng"]);
+  });
+
+  it("BRAIN-USED-DECIDES each use is recorded before anything is returned; if it cannot be recorded, nothing is returned", async () => {
+    const recorded: string[] = [];
+    const ok = broker.startTurn({ agentGuid: "echo", slackUserId: ANA, who: "Ana" }, { onUse: async (id) => void recorded.push(id) });
+    await call(ok.token, "read", { brain: "Engineering", path: "AI/typesafe-ai.md" });
+    expect(recorded).toEqual(["b-eng"]);
+    const broken = broker.startTurn({ agentGuid: "echo", slackUserId: ANA, who: "Ana" }, { onUse: async () => { throw new Error("disk full"); } });
+    const r = await call(broken.token, "read", { brain: "Engineering", path: "AI/typesafe-ai.md" });
+    expect(r.status).toBe(502);
+    expect(r.text).not.toContain("System One");
+  });
+
+  it("BRAIN-USED-DECIDES a refusal that names brains counts them as used", async () => {
+    const { token } = broker.startTurn({ agentGuid: "echo", slackUserId: BEN, who: "Ben" });
+    await call(token, "write", { brain: "Engineering", path: "x.md", content: "x", note: "x" });
+    expect(broker.endTurn(token).used.sort()).toEqual(["b-ben", "b-eng"]);
   });
 
   it("BRAIN-USED-DECIDES a search counts only the brains it found something in", async () => {
