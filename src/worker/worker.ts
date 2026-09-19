@@ -21,6 +21,7 @@ import * as path from "node:path";
 import type { Config, AgentConfig } from "../config";
 import type { Connector, TurnEvent, TurnRunner, TurnUsage } from "../core/contracts";
 import { SlackConnector } from "../connector/slack";
+import { threadOwners, type ThreadOwners } from "../connector/threadowners";
 import * as cmds from "./commands";
 import * as plaudcli from "./plaudcli";
 import * as claudecode from "../harness/claudecode";
@@ -629,6 +630,13 @@ function runClosure(runner: TurnRunner, cfg: AgentConfig): Wired["run"] {
  *  agent until one enables the toggle — which is every agent today. */
 const voiceWatch = new Map<string, Set<string>>();
 
+/** Which agent last answered each thread, shared by every agent this worker serves, so a bare
+ *  `!command` in a shared thread goes to that one (CONVO-WHO-IS-ADDRESSED). Made on first use, in the
+ *  state root, and kept across restarts. */
+let owners: ThreadOwners | undefined;
+const sharedThreadOwners = (): ThreadOwners =>
+  (owners ??= threadOwners({ file: path.join(process.env.TONOMAN_STATE_ROOT ?? "/root/.tonoman", "thread-owners.json") }));
+
 /** Build the connector + runner for ONE agent, or return null with a logged reason. Shared by the
  *  boot wiring and by live reload (which wires a newly-added or structurally-changed agent), so the
  *  skip rules — channel, tokens, harness — are decided in exactly one place. The `only` filter is
@@ -661,6 +669,7 @@ function wireOne(a: AgentConfig, harnesses: ReturnType<typeof defaultHarnesses>)
     // Another agent served here watches the same channel: a plain message there is answered only
     // when it names one of them (CONVO-WHO-IS-ADDRESSED). Agents on another worker are not seen.
     sharedWatch: (channel: string) => [...voiceWatch].some(([other, set]) => other !== a.name && set.has(channel)),
+    threadOwners: sharedThreadOwners(),
   });
 
   const runner = newRunnerFor(a, harnesses);

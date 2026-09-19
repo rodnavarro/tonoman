@@ -4,6 +4,7 @@
 // rule they prove.
 import { describe, it, expect } from "vitest";
 import { SlackConnector } from "./slack";
+import { threadOwners, type ThreadOwners } from "./threadowners";
 
 class FakeSocket {
   static last: FakeSocket | undefined;
@@ -22,8 +23,12 @@ class FakeSocket {
   }
 }
 
-/** Echo's connector. `lastInThread` is who conversations.replies says spoke last among the bots. */
-function echo(o: { watched?: string[]; sharedWatch?: (c: string) => boolean; lastInThread?: string } = {}): { conn: SlackConnector; calls: string[] } {
+/** Echo's connector. `lastInThread` is the agent the worker recorded as last answering thread C1/1.0
+ *  (UBOT is Echo, UGOLF is Golf); absent = no record, as after a restart. Slack's own thread history is
+ *  deliberately NOT what decides it: the fake answers conversations.replies with Golf last. */
+function echo(o: { watched?: string[]; sharedWatch?: (c: string) => boolean; lastInThread?: string; owners?: ThreadOwners } = {}): { conn: SlackConnector; calls: string[]; owners: ThreadOwners } {
+  const owners = o.owners ?? threadOwners();
+  if (o.lastInThread) owners.set("C1", "1.0", o.lastInThread);
   const calls: string[] = [];
   const fetchImpl = (async (url: string, init?: { body?: string }) => {
     const method = String(url).split("/").pop()!.split("?")[0]!;
@@ -42,7 +47,6 @@ function echo(o: { watched?: string[]; sharedWatch?: (c: string) => boolean; las
                     { ts: "1.0", user: "UANA", text: "root" },
                     { ts: "1.1", user: "UBOT", bot_id: "BECHO", text: "echo here" },
                     { ts: "1.2", user: "UGOLF", bot_id: "BGOLF", text: "golf here" },
-                    ...(o.lastInThread === "UBOT" ? [{ ts: "1.3", user: "UBOT", bot_id: "BECHO", text: "echo again" }] : []),
                   ],
                 }
               : { ok: true, ts: "9.9" };
@@ -55,8 +59,9 @@ function echo(o: { watched?: string[]; sharedWatch?: (c: string) => boolean; las
     socketImpl: FakeSocket as unknown as typeof WebSocket,
     watchedChannels: () => new Set(o.watched ?? []),
     sharedWatch: o.sharedWatch,
+    threadOwners: owners,
   });
-  return { conn, calls };
+  return { conn, calls, owners };
 }
 
 /** Push frames, then a final human DM as a sentinel, and return the texts of every envelope that came
@@ -133,12 +138,38 @@ describe("who a message is for", () => {
 
   it("CONVO-WHO-IS-ADDRESSED a !command with no mention in a shared thread goes to the agent that last answered there", async () => {
     // Golf answered last: Echo leaves it, though the thread is Echo's own.
-    const golfLast = echo();
+    const golfLast = echo({ lastInThread: "UGOLF" });
     expect(await seen(golfLast.conn, [{ type: "message", channel: "C1", user: "UANA", text: "!new", ts: "5.1", thread_ts: "1.0", parent_user_id: "UANA" }])).toEqual([]);
-    const golfLastOwn = echo();
+    const golfLastOwn = echo({ lastInThread: "UGOLF" });
     expect(await seen(golfLastOwn.conn, [{ type: "message", channel: "C1", user: "UANA", text: "!new", ts: "5.2", thread_ts: "1.0", parent_user_id: "UBOT" }])).toEqual([]);
     // Echo answered last: Echo takes it, even in a thread somebody else started.
     const echoLast = echo({ lastInThread: "UBOT" });
     expect(await seen(echoLast.conn, [{ type: "message", channel: "C1", user: "UANA", text: "!new", ts: "5.3", thread_ts: "1.0", parent_user_id: "UANA" }])).toEqual(["!new"]);
+    // Decided from the worker's own record, never by reading the thread from Slack (which pages, and
+    // counts every integration bot in it).
+    expect(echoLast.calls).not.toContain("conversations.replies");
+  });
+
+  it("CONVO-WHO-IS-ADDRESSED a !command that names another agent is never run by this one, even where this one answered last", async () => {
+    const { conn } = echo({ lastInThread: "UBOT" });
+    expect(await seen(conn, [{ type: "message", channel: "C1", user: "UANA", text: "!new <@UGOLF>", ts: "6.1", thread_ts: "1.0", parent_user_id: "UBOT" }])).toEqual([]);
+  });
+
+  it("CONVO-WHO-IS-ADDRESSED with no record of who answered last (after a restart), only the agent whose own thread it is runs a bare !command", async () => {
+    const own = echo();
+    expect(await seen(own.conn, [{ type: "message", channel: "C1", user: "UANA", text: "!new", ts: "7.1", thread_ts: "1.0", parent_user_id: "UBOT" }])).toEqual(["!new"]);
+    const notOwn = echo();
+    expect(await seen(notOwn.conn, [{ type: "message", channel: "C1", user: "UANA", text: "!new", ts: "7.2", thread_ts: "1.0", parent_user_id: "UANA" }])).toEqual([]);
+    // A channel two agents watch is not "own" enough: nobody runs it.
+    const shared = echo({ watched: ["C1"], sharedWatch: () => true });
+    expect(await seen(shared.conn, [{ type: "message", channel: "C1", user: "UANA", text: "!new", ts: "7.3", thread_ts: "1.0", parent_user_id: "UANA" }])).toEqual([]);
+  });
+
+  it("CONVO-WHO-IS-ADDRESSED answering in a thread is what records the agent as the last to answer there", async () => {
+    const owners = threadOwners();
+    const { conn } = echo({ owners });
+    await seen(conn, []); // connects, and learns its own bot id
+    await conn.reply("T1/C1/1.0").send("an answer");
+    expect(owners.get("C1", "1.0")).toBe("UBOT");
   });
 });

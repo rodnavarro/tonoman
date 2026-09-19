@@ -19,6 +19,7 @@ import { promises as fs } from "node:fs";
 import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 import { toMrkdwn } from "./mrkdwn";
+import type { ThreadOwners } from "./threadowners";
 import type { Connector, Envelope, Reply } from "../core/contracts";
 
 export interface SlackOptions {
@@ -63,6 +64,9 @@ export interface SlackOptions {
   /** Does ANOTHER agent watch this channel too? Then a plain message there is answered only when it
    *  names one of them (CONVO-WHO-IS-ADDRESSED). Asked per message. Absent = nobody else does. */
   sharedWatch?: (channel: string) => boolean;
+  /** The worker's record of which agent last answered each thread (CONVO-WHO-IS-ADDRESSED), shared
+   *  by every agent it serves. This connector writes to it whenever it answers in a thread. */
+  threadOwners?: ThreadOwners;
 }
 
 /** A slash command, normalized for the worker's `!` dispatcher. `text` is already the `!`-prefixed
@@ -236,15 +240,9 @@ export class SlackConnector implements Connector {
     return false;
   }
 
-  /** The bot user that posted last in a thread, if any bot has. */
-  private async lastBotInThread(channel: string, threadTs: string): Promise<string | undefined> {
-    const r = await this.call<{ messages?: { user?: string; bot_id?: string; ts?: string }[] }>("conversations.replies", {
-      channel,
-      ts: threadTs,
-      limit: 200,
-    }).catch(() => undefined);
-    const bots = (r?.messages ?? []).filter((m) => m.bot_id && m.user);
-    return bots.length ? bots[bots.length - 1]!.user : undefined;
+  /** This agent just answered in a thread: it is now the one a bare `!command` there is for. */
+  noteAnswered(channel: string, threadTs: string | undefined): void {
+    if (threadTs && this.botUserID) this.o.threadOwners?.set(channel, threadTs, this.botUserID);
   }
 
   /** Our own bot user id, so we never answer ourselves. Resolved once, best-effort: if it fails
@@ -520,12 +518,16 @@ export class SlackConnector implements Connector {
     // Everything that reached us without one is re-checked:
     if (e.type !== "app_mention" && !isDm) {
       if (threadCommand) {
-        // A bare `!command` in a shared thread belongs to whichever agent answered there last.
-        const last = await this.lastBotInThread(e.channel, e.thread_ts!);
+        // A command that names another agent is that agent's, wherever it is typed.
+        if (await this.mentionsAnotherBot(e.text)) return null;
+        // A bare `!command` in a shared thread belongs to whichever agent answered there last, as the
+        // worker recorded it. With no record (a thread nobody answered since a restart), only the agent
+        // whose own thread it is — or the only agent watching the channel — runs it; never two.
+        const last = this.o.threadOwners?.get(e.channel, e.thread_ts!);
         if (last) {
           if (last !== this.botUserID) return null;
-        } else if (!isWatchedMessage && !inOwnThread) {
-          return null; // no agent has answered here and it is not ours by the old rules either
+        } else if (!inOwnThread && !(isWatchedMessage && !this.o.sharedWatch?.(e.channel))) {
+          return null;
         }
       } else if (!this.mentionsMe(e.text)) {
         // A message that names another agent, and not this one, is that agent's — even in this
@@ -812,6 +814,7 @@ class SlackReply implements Reply {
       unfurl_links: false,
       unfurl_media: false,
     });
+    this.c.noteAnswered(this.target.channel, this.target.threadTs);
     return res.ts ?? "";
   }
 
