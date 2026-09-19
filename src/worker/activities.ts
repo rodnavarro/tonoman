@@ -367,7 +367,7 @@ export function sessionKeyOf(conversation: string, user?: string, provider?: "cl
  *  of a login is recorded against THAT provider — not whatever the agent was switched to while it
  *  ran (INFER-SWITCH-COUNTS-CURRENT). Bounded; an entry is only needed until the notice is posted. */
 const turnProvider = new Map<string, "claude" | "codex">();
-const turnProviderKey = (agent: string, conversation: string, user?: string): string => `${agent} ${conversation} ${user ?? ""}`;
+const turnProviderKey = (agent: string, conversation: string, user?: string): string => `${agent}\u0000${conversation}\u0000${user ?? ""}`;
 
 /** What a turn needs from the brains (docs/definition/objects/brain.md). Absent = no brains here. */
 export interface TurnBrains {
