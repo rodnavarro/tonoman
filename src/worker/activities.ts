@@ -963,6 +963,7 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
     if (brains && input.user) {
       prior = await brains.provenance(input.agent, key).catch(() => ["unknown"]);
       audience = await brains.audience(input.agent, input.conversation, input.user).catch((e: Error) => ({ kind: "unknown", why: e.message }) as Audience);
+      if (audience.kind === "unknown") console.log(`worker: ${input.agent} could not count who is in ${input.conversation}: ${audience.why}`);
       // A history that drew on a brain this person no longer reaches is not continued: what it holds
       // is no longer theirs to hear (BRAIN-GRANT-TIMING). The turn starts a fresh session instead.
       if (prior.length) {
@@ -1306,6 +1307,8 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
       const now = await brains.reach(input.agent, input.user).catch(() => null);
       const readable = audience.kind === "members" ? await brains.readableByAll(input.agent, drawnOn, audience.members).catch(() => null) : null;
       if (decideRoute(audience, drawnOn, readable).to === "private") {
+        // Why it went private, by kind and reason only — never the answer or a brain's content.
+        console.log(`worker: ${input.agent} answer sent privately — audience ${audience.kind}${"why" in audience ? `: ${audience.why}` : ""}`);
         const names = drawnOn.map((b) => now?.get(b)).filter((n): n is string => !!n);
         const sent = await brains.dm(input.agent, input.user, `${privateReason(names, audience)}\n\n${final}`).catch(() => false);
         const note = sent ? THREAD_NOTE : THREAD_NOTE_FAILED;

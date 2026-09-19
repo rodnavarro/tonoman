@@ -207,13 +207,19 @@ export class SlackConnector implements Connector {
   /** Calls a Slack Web API method with the BOT token. Slack answers 200 with `{ok:false}`, so
    *  the error path is the body, not the status. */
   async call<T = unknown>(method: string, body: Record<string, unknown> = {}, token?: string): Promise<T> {
+    // Slack's READ methods refuse a JSON body (`invalid_arguments`) and take form fields; its write
+    // methods take JSON. Sending every call as JSON is why a DM's audience could never be counted
+    // live, and every answer that used a brain went privately — even in the person's own DM.
+    const form = FORM_METHODS.has(method);
     const r = await this.fetch(`${this.apiBase()}/${method}`, {
       method: "POST",
       headers: {
-        "content-type": "application/json; charset=utf-8",
+        "content-type": form ? "application/x-www-form-urlencoded; charset=utf-8" : "application/json; charset=utf-8",
         authorization: `Bearer ${token ?? this.o.botToken}`,
       },
-      body: JSON.stringify(body),
+      body: form
+        ? new URLSearchParams(Object.entries(body).map(([k, v]): [string, string] => [k, typeof v === "string" ? v : JSON.stringify(v)])).toString()
+        : JSON.stringify(body),
     });
     const j = (await r.json()) as { ok?: boolean; error?: string } & Record<string, unknown>;
     if (!j.ok) throw new Error(`slack ${method}: ${j.error ?? `http ${r.status}`}`);
@@ -638,6 +644,17 @@ export class SlackConnector implements Connector {
     }
   }
 }
+
+/** Slack Web API methods that take form fields, not JSON (the read methods). */
+const FORM_METHODS = new Set([
+  "auth.test",
+  "bots.info",
+  "conversations.history",
+  "conversations.info",
+  "conversations.members",
+  "conversations.replies",
+  "users.info",
+]);
 
 /** PURE: is this a reply in a thread the AGENT started — a recap it posted, an answer it gave at
  *  top level? Then it is addressed to the agent without an @mention: a person replying under the

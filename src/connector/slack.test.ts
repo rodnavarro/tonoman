@@ -489,3 +489,43 @@ describe("repliesToOwnThread — a reply under the agent's own message needs no 
     expect(repliesToOwnThread({ type: "message", ts: "2.0", thread_ts: "1.0", parent_user_id: BOT }, undefined)).toBe(false);
   });
 });
+
+describe("asking Slack the way Slack answers", () => {
+  // Real Slack refuses a JSON body on its read methods with `invalid_arguments`; this fake does the
+  // same, where the old one accepted anything — which is how every brain answer went private live.
+  const READS = new Set(["conversations.info", "conversations.members", "users.info", "auth.test", "bots.info"]);
+  const strictSlack = (handlers: Record<string, (args: URLSearchParams) => unknown>) =>
+    (async (url: string, init?: { headers?: Record<string, string>; body?: unknown }) => {
+      const method = String(url).split("/").pop()!.split("?")[0]!;
+      const type = init?.headers?.["content-type"] ?? "";
+      if (READS.has(method) && type.includes("json")) return { json: async () => ({ ok: false, error: "invalid_arguments" }) } as unknown as Response;
+      const args = type.includes("json") ? new URLSearchParams(Object.entries(JSON.parse(String(init?.body ?? "{}"))).map(([k, v]) => [k, String(v)])) : new URLSearchParams(String(init?.body ?? ""));
+      const h = handlers[method];
+      return { json: async () => (h ? h(args) : { ok: true }) } as unknown as Response;
+    }) as unknown as typeof fetch;
+
+  it("BRAIN-AUDIENCE the speaker's own DM counts as the speaker alone, as real Slack reports it", async () => {
+    const conn = new SlackConnector({
+      appToken: "xapp",
+      botToken: "xoxb",
+      fetchImpl: strictSlack({
+        "auth.test": () => ({ ok: true, user_id: "UBOT" }),
+        "conversations.info": (a) => (a.get("channel") === "D1" ? { ok: true, channel: { id: "D1", is_im: true, user: "UANA" } } : { ok: false, error: "channel_not_found" }),
+      }),
+    });
+    expect(await conn.audience("T1/D1", "UANA")).toEqual({ kind: "self" });
+  });
+
+  it("BRAIN-AUDIENCE a private channel's members are counted from real Slack's answer", async () => {
+    const conn = new SlackConnector({
+      appToken: "xapp",
+      botToken: "xoxb",
+      fetchImpl: strictSlack({
+        "auth.test": () => ({ ok: true, user_id: "UBOT" }),
+        "conversations.info": () => ({ ok: true, channel: { id: "G1", is_private: true, name: "eng" } }),
+        "conversations.members": (a) => (a.get("channel") === "G1" ? { ok: true, members: ["UANA", "UBEN", "UBOT"] } : { ok: false, error: "channel_not_found" }),
+      }),
+    });
+    expect(await conn.audience("T1/G1/1.2", "UANA")).toEqual({ kind: "members", members: ["UANA", "UBEN"], name: "eng" });
+  });
+});
