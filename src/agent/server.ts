@@ -33,25 +33,66 @@ import { execFile, spawn } from "node:child_process";
 import * as claudecode from "../harness/claudecode";
 import * as codex from "../harness/codex";
 import type { BackendMode } from "../harness/claudecode";
-import type { Spec } from "../harness";
+import type { HarnessKind, Spec } from "../harness";
 import type { TurnEvent, TurnRequest, TurnRunner } from "../core/contracts";
 import { fetchAccountUsage } from "../statusline";
-import { extractAuthUrl, looksLoggedIn } from "../authflow";
+import { extractAuthUrl, extractDeviceAuth, looksLoggedIn } from "../authflow";
 
 // This ONE agent binary can drive EITHER harness — the dual-harness image bakes both `claude`
 // and `codex`, and both subscription credentials are mounted. The pod's DEFAULT harness is set
 // by TONOMAN_HARNESS (default "claude-code"); it decides /health, /auth and /usage (which hold
 // a harness's credential + login), and the runner used when a turn carries no model override.
-function activeHarness(): "codex" | "claude-code" {
+function activeHarness(): HarnessKind {
   return process.env.TONOMAN_HARNESS === "codex" ? "codex" : "claude-code";
 }
 /** The active harness's Spec (loginArgs/statusArgs/credFile/bin), for /auth + /health + /usage. */
 function activeSpec(): Spec {
-  return activeHarness() === "codex" ? codex.spec() : claudecode.spec();
+  return specFor(activeHarness());
 }
 /** Default CLI binary for the active harness (version probe). */
 function activeBin(): string {
-  return activeHarness() === "codex" ? "codex" : "claude";
+  return binFor(activeHarness());
+}
+
+// --- per-REQUEST harness (W1) ------------------------------------------------------------------
+// The pod's TONOMAN_HARNESS is a DEFAULT, not a fact. One worker serves a whole tenant, and two of
+// its agents can answer on two different providers — so the caller says which one it means and the
+// request wins over the env. Everything that differs between them is resolved through this one
+// helper rather than five ternaries at five call sites, because the fifth is the one that gets
+// missed: the cred FILENAME differs (.credentials.json / auth.json), the config-home ROOT differs
+// (/root/.claude / /root/.codex) and the ENV VAR that points a child at it differs
+// (CLAUDE_CONFIG_DIR / CODEX_HOME). Getting one of the three wrong means a login that reports
+// success into a directory nothing reads.
+
+/** Which harness a request is about: `?harness=` / the JSON body, else the pod's default. */
+function harnessOf(req: http.IncomingMessage, body?: Record<string, unknown>): HarnessKind {
+  const q = new URL(req.url ?? "/", "http://x").searchParams.get("harness");
+  const b = typeof body?.harness === "string" ? body.harness : undefined;
+  const asked = q || b;
+  if (asked === "codex") return "codex";
+  if (asked === "claude-code") return "claude-code";
+  return activeHarness(); // unknown or absent → the pod's configured default, as before
+}
+
+function specFor(h: HarnessKind): Spec {
+  return h === "codex" ? codex.spec() : claudecode.spec();
+}
+function binFor(h: HarnessKind): string {
+  return h === "codex" ? "codex" : "claude";
+}
+/** This harness's per-agent (and per-person) config home. */
+function homeFor(h: HarnessKind, agent: string | undefined, user?: string): string {
+  return h === "codex" ? codex.configHomeFor(agent, user) : claudecode.configHomeFor(agent, user);
+}
+/** The env that points a child process at that config home — a DIFFERENT variable per harness. */
+function homeEnv(h: HarnessKind, agent: string | undefined, user?: string): NodeJS.ProcessEnv | undefined {
+  if (!agent) return undefined;
+  const home = homeFor(h, agent, user);
+  return h === "codex" ? { CODEX_HOME: home } : { CLAUDE_CONFIG_DIR: home };
+}
+/** The credential file a login for this harness writes, in that home. */
+function credFileIn(h: HarnessKind, home: string): string {
+  return h === "codex" ? `${home}/auth.json` : `${home}/.credentials.json`;
 }
 
 /** Which harness a model name belongs to — lets `/model` switch harness per turn (default codex
@@ -71,7 +112,7 @@ export interface RuntimeOptions {
    * agent — the token (plus a NetworkPolicy in k8s) is the access control. */
   token?: string;
   /** injectable for tests; default builds a local-exec claudecode Runner per turn. */
-  newRunner?: (o: { model?: string; maxTurns?: number; backend?: BackendMode; disallowedTools?: string[] }) => TurnRunner;
+  newRunner?: (o: { model?: string; maxTurns?: number; backend?: BackendMode; disallowedTools?: string[]; harness?: HarnessKind }) => TurnRunner;
   /** Claude-Code-specific tools to drop from every turn (--disallowedTools), from
    * $CLAUDE_CODE_DISALLOWED_TOOLS. Trims their schemas off the context floor for an agent that
    * never uses them (e.g. Task/NotebookEdit/TodoWrite). Backend-specific — see RunnerOptions. */
@@ -91,8 +132,8 @@ export interface RuntimeOptions {
    * Injectable because the unit tests run on a host without `script`; they substitute a plain
    * redirect, which exercises the stdin/outcome plumbing but not the PTY itself. */
   ptyArgv?: (cmd: string, log: string) => string[];
-  /** how long to let the harness exchange the code + write creds before we judge the outcome;
-   * default 4500ms (a real OAuth exchange). Tests shrink it — a fake login needs no round trip. */
+  /** the LONGEST to wait for the harness to exchange the code and report logged in; default 30s.
+   *  It is polled, not slept: success is reported the moment it is true. Tests shrink it. */
   authSettleMs?: number;
   /** claude binary for the /health version check; default "claude". */
   bin?: string;
@@ -122,6 +163,15 @@ interface TurnBody {
   /** inbound media the gateway downloaded, base64'd for the wire (split-media-carried). Written
    * back under AGENT_MEDIA_DIR at each basename so the prompt's path reference resolves here. */
   media?: { name?: string; b64?: string }[];
+  /** WHICH provider answers this turn (W1): "claude-code" | "codex". The pod holds both CLIs and
+   * both credentials, so a turn that does not say runs on TONOMAN_HARNESS — which for an agent
+   * configured the other way is the wrong model on the wrong account. The gateway sends it on
+   * every turn; an absent value keeps the pod default, so an older gateway is unchanged. */
+  harness?: string;
+  /** WHOSE credential directory this turn runs under, when the agent runs inference per person.
+   * Resolved gateway-side (only it knows the provider AND the speaker) and applied here through
+   * the harness's own env var. Unset = the agent's one shared login. */
+  configHome?: string;
 }
 
 /** Where inbound wire media is materialized in THIS pod; must match the gateway connector's
@@ -209,8 +259,11 @@ export function encodeEvent(ev: TurnEvent): string {
  *    configured default (e.g. codex `sol`) with no model flag.
  * Both credentials are mounted and each Runner points at its own CONFIG_HOME, so the two never
  * cross-contaminate. */
-const localRunner = (o: { model?: string; maxTurns?: number; backend?: BackendMode; disallowedTools?: string[] }): TurnRunner => {
-  const useCodex = isCodexModel(o.model) || (!o.model && activeHarness() === "codex");
+const localRunner = (o: { model?: string; maxTurns?: number; backend?: BackendMode; disallowedTools?: string[]; harness?: HarnessKind }): TurnRunner => {
+  // The turn's OWN harness (W1) stands in for the pod default; an explicit model still wins over
+  // both, because `/model opus` on a codex agent is a deliberate one-turn hop and always was.
+  const dflt = o.harness ?? activeHarness();
+  const useCodex = isCodexModel(o.model) || (!o.model && dflt === "codex");
   if (useCodex && !isClaudeModel(o.model)) {
     return new codex.Runner({ local: true, model: o.model, maxTurns: o.maxTurns });
   }
@@ -269,10 +322,19 @@ async function handleUsage(req: http.IncomingMessage, res: http.ServerResponse, 
   // the ChatGPT /codex/usage endpoint, claude from Anthropic's OAuth-usage API. Both read usage (not
   // inference) with the account's own token. So a codex agent shows the same 5h/7d window as claude.
   let windows: import("../statusline").UsageWindow[] = [];
-  if (activeHarness() === "codex") {
-    windows = await codex.fetchCodexUsage(process.env.CODEX_HOME || codex.CONFIG_HOME);
+  const h = harnessOf(req);
+  if (h === "codex") {
+    // This agent's OWN codex home when it named itself, exactly as the claude branch below reads
+    // this agent's own credential — headroom belongs to whoever's subscription is answering.
+    const who = agentOf(req);
+    windows = await codex.fetchCodexUsage(who ? codex.configHomeFor(who, userOf(req)) : process.env.CODEX_HOME || codex.CONFIG_HOME);
   } else {
-    const credFile = opts.credFile ?? `${claudecode.CONFIG_HOME}/.credentials.json`;
+    // This agent's own credential: the headroom belongs to whoever's subscription is answering,
+    // and reading the shared file would report one person's quota under everybody's name.
+    const usageAgent = agentOf(req);
+    const credFile = usageAgent
+      ? `${claudecode.configHomeFor(usageAgent, userOf(req))}/.credentials.json`
+      : (opts.credFile ?? `${claudecode.CONFIG_HOME}/.credentials.json`);
     try {
       const raw = await fs.readFile(credFile, "utf8");
       const token = (JSON.parse(raw).claudeAiOauth?.accessToken as string) || null;
@@ -292,7 +354,26 @@ async function handleUsage(req: http.IncomingMessage, res: http.ServerResponse, 
 // request while the login process (and its PKCE verifier) stays alive in between.
 const DEFAULT_AUTH_LOG = path.join(os.tmpdir(), "tonoman-auth.log");
 const DEFAULT_PTY = (cmd: string, log: string): string[] => ["script", "-qfc", cmd, log];
-let pendingLogin: { child: import("node:child_process").ChildProcess } | null = null;
+/** The login in flight, and WHOSE it is - the follow-up code must be judged against the same
+ *  agent that started it, not against whatever the second request happens to say.
+ *
+ *  `harness` and `credBefore` are here for device auth (codex, W2), which has no second request to
+ *  carry them: nothing comes back through us, so the login's own credential BASELINE has to be
+ *  snapshotted at start time or "the credential changed" means nothing when /auth/pending asks. */
+let pendingLogin: {
+  child: import("node:child_process").ChildProcess;
+  agent?: string;
+  user?: string;
+  harness: HarnessKind;
+  credFile: string;
+  credBefore: [number, number];
+  /** The child has EXITED, but its record is kept. `codex login --device-auth` exits the moment it
+   *  succeeds, so dropping the record on exit would throw away the one thing that makes the next
+   *  /auth/pending poll honest: the credential's baseline. Without it the poll falls back to status
+   *  alone, and a stale-but-valid auth.json sitting on disk answers "yes" for a login that never
+   *  happened. Kept until the poll reads it, or until another login supersedes it. */
+  exited?: boolean;
+} | null = null;
 
 /** The credential's (mtime, size) — the OUTCOME signal for a login. 0/0 when absent. */
 async function credStamp(credFile: string): Promise<[number, number]> {
@@ -308,16 +389,54 @@ function authUnauthorized(req: http.IncomingMessage, opts: RuntimeOptions): bool
   return !!opts.token && req.headers["authorization"] !== `Bearer ${opts.token}`;
 }
 
-/** POST /auth/login — start the harness's own login under a PTY and return the OAuth URL.
- * Takes NO command from the caller: the argv comes from this agent's harness spec, so the
- * endpoint can't be turned into a remote-exec primitive. Bearer-gated like /turn. */
+/** Which agent a login request is about, from `?agent=` or the JSON body.
+ *
+ *  One runtime serves every agent a pool has, and a Claude subscription belongs to a person — so a
+ *  login has to say WHOSE it is or the first person's credential is replaced by the second's.
+ *  `configHomeFor` sanitises the name; it decides a filesystem path and it arrives over the wire. */
+function agentOf(req: http.IncomingMessage, body?: Record<string, unknown>): string | undefined {
+  const q = new URL(req.url ?? "/", "http://x").searchParams.get("agent");
+  const b = typeof body?.agent === "string" ? body.agent : undefined;
+  return (q || b || undefined) ?? undefined;
+}
+
+/** WHICH PERSON's login under the agent, from `?user=` or the JSON body — set only when the agent
+ *  runs inference per person, so each teammate signs into their own credential dir. `configHomeFor`
+ *  sanitises it the same way as the agent name, since it too decides a filesystem path from the wire.
+ *  Absent = the agent's one shared login, which is every agent today. */
+function userOf(req: http.IncomingMessage, body?: Record<string, unknown>): string | undefined {
+  const q = new URL(req.url ?? "/", "http://x").searchParams.get("user");
+  const b = typeof body?.user === "string" ? body.user : undefined;
+  return (q || b || undefined) ?? undefined;
+}
+
+/** Where this agent's login writes, and where its credential is checked — the person's own dir when
+ *  `user` is set, else the agent's shared one. */
+function credFileFor(opts: RuntimeOptions, h: HarnessKind, agent: string | undefined, user?: string): string {
+  if (agent) return credFileIn(h, homeFor(h, agent, user));
+  return opts.credFile ?? specFor(h).credFile ?? credFileIn(h, h === "codex" ? codex.CONFIG_HOME : claudecode.CONFIG_HOME);
+}
+
+/** POST /auth/login — start the harness's own login under a PTY and return what the person needs.
+ *
+ * Takes NO command from the caller: the argv comes from the named harness's spec, so the endpoint
+ * can't be turned into a remote-exec primitive. Bearer-gated like /turn.
+ *
+ * TWO SHAPES, because the two providers ask for two different things:
+ *  - claude  → `{ url }`.        The person pastes a code back; `/auth/code` completes it.
+ *  - codex   → `{ url, code }`.  Device auth: the person enters OUR code on OpenAI's page and the
+ *                                CLI polls. Nothing comes back through us, so there is no second
+ *                                request — the child stays alive and `/auth/pending` watches it.
+ */
 async function handleAuthLogin(req: http.IncomingMessage, res: http.ServerResponse, opts: RuntimeOptions): Promise<void> {
   if (authUnauthorized(req, opts)) {
     res.writeHead(401, { "content-type": "application/json" });
     res.end('{"error":"unauthorized"}\n');
     return;
   }
-  const loginArgs = opts.loginArgs ?? activeSpec().loginArgs ?? [];
+  const h = harnessOf(req);
+  const deviceAuth = h === "codex";
+  const loginArgs = opts.loginArgs ?? specFor(h).loginArgs ?? [];
   if (!loginArgs.length) {
     res.writeHead(501, { "content-type": "application/json" });
     res.end('{"error":"this harness defines no login command"}\n');
@@ -331,27 +450,69 @@ async function handleAuthLogin(req: http.IncomingMessage, res: http.ServerRespon
   const authLog = opts.authLog ?? DEFAULT_AUTH_LOG;
   await fs.rm(authLog, { force: true }).catch(() => {});
 
-  const argv = (opts.ptyArgv ?? DEFAULT_PTY)(loginArgs.join(" "), authLog);
-  const child = spawn(argv[0], argv.slice(1), { stdio: ["pipe", "ignore", "ignore"] });
-  pendingLogin = { child };
+  // DEVICE AUTH NEEDS NO PTY. `codex login --device-auth` prints its URL and code straight to a
+  // plain pipe (verified against codex-cli 0.154), so the transcript is captured by redirecting the
+  // child's own stdout — no `script`, and no guessing how the CLI renders under a TTY it thinks a
+  // person is watching. Claude's login IS a TUI and still gets the PTY, which is what `script` was
+  // brought in for. `ptyArgv` is honoured either way, because that is what the tests inject.
+  const argv = opts.ptyArgv ? opts.ptyArgv(loginArgs.join(" "), authLog) : deviceAuth ? loginArgs : DEFAULT_PTY(loginArgs.join(" "), authLog);
+  const logFd = !opts.ptyArgv && deviceAuth ? await fs.open(authLog, "a") : undefined;
+  // The login writes wherever the harness's config-home env points, so this is the line that
+  // decides whose subscription an agent ends up running on. Without it every login in the pool
+  // lands in one directory and the last person to sign in owns every agent. WHICH variable that
+  // is differs by harness (CLAUDE_CONFIG_DIR / CODEX_HOME) — see homeEnv.
+  const who = agentOf(req);
+  const user = userOf(req);
+  // codex refuses a missing CODEX_HOME; make sure the per-person home exists before the login runs.
+  if (h === "codex" && who) codex.ensureCodexHome(homeFor(h, who, user));
+  const overlay = homeEnv(h, who, user);
+  const child = spawn(argv[0], argv.slice(1), {
+    // Device auth writes its own transcript; the PTY path has `script` write it instead.
+    stdio: logFd ? ["pipe", logFd.fd, logFd.fd] : ["pipe", "ignore", "ignore"],
+    env: overlay ? { ...process.env, ...overlay } : process.env,
+  });
+  // Ours to close once the child holds its own descriptor.
+  await logFd?.close().catch(() => {});
+  // The BASELINE, taken before the login can have written anything. Device auth completes with no
+  // further request from us, so without this snapshot /auth/pending has nothing to compare against
+  // and would bless a pre-existing credential as a login that just happened.
+  const credFile = credFileFor(opts, h, who, user);
+  pendingLogin = { child, agent: who, user, harness: h, credFile, credBefore: await credStamp(credFile) };
+  // A spawn that never started has no baseline worth keeping — it wrote nothing.
   child.on("error", () => {
     if (pendingLogin?.child === child) pendingLogin = null;
   });
+  // An exit is NOT the end of the record. Device auth exits ON SUCCESS, and the poll that has not
+  // asked yet still needs the baseline to tell that success apart from a credential that was
+  // already there. See `exited` above.
   child.on("exit", () => {
-    if (pendingLogin?.child === child) pendingLogin = null;
+    if (pendingLogin?.child === child) pendingLogin.exited = true;
   });
 
   const deadline = Date.now() + 25_000;
   for (;;) {
     const raw = await fs.readFile(authLog, "utf8").catch(() => "");
-    const url = extractAuthUrl(raw);
-    if (url) {
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ url }) + "\n");
-      return;
+    if (deviceAuth) {
+      // Both or neither: a URL with no code is not something a person can act on, and answering
+      // with half of it would put them on a page that asks for something we have not read yet.
+      const d = extractDeviceAuth(raw);
+      if (d) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ url: d.url, code: d.code }) + "\n");
+        return;
+      }
+    } else {
+      const url = extractAuthUrl(raw);
+      if (url) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ url }) + "\n");
+        return;
+      }
     }
     // Bail on: timeout, the login exiting, or the spawn failing outright (the "error" handler
     // clears pendingLogin) — never spin for 25s on a login that was never going to speak.
+    // Bail on: timeout, the login exiting before it spoke, or the spawn failing outright. A login
+    // that exited WITHOUT printing its URL has nothing to offer either way, so the record goes too.
     if (Date.now() > deadline || child.exitCode !== null || pendingLogin?.child !== child) {
       child.kill();
       pendingLogin = null;
@@ -361,6 +522,52 @@ async function handleAuthLogin(req: http.IncomingMessage, res: http.ServerRespon
     }
     await new Promise((r) => setTimeout(r, 400));
   }
+}
+
+/** GET /auth/pending — has the login started by /auth/login finished? (W2, device auth.)
+ *
+ * Judged exactly as `/auth/code` judges a pasted code, and for the same reason: OUTCOME-TRUE. The
+ * credential file must actually have changed since the login started AND the harness's own status
+ * must agree. `auth status` alone would read a PRE-EXISTING credential and report a cheerful ✓ for
+ * a login nobody ever completed.
+ *
+ * It tolerates a MISSING pendingLogin rather than 409-ing: a poll runs for ten minutes, and the
+ * child can be gone (it exited the moment it finished, or the process was restarted) while the
+ * credential it wrote is right there. With no baseline to compare against, status alone is the
+ * best available signal — reported honestly as `credChanged: false` so the caller can tell.
+ */
+async function handleAuthPending(req: http.IncomingMessage, res: http.ServerResponse, opts: RuntimeOptions): Promise<void> {
+  if (authUnauthorized(req, opts)) {
+    res.writeHead(401, { "content-type": "application/json" });
+    res.end('{"error":"unauthorized"}\n');
+    return;
+  }
+  const h = harnessOf(req);
+  const who = agentOf(req);
+  const user = userOf(req);
+  // The login's OWN record wins over what this request says, so a stray poll cannot judge one
+  // person's credential to bless another's login — the same rule /auth/code follows.
+  const mine = pendingLogin && (pendingLogin.agent ?? undefined) === who && (pendingLogin.user ?? undefined) === user;
+  const credFile = mine ? pendingLogin!.credFile : credFileFor(opts, h, who, user);
+  const before = mine ? pendingLogin!.credBefore : undefined;
+  const after = await credStamp(credFile);
+  const credChanged = before ? after[0] > before[0] || after[1] !== before[1] : false;
+
+  const statusArgs = opts.statusArgs ?? specFor(mine ? pendingLogin!.harness : h).statusArgs ?? [];
+  const status = statusArgs.length
+    ? (await run(statusArgs[0], statusArgs.slice(1), homeEnv(mine ? pendingLogin!.harness : h, who, user))).trim()
+    : "";
+  const loggedIn = looksLoggedIn(status);
+  // Done = the credential moved AND the harness agrees. With no baseline (the child is gone) the
+  // harness's word is all there is, and it is reported as such rather than dressed up.
+  const done = loggedIn && (credChanged || !before);
+  if (done) {
+    pendingLogin?.child.kill();
+    pendingLogin = null;
+    await fs.rm(opts.authLog ?? DEFAULT_AUTH_LOG, { force: true }).catch(() => {});
+  }
+  res.writeHead(200, { "content-type": "application/json" });
+  res.end(JSON.stringify({ done, loggedIn, credChanged, pending: !!pendingLogin, status }) + "\n");
 }
 
 /** POST /auth/code {code} — hand the code to the waiting login and report OUTCOME-TRUE success:
@@ -388,15 +595,54 @@ async function handleAuthCode(req: http.IncomingMessage, res: http.ServerRespons
     res.end('{"error":"no login in progress — start one with auth login --headless"}\n');
     return;
   }
-  const credFile = opts.credFile ?? activeSpec().credFile ?? `${claudecode.CONFIG_HOME}/.credentials.json`;
+  // The SAME agent the login was started for - taken from the pending login rather than from
+  // this request, so a mistyped follow-up cannot check one person's credential to bless
+  // another's login.
+  // Falls back to the agent named on THIS request only when the pending login recorded none —
+  // an older client that sent it one way and not the other should still be judged per agent.
+  // The harness the login was STARTED on, for the same reason as the agent: the pending login is
+  // the authority on what it is, not a follow-up request that may say anything.
+  const h = pendingLogin?.harness ?? harnessOf(req);
+  const credFile = credFileFor(opts, h, pendingLogin?.agent ?? agentOf(req), pendingLogin?.user ?? userOf(req));
+  // Taken NOW, not at login time, and deliberately: this flow's window is the few seconds between
+  // the person pasting a code and the CLI writing the credential. Widening it to the whole login
+  // would let a routine background token refresh count as "the credential changed", and bless a
+  // wrong code on an agent that happened to already be signed in. (Device auth cannot do it this
+  // way — nothing comes back through us to mark the start of that window — which is exactly why
+  // /auth/pending carries its own baseline from /auth/login instead.)
   const before = await credStamp(credFile);
 
   pendingLogin.child.stdin?.write(`${code}\n`);
-  await new Promise((r) => setTimeout(r, opts.authSettleMs ?? 4500)); // exchange the code + write creds
 
-  const after = await credStamp(credFile);
-  const statusArgs = opts.statusArgs ?? activeSpec().statusArgs ?? [];
-  const status = statusArgs.length ? (await run(statusArgs[0], statusArgs.slice(1))).trim() : "";
+  const statusArgs = opts.statusArgs ?? specFor(h).statusArgs ?? [];
+  // The SAME directory the login wrote to. Asked without it, this reads the shared home, reports
+  // "loggedIn": false for a login that worked perfectly, and tells the person their code failed —
+  // which is exactly what it did: the credential file had changed, and the status check was
+  // looking somewhere else entirely.
+  const codeAgent = pendingLogin?.agent ?? agentOf(req);
+  const codeUser = pendingLogin?.user ?? userOf(req);
+  const statusNow = async (): Promise<string> =>
+    statusArgs.length
+      ? (
+          await run(statusArgs[0], statusArgs.slice(1), homeEnv(h, codeAgent, codeUser))
+        ).trim()
+      : "";
+
+  // POLLED, not a fixed sleep. The CLI writes the credential file first and the account state that
+  // `auth status` reads a moment later, so one check 4.5s in reported `loggedIn: false` for logins
+  // that had worked — twice in a row — and people re-did a login that was already done. Wait for the
+  // credential to change AND status to agree, up to the settle limit.
+  const deadline = Date.now() + (opts.authSettleMs ?? 30_000);
+  let after = before;
+  let status = "";
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 250));
+    after = await credStamp(credFile);
+    if (!(after[0] > before[0] || after[1] !== before[1])) continue;
+    status = await statusNow();
+    if (!statusArgs.length || looksLoggedIn(status)) break;
+  }
+  if (!status) status = await statusNow();
   const authLog = opts.authLog ?? DEFAULT_AUTH_LOG;
   const loginTail = (await fs.readFile(authLog, "utf8").catch(() => "")).slice(-400);
 
@@ -416,16 +662,23 @@ async function handleAuthStatus(req: http.IncomingMessage, res: http.ServerRespo
     res.end('{"error":"unauthorized"}\n');
     return;
   }
-  const statusArgs = opts.statusArgs ?? activeSpec().statusArgs ?? [];
-  const status = statusArgs.length ? (await run(statusArgs[0], statusArgs.slice(1))).trim() : "";
+  // The harness asked about (W1), not the pod's default: one runtime holds both CLIs and both
+  // credentials, so `codex login status` and `claude auth status` answer about different accounts.
+  const h = harnessOf(req);
+  const statusArgs = opts.statusArgs ?? specFor(h).statusArgs ?? [];
+  // Scoped to the agent asked about. Without this every agent reports the POOL's credential,
+  // which is the confusion per-agent logins exist to remove - and the answer would look right.
+  const who = agentOf(req);
+  const user = userOf(req);
+  const status = statusArgs.length ? (await run(statusArgs[0], statusArgs.slice(1), homeEnv(h, who, user))).trim() : "";
   res.writeHead(200, { "content-type": "application/json" });
   res.end(JSON.stringify({ loggedIn: looksLoggedIn(status), status }) + "\n");
 }
 
 /** execFile → combined output, never throws (a non-zero `auth status` is information, not a crash). */
-function run(bin: string, args: string[]): Promise<string> {
+function run(bin: string, args: string[], envOverlay?: NodeJS.ProcessEnv): Promise<string> {
   return new Promise((resolve) =>
-    execFile(bin, args, { windowsHide: true, maxBuffer: 1 << 22 }, (_e, so, se) => resolve((so?.toString() ?? "") + (se?.toString() ?? ""))),
+    execFile(bin, args, { windowsHide: true, maxBuffer: 1 << 22, env: envOverlay ? { ...process.env, ...envOverlay } : process.env }, (_e, so, se) => resolve((so?.toString() ?? "") + (se?.toString() ?? ""))),
   );
 }
 
@@ -494,8 +747,17 @@ async function handleTurn(req: http.IncomingMessage, res: http.ServerResponse, o
     sessionId: body.sessionId,
     sessionNew: body.sessionNew,
     mediaPaths,
+    // WHOSE login answers, on a per-person agent. The runner applies it through its own harness's
+    // env var, so the same field means CLAUDE_CONFIG_DIR for one and CODEX_HOME for the other.
+    configHome: body.configHome,
   };
-  const runner = (opts.newRunner ?? localRunner)({ model: body.model, maxTurns: body.maxTurns, backend: body.backend, disallowedTools: opts.disallowedTools });
+  const runner = (opts.newRunner ?? localRunner)({
+    model: body.model,
+    maxTurns: body.maxTurns,
+    backend: body.backend,
+    disallowedTools: opts.disallowedTools,
+    harness: harnessOf(req, body as unknown as Record<string, unknown>),
+  });
 
   res.writeHead(200, {
     "content-type": "application/x-ndjson",
@@ -565,6 +827,12 @@ export function serveRuntime(opts: RuntimeOptions): http.Server {
     }
     if (req.method === "GET" && url === "/auth/status") {
       void handleAuthStatus(req, res, opts);
+      return;
+    }
+    // /auth/pending (W2): device auth has no code to send back, so the gateway POLLS here until the
+    // person has finished on OpenAI's page and the CLI has written the credential.
+    if (req.method === "GET" && url === "/auth/pending") {
+      void handleAuthPending(req, res, opts);
       return;
     }
     res.writeHead(404, { "content-type": "application/json" });

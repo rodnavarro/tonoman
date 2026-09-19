@@ -47,6 +47,9 @@ export interface TurnUsage {
    * reports it (claude-code num_turns; codex counts its tool/command items). Shown in the
    * statusline so the operator sees how hard a turn worked / how close it ran to the cap. */
   iterationsUsed?: number;
+  /** The speaker's own plan allowance as this turn left it (5h/7d), when the harness reads it from
+   *  the turn itself — codex's rollout. Claude's comes from the account usage API instead. */
+  accountWindows?: { key: string; usedPct: number; resetAt?: string }[];
 }
 
 /** One normalized event emitted by a harness turn (A2). */
@@ -82,6 +85,28 @@ export interface TurnRequest {
   sessionId?: string;
   /** true = this session doesn't exist yet → CREATE it (--session-id); false = RESUME it. */
   sessionNew?: boolean;
+  /** optional: the model for THIS turn only. The harness's own `setModel` knob is per-process and
+   * therefore shared by every conversation the process serves — which made one person's `/model`
+   * silently change everybody else's. A turn that names its model does not have that problem. */
+  model?: string;
+  /** optional: a LEAN inference turn — no tools, no connectors, one turn. Used for Talent `infer`,
+   * where the agent reasons on its subscription and NOTHING else: every built-in tool is disallowed
+   * (their schemas leave the context too) and the agentic loop is capped at one turn, on top of the
+   * `--strict-mcp-config` that already keeps connectors out. A recap is a completion, not a session. */
+  lean?: boolean;
+  /** optional: the credential/config directory for THIS turn, overriding the runner's per-agent
+   * default. Set only when an agent runs inference PER PERSON — then the speaker's own login is
+   * used, so each teammate answers (and bills) on their own subscription. Unset = the agent's one
+   * shared login, which is every agent today. Per turn rather than per process for the same reason
+   * `model` is: one process serves every conversation, so a per-process credential would be one
+   * person's login answering for everybody. */
+  configHome?: string;
+  /** optional: MCP servers this turn may use — the brain tool. Never given to a lean turn. */
+  mcpServers?: { name: string; command: string; args: string[]; env: Record<string, string> }[];
+  /** set by a runner: where it wrote those servers' configuration for this turn. */
+  mcpConfigFile?: string;
+  /** optional: the turn's own working folder — its cwd, holding its attachments and nothing else. */
+  cwd?: string;
 }
 
 /** Drives one harness turn and yields normalized events (A2). The iterable

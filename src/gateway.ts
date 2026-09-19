@@ -14,6 +14,7 @@ import type { Config, AgentConfig } from "./config";
 import { validate } from "./config";
 import { TelegramConnector } from "./connector/telegram";
 import { TeamsConnector } from "./connector/teams";
+import { SlackConnector } from "./connector/slack";
 import type { Connector, Envelope, MemoryStore } from "./core/contracts";
 import { Registry as HarnessRegistry, type Spec } from "./harness";
 import * as claudecode from "./harness/claudecode";
@@ -374,9 +375,22 @@ async function runAgent(
   // Non-service path: select the channel connector (channel-teams). validate() guarantees
   // the chosen channel's credentials are present. The harness/router/queue downstream are
   // channel-neutral — only this instantiation differs.
-  const isTeams = (ra.cfg.channel ?? (ra.cfg.teams ? "teams" : "telegram")) === "teams";
+  const channel = ra.cfg.channel ?? (ra.cfg.slack ? "slack" : ra.cfg.teams ? "teams" : "telegram");
+  const isTeams = channel === "teams";
   let conn: Connector;
-  if (isTeams) {
+  if (channel === "slack") {
+    const sl = ra.cfg.slack ?? {};
+    // Both tokens are SECRETS (cfg-no-secrets): prefer them injected via env at run time, fall
+    // back to the roster fields for dev. Error clearly rather than dialling with an empty token,
+    // which Slack answers with a bare `invalid_auth` that says nothing about which one is missing.
+    const appToken = sl.app_token || process.env.SLACK_APP_TOKEN || "";
+    const botToken = sl.bot_token || process.env.SLACK_BOT_TOKEN || "";
+    const absent = [!appToken && "SLACK_APP_TOKEN", !botToken && "SLACK_BOT_TOKEN"].filter(Boolean);
+    if (absent.length > 0) {
+      throw new Error(`slack: agent "${rec.name}" is missing ${absent.join(" and ")}`);
+    }
+    conn = new SlackConnector({ appToken, botToken, allowedUsers: sl.allowed_users });
+  } else if (channel === "teams") {
     const tm = ra.cfg.teams!;
     // app_password is a SECRET (cfg-no-secrets): prefer it injected via env at run time,
     // fall back to the roster field for dev. Error clearly if neither is present.
@@ -540,10 +554,19 @@ async function runAgent(
           heartbeatMs: 0,
           maxLen: 4000,
           prefixStream: true,
+          // Teams collapses "\n\n" to one break, so the footer needs a zero-width-space paragraph
+          // to sit under a blank line. Slack does not, and gets a plain "\n\n".
+          collapsesBlankLines: true,
         }
       : {
           cursor: cfg.stream.cursor,
-          editIntervalMs: cfg.stream.edit_interval_ms,
+          // Slack rate-limits chat.update to roughly one call per second per channel, and a
+          // burst answers 429 for the whole stream. Floor the edit interval rather than let a
+          // fast turn spend the turn's budget on edits it will immediately overwrite.
+          editIntervalMs:
+            channel === "slack"
+              ? Math.max(cfg.stream.edit_interval_ms, 1200)
+              : cfg.stream.edit_interval_ms,
           heartbeatMs: cfg.stream.heartbeat_ms,
         },
   );

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { extractAuthUrl, looksLoggedIn, isAuthError, authNotice, isStaleSessionError, resumeResetNotice, turnErrorNotice } from "./authflow";
+import { extractAuthUrl, extractDeviceAuth, looksLoggedIn, isAuthError, authNotice, isStaleSessionError, resumeResetNotice, turnErrorNotice } from "./authflow";
 
 // roster-auth-headless — the URL extractor is the pure, tricky bit: it must recover the
 // complete OAuth URL from a real PTY transcript (ANSI escapes, cursor-column moves, 80-col
@@ -94,5 +94,59 @@ describe("isStaleSessionError + notices (gw-turn-ended-actionable)", () => {
 
   it("resumeResetNotice tells the user a fresh session started", () => {
     expect(resumeResetNotice().toLowerCase()).toContain("fresh one");
+  });
+});
+
+// W2 (codex device auth) — the two pure pieces the flow rests on, both fixed against bytes
+// captured from codex-cli 0.154 on this machine rather than written from imagination.
+describe("codex device auth (W2)", () => {
+  // Verbatim `codex login --device-auth` output, with the ANSI colour runs codex emits.
+  const transcript =
+    'WARNING: proceeding, even though we could not create PATH aliases: Refusing to create helper binaries under temporary dir "C:\\Users\\x\\Temp\\\\"\n' +
+    "\n" +
+    "Welcome to Codex [v\x1b[90m0.154.0\x1b[0m]\n" +
+    "\x1b[90mOpenAI's command-line coding agent\x1b[0m\n" +
+    "\n" +
+    "Follow these steps to sign in with ChatGPT using device code authorization:\n" +
+    "\n" +
+    "1. Open this link in your browser and sign in to your account\n" +
+    "   \x1b[94mhttps://auth.openai.com/codex/device\x1b[0m\n" +
+    "\n" +
+    "2. Enter this one-time code \x1b[90m(expires in 15 minutes)\x1b[0m\n" +
+    "   \x1b[94mJLEP-DT273\x1b[0m\n" +
+    "\n" +
+    "\x1b[90mContinue only if you started this login in Codex.\x1b[0m\n";
+
+  it("recovers the verification URL and the one-time code", () => {
+    expect(extractDeviceAuth(transcript)).toEqual({
+      url: "https://auth.openai.com/codex/device",
+      code: "JLEP-DT273",
+    });
+  });
+
+  it("returns undefined before the code has been printed", () => {
+    expect(extractDeviceAuth("Welcome to Codex\n\nStarting device authorization…\n")).toBeUndefined();
+  });
+
+  it("returns undefined when the URL appeared but the code has not yet", () => {
+    const partial = transcript.slice(0, transcript.indexOf("2. Enter"));
+    expect(extractDeviceAuth(partial)).toBeUndefined();
+  });
+
+  it("recovers the URL even when a narrow PTY wrapped it across lines", () => {
+    const wrapped = transcript.replace(
+      "https://auth.openai.com/codex/device",
+      "https://auth.openai.com/co\r\ndex/device",
+    );
+    expect(extractDeviceAuth(wrapped)?.url).toBe("https://auth.openai.com/codex/device");
+  });
+
+  // The bug this exists for: `\blogged in\b` matches "Not logged in", so an EMPTY codex credential
+  // home reported a healthy login and every outcome judged from it came out backwards.
+  it("reads codex's own status lines the right way round", () => {
+    expect(looksLoggedIn("Not logged in")).toBe(false);
+    expect(looksLoggedIn("Logged in using ChatGPT")).toBe(true);
+    expect(looksLoggedIn("not signed in")).toBe(false);
+    expect(looksLoggedIn("")).toBe(false);
   });
 });

@@ -1,5 +1,8 @@
 import { describe, it, expect } from "vitest";
-import { parseLine, mapUsage, normalizeModel, shortModel, localEnv, identityPreamble, parseCodexRateLimits, CODEX_CONTEXT_WINDOW } from "./codex";
+import { parseLine, mapUsage, normalizeModel, shortModel, localEnv, ensureCodexHome, identityPreamble, parseCodexRateLimits, CODEX_CONTEXT_WINDOW } from "./codex";
+import * as os from "node:os";
+import * as fs from "node:fs";
+import * as path from "node:path";
 
 describe("codex harness — model normalization (gw-command-model)", () => {
   it("maps the friendly tier aliases to gpt-5.6 slugs, passes slugs/unknowns through", () => {
@@ -24,6 +27,11 @@ describe("codex harness — event parsing (the --json stream → neutral TurnEve
     const ev = parseLine(JSON.stringify({ type: "item.completed", item: { type: "file_change", status: "completed" } }));
     expect(ev?.kind).toBe("tool");
     expect(ev?.tool).toBe("file_change");
+  });
+  it("an MCP tool call is named by its server and tool, as Claude names it (mcp__brain__brain_pages)", () => {
+    const ev = parseLine(JSON.stringify({ type: "item.completed", item: { type: "mcp_tool_call", server: "brain", tool: "brain_pages", status: "completed" } }));
+    expect(ev?.kind).toBe("tool");
+    expect(ev?.tool).toBe("mcp__brain__brain_pages");
   });
   it("turn.completed → a done event carrying normalized usage", () => {
     const ev = parseLine(
@@ -72,5 +80,25 @@ describe("codex harness — env + identity (ToS-safe subscription, no API key)",
   it("identityPreamble is empty when no file is given (a missing persona never fails a turn)", () => {
     expect(identityPreamble(undefined)).toBe("");
     expect(identityPreamble("/no/such/file/xyz")).toBe("");
+  });
+});
+
+describe("codex harness — CODEX_HOME must exist (codex refuses a missing one)", () => {
+  it("localEnv creates the config home it points at", () => {
+    const home = path.join(os.tmpdir(), `codexhome-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    expect(fs.existsSync(home)).toBe(false);
+    const env = localEnv(process.env, home);
+    expect(env.CODEX_HOME).toBe(home);
+    expect(fs.existsSync(home)).toBe(true);
+    // and never carries an API key that would outrank the subscription
+    expect(env.OPENAI_API_KEY).toBeUndefined();
+    fs.rmSync(home, { recursive: true, force: true });
+  });
+  it("ensureCodexHome is idempotent", () => {
+    const home = path.join(os.tmpdir(), `codexhome-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    ensureCodexHome(home);
+    ensureCodexHome(home);
+    expect(fs.existsSync(home)).toBe(true);
+    fs.rmSync(home, { recursive: true, force: true });
   });
 });
