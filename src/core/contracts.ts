@@ -47,6 +47,9 @@ export interface TurnUsage {
    * reports it (claude-code num_turns; codex counts its tool/command items). Shown in the
    * statusline so the operator sees how hard a turn worked / how close it ran to the cap. */
   iterationsUsed?: number;
+  /** The speaker's own plan allowance as this turn left it (5h/7d), when the harness reads it from
+   *  the turn itself — codex's rollout. Claude's comes from the account usage API instead. */
+  accountWindows?: { key: string; usedPct: number; resetAt?: string }[];
 }
 
 /** One normalized event emitted by a harness turn (A2). */

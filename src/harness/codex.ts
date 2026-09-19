@@ -88,6 +88,7 @@ export interface RunnerOptions {
   container?: string; // required for the podman-exec transport; omitted in local-exec mode
   model?: string; // alias or slug; normalized to a gpt-5.6-* slug per turn
   bin?: string; // codex binary; default "codex"
+  binArgs?: string[]; // arguments before codex's own (a wrapper script, e.g. in tests)
   podman?: string; // podman binary; default "podman"
   // The agentic-loop cap (parity with claude --max-turns): after this many agentic steps
   // (tool/command/file_change items) the turn is paused and the partial answer delivered.
@@ -177,7 +178,10 @@ export class Runner implements TurnRunner {
     // The turn's own folder when it has one (its attachments and nothing else), else the runner's.
     const cwd = req?.cwd ?? this.o.cwd ?? process.env.TONOMAN_WORKDIR ?? process.cwd();
     args.push("-C", cwd);
-    if (this.model) args.push("-m", this.model);
+    // The model THIS turn asks for (the Hub's current default, or a thread's `!model`), else the
+    // runner's own: a runner is built once, so its model alone would miss a change made since.
+    const model = normalizeModel(req?.model) ?? this.model;
+    if (model) args.push("-m", model);
     // The brain tool, as this turn's only MCP server.
     if (req && !req.lean && req.mcpServers?.length) args.push(...codexMcpOverrides(req.mcpServers));
     if (this.o.extraArgs) args.push(...this.o.extraArgs);
@@ -200,7 +204,7 @@ export class Runner implements TurnRunner {
     if (this.o.local) {
       // `req.configHome` overrides the runner's per-agent default for THIS turn only — set when
       // the agent runs inference per person, so the speaker's own login answers.
-      child = spawn(bin, this.localArgs(req), {
+      child = spawn(bin, [...(this.o.binArgs ?? []), ...this.localArgs(req)], {
         windowsHide: true,
         env: localEnv(process.env, req.configHome ?? this.o.configHome ?? CONFIG_HOME),
       });
@@ -244,9 +248,12 @@ export class Runner implements TurnRunner {
     let usage: TurnUsage | undefined;
     let capped = false;
     let parseErr: Error | undefined;
+    let threadId: string | undefined;
 
     try {
       for await (const line of rl) {
+        const tid = threadIdOf(line);
+        if (tid) threadId = tid;
         const ev = parseLine(line.trim());
         if (!ev) continue;
         if (ev.kind === "text") {
@@ -254,6 +261,8 @@ export class Runner implements TurnRunner {
           yield ev;
         } else if (ev.kind === "tool") {
           iterations++;
+          // The same trace a Claude turn leaves (gateway: [local] → tool_use …), bounded to the label.
+          if (trace) console.error(`gateway: [${label}] ${codexTrace(ev)}`);
           yield ev;
           if (cap && iterations >= cap) {
             capped = true;
@@ -265,7 +274,7 @@ export class Runner implements TurnRunner {
           // turn.completed: carries usage only; the final text is what we accumulated. codex's
           // turn.completed omits the model name, so stamp it from our own model knob (statusline).
           usage = ev.usage;
-          if (usage && !usage.model) usage.model = shortModel(this.model);
+          if (usage && !usage.model) usage.model = shortModel(normalizeModel(req.model) ?? this.model);
         } else if (ev.kind === "error") {
           yield ev;
           signal?.removeEventListener("abort", onAbort);
@@ -287,7 +296,20 @@ export class Runner implements TurnRunner {
     }
 
     const final = finalParts.join("\n\n").trim();
-    const u: TurnUsage | undefined = usage ? { ...usage, iterationsUsed: iterations } : undefined;
+    // What the turn's own rollout says (CONVO-FOOTER-BOTH-PROVIDERS): the model calls it took, what
+    // the last one held, and the speaker's 5h/7d allowance — read by this turn's thread id, never the
+    // newest file, which may be another person's conversation.
+    const report = this.o.local && threadId ? readTurnRollout(req.configHome ?? this.o.configHome ?? CONFIG_HOME, threadId) : undefined;
+    const u: TurnUsage | undefined = usage
+      ? {
+          ...usage,
+          iterationsUsed: Math.max(1, report?.modelCalls ?? 0),
+          ...(report?.lastInput ? { contextTokens: report.lastInput } : {}),
+          ...(report?.windows.length ? { accountWindows: report.windows } : {}),
+        }
+      : undefined;
+
+    if (trace && u) console.error(`gateway: [${label}] ${codexResultTrace(u, final)}`);
 
     // A terminal done if we got any answer or a clean/killed exit; otherwise surface an error so
     // the router never hangs.
@@ -338,6 +360,17 @@ function toolLabel(item: CodexItem): { tool: string; text: string } {
   if (item.command) detail = String(item.command);
   else if (item.type === "file_change") detail = item.status ? `(${item.status})` : "";
   return { tool: kind, text: detail.replace(/\s+/g, " ").trim().slice(0, 60) };
+}
+
+/** PURE: the trace line for one codex step, as a Claude turn's `→ tool_use name(args)`. */
+export function codexTrace(ev: TurnEvent): string {
+  return `→ tool_use ${ev.tool ?? "step"}(${(ev.text ?? "").slice(0, 200)})`;
+}
+
+/** PURE: the trace line for a finished codex turn, as a Claude turn's `✓ result Ntok …`. */
+export function codexResultTrace(u: TurnUsage, final: string): string {
+  const tok = (u.inputTokens ?? 0) + (u.cacheReadTokens ?? 0) + (u.outputTokens ?? 0);
+  return `✓ result ${tok}tok ⟳${u.iterationsUsed ?? 0} ${final.replace(/\s+/g, " ").trim().slice(0, 200)}`;
 }
 
 /** Map a codex model slug to a compact statusline name ("gpt-5.6-sol" → "sol"). */
@@ -424,6 +457,68 @@ export function parseCodexRateLimits(rl: { primary?: CodexRateWindow; secondary?
     });
   }
   return out.sort((a, b) => (a.key.endsWith("h") ? 0 : 1) - (b.key.endsWith("h") ? 0 : 1));
+}
+
+/** The thread id `codex exec --json` announces first (`thread.started`), or undefined. */
+export function threadIdOf(line: string): string | undefined {
+  if (!line.includes('"thread.started"')) return undefined;
+  try {
+    const o = JSON.parse(line) as CodexLine;
+    return o.type === "thread.started" && typeof o.thread_id === "string" ? o.thread_id : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** One turn's own rollout, found by its thread id under CODEX_HOME/sessions: how many model calls it
+ *  made (one `token_count` each), what the last call held, and the last 5h/7d windows it saw.
+ *  Undefined when the file is not there — never throws. */
+export function readTurnRollout(codexHomeDir: string, threadId: string): { modelCalls: number; lastInput: number; windows: UsageWindow[] } | undefined {
+  const safe = threadId.replace(/[^A-Za-z0-9-]/g, "");
+  if (!safe) return undefined;
+  const find = (d: string, depth: number): string | undefined => {
+    let ents: fs.Dirent[];
+    try {
+      ents = fs.readdirSync(d, { withFileTypes: true });
+    } catch {
+      return undefined;
+    }
+    for (const e of ents) {
+      const p = `${d}/${e.name}`;
+      if (e.isFile() && e.name.startsWith("rollout-") && e.name.endsWith(`${safe}.jsonl`)) return p;
+      if (e.isDirectory() && depth < 4) {
+        const f = find(p, depth + 1);
+        if (f) return f;
+      }
+    }
+    return undefined;
+  };
+  try {
+    const f = find(`${codexHomeDir}/sessions`, 0);
+    if (!f) return undefined;
+    let modelCalls = 0;
+    let lastInput = 0;
+    let windows: UsageWindow[] = [];
+    for (const line of fs.readFileSync(f, "utf8").split("\n")) {
+      if (!line.includes('"token_count"')) continue;
+      let o: { payload?: { type?: string; info?: { last_token_usage?: { input_tokens?: number } } | null; rate_limits?: unknown } };
+      try {
+        o = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (o.payload?.type !== "token_count") continue;
+      if (o.payload.info) {
+        modelCalls++;
+        lastInput = o.payload.info.last_token_usage?.input_tokens ?? lastInput;
+      }
+      const w = parseCodexRateLimits(o.payload.rate_limits as never);
+      if (w.length) windows = w;
+    }
+    return { modelCalls, lastInput, windows };
+  } catch {
+    return undefined;
+  }
 }
 
 /** Recursively find a `rate_limits` object anywhere in a parsed rollout line. */

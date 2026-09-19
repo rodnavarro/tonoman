@@ -1348,7 +1348,9 @@ export async function run(
       if (mode === "none" || !u) return null;
       // The windows are cached for two minutes, so this is a fetch at most once per window per
       // agent — an answer must never wait on the usage API to be delivered.
-      const windows = await windowsFor(name).catch(() => [] as UsageWindow[]);
+      // A Codex turn read its own login's allowance from its rollout (CONVO-FOOTER-BOTH-PROVIDERS);
+      // the account usage API is Anthropic's and would say nothing true about it.
+      const windows = u.accountWindows?.length ? u.accountWindows : await windowsFor(name).catch(() => [] as UsageWindow[]);
       return renderStatus(mode, u, wired.get(name)?.runner.getModel?.(), windows, Date.now());
     },
     say: async (name: string, user: string, text: string) => {
@@ -2182,7 +2184,7 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
                 console.error(`worker: auth prompt failed for ${name}: ${(e as Error).message}`);
                 return false;
               });
-            if (asked) console.log(`worker: ${name} asked ${env.user} to connect their own Claude (per_user)`);
+            if (asked) console.log(`worker: ${name} asked ${env.user} to connect their own ${providerLabel(providerOf(a.cfg))} (per_user)`);
             continue;
           }
         } else if (a.cfg.auth_state && a.cfg.auth_state !== "ok") {
