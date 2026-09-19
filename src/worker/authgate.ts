@@ -38,12 +38,19 @@ export interface AuthGateDeps {
   provider?(agent: string): InferenceProvider;
   /** Report the OUTCOME back to the registry, so the next turn is not gated. `user` names the person
    *  whose own login this was, on a per-person agent — their state is theirs, not the agent's. */
-  setAuthState(agent: string, state: "ok" | "error", user?: string): Promise<void>;
+  setAuthState(agent: string, state: "ok" | "error", user?: string, provider?: InferenceProvider): Promise<void>;
   /** A person just completed a login through THIS gate — the normal first step for someone new,
    *  since the gate offers it on its own the moment a turn finds no credential. Optional, best-effort:
    *  the worker uses it to register the person into the tenant, so their very first chat already
    *  knows their name (rather than only learning it when they connect Plaud later). */
   onLogin?(agent: string, user: string): Promise<void>;
+}
+
+/** PURE: does a login outcome for `forProvider` count for an agent now on `current`? An outcome for
+ *  a provider the agent was switched away from never changes its badge (INFER-SWITCH-COUNTS-CURRENT);
+ *  one that names no provider is taken as the current one's, as every caller before this did. */
+export function outcomeIsCurrent(forProvider: InferenceProvider | undefined, current: InferenceProvider): boolean {
+  return !forProvider || forProvider === current;
 }
 
 /** What the agent says when it cannot answer yet. Names the agent, says what is missing, and gives
@@ -252,12 +259,15 @@ export async function watchDeviceLogin(
   audience: string | undefined = user,
 ): Promise<void> {
   const conn = deps.conn(agent);
+  // The provider this login is FOR, fixed before the wait: it can take ten minutes, and if the Hub
+  // switches the agent meanwhile, the outcome is still this provider's (INFER-SWITCH-COUNTS-CURRENT).
+  const provider = deps.provider?.(agent) ?? "claude";
   const r = await awaitDeviceLogin(ops, o);
   // Registered BEFORE the state is reported: the per-person auth-state row only UPDATES a principal
   // the tenant already knows, and answers 404 for somebody signing in for the first time — which is
   // precisely the person this gate exists for.
   if (r.ok && user) await deps.onLogin?.(agent, user).catch(() => {});
-  await deps.setAuthState(agent, r.ok ? "ok" : "error", user).catch(() => {});
+  await deps.setAuthState(agent, r.ok ? "ok" : "error", user, provider).catch(() => {});
   if (!conn) return;
   const text = r.ok
     ? "✅ Connected. Ask me again and I'll answer."
@@ -321,7 +331,7 @@ export async function handleInteraction(deps: AuthGateDeps, agent: string, it: S
     // since connecting is how somebody new first identifies themselves. Register first, report after.
     // The submitter IS the person who just signed in — the modal carries no user of its own.
     if (r.ok && it.userId) await deps.onLogin?.(agent, it.userId).catch(() => {});
-    await deps.setAuthState(agent, r.ok ? "ok" : "error", it.userId).catch(() => {});
+    await deps.setAuthState(agent, r.ok ? "ok" : "error", it.userId, deps.provider?.(agent) ?? "claude").catch(() => {});
     if (conversation) {
       await conn
         .reply(conversation)

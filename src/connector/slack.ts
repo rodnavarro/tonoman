@@ -60,6 +60,9 @@ export interface SlackOptions {
    *  the app needs `channels:history` + a `message.channels` subscription before Slack delivers a
    *  channel message at all. */
   watchedChannels?: () => Set<string>;
+  /** Does ANOTHER agent watch this channel too? Then a plain message there is answered only when it
+   *  names one of them (CONVO-WHO-IS-ADDRESSED). Asked per message. Absent = nobody else does. */
+  sharedWatch?: (channel: string) => boolean;
 }
 
 /** A slash command, normalized for the worker's `!` dispatcher. `text` is already the `!`-prefixed
@@ -181,6 +184,8 @@ export class SlackConnector implements Connector {
    *  becoming two turns; see normalize(). */
   private readonly recentContent = new Map<string, number>();
   private botUserID = "";
+  /** Slack user id → is it a bot? Asked once per id; bots do not stop being bots. */
+  private readonly botness = new Map<string, boolean>();
 
   constructor(private readonly o: SlackOptions) {}
 
@@ -209,6 +214,37 @@ export class SlackConnector implements Connector {
     const j = (await r.json()) as { ok?: boolean; error?: string } & Record<string, unknown>;
     if (!j.ok) throw new Error(`slack ${method}: ${j.error ?? `http ${r.status}`}`);
     return j as T;
+  }
+
+  /** Does the text @mention this agent? */
+  private mentionsMe(text: string | undefined): boolean {
+    return !!this.botUserID && (text ?? "").includes(`<@${this.botUserID}>`);
+  }
+
+  /** Does the text @mention a bot other than this agent — another agent in the workspace? Each id is
+   *  asked of Slack once (`users.info`); an id Slack will not describe is taken as a person, so a
+   *  failed lookup never silences an agent in its own thread. */
+  private async mentionsAnotherBot(text: string | undefined): Promise<boolean> {
+    const ids = [...(text ?? "").matchAll(/<@([A-Z0-9]+)(?:\|[^>]*)?>/g)].map((m) => m[1]!).filter((id) => id !== this.botUserID);
+    for (const id of ids) {
+      if (!this.botness.has(id)) {
+        const u = await this.call<{ user?: { is_bot?: boolean } }>("users.info", { user: id }).catch(() => undefined);
+        this.botness.set(id, !!u?.user?.is_bot);
+      }
+      if (this.botness.get(id)) return true;
+    }
+    return false;
+  }
+
+  /** The bot user that posted last in a thread, if any bot has. */
+  private async lastBotInThread(channel: string, threadTs: string): Promise<string | undefined> {
+    const r = await this.call<{ messages?: { user?: string; bot_id?: string; ts?: string }[] }>("conversations.replies", {
+      channel,
+      ts: threadTs,
+      limit: 200,
+    }).catch(() => undefined);
+    const bots = (r?.messages ?? []).filter((m) => m.bot_id && m.user);
+    return bots.length ? bots[bots.length - 1]!.user : undefined;
   }
 
   /** Our own bot user id, so we never answer ourselves. Resolved once, best-effort: if it fails
@@ -462,16 +498,43 @@ export class SlackConnector implements Connector {
     const isDm = e.type === "message" && e.channel_type === "im";
     const isWatchedMessage = e.type === "message" && watched;
     const inOwnThread = repliesToOwnThread(e, this.botUserID);
-    if (e.type !== "app_mention" && !isDm && !isWatchedMessage && !inOwnThread) return null;
+    // A `!command` in a thread, with no mention: it may be this agent's even in a thread it did not
+    // start, if it answered there last (CONVO-WHO-IS-ADDRESSED) — decided below, after the cheap checks.
+    const threadCommand =
+      e.type === "message" && !isDm && !!e.thread_ts && e.thread_ts !== e.ts && /^\s*!/.test(e.text ?? "") && !this.mentionsMe(e.text);
+    if (e.type !== "app_mention" && !isDm && !isWatchedMessage && !inOwnThread && !threadCommand) return null;
     // A subtype usually means it is not a plain human message: message_changed, message_deleted,
     // channel_join, bot_message — none of them something to answer. The ONE exception is
     // `file_share`: a person uploading a file (with an optional caption) is a real turn, and it is
     // the only way an attachment ever arrives — dropping it here is why attachments never landed.
     if (e.subtype && e.subtype !== "file_share") return null;
+    // ANY bot, not only this one: two agents in a workspace must never answer each other on their
+    // own (CONVO-NO-BOT-LOOPS). A bot's post always carries `bot_id`.
     if (e.bot_id) return null;
     if (!e.user || !e.channel) return null;
     if (this.botUserID && e.user === this.botUserID) return null;
     if (this.o.allowedUsers?.length && !this.o.allowedUsers.includes(e.user)) return null;
+
+    // WHO THE MESSAGE IS FOR, when several agents share a workspace (CONVO-WHO-IS-ADDRESSED). An
+    // @mention of this agent is always its own (Slack sends `app_mention` only to the app named).
+    // Everything that reached us without one is re-checked:
+    if (e.type !== "app_mention" && !isDm) {
+      if (threadCommand) {
+        // A bare `!command` in a shared thread belongs to whichever agent answered there last.
+        const last = await this.lastBotInThread(e.channel, e.thread_ts!);
+        if (last) {
+          if (last !== this.botUserID) return null;
+        } else if (!isWatchedMessage && !inOwnThread) {
+          return null; // no agent has answered here and it is not ours by the old rules either
+        }
+      } else if (!this.mentionsMe(e.text)) {
+        // A message that names another agent, and not this one, is that agent's — even in this
+        // agent's own thread. Naming a PERSON does not count: the thread is still ours.
+        if (await this.mentionsAnotherBot(e.text)) return null;
+        // In a channel another agent watches too, a message naming nobody is nobody's.
+        if (isWatchedMessage && !inOwnThread && this.o.sharedWatch?.(e.channel)) return null;
+      }
+    }
 
     // ONE message must be ONE turn, and Slack gives several ways for it not to be: a DM that
     // mentions the bot arrives as both message.im and app_mention; a socket that drops before our

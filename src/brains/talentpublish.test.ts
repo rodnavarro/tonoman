@@ -1,12 +1,15 @@
 // A Talent filing into a brain (BRAIN-TALENT-TARGET): the recap's page and transcript as one commit
 // with a log line, named as the recap names them, never over another recording's page.
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { createStore, seed, seedFiles, type BrainRef } from "./store";
 import { publishRecapToBrain } from "./talentpublish";
+
+// Real git, several pushes racing: slow when the whole suite runs at once.
+vi.setConfig({ testTimeout: 30_000 });
 
 let tmp: string;
 let remote: string;

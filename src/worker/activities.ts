@@ -63,6 +63,9 @@ export interface TurnDeps {
     agent: string,
     state: "ok" | "error" | "expired" | "unconfigured",
     user?: string,
+    /** The provider the outcome is about. An outcome for a provider the agent no longer uses is
+     *  dropped (INFER-SWITCH-COUNTS-CURRENT); absent = the agent's current one. */
+    provider?: "claude" | "codex",
   ): Promise<void>;
   /** How this agent's provider is named to a person ("Claude" / "Codex"), for a notice that has to
    *  tell somebody which login to start. */
@@ -351,10 +354,20 @@ export interface TurnRunReq {
 }
 
 /** PURE: the session a person's turns in a conversation continue in (D-THREAD-HISTORY). Each person
- *  has their own history of a thread, so one person's reading never rides into another's context. */
-export function sessionKeyOf(conversation: string, user?: string): string {
-  return `${conversation}#${(user ?? "").replace(/[^A-Za-z0-9_-]/g, "") || "platform"}`;
+ *  has their own history of a thread, so one person's reading never rides into another's context.
+ *  And one per provider (INFER-SWITCH-COUNTS-CURRENT): after the Hub switches an agent to Codex, the
+ *  next turn starts a fresh session instead of trying to resume a Claude one. Claude keeps the
+ *  unsuffixed name, so every session made before this still resumes. */
+export function sessionKeyOf(conversation: string, user?: string, provider?: "claude" | "codex"): string {
+  const base = `${conversation}#${(user ?? "").replace(/[^A-Za-z0-9_-]/g, "") || "platform"}`;
+  return provider === "codex" ? `${base}@codex` : base;
 }
+
+/** Which provider each person's latest turn in a conversation ran on, so a turn that fails for want
+ *  of a login is recorded against THAT provider — not whatever the agent was switched to while it
+ *  ran (INFER-SWITCH-COUNTS-CURRENT). Bounded; an entry is only needed until the notice is posted. */
+const turnProvider = new Map<string, "claude" | "codex">();
+const turnProviderKey = (agent: string, conversation: string, user?: string): string => `${agent} ${conversation} ${user ?? ""}`;
 
 /** What a turn needs from the brains (docs/definition/objects/brain.md). Absent = no brains here. */
 export interface TurnBrains {
@@ -517,7 +530,12 @@ export function makeActivities(deps: TurnDeps) {
         const label = deps.providerLabel?.(input.agent) ?? "Claude";
         text = notLoggedInNotice(`!connect ${label.toLowerCase()}`);
         await deps
-          .reportAuthState?.(input.agent, authFailureState(input.authFailure.reason), input.authFailure.user)
+          .reportAuthState?.(
+            input.agent,
+            authFailureState(input.authFailure.reason),
+            input.authFailure.user,
+            turnProvider.get(turnProviderKey(input.agent, input.conversation, input.authFailure.user)),
+          )
           .catch((e) => console.error(`activities: ${input.agent} auth-state report failed: ${String(e)}`));
       }
       const found = deps.agent(input.agent);
@@ -931,7 +949,12 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
     // speaker's own DM, a person who reaches any brain has the answer HELD — no streaming, no tool
     // details in the work log — until the end of the turn decides where it goes (BRAIN-PRIVATE-DELIVERY).
     const brains = deps.brains;
-    const key = sessionKeyOf(input.conversation, input.user);
+    // The provider this turn runs on, fixed now: a switch in the Hub while it runs changes the NEXT
+    // turn, and this one finishes — and is recorded — on the provider it started with.
+    const provider = found.cfg.inference_provider === "codex" ? "codex" : "claude";
+    turnProvider.set(turnProviderKey(input.agent, input.conversation, input.user), provider);
+    if (turnProvider.size > 1000) turnProvider.delete(turnProvider.keys().next().value as string);
+    const key = sessionKeyOf(input.conversation, input.user, provider);
     let audience: Audience = { kind: "self" };
     let held = false;
     let prior: string[] = [];

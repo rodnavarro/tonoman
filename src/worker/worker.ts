@@ -40,6 +40,7 @@ import {
 } from "../statusline";
 import { httpAuthOps, looksLoggedIn } from "../authflow";
 import * as gate from "./authgate";
+import { threadModels } from "./threadmodels";
 import * as secondbrain from "./secondbrain";
 import { createStore, type BrainStore, type BrainRef } from "../brains/store";
 import { recoverWrites } from "../brains/recover";
@@ -657,6 +658,9 @@ function wireOne(a: AgentConfig, harnesses: ReturnType<typeof defaultHarnesses>)
     mediaMount: mediaDir,
     // Read live per message: `wireVoice` keeps this set in step with the agent's Talent config.
     watchedChannels: () => voiceWatch.get(a.name) ?? new Set<string>(),
+    // Another agent served here watches the same channel: a plain message there is answered only
+    // when it names one of them (CONVO-WHO-IS-ADDRESSED). Agents on another worker are not seen.
+    sharedWatch: (channel: string) => [...voiceWatch].some(([other, set]) => other !== a.name && set.has(channel)),
   });
 
   const runner = newRunnerFor(a, harnesses);
@@ -1208,7 +1212,8 @@ export async function run(
   /** The model each conversation has chosen. Per conversation, NOT per process: this worker serves
    *  every agent in the tenant and every thread they are in, and the harness's own knob is a single
    *  variable — so `!model opus` in one thread moved everyone. */
-  const models = new Map<string, string>();
+  // A thread's `!model`, per agent and per provider (CONVO-EACH-AGENT-ITS-OWN, INFER-SWITCH-COUNTS-CURRENT).
+  const models = threadModels();
   const { claim: claimSession, reset: resetSession, forget: forgetSession, provenance, remember } = sessionStore();
   const brainsSys = await startBrains().catch((e: Error) => {
     console.error(`worker: brains are off — ${e.message}`);
@@ -1289,7 +1294,8 @@ export async function run(
     // at wire time, and a reload that changes only the default model is a plain cfg swap (no runner
     // rebuild) on the promise that the model is read per turn. Without this a Hub edit to "opus"
     // saved, reloaded, and every new conversation still opened on the old default.
-    modelFor: (agent: string, conversation: string) => models.get(conversation) ?? wired.get(agent)?.cfg.model,
+    modelFor: (agent: string, conversation: string) =>
+      models.get(agent, conversation, providerOf(wired.get(agent)?.cfg)) ?? wired.get(agent)?.cfg.model,
     claimSession,
     resetSession,
     brains: turnBrains(brainsSys),
@@ -1383,8 +1389,8 @@ export async function run(
     },
     // W3: what a failed turn learned about the credential, recorded where it belongs — the speaker's
     // own row on a per-person agent, the agent's otherwise. Best-effort by contract.
-    reportAuthState: (name: string, state: "ok" | "error" | "expired" | "unconfigured", user?: string) =>
-      reportAuthState(name, state, user).catch((e) =>
+    reportAuthState: (name: string, state: "ok" | "error" | "expired" | "unconfigured", user?: string, provider?: InferenceProvider) =>
+      reportAuthState(name, state, user, provider).catch((e) =>
         console.error(`worker: ${name} auth-state report failed — ${(e as Error).message}`),
       ),
     providerLabel: (name: string): string => providerLabel(providerOf(wired.get(name)?.cfg)),
@@ -1712,7 +1718,12 @@ export async function run(
         return looksLoggedIn(line) ? line.slice(0, 120) : "not signed in";
       }
     },
-    resetSession: (name, conversation) => void forgetSession(name, conversation).catch(() => {}),
+    // `!new` forgets the person's session on either provider (INFER-SWITCH-COUNTS-CURRENT keys a
+    // Codex session apart), so it always means "start over", whatever the agent was on before.
+    resetSession: (name, conversation) => {
+      void forgetSession(name, conversation).catch(() => {});
+      void forgetSession(name, `${conversation}@codex`).catch(() => {});
+    },
     plaudConnected: (name, user) => {
       // Per-person: is the SPEAKER's own account connected. Shared: the tenant's one account, and the
       // user is ignored — same question either way for a shared agent.
@@ -1827,11 +1838,8 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
       );
     },
     // What THIS conversation runs: its own choice, else whatever the roster row says.
-    getModel: (name, conversation) => models.get(conversation) ?? wired.get(name)?.cfg.model,
-    setModel: (_name, conversation, model) => {
-      if (model) models.set(conversation, model);
-      else models.delete(conversation);
-    },
+    getModel: (name, conversation) => models.get(name, conversation, providerOf(wired.get(name)?.cfg)) ?? wired.get(name)?.cfg.model,
+    setModel: (name, conversation, model) => models.set(name, conversation, model),
   };
 
   // --- adding a calendar by its published address -------------------------------------------------
@@ -1924,7 +1932,7 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
     },
     conn: (name) => wired.get(name)?.conn as SlackConnector | undefined,
     provider: (name) => providerOf(wired.get(name)?.cfg),
-    setAuthState: (name, state, user) => reportAuthState(name, state, user),
+    setAuthState: (name, state, user, provider) => reportAuthState(name, state, user, provider),
     // The gate-offered login is how a NEW person first arrives (Celine's path): the `!connect claude`
     // command hook never fires for them, so register here too — before their first real turn.
     // Seeded with the outcome: the row is created (or refreshed) ALREADY carrying the auth state,
@@ -1950,11 +1958,18 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
     name: string,
     state: "ok" | "error" | "expired" | "unconfigured",
     user?: string,
+    forProvider?: InferenceProvider,
   ): Promise<void> => {
     const a = wired.get(name);
     const api = process.env.TONOMANCLOUD_API_URL;
     if (!a?.cfg.guid || !api) return; // a file roster has no registry to tell
     const provider = providerOf(a.cfg);
+    // A login or turn that started on the provider the agent has since been switched away from:
+    // its outcome is about a login nobody uses now, and must not move the new badge.
+    if (!gate.outcomeIsCurrent(forProvider, provider)) {
+      console.log(`worker: ${name} dropped a late ${forProvider} ${state} — the agent now runs on ${provider}`);
+      return;
+    }
 
     const token = process.env.TONOMANCLOUD_API_TOKEN ?? "";
 
