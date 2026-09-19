@@ -313,3 +313,46 @@ describe("what a Talent announces", () => {
     expect(inThread().at(-1)).toContain("Recap: shipped.");
   });
 });
+
+describe("files someone attaches", () => {
+  const fsp = () => import("node:fs/promises");
+  const tmp = async () => {
+    const { mkdtemp } = await fsp();
+    const os = await import("node:os");
+    const path = await import("node:path");
+    return mkdtemp(path.join(os.tmpdir(), "media-"));
+  };
+
+  it("CONVO-FILES-IN-THE-TURN an attached file is handed to the agent inside the turn's own folder, which is its working directory", async () => {
+    const { writeFile } = await fsp();
+    const path = await import("node:path");
+    const media = path.join(await tmp(), "receipt.jpg");
+    await writeFile(media, "jpeg bytes");
+    const { acts } = build({ audience: { kind: "self" }, uses: [], answer: "Filed." });
+    await acts.runTurn({ ...turn("D1"), mediaPaths: [media] } as never);
+    const req = requests[0]!;
+    expect(req.mediaPaths).toHaveLength(1);
+    expect(path.dirname(req.mediaPaths![0]!)).toBe(req.cwd);
+    expect(req.mediaPaths![0]).not.toBe(media);
+    expect(req.prompt).toContain(req.mediaPaths![0]!);
+  });
+
+  it("CONVO-FILES-IN-THE-TURN a file that could not be placed in the turn's folder is never handed over by a path the agent may not read", async () => {
+    const { acts } = build({ audience: { kind: "self" }, uses: [], answer: "Nothing to read." });
+    await acts.runTurn({ ...turn("D1"), mediaPaths: ["/root/.tonoman/media/echo/gone.jpg"] } as never);
+    const req = requests[0]!;
+    expect(req.mediaPaths ?? []).toEqual([]);
+    expect(req.prompt).not.toContain("/root/.tonoman");
+    expect(req.prompt).toMatch(/could not be opened/i);
+  });
+
+  it("CONVO-FILES-IN-THE-TURN the turn's folder, with the file in it, is gone when the turn ends", async () => {
+    const { writeFile, access } = await fsp();
+    const path = await import("node:path");
+    const media = path.join(await tmp(), "receipt.jpg");
+    await writeFile(media, "jpeg bytes");
+    const { acts } = build({ audience: { kind: "self" }, uses: [], answer: "Filed." });
+    await acts.runTurn({ ...turn("D1"), mediaPaths: [media] } as never);
+    await expect(access(requests[0]!.cwd!)).rejects.toThrow();
+  });
+});

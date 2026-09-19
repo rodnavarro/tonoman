@@ -1145,14 +1145,18 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
     // the gateway's media convention so there is one shape, not two. Empty for an ordinary message.
     // THE TURN'S OWN FOLDER: its working directory, holding its attachments and nothing else.
     const turnDir = await fs.mkdtemp(path.join(os.tmpdir(), "tonoman-turn-"));
+    // A file that cannot be placed here is NOT handed over by its original path: that is on the
+    // worker's state volume, which a turn may not read (CONVO-FILES-IN-THE-TURN). The agent is told
+    // instead, so it can ask for the file again rather than fail to open it.
     const media: string[] = [];
+    let unplaced = 0;
     for (const m of input.mediaPaths ?? []) {
       const dest = path.join(turnDir, path.basename(m));
-      await fs.copyFile(m, dest).then(() => media.push(dest), () => media.push(m));
+      await fs.copyFile(m, dest).then(() => media.push(dest), () => void unplaced++);
     }
-    const mediaNote = media.length
-      ? `\n\nAttached file(s) — read them:\n${media.map((p) => `- ${p}`).join("\n")}`
-      : "";
+    const mediaNote =
+      (media.length ? `\n\nAttached file(s) — read them:\n${media.map((p) => `- ${p}`).join("\n")}` : "") +
+      (unplaced ? `\n\n${unplaced} attached file(s) could not be opened; ask the person to send them again.` : "");
 
     const consume = async (): Promise<void> => {
       for await (const ev of run(
