@@ -789,6 +789,11 @@ export function makeActivities(deps: TurnDeps) {
         // the person was actually told; `summary` is the Talent's own one-liner and the fallback.
         // Capped here rather than at the registry, because a 2000-char field is a contract and a
         // 40kB transcript arriving at it is a 413 nobody will connect to a recap.
+        // Not when the run filed into a brain: the run record is read tenant-wide, and what was filed
+        // is for the people who can read that brain (BRAIN-NO-DISCLOSURE). The record says only that.
+        if (outcome.brains?.length) {
+          return { status: outcome.status, summary: "Filed into a brain. Only people who can read it were told what." };
+        }
         return {
           status: outcome.status,
           summary: (outcome.steer ?? outcome.summary ?? "").slice(0, 2000) || undefined,
@@ -902,6 +907,17 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
     const { conn, run } = found;
 
     const reply: Reply = conn.reply(input.conversation);
+    // AN ANNOUNCEMENT OF WHAT A TALENT FILED goes only to a person who may read where it was filed
+    // (BRAIN-PRIVATE-CONFIRMATIONS). A run can file through the agent's own grant, so the person it is
+    // for is checked here, before the harness runs or anything is shown. Nobody to check — no person
+    // on the announcement — is not a pass: nothing is said.
+    if (input.drewOn?.length) {
+      const theirs = deps.brains && input.user ? await deps.brains.reach(input.agent, input.user).catch(() => null) : null;
+      if (!theirs || input.drewOn.some((b) => !theirs.has(b))) {
+        console.error(`worker: ${input.agent} did not announce a filing — ${input.user ? "that person cannot read the brain it went into" : "it names nobody to tell"}`);
+        return;
+      }
+    }
     // One verb for the whole turn, picked before the first cue. Re-picking mid-turn would read
     // as a different agent taking over the answer.
     const verb = randomMysticVerb();
@@ -939,8 +955,9 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
         prior = [...new Set([...prior, ...input.drewOn])];
       }
       brainTurn = brains.start(input.agent, input.user, input.user, key);
-      // Outside the speaker's own DM, a turn that can reach brains — or remembers one — is held.
-      held = audience.kind !== "self" && (!!brainTurn || prior.length > 0);
+      // Outside the speaker's own DM, a turn that can reach brains — or remembers one — is held. An
+      // announcement is held even in their DM: it is posted only after the reach is checked again.
+      held = (audience.kind !== "self" && (!!brainTurn || prior.length > 0)) || !!input.drewOn?.length;
     }
 
     const started = Date.now();

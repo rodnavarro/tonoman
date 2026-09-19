@@ -292,6 +292,20 @@ describe("talent_run records carry the trigger, who asked, and the result", () =
     expect(r.summary).toHaveLength(2000);
   });
 
+  it("BRAIN-NO-DISCLOSURE a run that filed into a brain leaves no word of what it filed in the run record", async () => {
+    withActivityContext();
+    const deps = {
+      talentPlane: {
+        spawn: async () => ({ status: "done", steer: "Recap: Jev is TypeSafe's secret model", summary: "Jev secret", links: [{ label: "AI/jev-recap.md", url: "x" }], brains: ["b-eng"] }),
+      },
+      ask: async () => {},
+    } as unknown as TurnDeps;
+    const r = await makeActivities(deps).runTalent({ agent: "a", item: "i", notify: "U1" });
+    expect(r.status).toBe("done");
+    expect(JSON.stringify(r)).not.toMatch(/Jev|jev-recap/);
+    expect(r.links).toBeUndefined();
+  });
+
   it("falls back to the Talent's own summary when there was nothing to announce", async () => {
     withActivityContext();
     const deps = {

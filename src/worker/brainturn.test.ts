@@ -284,6 +284,28 @@ describe("what a Talent announces", () => {
     expect(inThread()).toEqual([THREAD_NOTE]);
   });
 
+  it("BRAIN-PRIVATE-CONFIRMATIONS a filing is not announced at all to a person who cannot read the brain it went into", async () => {
+    const { acts } = build({ audience: { kind: "self" }, uses: [], answer: "Recap: Engineering's secret plan.", reachAtStart: { "b-ana": "Ana's brain" } });
+    await acts.runTurn(announce("D1", ["b-eng"]));
+    expect(requests).toHaveLength(0);
+    expect(inThread()).toEqual([]);
+    expect(dms).toEqual([]);
+  });
+
+  it("BRAIN-PRIVATE-CONFIRMATIONS an announcement naming nobody to tell says nothing", async () => {
+    const { acts } = build({ audience: { kind: "public", name: "sapien-dev" }, uses: [], answer: "Recap: Engineering's secret plan." });
+    await acts.runTurn({ ...announce("T/C1/9", ["b-eng"]), user: "" });
+    expect(requests).toHaveLength(0);
+    expect(inThread()).toEqual([]);
+  });
+
+  it("BRAIN-PRIVATE-CONFIRMATIONS even in the person's own DM an announcement is not streamed before its final check", async () => {
+    const { acts } = build({ audience: { kind: "self" }, uses: [], answer: "one two three four five six seven eight nine ten", reachAtStart: { "b-eng": "Engineering" }, reachAtEnd: {} });
+    await acts.runTurn(announce("D1", ["b-eng"]));
+    expect(posted.filter((p) => p.op === "update")).toEqual([]);
+    expect(inThread().join(" ")).not.toMatch(/\bone\b/);
+  });
+
   it("BRAIN-PRIVATE-CONFIRMATIONS in a private channel whose members all read that brain, it is announced there", async () => {
     const { acts } = build({ audience: { kind: "members", members: ["UANA", "UBEN"], name: "eng" }, uses: [], readable: ["b-eng"], answer: "Recap: shipped." });
     await acts.runTurn(announce("T/G1/9", ["b-eng"]));
