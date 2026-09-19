@@ -21,6 +21,8 @@ import * as inference from "./inference";
 import { meetingRecap } from "./talents/meeting-recap";
 import * as calendar from "./calendar";
 import * as worklog from "./worklog";
+import { decideRoute, privateReason, THREAD_NOTE, THREAD_NOTE_FAILED, type Audience } from "../brains/delivery";
+import type { McpServerSpec } from "../brains/broker";
 import { randomMysticVerb } from "../core/mystic";
 import type { CapabilityPlane } from "./capability-plane";
 import { isAuthError } from "../authflow";
@@ -124,6 +126,7 @@ export interface TurnDeps {
   /** Abandon this conversation's session and hand back a fresh one. The resume-miss repair, and
    *  what `!new` does. */
   resetSession?(agent: string, conversation: string): Promise<{ id: string; isNew: boolean }>;
+  brains?: TurnBrains;
 }
 
 /** PURE: the text of a transcript value, whichever shape it arrived in. */
@@ -324,6 +327,34 @@ export interface TurnRunReq {
   mediaPaths?: string[];
   /** A lean inference turn — no tools, no connectors, one turn. Set by Talent `infer`. */
   lean?: boolean;
+  /** The brain tool, for this turn only. */
+  mcpServers?: McpServerSpec[];
+  /** The turn's own working folder. */
+  cwd?: string;
+}
+
+/** PURE: the session a person's turns in a conversation continue in (D-THREAD-HISTORY). Each person
+ *  has their own history of a thread, so one person's reading never rides into another's context. */
+export function sessionKeyOf(conversation: string, user?: string): string {
+  return `${conversation}#${(user ?? "").replace(/[^A-Za-z0-9_-]/g, "") || "platform"}`;
+}
+
+/** What a turn needs from the brains (docs/definition/objects/brain.md). Absent = no brains here. */
+export interface TurnBrains {
+  /** Open this person's brain access for one turn. */
+  start(agent: string, user: string, who: string): { token: string; mcp: McpServerSpec } | undefined;
+  /** Close it; the brains the turn used. */
+  end(token: string): string[];
+  /** Brains this person's history of the conversation has already drawn on. */
+  provenance(agent: string, key: string): Promise<string[]>;
+  remember(agent: string, key: string, used: string[]): Promise<void>;
+  /** Who will see a reply here. */
+  audience(agent: string, conversation: string, user: string): Promise<Audience>;
+  /** What this person reaches right now: id → name. Null if the registry could not say. */
+  reach(agent: string, user: string): Promise<Map<string, string> | null>;
+  readableByAll(agent: string, brainIds: string[], members: string[]): Promise<string[] | null>;
+  /** Send the person a direct message. False if it could not be sent. */
+  dm(agent: string, user: string, text: string): Promise<boolean>;
 }
 
 export interface TurnInput {
@@ -860,6 +891,24 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
     // to put in it, and the work log below is a separate note rather than the answer's message.
     await reply.working?.(worklog.statusFor(undefined, verb)).catch(() => {});
 
+    // WHO WILL SEE THIS, decided before anything of the answer is shown (BRAIN-AUDIENCE). Outside the
+    // speaker's own DM, a person who reaches any brain has the answer HELD — no streaming, no tool
+    // details in the work log — until the end of the turn decides where it goes (BRAIN-PRIVATE-DELIVERY).
+    const brains = deps.brains;
+    const key = sessionKeyOf(input.conversation, input.user);
+    let audience: Audience = { kind: "self" };
+    let held = false;
+    let prior: string[] = [];
+    let brainTurn: { token: string; mcp: McpServerSpec } | undefined;
+    if (brains && input.user) {
+      prior = await brains.provenance(input.agent, key).catch(() => []);
+      audience = await brains.audience(input.agent, input.conversation, input.user).catch((e: Error) => ({ kind: "unknown", why: e.message }) as Audience);
+      const reach = await brains.reach(input.agent, input.user).catch(() => null);
+      // Unknown reach is treated as reaching something: holding costs only the streaming effect.
+      held = audience.kind !== "self" && (reach === null || reach.size > 0 || prior.length > 0);
+      brainTurn = brains.start(input.agent, input.user, input.user);
+    }
+
     const started = Date.now();
     let answer = "";
     let usage: TurnUsage | undefined;
@@ -890,6 +939,8 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
     let lastTick = 0;
     const tick = async (): Promise<void> => {
       if (done || ctx.cancellationSignal.aborted) return;
+      // A held turn shows that it is working, and nothing of what it is working on.
+      if (held && noteId) return;
       if (posting) return;
       // Once the answer is streaming, do not CREATE a note: it would post below the reply and
       // read as a footnote. But an EXISTING one keeps ticking — freezing it is what made the
@@ -971,8 +1022,14 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
     // No sender at all means a system notification, not an unknown person. Treating it as a stranger
     // made the agent refuse to discuss the meeting it had just been handed.
     const speaker = speakerContext({ user: input.user, label: known?.label, fromSystem: input.fromSystem });
+    if (brainTurn && brains && known?.label) {
+      // Re-open with the person's name for log.md; the first token is closed unused.
+      brains.end(brainTurn.token);
+      brainTurn = brains.start(input.agent, input.user, known.label);
+    }
     const parts = [
       found.context ?? "",
+      brainTurn ? BRAIN_GUIDANCE : "",
       input.afterInterruption
         ? "(your previous answer was interrupted by a new message; continue from what the user now says)"
         : "",
@@ -1004,14 +1061,20 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
     // The session this thread continues in. Claimed, not peeked at: `--session-id` creates and
     // may be used once, every later turn resumes, and the one thing that can go wrong with that —
     // no session on disk to resume — is repaired below rather than left to fail forever.
-    let session = await deps.claimSession?.(input.agent, input.conversation);
+    let session = await deps.claimSession?.(input.agent, key);
 
     // Files the person attached, named for the model to open with its Read tool (images and PDFs it
     // reads; a text file it reads; an audio file it can see and name but not transcribe here). Mirrors
     // the gateway's media convention so there is one shape, not two. Empty for an ordinary message.
-    const media = input.mediaPaths ?? [];
+    // THE TURN'S OWN FOLDER: its working directory, holding its attachments and nothing else.
+    const turnDir = await fs.mkdtemp(path.join(os.tmpdir(), "tonoman-turn-"));
+    const media: string[] = [];
+    for (const m of input.mediaPaths ?? []) {
+      const dest = path.join(turnDir, path.basename(m));
+      await fs.copyFile(m, dest).then(() => media.push(dest), () => media.push(m));
+    }
     const mediaNote = media.length
-      ? `\n\nAttached file(s) on the shared mount — read them:\n${media.map((p) => `- ${p}`).join("\n")}`
+      ? `\n\nAttached file(s) — read them:\n${media.map((p) => `- ${p}`).join("\n")}`
       : "";
 
     const consume = async (): Promise<void> => {
@@ -1026,6 +1089,8 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
           // WHO is speaking — the run closure turns this into the speaker's own credential when the
           // agent runs inference per person, and ignores it otherwise.
           user: input.user,
+          mcpServers: brainTurn ? [brainTurn.mcp] : undefined,
+          cwd: turnDir,
         },
         // Passing the signal is what makes a steer actually stop the model. Without it the child
         // ran to completion after the person had already moved on — paid for, unread, and still
@@ -1036,14 +1101,14 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
         if (ev.kind === "text" && ev.text) {
           answer += ev.text;
           const now = Date.now();
-          if (now - lastEdit >= EDIT_INTERVAL_MS && answer.trim()) {
+          if (!held && now - lastEdit >= EDIT_INTERVAL_MS && answer.trim()) {
             lastEdit = now;
             await show(answer).catch(() => {});
           }
         } else if (ev.kind === "tool") {
           // Recorded for the work log, and mirrored into the status line straight away so the
           // cue changes the moment a tool starts rather than on the next tick.
-          current = { tool: ev.tool ?? "working", detail: ev.text };
+          current = { tool: ev.tool ?? "working", detail: held ? undefined : ev.text };
           calls.push(current);
           if (!answer) await runTick();
         } else if (ev.kind === "done") {
@@ -1097,7 +1162,7 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
           `worker: ${input.agent} could not resume session ${session.id} ` +
             `(${String((e as Error)?.message ?? e).slice(0, 140)}); starting a fresh one`,
         );
-        session = await deps.resetSession?.(input.agent, input.conversation);
+        session = await deps.resetSession?.(input.agent, key);
         await reply.reset?.().catch(() => {});
         await consume();
       }
@@ -1107,13 +1172,23 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
       // under the composer for good — the turn reads as still running, forever.
       dropLog();
       await settleCue();
+      if (brainTurn && brains) {
+        const used = brains.end(brainTurn.token);
+        if (used.length) await brains.remember(input.agent, key, used).catch(() => {});
+      }
       throw e;
     } finally {
       clearInterval(ticker);
       await fs.rm(turnSystemFile, { force: true }).catch(() => {});
+      await fs.rm(turnDir, { recursive: true, force: true }).catch(() => {});
     }
 
     done = true;
+    // What this turn drew on, remembered for the rest of this person's history of the thread: the
+    // agent can repeat it later without looking again (BRAIN-USED-DECIDES).
+    const used = brainTurn && brains ? brains.end(brainTurn.token) : [];
+    if (used.length && brains) await brains.remember(input.agent, key, used).catch(() => {});
+    const drawnOn = [...new Set([...prior, ...used])];
     if (usage) deps.recordUsage?.(input.conversation, usage);
     // Slack leaves "is thinking…" on screen until it is cleared, so an answered turn that
     // forgets this looks permanently busy.
@@ -1126,7 +1201,7 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
     // Settle the work log into one line of what the turn actually did, or take it down when
     // there is nothing worth keeping above the answer.
     if (noteId) {
-      const settled = worklog.settledNote(calls, Date.now() - started, verb);
+      const settled = worklog.settledNote(held ? [] : calls, Date.now() - started, verb);
       await reply.note?.(noteId, settled).catch(() => {});
     }
 
@@ -1136,7 +1211,38 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
     // is metadata rather than the last paragraph of the answer, and so wanted visible separation.
     // In Slack it reads as detached instead: a stray line floating below the message, far enough
     // away that it stops looking related to it. One blank line is the separation that was wanted.
-    const final = footer ? `${body}\n\n${footer}` : body;
+    let final = footer ? `${body}\n\n${footer}` : body;
+
+    // WHERE IT GOES. Only a turn that drew on a brain, outside the speaker's own DM, needs asking.
+    if (brains && input.user && drawnOn.length && audience.kind !== "self") {
+      const now = await brains.reach(input.agent, input.user).catch(() => null);
+      // Access changed while it worked: nothing new from a brain they no longer reach (BRAIN-GRANT-TIMING).
+      if (!now || used.some((b) => !now.has(b))) {
+        final = "I can't share that answer: access to a brain it used changed while I was working. Ask me again.";
+      }
+      const readable = audience.kind === "members" ? await brains.readableByAll(input.agent, drawnOn, audience.members).catch(() => null) : null;
+      if (decideRoute(audience, drawnOn, readable).to === "private") {
+        const names = drawnOn.map((b) => now?.get(b)).filter((n): n is string => !!n);
+        const sent = await brains.dm(input.agent, input.user, `${privateReason(names, audience)}\n\n${final}`).catch(() => false);
+        const note = sent ? THREAD_NOTE : THREAD_NOTE_FAILED;
+        if (!msgId) msgId = await reply.send(note);
+        else await reply.finalize(msgId, note);
+        return;
+      }
+    }
     if (!msgId) msgId = await reply.send(final);
     else await reply.finalize(msgId, final);
 }
+
+/** What a turn with the brain tool is told about it. The rules it restates are the brain object's. */
+const BRAIN_GUIDANCE = [
+  "You have a brain tool: brain_list, brain_search, brain_read, brain_write. Brains hold this person's",
+  "knowledge — their own brain, and any shared with them. Nothing else of theirs is on this machine.",
+  "- Start with brain_list: it shows each brain and the start of its index.md. Follow the index and its hubs, then search.",
+  "- Answer questions about their work, people and decisions from the brains, and name the brain and page each fact came from.",
+  "- To remember something: if you do not know what it is or where it belongs, ask — or research it when asked — and never file a guess.",
+  "  Pick the best-fitting brain they can write to, and an existing page before a new one (brain_read it first and pass its revision).",
+  "  Add the page to the index or its topic's hub. Say which brain and page you used, and only once brain_write says it is saved.",
+  "- If a brain is read only, say so, and offer one they can write to or the text itself.",
+  "- If the tool says something was cut or could not be reached, say what you could not look at.",
+].join("\n");

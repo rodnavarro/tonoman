@@ -1,3 +1,4 @@
+import { FILE_DENY_RULES } from "./turnenv";
 import { describe, it, expect } from "vitest";
 import { Runner, spec, KIND, parseLine, decodeTrace, resolveTraceMode, localEnv, toolPreview } from "./claudecode";
 
@@ -24,11 +25,26 @@ describe("claudecode Runner.podmanArgs — model knob is per-turn (gw-command-mo
     expect(r.podmanArgs(req)).not.toContain("--model");
   });
 
-  it("emits --disallowedTools as a comma list to trim the context floor; omits it when empty/unset", () => {
+  it("emits --disallowedTools as a comma list to trim the context floor, always followed by the file-tool deny rules", () => {
     const r = new Runner({ container: "cody", disallowedTools: ["Task", "NotebookEdit", "TodoWrite"] });
-    expect(flagValue(r.podmanArgs(req), "--disallowedTools")).toBe("Task,NotebookEdit,TodoWrite");
-    expect(new Runner({ container: "cody" }).podmanArgs(req)).not.toContain("--disallowedTools");
-    expect(new Runner({ container: "cody", disallowedTools: [] }).podmanArgs(req)).not.toContain("--disallowedTools");
+    expect(flagValue(r.podmanArgs(req), "--disallowedTools")).toBe(["Task", "NotebookEdit", "TodoWrite", ...FILE_DENY_RULES].join(","));
+    // With nothing configured the deny rules are still there: no setting can take them away.
+    expect(flagValue(new Runner({ container: "cody" }).podmanArgs(req), "--disallowedTools")).toBe(FILE_DENY_RULES.join(","));
+    expect(flagValue(new Runner({ container: "cody", disallowedTools: [] }).podmanArgs(req), "--disallowedTools")).toBe(FILE_DENY_RULES.join(","));
+  });
+
+  it("BRAIN-WORKSPACE a full turn's file tools can never open brains, credentials or other people's histories", () => {
+    const deny = flagValue(new Runner({ container: "cody" }).podmanArgs(req), "--disallowedTools")!.split(",");
+    for (const rule of ["Read(//root/.tonoman/**)", "Read(//root/.claude/**)", "Read(//root/.codex/**)", "Read(//etc/tonoman/**)"]) {
+      expect(deny).toContain(rule);
+    }
+  });
+
+  it("BRAIN-EVERY-AGENT a full turn gets its MCP configuration file; a lean one never does", () => {
+    const r = new Runner({ container: "cody" });
+    expect(flagValue(r.podmanArgs({ prompt: "hi", mcpConfigFile: "/tmp/t/.mcp-tonoman.json" }), "--mcp-config")).toBe("/tmp/t/.mcp-tonoman.json");
+    expect(r.podmanArgs({ prompt: "hi", lean: true, mcpConfigFile: "/tmp/t/.mcp-tonoman.json" })).not.toContain("--mcp-config");
+    expect(r.podmanArgs({ prompt: "hi", mcpConfigFile: "/tmp/t/.mcp-tonoman.json" })).toContain("--strict-mcp-config");
   });
 
   it("a LEAN turn offers NO tools and caps to one turn, overriding the runner's own knobs", () => {
@@ -40,7 +56,7 @@ describe("claudecode Runner.podmanArgs — model knob is per-turn (gw-command-mo
     expect(lean).not.toContain("--disallowedTools");
     expect(flagValue(lean, "--max-turns")).toBe("1");
     // A non-lean turn is unchanged — the runner's own disallow list and cap still apply.
-    expect(flagValue(r.podmanArgs({ prompt: "hi" }), "--disallowedTools")).toBe("Task");
+    expect(flagValue(r.podmanArgs({ prompt: "hi" }), "--disallowedTools")).toBe(["Task", ...FILE_DENY_RULES].join(","));
     expect(flagValue(r.podmanArgs({ prompt: "hi" }), "--max-turns")).toBe("10");
   });
 

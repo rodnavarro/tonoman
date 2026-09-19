@@ -41,6 +41,11 @@ import {
 import { httpAuthOps, looksLoggedIn } from "../authflow";
 import * as gate from "./authgate";
 import * as secondbrain from "./secondbrain";
+import { createStore } from "../brains/store";
+import { createBroker, type Broker } from "../brains/broker";
+import { registryClient } from "../brains/registry";
+import { adoProvisioner } from "../brains/ado";
+import type { Audience } from "../brains/delivery";
 import * as recapFloor from "./recap";
 import { recordingKey } from "./recordingkey";
 import { withAuthRaceRetry } from "./authrace";
@@ -55,7 +60,7 @@ import { promises as fsp } from "node:fs";
 import { defaultHarnesses } from "../gateway";
 import { parseMountRef, parseRef, registrySecretPath } from "../core/secretref";
 import { harnessForProvider, providerAccountLabel, providerLabel, type HarnessKind, type InferenceProvider } from "../harness";
-import { accountsFromUsers, makeActivities, type TurnRunReq, type VoiceConfig } from "./activities";
+import { accountsFromUsers, makeActivities, type TurnRunReq, type VoiceConfig, type TurnBrains } from "./activities";
 import { startCapabilityPlane, type CapabilityPlane } from "./capability-plane";
 import { agendaTickWorkflow, conversationWorkflow, messageSignal, plaudPollWorkflow, runTalentWorkflow, type AgendaTickInput, type Inbound, type PollInput } from "./workflows";
 import { agendaBrief, parseAgendaTimes } from "./talents/agenda-brief";
@@ -415,6 +420,28 @@ function disallowedTools(): string[] {
   return env.split(",").map((s) => s.trim()).filter(Boolean);
 }
 
+
+// --- Brains (docs/definition/objects/brain.md in Tonoman Cloud) -------------------------------------
+
+/** The brain store and tool, when this worker has a registry to ask. Off with TONOMAN_BRAINS=off. */
+async function startBrains(): Promise<{ registry: ReturnType<typeof registryClient>; broker: Broker } | undefined> {
+  const base = process.env.TONOMANCLOUD_API_URL;
+  if (!base || process.env.TONOMAN_BRAINS === "off") return undefined;
+  const registry = registryClient(base, process.env.TONOMANCLOUD_API_TOKEN ?? "");
+  const root = path.join(process.env.TONOMAN_STATE_ROOT ?? "/root/.tonoman", "brains");
+  // One credential for the brains' git host, by reference (a mounted secret). Used per command.
+  const gitSecret = process.env.TONOMAN_BRAIN_GIT_SECRET ?? "";
+  const pat = async (): Promise<string> => (gitSecret ? resolveRef(gitSecret) : "");
+  const store = createStore({ root, token: async (b) => (/^https:\/\/dev\.azure\.com\//i.test(b.repoUrl) ? pat() : "") });
+  const org = process.env.TONOMAN_BRAIN_ADO_ORG;
+  const project = process.env.TONOMAN_BRAIN_ADO_PROJECT;
+  const provisioner = org && project ? adoProvisioner({ org, project, suffix: process.env.TONOMAN_BRAIN_REPO_SUFFIX ?? "", pat }) : undefined;
+  const broker = createBroker({ store, registry, provisioner, scratch: path.join(root, "_scratch") });
+  await broker.start();
+  console.log(`worker: brains on — ${provisioner ? `new brains go to Azure DevOps ${org}/${project}` : "no git host configured, so no new brains can be created"}`);
+  return { registry, broker };
+}
+
 /** One wired agent: the roster row, its channel, its harness, and the second-brain note the turn
  *  is given. The runner is kept alongside `run` because the model knob (`!model`) lives on it. */
 interface Wired {
@@ -558,6 +585,8 @@ function runClosure(runner: TurnRunner, cfg: AgentConfig): Wired["run"] {
           // /root/.codex/agents/<agent>/users/<user>, and pointing a codex turn at Claude's
           // directory would find no credential there and fail while the login sat right beside it.
           configHome: perPerson ? configHomeOf(cfg, r.user) : undefined,
+          mcpServers: r.lean ? undefined : r.mcpServers,
+          cwd: r.cwd,
         },
         signal,
       ),
@@ -655,6 +684,8 @@ export function sessionStore(
   claim: (agent: string, conversation: string) => Promise<{ id: string; isNew: boolean }>;
   reset: (agent: string, conversation: string) => Promise<{ id: string; isNew: boolean }>;
   forget: (agent: string, conversation: string) => Promise<void>;
+  provenance: (agent: string, conversation: string) => Promise<string[]>;
+  remember: (agent: string, conversation: string, brains: string[]) => Promise<void>;
 } {
   /** One file per conversation, under the agent that owns it — which is also what keeps two agents
    *  in two workspaces from colliding on a thread timestamp that is only unique within one of
@@ -700,6 +731,29 @@ export function sessionStore(
      *  no pointer at all, the next turn simply creates its session. */
     forget: async (agent: string, conversation: string) => {
       await fsp.rm(fileFor(agent, conversation), { force: true }).catch(() => {});
+    },
+    /** The brains this history has drawn on (BRAIN-USED-DECIDES). Kept with the session pointer, so it
+     *  lives and dies with the history it describes: `!new` and a resume repair clear both. */
+    provenance: async (agent: string, conversation: string) => {
+      try {
+        const j = JSON.parse(await fsp.readFile(fileFor(agent, conversation), "utf8")) as { brains?: unknown };
+        return Array.isArray(j.brains) ? j.brains.filter((x): x is string => typeof x === "string") : [];
+      } catch {
+        return [];
+      }
+    },
+    remember: async (agent: string, conversation: string, brains: string[]) => {
+      const f = fileFor(agent, conversation);
+      let j: Record<string, unknown> = {};
+      try {
+        j = JSON.parse(await fsp.readFile(f, "utf8")) as Record<string, unknown>;
+      } catch {
+        /* no pointer yet: the provenance starts one */
+      }
+      const had = Array.isArray(j.brains) ? (j.brains as string[]) : [];
+      j.brains = [...new Set([...had, ...brains])];
+      await fsp.mkdir(path.dirname(f), { recursive: true });
+      await fsp.writeFile(f, JSON.stringify(j), "utf8");
     },
   };
 }
@@ -776,6 +830,8 @@ export async function run(
    *  voice flow is that a meeting recorded minutes ago is something the agent can talk about, and a
    *  checkout taken only at boot would mean the answer is "I don't know" until somebody restarts a
    *  pod. */
+  // Brains are on when the worker has a registry to ask; decided before the first sync below.
+  const brainsOn = !!process.env.TONOMANCLOUD_API_URL && process.env.TONOMAN_BRAINS !== "off";
   const syncAll = async (): Promise<void> => {
     for (const [name, a] of wired) {
     const sources = (a.cfg.secondbrain ?? []).map((s) => ({
@@ -814,6 +870,7 @@ export async function run(
           status: c.status,
         })),
         a.cfg.displayName ?? "",
+        brainsOn,
       );
     }
   };
@@ -1126,7 +1183,11 @@ export async function run(
    *  every agent in the tenant and every thread they are in, and the harness's own knob is a single
    *  variable — so `!model opus` in one thread moved everyone. */
   const models = new Map<string, string>();
-  const { claim: claimSession, reset: resetSession, forget: forgetSession } = sessionStore();
+  const { claim: claimSession, reset: resetSession, forget: forgetSession, provenance, remember } = sessionStore();
+  const brainsSys = await startBrains().catch((e: Error) => {
+    console.error(`worker: brains are off — ${e.message}`);
+    return undefined;
+  });
 
   /** Where THIS agent's voice flow speaks: its configured channel, else a DM with the recipient.
    *
@@ -1141,6 +1202,38 @@ export async function run(
     return dmFor(name, user);
   };
 
+  /** What a conversation turn needs from the brains, bound to this worker's agents. */
+  const turnBrains = (b: { registry: ReturnType<typeof registryClient>; broker: Broker }): TurnBrains => ({
+    start: (agent, user, who) => {
+      const g = wired.get(agent)?.cfg.guid;
+      return g ? b.broker.startTurn({ agentGuid: g, slackUserId: user, who }) : undefined;
+    },
+    end: (token) => b.broker.endTurn(token).used,
+    provenance: (agent, key) => provenance(agent, key),
+    remember: (agent, key, used) => remember(agent, key, used),
+    audience: async (agent, conversation, user) => {
+      const conn = wired.get(agent)?.conn as { audience?: (c: string, u: string) => Promise<Audience> } | undefined;
+      return conn?.audience ? conn.audience(conversation, user) : { kind: "unknown", why: "this channel cannot say who is in it" };
+    },
+    reach: async (agent, user) => {
+      const g = wired.get(agent)?.cfg.guid;
+      if (!g) return null;
+      const r = await b.registry.reach(g, user);
+      return new Map(r.brains.map((x) => [x.id, x.name]));
+    },
+    readableByAll: async (agent, ids, members) => {
+      const g = wired.get(agent)?.cfg.guid;
+      return g ? b.registry.readableByAll(g, ids, members) : null;
+    },
+    dm: async (agent, user, text) => {
+      const a = wired.get(agent);
+      const conv = a ? await dmFor(agent, user) : undefined;
+      if (!a || !conv) return false;
+      await a.conn.reply(conv).send(text);
+      return true;
+    },
+  });
+
   const deps = {
     agent: (name: string) => wired.get(name),
     voice: (name: string) => voiceCreds.get(name),
@@ -1153,6 +1246,7 @@ export async function run(
     modelFor: (agent: string, conversation: string) => models.get(conversation) ?? wired.get(agent)?.cfg.model,
     claimSession,
     resetSession,
+    brains: brainsSys ? turnBrains(brainsSys) : undefined,
     footer: async (name: string, conversation: string, u: TurnUsage | undefined): Promise<string | null> => {
       const mode = modeFor(conversation);
       if (mode === "none" || !u) return null;

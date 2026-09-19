@@ -26,6 +26,7 @@ import {
   setHandler,
   startChild,
   workflowInfo,
+  patched,
 } from "@temporalio/workflow";
 import type { Activities } from "./activities";
 // From `turnfailure`, NOT from `authflow`. A workflow is bundled into a sandbox with no Node
@@ -86,10 +87,14 @@ export async function conversationWorkflow(input: ConversationInput): Promise<vo
   if (input.first) queue.push(input.first);
 
   let inFlight: CancellationScope | undefined;
+  let inFlightUser: string | undefined;
   let interrupted = false;
 
   setHandler(messageSignal, (m: Inbound) => {
     queue.push(m);
+    // Another person's message waits its turn: each person has their own history of the thread
+    // (D-THREAD-HISTORY), so it is not a correction of the answer in flight.
+    if (inFlight && patched("steer-same-speaker") && m.user !== inFlightUser) return;
     // STEER, not queue-and-wait. Someone correcting themselves mid-answer should not have to ask
     // for the correction to be applied — the queue-with-/pop default is right for Teams and wrong
     // for a chat where the next message is usually "no, I meant…".
@@ -112,6 +117,7 @@ export async function conversationWorkflow(input: ConversationInput): Promise<vo
     try {
       await CancellationScope.cancellable(async () => {
         inFlight = CancellationScope.current();
+        inFlightUser = m.user;
         await runTurn({
           agent: input.agent,
           conversation: input.conversation,

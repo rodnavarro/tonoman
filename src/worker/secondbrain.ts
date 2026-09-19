@@ -133,6 +133,8 @@ export function contextNote(
   timezone = "",
   connections: ConnectionNote[] = [],
   name = "",
+  /** Brains are on: knowledge comes through the brain tool, so no checkout path is given out. */
+  viaBrains = false,
 ): string {
   // WHO THE AGENT CURRENTLY IS. The name lives in the registry and can be changed from the Hub; the
   // identity/instructions prose is written once and goes stale the moment it is. So the live name is
@@ -147,7 +149,7 @@ export function contextNote(
         `and refer to yourself as ${name}.`,
       ].join("\n")
     : "";
-  if (ready.length === 0) return naming;
+  if (ready.length === 0 && !viaBrains) return naming;
   const lines = ready.map((r) => `- ${r.label}: ${r.dir}`).join("\n");
   // WHAT TIME IT IS FOR THIS PERSON. A recap page carries a UTC instant and a local rendering, and
   // without being told which is which the agent reads whichever it finds first — asked how many
@@ -192,6 +194,18 @@ export function contextNote(
         "say so and name the connection required.",
       ].join("\n");
 
+  if (viaBrains) {
+    return [
+      naming,
+      clock,
+      accounts,
+      "",
+      "If the answer is not in the brains, say so plainly rather than guessing — a wrong",
+      "recollection about a real client conversation is worse than no recollection.",
+    ]
+      .join("\n")
+      .trim();
+  }
   return [
     naming,
     naming ? "" : undefined,

@@ -98,6 +98,12 @@ export interface TurnRequest {
    * `model` is: one process serves every conversation, so a per-process credential would be one
    * person's login answering for everybody. */
   configHome?: string;
+  /** optional: MCP servers this turn may use — the brain tool. Never given to a lean turn. */
+  mcpServers?: { name: string; command: string; args: string[]; env: Record<string, string> }[];
+  /** set by a runner: where it wrote those servers' configuration for this turn. */
+  mcpConfigFile?: string;
+  /** optional: the turn's own working folder — its cwd, holding its attachments and nothing else. */
+  cwd?: string;
 }
 
 /** Drives one harness turn and yields normalized events (A2). The iterable

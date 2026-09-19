@@ -23,6 +23,7 @@ import * as readline from "node:readline";
 import type { TurnEvent, TurnRequest, TurnRunner, TurnUsage } from "../core/contracts";
 import type { Spec, RunnerParams, EphemeralParams } from "../harness";
 import type { UsageWindow } from "../statusline";
+import { codexMcpOverrides, scrubEnv } from "./turnenv";
 
 /** The harness key used in agent config. */
 export const KIND = "codex";
@@ -117,7 +118,8 @@ export function localEnv(base: NodeJS.ProcessEnv, configHome: string = CONFIG_HO
   // would create its config dir. So the home is ensured here, at the one place every codex child's
   // CODEX_HOME is set — a login, a turn, a status check all pass through localEnv or homeEnv.
   ensureCodexHome(configHome);
-  const env: NodeJS.ProcessEnv = { ...base, CODEX_HOME: configHome };
+  // A Codex turn has a shell: whatever is in its environment, it can print. The worker's secrets stay out.
+  const env: NodeJS.ProcessEnv = { ...scrubEnv(base), CODEX_HOME: configHome };
   delete env.OPENAI_API_KEY;
   return env;
 }
@@ -170,11 +172,14 @@ export class Runner implements TurnRunner {
   }
 
   /** The transport-neutral `codex exec` flags for one turn (everything AFTER the binary). */
-  codexTail(): string[] {
+  codexTail(req?: TurnRequest): string[] {
     const args = ["exec", "--json", "--skip-git-repo-check", ...this.sandboxFlags()];
-    const cwd = this.o.cwd ?? process.env.TONOMAN_WORKDIR ?? process.cwd();
+    // The turn's own folder when it has one (its attachments and nothing else), else the runner's.
+    const cwd = req?.cwd ?? this.o.cwd ?? process.env.TONOMAN_WORKDIR ?? process.cwd();
     args.push("-C", cwd);
     if (this.model) args.push("-m", this.model);
+    // The brain tool, as this turn's only MCP server.
+    if (req && !req.lean && req.mcpServers?.length) args.push(...codexMcpOverrides(req.mcpServers));
     if (this.o.extraArgs) args.push(...this.o.extraArgs);
     return args;
   }
@@ -185,8 +190,8 @@ export class Runner implements TurnRunner {
     return ["exec", "-i", this.o.container!, bin, ...this.codexTail()];
   }
 
-  localArgs(): string[] {
-    return this.codexTail();
+  localArgs(req?: TurnRequest): string[] {
+    return this.codexTail(req);
   }
 
   async *run(req: TurnRequest, signal?: AbortSignal): AsyncIterable<TurnEvent> {
@@ -195,7 +200,7 @@ export class Runner implements TurnRunner {
     if (this.o.local) {
       // `req.configHome` overrides the runner's per-agent default for THIS turn only — set when
       // the agent runs inference per person, so the speaker's own login answers.
-      child = spawn(bin, this.localArgs(), {
+      child = spawn(bin, this.localArgs(req), {
         windowsHide: true,
         env: localEnv(process.env, req.configHome ?? this.o.configHome ?? CONFIG_HOME),
       });

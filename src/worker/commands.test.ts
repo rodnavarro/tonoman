@@ -207,8 +207,10 @@ describe("run", () => {
       "nelly",
       "c",
       { name: "new", arg: "" },
+      "UANA",
     );
-    expect(forgotten).toEqual([["nelly", "c"]]);
+    // Only the caller's own history of the thread (D-THREAD-HISTORY): Ben's is untouched.
+    expect(forgotten).toEqual([["nelly", "c#UANA"]]);
     expect(out).toContain("Forgotten");
   });
 

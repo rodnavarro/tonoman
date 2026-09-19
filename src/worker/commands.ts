@@ -456,7 +456,8 @@ export async function run(
 
     case "new":
       if (!deps.resetSession) return NEW_NOOP;
-      deps.resetSession(agent, conversation);
+      // Only the caller's own history of this thread (D-THREAD-HISTORY) — the key is theirs.
+      deps.resetSession(agent, `${conversation}#${(user ?? "").replace(/[^A-Za-z0-9_-]/g, "") || "platform"}`);
       return NEW_DONE;
 
     case "status":

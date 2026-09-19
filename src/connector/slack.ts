@@ -14,6 +14,7 @@
 //   2. Slack rotates the socket every ~10-60 minutes and warns first (`disconnect`). We treat that
 //      as ordinary, not an error: reconnect and keep yielding from the same iterator.
 
+import { audienceOf, type Audience } from "../brains/delivery";
 import { promises as fs } from "node:fs";
 import * as path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -440,6 +441,12 @@ export class SlackConnector implements Connector {
     } catch {
       return false;
     }
+  }
+
+  /** Who will see a reply in this conversation (BRAIN-AUDIENCE). Asked of Slack every time. */
+  async audience(conversation: string, user: string): Promise<Audience> {
+    await this.resolveBotUser();
+    return audienceOf((m, b) => this.call(m, b), parseConversation(conversation).channel, user, this.botUserID);
   }
 
   /** Turns a Slack event into a neutral envelope, or null to ignore it.

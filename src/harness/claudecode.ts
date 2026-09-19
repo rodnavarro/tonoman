@@ -12,11 +12,13 @@
 
 import { spawn } from "node:child_process";
 import { promises as fsp } from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import * as readline from "node:readline";
 import type { TurnEvent, TurnRequest, TurnRunner } from "../core/contracts";
 import type { Spec, RunnerParams, EphemeralParams } from "../harness";
 import { registerClaudeHook } from "../telemetry";
+import { FILE_DENY_RULES, scrubEnv, writeMcpConfig } from "./turnenv";
 
 /** The harness key used in agent config. */
 export const KIND = "claude-code";
@@ -260,10 +262,16 @@ export class Runner implements TurnRunner {
     // six times on one meeting. Connectors are already out (strict-mcp).
     if (req.lean) {
       args.push("--tools", "");
-    } else if (this.o.disallowedTools?.length) {
-      // Drop tools this agent never uses, so their schemas leave the context floor (claude-code-only).
-      args.push("--disallowedTools", this.o.disallowedTools.join(","));
+    } else {
+      // Drop tools this agent never uses, so their schemas leave the context floor (claude-code-only),
+      // and ALWAYS keep the file tools out of brains, credentials and other people's histories —
+      // added on top of the configurable list, so no environment setting can take them away.
+      const deny = [...(this.o.disallowedTools ?? []), ...FILE_DENY_RULES];
+      args.push("--disallowedTools", deny.join(","));
     }
+    // The turn's MCP servers (the brain tool), from a file in its own folder. `--strict-mcp-config`
+    // above still keeps every server the account happens to have out.
+    if (!req.lean && req.mcpConfigFile) args.push("--mcp-config", req.mcpConfigFile);
     if (req.systemPromptFile) args.push("--append-system-prompt-file", req.systemPromptFile);
     // Per-TURN model first, then the process-wide knob. The knob is right for a single-agent
     // gateway and wrong for a worker serving many conversations at once.
@@ -326,15 +334,20 @@ export class Runner implements TurnRunner {
       // `req.configHome` overrides the runner's per-agent default for THIS turn only — set when the
       // agent runs inference per person, so the speaker's own login answers. Unset (every agent
       // today) keeps the one shared per-agent login.
-      const env = localEnv(process.env, this.o.backend, req.configHome ?? this.o.configHome ?? CONFIG_HOME);
-      if (req.configHome) {
-        // Best-effort: failing to share costs the thread's memory on a speaker change, which is not
-        // worth failing the turn over. Said out loud so it is not a mystery when it happens.
-        await shareConversationHistory(req.configHome).catch((e: Error) =>
-          console.error(`claudecode: could not share conversation history for ${req.configHome}: ${e.message}`),
-        );
+      // The worker's secrets never reach a turn (AWS stays for a Bedrock backend, which needs it).
+      const env = localEnv(
+        scrubEnv(process.env, (k) => this.o.backend === "bedrock" && k.startsWith("AWS_")),
+        this.o.backend,
+        req.configHome ?? this.o.configHome ?? CONFIG_HOME,
+      );
+      // History is no longer shared between people (D-THREAD-HISTORY): each person's login keeps
+      // its own sessions, so `shareConversationHistory` is not called for a per-person turn.
+      let turnReq = req;
+      if (!req.lean && req.mcpServers?.length) {
+        const mcpConfigFile = await writeMcpConfig(req.cwd ?? path.join(os.tmpdir(), `tonoman-mcp-${process.pid}`), req.mcpServers);
+        turnReq = { ...req, mcpConfigFile };
       }
-      child = spawn(bin, this.localArgs(req), { windowsHide: true, env });
+      child = spawn(bin, this.localArgs(turnReq), { windowsHide: true, env, ...(req.cwd ? { cwd: req.cwd } : {}) });
     } else {
       const podman = this.o.podman ?? "podman";
       child = spawn(podman, this.podmanArgs(req), { windowsHide: true });
