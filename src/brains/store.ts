@@ -17,6 +17,7 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
+import { tmpdir } from "node:os";
 import * as path from "node:path";
 
 export interface BrainRef {
@@ -116,7 +117,10 @@ function git(args: string[], cwd?: string, input?: string, token?: string): Prom
       "git",
       args,
       {
-        cwd,
+        // Never the process's own folder: a worker started inside a git checkout (dev mounts its source,
+        // a worktree whose .git points at a host path) would make every repo-less command — clone,
+        // ls-remote — read that checkout first and fail.
+        cwd: cwd ?? tmpdir(),
         windowsHide: true,
         maxBuffer: 1 << 26,
         // No prompt, ever: a missing credential must fail, not hang a turn waiting on a terminal.

@@ -114,3 +114,20 @@ describe("latest", () => {
     expect((await s.read(brain, "new.md"))?.content).toBe("just pushed\n");
   });
 });
+
+describe("where the worker runs", () => {
+  it("BRAIN-REPO-ON-FIRST-USE a new repo is seeded even from inside a broken git checkout", async () => {
+    const inside = mkdtempSync(path.join(tmp, "live-"));
+    writeFileSync(path.join(inside, ".git"), "gitdir: C:/somewhere/else/.bare/worktrees/agent-a\n");
+    const fresh = path.join(tmp, "fresh.git");
+    sh(["init", "-q", "--bare", "-b", "main", fresh]);
+    const was = process.cwd();
+    process.chdir(inside);
+    try {
+      expect(await seed(fresh, "", seedFiles("Ben's brain"), tmp)).toBe("seeded");
+      await expect(store("s-inside").read({ id: "b-ben", tenant: "test-a", repoUrl: fresh }, "BRAIN.md")).resolves.not.toBeNull();
+    } finally {
+      process.chdir(was);
+    }
+  });
+});

@@ -451,7 +451,7 @@ async function startBrains(): Promise<{ registry: ReturnType<typeof registryClie
   // given. With no URL, brains are still mapped, just not connected by topic.
   const refreshUrl = (process.env.TONOMAN_BRAIN_REFRESH_URL ?? "").replace(/\/+$/, "");
   const provider: LlmProvider | undefined = refreshUrl
-    ? { name: "brain-refresh", url: refreshUrl, model: process.env.TONOMAN_BRAIN_REFRESH_MODEL || "gemma4:e4b", timeoutMs: 180_000 }
+    ? { name: "brain-refresh", url: refreshUrl, model: process.env.TONOMAN_BRAIN_REFRESH_MODEL || "gemma4:e4b-it-qat", timeoutMs: 180_000 }
     : undefined;
   const publish = (id: string, p: RefreshPublish) => registry.publishIndex(id, p as unknown as Record<string, unknown>);
   const queue = createRefreshQueue({

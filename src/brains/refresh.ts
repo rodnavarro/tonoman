@@ -16,7 +16,7 @@ import { promises as fs } from "node:fs";
 import * as path from "node:path";
 import { execFile } from "node:child_process";
 import { buildGraph, graphStats, type Graph, type GraphEdge } from "../secondbrain/wiki-reindex/graph";
-import { readOrders, readLinkContent } from "../secondbrain/wiki-reindex/reindex";
+import { readOrders } from "../secondbrain/wiki-reindex/reindex";
 import { parseEnrichment, pageExcerpt } from "../secondbrain/wiki-reindex/enrich";
 import { inferChat, type LlmProvider } from "../secondbrain/wiki-reindex/llm";
 import { isRefreshPath, type BrainRef, type BrainStore } from "./store";
@@ -90,6 +90,33 @@ export function relatedEdges(notes: Map<string, PageNote>, existing: GraphEdge[]
   return { edges, topics: kept };
 }
 
+/** PURE: a page's links as the graph reads them, `](/<page>)`. People and agents write ordinary
+ *  relative links (`](pricing.md)`, `](../Team/offsite.md)`); the graph only resolves ones from the
+ *  brain's root. A link to a web address, an anchor, or out of the brain is left as it is. */
+export function rootedLinks(pageId: string, text: string, sub = ""): string {
+  return text.replace(/\]\(([^)\s]+)/g, (whole, href: string) => {
+    if (/^[a-z][a-z0-9+.-]*:/i.test(href) || href.startsWith("#")) return whole;
+    if (href.startsWith("/")) return sub && href.startsWith(`/${sub}/`) ? `](${href.slice(sub.length + 1)}` : whole;
+    const to = path.posix.normalize(path.posix.join(path.posix.dirname(pageId), href));
+    return to.startsWith("..") ? whole : `](/${to}`;
+  });
+}
+
+/** Every page's lines that carry a link, by page id (relative to the brain's folder). */
+async function linkLines(dir: string, sub: string, ids: Set<string>): Promise<Map<string, string>> {
+  const out = await gitOut(dir, ["grep", "-I", "-z", "--no-color", "-F", "-e", "](", "HEAD", "--", sub ? `${sub}/*.md` : "*.md"]).catch(() => "");
+  const byPage = new Map<string, string[]>();
+  for (const rec of out.split("\n")) {
+    const nul = rec.indexOf("\0");
+    if (nul < 0) continue;
+    const full = rec.slice(0, nul).replace(/^HEAD:/, "");
+    const id = (sub ? full.slice(sub.length + 1) : full).replace(/\.md$/i, "");
+    if (!ids.has(id)) continue;
+    (byPage.get(id) ?? byPage.set(id, []).get(id)!).push(rootedLinks(id, rec.slice(nul + 1), sub));
+  }
+  return new Map([...byPage].map(([k, v]) => [k, v.join("\n")]));
+}
+
 const link = (id: string, label?: string) => `[${(label ?? id).replace(/[[\]()]/g, " ").trim()}](../${id}.md)`;
 
 /** PURE: the refresh's map of the brain. */
@@ -149,9 +176,7 @@ export async function refreshBrain(d: RefreshDeps, brain: BrainRef, name: string
     }
     const ids = new Set(pages.map((p) => p.path.replace(/\.md$/i, "")));
     const orders = readOrders(dir, orderPaths).map((o) => ({ folder: sub && o.folder.startsWith(`${sub}/`) ? o.folder.slice(sub.length + 1) : o.folder === sub ? "" : o.folder, children: o.children }));
-    const content = new Map(
-      [...readLinkContent(dir, new Set([...ids].map((i) => (sub ? `${sub}/${i}` : i))))].map(([k, v]) => [strip(k), v] as const),
-    );
+    const content = await linkLines(dir, sub, ids);
     const graph = buildGraph(pages.map((p) => ({ path: p.path, size: p.size })), orders, content);
     const orphans = graph.nodes.filter((n) => n.degree === 0 && !n.stub).map((n) => n.id);
 

@@ -7,7 +7,7 @@ import { mkdtempSync, rmSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { createStore, seed, type BrainRef } from "./store";
-import { refreshBrain, createRefreshQueue, relatedEdges, type RefreshPublish } from "./refresh";
+import { refreshBrain, createRefreshQueue, relatedEdges, rootedLinks, type RefreshPublish } from "./refresh";
 
 let tmp: string;
 let remote: string;
@@ -78,6 +78,21 @@ describe("connections", () => {
 });
 
 describe("the files an agent follows", () => {
+  it("BRAIN-TRAVERSAL-FILES a page's ordinary relative links are part of the map", async () => {
+    await store.write({ brain, path: "Team/plan.md", content: "# Plan\n\nSee [the offsite](offsite.md) and [Jev](../AI/jev.md), [out](../../x.md), [web](https://x.com/a.md).\n", note: "plan", who: "Ana" });
+    const r = await refreshBrain(deps(), brain, "Ana's brain");
+    const links = r.graph!.edges.filter((e) => e.kind !== "related" && e.source === "Team/plan").map((e) => e.target).sort();
+    expect(links).toEqual(["AI/jev", "Team/offsite"]);
+    expect(remoteFile(".tonoman/orphans.md")).not.toContain("Team/offsite.md");
+  });
+
+  it("BRAIN-TRAVERSAL-FILES links resolve from the page's own folder, and from the brain's root inside a shared repo", () => {
+    expect(rootedLinks("Team/plan", "[a](offsite.md) [b](../AI/jev.md#x) [c](/AI/p) [d](#top) [e](mailto:a@b.c)")).toBe(
+      "[a](/Team/offsite.md) [b](/AI/jev.md#x) [c](/AI/p) [d](#top) [e](mailto:a@b.c)",
+    );
+    expect(rootedLinks("plan", "[a](/Brains/Ana/AI/jev.md) [b](../other.md)", "Brains/Ana")).toBe("[a](/AI/jev.md) [b](../other.md)");
+  });
+
   it("BRAIN-TRAVERSAL-FILES each refresh writes the map, the hubs, the orphan list and a log line, under .tonoman/", async () => {
     await refreshBrain(deps({ infer: scripted([]), available: async () => true }), brain, "Ana's brain");
     expect(remoteFile(".tonoman/index.md")).toMatch(/# Ana's brain — map[\s\S]*## Topics[\s\S]*\[typesafe\]\(hubs\/typesafe\.md\) — 2 pages/);
