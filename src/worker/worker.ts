@@ -43,7 +43,7 @@ import * as gate from "./authgate";
 import * as secondbrain from "./secondbrain";
 import { createStore, type BrainStore } from "../brains/store";
 import { recoverWrites } from "../brains/recover";
-import { createBroker, type Broker } from "../brains/broker";
+import { createBroker, pickBrain, type Broker } from "../brains/broker";
 import { registryClient } from "../brains/registry";
 import { adoProvisioner } from "../brains/ado";
 import type { Audience } from "../brains/delivery";
@@ -1268,6 +1268,38 @@ export async function run(
     claimSession,
     resetSession,
     brains: turnBrains(brainsSys),
+    // Where a Talent files (BRAIN-TALENT-TARGET): the brain its settings name, else the personal brain
+    // of the person the run is for. An agent that already files into a second brain keeps doing so
+    // (BRAIN-MIGRATION). The run must be able to write there, now and again right before the push.
+    talentBrain: brainsSys
+      ? {
+          store: brainsSys.store,
+          target: async (agentName: string, user: string | undefined, talent: string) => {
+            const a = wired.get(agentName);
+            if (!a?.cfg.guid) return undefined;
+            const named = (a.cfg.talents ?? []).find((t) => t.name === talent)?.config?.brain;
+            if (!(typeof named === "string" && named.trim()) && (a.cfg.secondbrain ?? []).length) return undefined;
+            const guid = a.cfg.guid;
+            const r = await brainsSys.registry.reachUnattended(guid, user ?? null);
+            const b =
+              typeof named === "string" && named.trim()
+                ? pickBrain(r.brains, named)
+                : r.brains.find((x) => x.kind === "personal" && x.own);
+            if (!b) return { error: typeof named === "string" && named.trim() ? `the brain "${named}" is not one this run can reach` : "the person this run is for has no brain in this tenant" };
+            if (b.mode !== "write") return { error: `this run cannot write to ${b.name}` };
+            const ready = await brainsSys.broker.ensureRepo(r.tenant, b).catch(() => null);
+            if (!ready?.repoUrl) return { error: `${b.name} could not be set up yet` };
+            return {
+              agentGuid: guid,
+              id: b.id,
+              name: b.name,
+              who: user ?? "a Talent",
+              brain: { id: b.id, tenant: r.tenant, repoUrl: ready.repoUrl, subpath: b.subpath ?? undefined, branch: b.branch ?? undefined },
+              authorize: async () => (await brainsSys.registry.reachUnattended(guid, user ?? null)).brains.some((x) => x.id === b.id && x.mode === "write"),
+            };
+          },
+        }
+      : undefined,
     footer: async (name: string, conversation: string, u: TurnUsage | undefined): Promise<string | null> => {
       const mode = modeFor(conversation);
       if (mode === "none" || !u) return null;
@@ -1280,7 +1312,7 @@ export async function run(
       const conv = await voiceConversation(name, user);
       if (conv) await wired.get(name)?.conn.reply(conv).send(text);
     },
-    ask: async (name: string, user: string, text: string) => {
+    ask: async (name: string, user: string, text: string, drewOn?: string[]) => {
       const conv = await voiceConversation(name, user);
       if (!conv) return;
       await client.workflow.signalWithStart(conversationWorkflow, {
@@ -1289,7 +1321,7 @@ export async function run(
         args: [{ agent: name, conversation: conv, channel: "slack" }],
         signal: messageSignal,
         // The platform's words (a recap steer), for `user` and on their subscription — not typed by them.
-        signalArgs: [{ text, user, ts: String(Date.now()), fromSystem: true }],
+        signalArgs: [{ text, user, ts: String(Date.now()), fromSystem: true, ...(drewOn?.length ? { drewOn } : {}) }],
       });
     },
     // Inference on the AGENT'S OWN provider — a headless harness turn, captured not posted. The

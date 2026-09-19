@@ -743,14 +743,19 @@ export interface PageIdentity {
 }
 async function pageIdentity(file: string): Promise<PageIdentity | undefined> {
   try {
-    const head = (await fs.readFile(file, "utf8")).slice(0, 800);
-    const id = /^recording_id:[ \t]*(\S+)[ \t]*$/m.exec(head)?.[1];
-    const dt = /^datetime:[ \t]*(\S+)[ \t]*$/m.exec(head)?.[1];
-    const startMs = dt ? Date.parse(dt) : NaN;
-    return { id, startMs: Number.isFinite(startMs) ? startMs : undefined };
+    return identityOf(await fs.readFile(file, "utf8"));
   } catch {
     return undefined;
   }
+}
+
+/** PURE: which recording a recap page is, from its front matter. */
+export function identityOf(text: string): PageIdentity {
+  const head = text.slice(0, 800);
+  const id = /^recording_id:[ \t]*(\S+)[ \t]*$/m.exec(head)?.[1];
+  const dt = /^datetime:[ \t]*(\S+)[ \t]*$/m.exec(head)?.[1];
+  const startMs = dt ? Date.parse(dt) : NaN;
+  return { id, startMs: Number.isFinite(startMs) ? startMs : undefined };
 }
 
 /** PURE: is the page this recording's?

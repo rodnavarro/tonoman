@@ -11,6 +11,7 @@ import * as plaudapi from "./plaudapi";
 import { recordingKey } from "./recordingkey";
 import { accountFor, type TurnDeps } from "./activities";
 import type { TalentOutcome } from "../talent-sdk";
+import { publishRecapToBrain } from "../brains/talentpublish";
 
 // The capability plane — the runtime side of the Talent SDK's mediated capabilities (A15).
 //
@@ -29,6 +30,7 @@ interface RunToken {
   agent: string;
   item: string;
   user?: string;
+  talent?: string;
   expiresAt: number;
 }
 
@@ -36,7 +38,7 @@ export interface CapabilityPlane {
   /** Base URL handed to a spawned Talent as TONOMAN_CAPABILITY_URL. */
   url: string;
   /** Issue a token scoped to one run; pass it to the Talent as TONOMAN_CAPABILITY_TOKEN. */
-  mint(run: { agent: string; item: string; user?: string }): string;
+  mint(run: { agent: string; item: string; user?: string; talent?: string }): string;
   /** Drop a token once its child has exited. */
   revoke(token: string): void;
   /** Spawn a Talent CLI for one run against this plane and return its outcome. Used by the runTalent
@@ -85,6 +87,8 @@ async function runTalentProcess(
   revoke: (t: string) => void,
   run: { agent: string; item: string; user?: string; talent?: string },
   opts?: { signal?: AbortSignal; onProgress?: (note: string) => void },
+  /** The brains each run filed into, by token — set by /cap/publish, read once the run ends. */
+  filedIn: Map<string, string[]> = new Map(),
 ): Promise<TalentOutcome> {
   const talent = run.talent ?? "meeting-recap";
   const entry = TALENT_ENTRY[talent];
@@ -92,7 +96,7 @@ async function runTalentProcess(
   const voice = deps.voice?.(run.agent);
   if (!voice) return { status: "failed", reason: `no voice configuration for ${run.agent}` };
 
-  const token = mint({ agent: run.agent, item: run.item, user: run.user, expiresAt: Date.now() + 6 * 60 * 60 * 1000 });
+  const token = mint({ agent: run.agent, item: run.item, user: run.user, talent, expiresAt: Date.now() + 6 * 60 * 60 * 1000 });
   try {
     const input = {
       item: run.item,
@@ -163,14 +167,20 @@ async function runTalentProcess(
     if (!trimmed) {
       return { status: "failed", reason: `talent exited ${code} with no outcome — ${err.slice(-400)}` };
     }
-    return JSON.parse(trimmed) as TalentOutcome;
+    const outcome = JSON.parse(trimmed) as TalentOutcome;
+    // Which brains this run filed into — the runtime's record, never the Talent's say-so — so the
+    // announcement is delivered only where they may be read (BRAIN-PRIVATE-CONFIRMATIONS).
+    const filed = filedIn.get(token);
+    return filed?.length ? { ...outcome, brains: filed } : outcome;
   } finally {
     revoke(token);
+    filedIn.delete(token);
   }
 }
 
 export async function startCapabilityPlane(deps: TurnDeps): Promise<CapabilityPlane> {
   const tokens = new Map<string, RunToken>();
+  const filedIn = new Map<string, string[]>();
   let baseUrl = "";
   const mint = (run: RunToken): string => {
     const token = randomBytes(24).toString("hex");
@@ -179,7 +189,7 @@ export async function startCapabilityPlane(deps: TurnDeps): Promise<CapabilityPl
   };
   const revoke = (token: string): void => void tokens.delete(token);
   const spawnTalent: CapabilityPlane["spawn"] = (run, opts) =>
-    runTalentProcess(deps, baseUrl, mint, revoke, run, opts);
+    runTalentProcess(deps, baseUrl, mint, revoke, run, opts, filedIn);
 
   const server = http.createServer((req, res) => {
     void (async () => {
@@ -260,6 +270,24 @@ export async function startCapabilityPlane(deps: TurnDeps): Promise<CapabilityPl
         if (req.method === "POST" && pathname === "/cap/publish") {
           const rec = body.rec as recap.Recording;
           const r = body.recap as recap.Recap;
+          // Into a brain, when brains decide where this run files (BRAIN-TALENT-TARGET).
+          const target = deps.talentBrain ? await deps.talentBrain.target(run.agent, run.user, run.talent ?? "meeting-recap") : undefined;
+          if (target && "error" in target) return reply(403, { error: `Nothing was filed: ${target.error}.` });
+          if (target) {
+            const filed = await publishRecapToBrain(deps.talentBrain!.store, target, {
+              rec,
+              recap: r,
+              transcript: String(body.transcript ?? ""),
+              journal: voice.journal,
+              candidates: (body.candidates as CalEvent[]) ?? [],
+              by: (body.by as string[]) ?? [],
+              timezone: voice.timezone,
+              owner: run.user,
+            });
+            if (!filed.result.ok) return reply(502, { error: `Nothing was filed in ${target.name}: ${filed.result.detail}.` });
+            filedIn.set(token, [...new Set([...(filedIn.get(token) ?? []), target.id])]);
+            return reply(200, { published: filed.result.sha !== null, path: filed.page, route: filed.route, brain: target.name });
+          }
           const published = await recap.publish(
             voice.brainDir,
             rec,

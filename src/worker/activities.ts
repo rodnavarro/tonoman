@@ -23,6 +23,7 @@ import * as calendar from "./calendar";
 import * as worklog from "./worklog";
 import { decideRoute, privateReason, THREAD_NOTE, THREAD_NOTE_FAILED, type Audience } from "../brains/delivery";
 import type { McpServerSpec } from "../brains/broker";
+import type { BrainRef, BrainStore } from "../brains/store";
 import { randomMysticVerb } from "../core/mystic";
 import type { CapabilityPlane } from "./capability-plane";
 import { isAuthError } from "../authflow";
@@ -98,8 +99,8 @@ export interface TurnDeps {
       itemKey: string,
     ): Promise<{ status: "running" | "done" | "failed"; attempts: number } | undefined>;
   };
-  /** Run text as a turn addressed to a person. */
-  ask?(agent: string, user: string, text: string): Promise<void>;
+  /** Run text as a turn addressed to a person. `drewOn`: brains the text draws on (a Talent's filing). */
+  ask?(agent: string, user: string, text: string, drewOn?: string[]): Promise<void>;
   /** The display-only status footer for a finished turn: the model, the turn's tokens, context
    *  occupancy, and how much of the Claude plan's 5h/7d windows is left. Null for none. */
   footer?(agent: string, conversation: string, usage: TurnUsage | undefined): Promise<string | null>;
@@ -127,6 +128,22 @@ export interface TurnDeps {
    *  what `!new` does. */
   resetSession?(agent: string, conversation: string): Promise<{ id: string; isNew: boolean }>;
   brains?: TurnBrains;
+  /** Where a Talent run files its pages (BRAIN-TALENT-TARGET). `undefined` = the agent's second brain,
+   *  as it always has (BRAIN-MIGRATION); an error = the run cannot file, and says which brain and why. */
+  talentBrain?: {
+    target(agent: string, user: string | undefined, talent: string): Promise<TalentBrainTarget | { error: string } | undefined>;
+    store: Pick<BrainStore, "read" | "writeFiles">;
+  };
+}
+
+export interface TalentBrainTarget {
+  /** The agent the run is for — so a restart can finish the filing and tell the person. */
+  agentGuid?: string;
+  id: string;
+  name: string;
+  brain: BrainRef;
+  who: string;
+  authorize: () => Promise<boolean>;
 }
 
 /** PURE: the text of a transcript value, whichever shape it arrived in. */
@@ -371,6 +388,8 @@ export interface TurnInput {
   afterInterruption?: boolean;
   /** The platform wrote this message (a recap announcement), not `user`. */
   fromSystem?: boolean;
+  /** Brains the message draws on — a Talent's filing it announces. Routed like anything read from them. */
+  drewOn?: string[];
 }
 
 /** PURE: who is speaking in one turn, said where the model will believe it.
@@ -764,7 +783,7 @@ export function makeActivities(deps: TurnDeps) {
         // Report, don't speak: announce the Talent's steer as a real turn, so follow-ups land in the
         // same conversation. Skipped outcomes (no speech, already filed) carry no steer, say nothing.
         if (outcome.status === "done" && outcome.steer) {
-          await deps.ask?.(input.agent, input.notify ?? "", outcome.steer);
+          await deps.ask?.(input.agent, input.notify ?? "", outcome.steer, outcome.brains);
         }
         // The announcement text travels BACK OUT so the run record can hold it (W4). `steer` is what
         // the person was actually told; `summary` is the Talent's own one-liner and the fallback.
@@ -913,6 +932,11 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
           staleHistory = true;
           prior = [];
         }
+      }
+      // An announcement of what a Talent filed draws on the brain it filed into.
+      if (input.drewOn?.length) {
+        await brains.remember(input.agent, key, input.drewOn).catch(() => {});
+        prior = [...new Set([...prior, ...input.drewOn])];
       }
       brainTurn = brains.start(input.agent, input.user, input.user, key);
       // Outside the speaker's own DM, a turn that can reach brains — or remembers one — is held.

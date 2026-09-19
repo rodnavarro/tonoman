@@ -272,3 +272,22 @@ describe("found in review", () => {
     expect(inThread().at(-1)).not.toContain("secret plan");
   });
 });
+
+describe("what a Talent announces", () => {
+  const announce = (conversation: string, drewOn: string[]) => ({ ...turn(conversation, "UANA", "Announce the recap"), fromSystem: true, drewOn });
+
+  it("BRAIN-PRIVATE-CONFIRMATIONS a recap filed into a brain the channel cannot read is announced to its person by DM", async () => {
+    const { acts } = build({ audience: { kind: "public", name: "sapien-dev" }, uses: [], answer: "Recap: planned the offsite." });
+    await acts.runTurn(announce("T/C1/9", ["b-ana"]));
+    expect(dms).toHaveLength(1);
+    expect(dms[0].text).toContain("Recap: planned the offsite.");
+    expect(inThread()).toEqual([THREAD_NOTE]);
+  });
+
+  it("BRAIN-PRIVATE-CONFIRMATIONS in a private channel whose members all read that brain, it is announced there", async () => {
+    const { acts } = build({ audience: { kind: "members", members: ["UANA", "UBEN"], name: "eng" }, uses: [], readable: ["b-eng"], answer: "Recap: shipped." });
+    await acts.runTurn(announce("T/G1/9", ["b-eng"]));
+    expect(dms).toEqual([]);
+    expect(inThread().at(-1)).toContain("Recap: shipped.");
+  });
+});

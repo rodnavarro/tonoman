@@ -60,6 +60,8 @@ export interface Inbound {
   /** Paths to files attached to the message, on the shared volume for the turn to read. Absent for
    *  an ordinary message — every message today — so the turn is unchanged. */
   mediaPaths?: string[];
+  /** Brains this message draws on (a Talent's announcement). */
+  drewOn?: string[];
 }
 
 export interface ConversationInput {
@@ -126,6 +128,7 @@ export async function conversationWorkflow(input: ConversationInput): Promise<vo
           user: m.user,
           fromSystem: m.fromSystem,
           mediaPaths: m.mediaPaths,
+          drewOn: m.drewOn,
           afterInterruption: interrupted,
         });
         interrupted = false;

@@ -9,21 +9,25 @@ import type { BrainRef, BrainStore } from "./store";
 import type { BrainsRegistry } from "./broker";
 
 export interface RecoverDeps {
-  store: Pick<BrainStore, "interrupted" | "settle" | "write" | "cleanup">;
-  registry: Pick<BrainsRegistry, "reach">;
+  store: Pick<BrainStore, "interrupted" | "settle" | "write" | "cleanup"> & Partial<Pick<BrainStore, "writeFiles">>;
+  registry: Pick<BrainsRegistry, "reach"> & {
+    reachUnattended?(agentGuid: string, forSlackUserId: string | null): Promise<{ brains: { id: string; mode: string }[] }>;
+  };
   /** Tell a person something privately. False if it could not be sent. */
   tell(agentGuid: string, slackUserId: string, text: string): Promise<boolean>;
   log?: (s: string) => void;
 }
 
 interface Entry {
+  kind?: "files";
+  files?: { path: string; content: string }[];
   brain: BrainRef;
   path: string;
   content: string;
   baseBlob: string | null;
   note: string;
   who: string;
-  notify: { agentGuid?: string; slackUserId?: string } | null;
+  notify: { agentGuid?: string; slackUserId?: string; unattended?: boolean } | null;
 }
 
 export async function recoverWrites(d: RecoverDeps): Promise<{ landed: number; redone: number; abandoned: number; waiting: number }> {
@@ -32,6 +36,7 @@ export async function recoverWrites(d: RecoverDeps): Promise<{ landed: number; r
   await d.store.cleanup().catch(() => {});
   for (const it of await d.store.interrupted()) {
     const e = it.entry as unknown as Entry;
+    if (e.kind === "files" && e.files?.length) e.path = e.files[0].path;
     const who = e.notify?.agentGuid && e.notify?.slackUserId ? { agent: e.notify.agentGuid, user: e.notify.slackUserId } : undefined;
     const tell = async (text: string) => (who ? d.tell(who.agent, who.user, text).catch(() => false) : false);
     if (it.landed === "unknown") {
@@ -44,7 +49,12 @@ export async function recoverWrites(d: RecoverDeps): Promise<{ landed: number; r
       out.landed++;
       continue;
     }
-    const reach = who ? await d.registry.reach(who.agent, who.user).catch(() => null) : null;
+    // A Talent's filing is re-checked against what the RUN may reach; a person's note against theirs.
+    const reachNow = async () =>
+      e.notify?.unattended && d.registry.reachUnattended
+        ? d.registry.reachUnattended(who!.agent, who!.user)
+        : d.registry.reach(who!.agent, who!.user);
+    const reach = who ? await reachNow().catch(() => null) : null;
     const allowed = reach?.brains.some((b) => b.id === e.brain.id && b.mode === "write") ?? false;
     if (!allowed) {
       await d.store.settle(it.id, "abandoned", "access changed before it could be saved");
@@ -52,19 +62,11 @@ export async function recoverWrites(d: RecoverDeps): Promise<{ landed: number; r
       out.abandoned++;
       continue;
     }
-    const r = await d.store.write({
-      brain: e.brain,
-      path: e.path,
-      content: e.content,
-      baseBlob: e.baseBlob,
-      note: e.note,
-      who: e.who,
-      notify: e.notify ?? undefined,
-      authorize: async () => {
-        const now = await d.registry.reach(who!.agent, who!.user);
-        return now.brains.some((b) => b.id === e.brain.id && b.mode === "write");
-      },
-    });
+    const authorize = async () => (await reachNow()).brains.some((b) => b.id === e.brain.id && b.mode === "write");
+    const r =
+      e.kind === "files" && e.files && d.store.writeFiles
+        ? await d.store.writeFiles({ brain: e.brain, files: e.files, note: e.note, who: e.who, notify: e.notify ?? undefined, authorize })
+        : await d.store.write({ brain: e.brain, path: e.path, content: e.content, baseBlob: e.baseBlob, note: e.note, who: e.who, notify: e.notify ?? undefined, authorize });
     await d.store.settle(it.id, r.ok ? "pushed" : "failed", r.ok ? undefined : r.detail);
     await tell(r.ok ? `After a restart, I finished saving \`${e.path}\`.` : `After a restart, I could not save \`${e.path}\`: ${r.detail}.`);
     if (r.ok) out.redone++;

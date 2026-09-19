@@ -89,3 +89,28 @@ describe("a restart finds an unfinished write", () => {
     expect(f.told[0]).toMatch(/could not save `AI\/jev\.md`: remote said no/);
   });
 });
+
+describe("a restart finds an unfinished Talent filing", () => {
+  it("BRAIN-WRITE-SURVIVES-RESTART it is re-checked against what the run may reach, and redone as one filing", async () => {
+    const files = [{ path: "r/page.md", content: "p" }, { path: "r/Transcript.md", content: "t" }];
+    const redone: unknown[] = [];
+    const d = {
+      store: {
+        cleanup: async () => {},
+        interrupted: async () => [{ id: "op-2", entry: { status: "pending", kind: "files", files, brain, note: "Meeting recap", who: "UANA", notify: { agentGuid: "g-echo", slackUserId: "UANA", unattended: true } }, landed: "no" }],
+        settle: async () => {},
+        write: async () => { throw new Error("a filing is not a single page"); },
+        writeFiles: async (req: unknown) => { redone.push(req); return { ok: true, paths: ["r/page.md"], sha: "abc" }; },
+      },
+      registry: {
+        reach: async () => ({ tenant: "t", speaker: {}, brains: [] }), // the person alone cannot write there
+        reachUnattended: async () => ({ brains: [{ id: "b-ana", mode: "write" }] }), // the run can
+      },
+      tell: async () => true,
+      log: () => {},
+    };
+    expect(await recoverWrites(d as never)).toMatchObject({ redone: 1 });
+    expect(redone).toHaveLength(1);
+    expect((redone[0] as { files: unknown[] }).files).toEqual(files);
+  });
+});

@@ -4,6 +4,8 @@ import type { BrainsRegistry, Reach } from "./broker";
 
 export function registryClient(baseUrl: string, token: string, fetchImpl: typeof fetch = fetch): BrainsRegistry & {
   readableByAll(agentGuid: string, brainIds: string[], slackUserIds: string[]): Promise<string[]>;
+  /** With nobody speaking: the agent's grants and the brains of the person a run is for (BRAIN-UNATTENDED-REACH). */
+  reachUnattended(agentGuid: string, forSlackUserId: string | null): Promise<{ tenant: string; brains: Reach["brains"] }>;
 } {
   const call = async <T>(method: string, pathname: string, body: unknown): Promise<T> => {
     const r = await fetchImpl(`${baseUrl}${pathname}`, {
@@ -19,6 +21,8 @@ export function registryClient(baseUrl: string, token: string, fetchImpl: typeof
     recordRepo: async (brainId, repoUrl, repoName) => {
       await call("PUT", `/v1/system/brains/${encodeURIComponent(brainId)}/repo`, { repoUrl, repoName });
     },
+    reachUnattended: (agentGuid, forSlackUserId) =>
+      call<{ tenant: string; brains: Reach["brains"] }>("POST", `/v1/system/agents/${encodeURIComponent(agentGuid)}/brain-reach-unattended`, { forSlackUserId }),
     readableByAll: async (agentGuid, brainIds, slackUserIds) =>
       (await call<{ readableByAll: string[] }>("POST", `/v1/system/agents/${encodeURIComponent(agentGuid)}/brain-audience`, { brainIds, slackUserIds })).readableByAll,
   };

@@ -322,6 +322,8 @@ export function createBroker(o: BrokerOptions) {
     get url() {
       return baseUrl;
     },
+    /** Make a brain's repo if it has none yet (a Talent's first filing into it). */
+    ensureRepo: (tenant: string, b: Reachable): Promise<Reachable> => (b.state === "active" ? Promise.resolve(b) : provision(tenant, b)),
     /** Open a turn's access. Returns the MCP server the harness should start. */
     startTurn(spec: TurnSpec, hooks: TurnHooks = {}): { token: string; mcp: McpServerSpec } {
       const token = randomBytes(24).toString("hex");

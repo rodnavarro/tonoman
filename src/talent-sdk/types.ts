@@ -86,6 +86,8 @@ export interface TalentOutcome {
    *  would be a guess, and a link that 404s is worse than no link. Optional, and no built-in Talent
    *  supplies one yet. */
   links?: { label: string; url: string }[];
+  /** Set by the runtime, never by a Talent: the brains this run filed into. */
+  brains?: string[];
 }
 
 // --- The capability plane, as the Talent sees it -------------------------------------------------

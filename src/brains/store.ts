@@ -72,6 +72,21 @@ export interface WriteRequest {
   authorize?: () => Promise<boolean>;
 }
 
+/** Several pages written as one commit, replacing what is there — what a Talent files (a recap page
+ *  and its transcript). The Talent owns those paths; a person's pages are written with `write`. */
+export interface FilesRequest {
+  brain: BrainRef;
+  files: { path: string; content: string }[];
+  note: string;
+  who: string;
+  notify?: Record<string, unknown>;
+  authorize?: () => Promise<boolean>;
+}
+
+export type FilesResult =
+  | { ok: true; paths: string[]; sha: string | null }
+  | { ok: false; reason: "push-failed" | "bad-path" | "not-allowed"; detail: string };
+
 interface GitResult {
   code: number;
   out: string;
@@ -449,6 +464,86 @@ export function createStore(o: StoreOptions) {
     return out;
   }
 
+  async function attemptFiles(req: FilesRequest, rels: string[], opId: string): Promise<FilesResult | "retry"> {
+    const b = req.brain;
+    const token = await o.token(b);
+    const dir = await fetchNow(b);
+    if (!(await hasRemoteBranch(dir, b))) return { ok: false, reason: "push-failed", detail: "this brain has not been set up yet" };
+    const logRel = safePagePath("log.md", b.subpath)!;
+    for (const rel of [...rels, logRel]) {
+      if (!(await plainPath(dir, remoteRef(b), rel))) return { ok: false, reason: "bad-path", detail: "a page sits behind a link in the brain" };
+    }
+    const wt = path.join(dir, `.tonoman-wt-${opId.slice(0, 8)}`);
+    await git(["worktree", "remove", "--force", wt], dir);
+    await fs.rm(wt, { recursive: true, force: true });
+    const add = await git(["worktree", "add", "--detach", wt, remoteRef(b)], dir);
+    if (add.code !== 0) return { ok: false, reason: "push-failed", detail: redact(add.out, token).slice(0, 300) };
+    try {
+      const root = await fs.realpath(wt);
+      for (let i = 0; i < rels.length; i++) {
+        const target = path.join(wt, rels[i]);
+        await fs.mkdir(path.dirname(target), { recursive: true });
+        if (!(await fs.realpath(path.dirname(target))).startsWith(root)) return { ok: false, reason: "bad-path", detail: "a page resolves outside the brain" };
+        await fs.writeFile(target, req.files[i].content);
+      }
+      await git(["add", "-A", "--", ...rels], wt);
+      // Nothing changed (a re-run of something already filed): no commit, no log line, still a success.
+      if ((await git(["diff", "--cached", "--quiet"], wt)).code === 0) return { ok: true, paths: req.files.map((f) => f.path), sha: null };
+      const logFile = path.join(wt, logRel);
+      const prior = await fs.readFile(logFile, "utf8").catch(() => "# Log\n\n");
+      await fs.mkdir(path.dirname(logFile), { recursive: true });
+      await fs.writeFile(logFile, prior + (prior.endsWith("\n") ? "" : "\n") + logLine(now(), req.files[0].path, req.note, req.who));
+      await git(["add", "--", logRel], wt);
+      const msg = `${req.note.replace(/\s+/g, " ").trim().slice(0, 72) || "Filed by a Talent"}\n\nFor: ${req.who}\nTonoman-Op: ${opId}\n`;
+      const c = await git(["commit", "-q", "-F", "-"], wt, msg);
+      if (c.code !== 0) return { ok: false, reason: "push-failed", detail: c.out.slice(0, 300) };
+      const sha = (await git(["rev-parse", "HEAD"], wt)).out.trim();
+      await journal(opId, { status: "committed", sha });
+      if (req.authorize && !(await req.authorize().catch(() => false))) {
+        return { ok: false, reason: "not-allowed", detail: "this run can no longer write to that brain" };
+      }
+      const pushed = await git(["push", "--porcelain", "origin", `HEAD:refs/heads/${branchOf(b)}`], wt, undefined, token);
+      if (pushed.code !== 0) {
+        if (/\[rejected\]|non-fast-forward|fetch first|failed to push some refs/.test(pushed.out)) return "retry";
+        return { ok: false, reason: "push-failed", detail: redact(pushed.out, token).slice(0, 300) };
+      }
+      await git(["update-ref", remoteRef(b), sha], dir);
+      lastFetch.set(b.id, Date.now());
+      return { ok: true, paths: req.files.map((f) => f.path), sha };
+    } finally {
+      await git(["worktree", "remove", "--force", wt], dir);
+      await fs.rm(wt, { recursive: true, force: true });
+    }
+  }
+
+  async function writeFiles(req: FilesRequest): Promise<FilesResult> {
+    const rels: string[] = [];
+    for (const f of req.files) {
+      const rel = safePagePath(f.path, req.brain.subpath);
+      const bare = safePagePath(f.path);
+      if (!rel || !bare || bare.toLowerCase() === "log.md") return { ok: false, reason: "bad-path", detail: `"${f.path}" is not a page name that can be written` };
+      rels.push(rel);
+    }
+    if (!rels.length) return { ok: false, reason: "bad-path", detail: "nothing to write" };
+    const opId = randomUUID();
+    await journal(opId, { status: "pending", kind: "files", brain: req.brain, files: req.files, note: req.note, who: req.who, notify: req.notify ?? null });
+    return serial(req.brain, async () => {
+      for (let i = 0; i < 4; i++) {
+        let r: FilesResult | "retry";
+        try {
+          r = await attemptFiles(req, rels, opId);
+        } catch (e) {
+          r = { ok: false, reason: "push-failed", detail: (e as Error).message.slice(0, 300) };
+        }
+        if (r === "retry") continue;
+        await journal(opId, r.ok ? { status: "pushed", sha: r.sha } : { status: r.reason === "not-allowed" ? "abandoned" : "failed", detail: r.detail });
+        return r;
+      }
+      await journal(opId, { status: "failed", detail: "the brain kept changing under the write" });
+      return { ok: false, reason: "push-failed", detail: "the brain kept changing under the write" };
+    });
+  }
+
   /** Worktrees a crash left behind, in every clone. */
   async function cleanup(): Promise<void> {
     const tenants = await fs.readdir(o.root).catch(() => [] as string[]);
@@ -469,7 +564,7 @@ export function createStore(o: StoreOptions) {
     await journal(id, { status, ...(detail ? { detail } : {}) });
   }
 
-  return { read, list, search, write, interrupted, settle, cleanup, refresh, dirOf, fetchNow };
+  return { read, list, search, write, writeFiles, interrupted, settle, cleanup, refresh, dirOf, fetchNow };
 }
 
 export type BrainStore = ReturnType<typeof createStore>;
