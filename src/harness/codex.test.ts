@@ -28,6 +28,11 @@ describe("codex harness — event parsing (the --json stream → neutral TurnEve
     expect(ev?.kind).toBe("tool");
     expect(ev?.tool).toBe("file_change");
   });
+  it("an MCP tool call is named by its server and tool, as Claude names it (mcp__brain__brain_pages)", () => {
+    const ev = parseLine(JSON.stringify({ type: "item.completed", item: { type: "mcp_tool_call", server: "brain", tool: "brain_pages", status: "completed" } }));
+    expect(ev?.kind).toBe("tool");
+    expect(ev?.tool).toBe("mcp__brain__brain_pages");
+  });
   it("turn.completed → a done event carrying normalized usage", () => {
     const ev = parseLine(
       JSON.stringify({ type: "turn.completed", model: "gpt-5.6-sol", usage: { input_tokens: 100, cached_input_tokens: 80, output_tokens: 20, reasoning_output_tokens: 5 } }),

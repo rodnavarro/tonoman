@@ -336,6 +336,8 @@ interface CodexItem {
   command?: string;
   status?: string; // "in_progress" | "completed" | "failed"
   changes?: unknown;
+  server?: string; // mcp_tool_call: which MCP server
+  tool?: string; // mcp_tool_call: which of its tools
 }
 interface CodexUsage {
   input_tokens?: number; // TOTAL input incl. cached
@@ -355,6 +357,8 @@ interface CodexLine {
 /** A short human label for a codex tool/command step (gw-tool-narration), bounded to avoid
  * dumping payloads/customer data. */
 function toolLabel(item: CodexItem): { tool: string; text: string } {
+  // An MCP call is named as Claude names it, so the work log reads the same on both providers.
+  if (item.type === "mcp_tool_call" && item.tool) return { tool: `mcp__${item.server ?? "mcp"}__${item.tool}`, text: "" };
   const kind = item.type ?? "step";
   let detail = "";
   if (item.command) detail = String(item.command);
