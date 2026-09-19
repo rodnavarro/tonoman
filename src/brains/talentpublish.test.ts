@@ -73,6 +73,24 @@ describe("a recap filed into a brain", () => {
     expect(remoteFile(b.page)).toContain("recording_id: rec-2");
   });
 
+  it("BRAIN-TALENT-TARGET two recordings of one minute filed AT THE SAME TIME, by two workers, both survive", async () => {
+    const one = createStore({ root: path.join(tmp, "w1"), token: async () => "", fetchEveryMs: 0, log: () => {} });
+    const two = createStore({ root: path.join(tmp, "w2"), token: async () => "", fetchEveryMs: 0, log: () => {} });
+    const [a, b] = await Promise.all([file(one, rec("rec-1", Date.UTC(2026, 8, 18, 15))), file(two, rec("rec-2", Date.UTC(2026, 8, 18, 15, 0, 30)))]);
+    expect(a.result.ok && b.result.ok).toBe(true);
+    expect(b.page).not.toBe(a.page);
+    expect(remoteFile(a.page)).toContain("recording_id: rec-1");
+    expect(remoteFile(b.page)).toContain("recording_id: rec-2");
+  });
+
+  it("BRAIN-TALENT-TARGET two recordings of one minute filed at the same time on one worker both survive", async () => {
+    const s = createStore({ root: path.join(tmp, "w"), token: async () => "", fetchEveryMs: 0, log: () => {} });
+    const [a, b] = await Promise.all([file(s, rec("rec-1", Date.UTC(2026, 8, 18, 15))), file(s, rec("rec-2", Date.UTC(2026, 8, 18, 15, 0, 30)))]);
+    expect(b.page).not.toBe(a.page);
+    expect(remoteFile(a.page)).toContain("recording_id: rec-1");
+    expect(remoteFile(b.page)).toContain("recording_id: rec-2");
+  });
+
   it("BRAIN-TALENT-TARGET a run that can no longer write there files nothing", async () => {
     const s = createStore({ root: path.join(tmp, "w"), token: async () => "", fetchEveryMs: 0, log: () => {} });
     const n = commits();

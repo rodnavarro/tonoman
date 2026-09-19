@@ -90,11 +90,17 @@ export interface FilesRequest {
   /** The refresh writing its own files under `.tonoman/`: allowed there only, no log.md line, and it
    *  does not start another refresh. */
   system?: boolean;
+  /** A path this write may replace only if what is there is already its own — checked on the pushed
+   *  tip inside every attempt, so two writers choosing one name cannot both win. */
+  claim?: { path: string; mine: (existing: string) => boolean };
+  /** The pushed revision this write was computed from. If the brain has moved on, nothing is written
+   *  ("superseded"): the refresh's map of an older state must not land on a newer one. */
+  basedOn?: string;
 }
 
 export type FilesResult =
   | { ok: true; paths: string[]; sha: string | null }
-  | { ok: false; reason: "push-failed" | "bad-path" | "not-allowed"; detail: string };
+  | { ok: false; reason: "push-failed" | "bad-path" | "not-allowed" | "taken" | "superseded"; detail: string };
 
 interface GitResult {
   code: number;
@@ -489,6 +495,17 @@ export function createStore(o: StoreOptions) {
     const token = await o.token(b);
     const dir = await fetchNow(b);
     if (!(await hasRemoteBranch(dir, b))) return { ok: false, reason: "push-failed", detail: "this brain has not been set up yet" };
+    if (req.basedOn) {
+      const tip = (await git(["rev-parse", remoteRef(b)], dir)).out.trim();
+      if (tip !== req.basedOn) return { ok: false, reason: "superseded", detail: "the brain changed after this was worked out" };
+    }
+    if (req.claim) {
+      const rel = safePagePath(req.claim.path, b.subpath);
+      const blob = rel ? await blobOf(dir, remoteRef(b), rel) : null;
+      if (blob && !req.claim.mine((await git(["cat-file", "blob", blob], dir)).out)) {
+        return { ok: false, reason: "taken", detail: `"${req.claim.path}" already holds something else` };
+      }
+    }
     const logRel = safePagePath("log.md", b.subpath)!;
     for (const rel of [...rels, logRel]) {
       if (!(await plainPath(dir, remoteRef(b), rel))) return { ok: false, reason: "bad-path", detail: "a page sits behind a link in the brain" };
@@ -551,7 +568,7 @@ export function createStore(o: StoreOptions) {
     }
     if (!rels.length) return { ok: false, reason: "bad-path", detail: "nothing to write" };
     const opId = randomUUID();
-    await journal(opId, { status: "pending", kind: "files", brain: req.brain, files: req.files, note: req.note, who: req.who, notify: req.notify ?? null });
+    await journal(opId, { status: "pending", kind: "files", system: !!req.system, brain: req.brain, files: req.files, note: req.note, who: req.who, notify: req.notify ?? null });
     return serial(req.brain, async () => {
       for (let i = 0; i < 4; i++) {
         let r: FilesResult | "retry";
@@ -602,12 +619,19 @@ export function createStore(o: StoreOptions) {
     }
   }
 
+  /** The brain's pushed revision, fetched now; null for a brain with nothing pushed. */
+  async function head(b: BrainRef): Promise<string | null> {
+    const dir = await serial(b, () => fetchNow(b));
+    if (!(await hasRemoteBranch(dir, b))) return null;
+    return (await git(["rev-parse", remoteRef(b)], dir)).out.trim() || null;
+  }
+
   /** Close a journal entry after recovery decided what happened. */
   async function settle(id: string, status: "pushed" | "failed" | "abandoned", detail?: string): Promise<void> {
     await journal(id, { status, ...(detail ? { detail } : {}) });
   }
 
-  return { read, list, search, write, writeFiles, withCheckout, interrupted, settle, cleanup, refresh, dirOf, fetchNow };
+  return { read, list, search, write, writeFiles, withCheckout, interrupted, settle, cleanup, refresh, dirOf, fetchNow, head };
 }
 
 export type BrainStore = ReturnType<typeof createStore>;
