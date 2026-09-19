@@ -31,14 +31,22 @@ export interface ToolCall {
  *  what it is doing NOW plus enough history to see the shape of it. */
 const TRACE_LINES = 5;
 
+/** The name a person reads: an MCP tool by its own name (`brain_list`), not `mcp__brain__brain_list`,
+ *  whose double underscores Slack turns into italics. */
+export function displayName(tool: string): string {
+  const m = /^mcp__[^_]+(?:_[^_]+)*__(.+)$/.exec(tool);
+  return m ? m[1]! : tool;
+}
+
 /** Collapse repeats into `name ×n`, preserving first-use order. This is what makes the settled line
  *  readable: "Grep ×4, Read ×2" rather than six identical bullets. */
 export function tally(calls: ToolCall[]): { tool: string; n: number }[] {
   const order: string[] = [];
   const counts = new Map<string, number>();
   for (const c of calls) {
-    if (!counts.has(c.tool)) order.push(c.tool);
-    counts.set(c.tool, (counts.get(c.tool) ?? 0) + 1);
+    const name = displayName(c.tool);
+    if (!counts.has(name)) order.push(name);
+    counts.set(name, (counts.get(name) ?? 0) + 1);
   }
   return order.map((tool) => ({ tool, n: counts.get(tool) ?? 0 }));
 }
@@ -47,7 +55,8 @@ export function tally(calls: ToolCall[]): { tool: string; n: number }[] {
  *  note that wraps to four lines per call stops being scannable. */
 function traceLine(c: ToolCall): string {
   const detail = (c.detail ?? "").replace(/\s+/g, " ").trim();
-  return detail ? `🔧 \`${c.tool}\` — ${detail.slice(0, 80)}` : `🔧 \`${c.tool}\``;
+  const name = displayName(c.tool);
+  return detail ? `🔧 \`${name}\` — ${detail.slice(0, 80)}` : `🔧 \`${name}\``;
 }
 
 /**
@@ -88,6 +97,6 @@ export function settledNote(calls: ToolCall[], elapsedMs: number, verb: MysticVe
  *  tool has run, "Nelly is marinating" — the same verb the note is using, lower-cased to sit in
  *  the sentence. */
 export function statusFor(current: ToolCall | undefined, verb: MysticVerb): string {
-  const what = current ? `running ${current.tool.toLowerCase()}` : verb.ing.toLowerCase();
+  const what = current ? `running ${displayName(current.tool).toLowerCase()}` : verb.ing.toLowerCase();
   return `is ${what}`.slice(0, 100);
 }

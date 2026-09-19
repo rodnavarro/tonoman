@@ -80,3 +80,13 @@ describe("statusFor", () => {
     expect(statusFor({ tool: "T".repeat(300) }, MARINATE).length).toBeLessThanOrEqual(100);
   });
 });
+
+describe("tool names people read", () => {
+  const verb: MysticVerb = { ing: "Vibing", ed: "Vibed" };
+  it("CONVO-WORK-LOG an MCP tool shows by its own name, never as mcp__server__tool (Slack turns the underscores into italics)", () => {
+    const calls = [{ tool: "mcp__brain__brain_list" }, { tool: "mcp__brain__brain_pages" }, { tool: "mcp__brain__brain_pages" }];
+    expect(settledNote(calls, 13_000, verb)).toMatch(/· brain_list, brain_pages ×2$/);
+    expect(liveNote(calls, 3_000, verb)).not.toContain("mcp__");
+    expect(statusFor(calls[0], verb)).toBe("is running brain_list");
+  });
+});
