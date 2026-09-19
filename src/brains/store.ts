@@ -27,6 +27,8 @@ export interface BrainRef {
   branch?: string;
   /** Read and write under this folder only (legacy second brains that live in a wiki subtree). */
   subpath?: string;
+  /** For the refresh's map and log; not used to find the brain. */
+  name?: string;
 }
 
 export interface StoreOptions {
@@ -37,6 +39,9 @@ export interface StoreOptions {
   log?: (s: string) => void;
   /** How long a fetch stays fresh for reads. Writes always fetch. */
   fetchEveryMs?: number;
+  /** Called after a person's or a Talent's write is pushed — never after the refresh's own
+   *  (BRAIN-REFRESH-NO-LOOP). The refresh queue listens here. */
+  onPushed?: (b: BrainRef) => void;
 }
 
 export interface Page {
@@ -81,6 +86,9 @@ export interface FilesRequest {
   who: string;
   notify?: Record<string, unknown>;
   authorize?: () => Promise<boolean>;
+  /** The refresh writing its own files under `.tonoman/`: allowed there only, no log.md line, and it
+   *  does not start another refresh. */
+  system?: boolean;
 }
 
 export type FilesResult =
@@ -145,6 +153,11 @@ export function safePagePath(p: string, subpath = ""): string | null {
   if (rel.length > 300) return null;
   const sub = subpath.replace(/^\/+|\/+$/g, "");
   return sub ? `${sub}/${rel}` : rel;
+}
+
+/** PURE: is this path inside the refresh's own folder? */
+export function isRefreshPath(p: string): boolean {
+  return p.replace(/\\/g, "/").split("/").some((seg) => seg.toLowerCase() === ".tonoman");
 }
 
 /** PURE: the dated log.md line for a write. */
@@ -404,7 +417,7 @@ export function createStore(o: StoreOptions) {
   async function write(req: WriteRequest): Promise<WriteResult> {
     const rel = safePagePath(req.path, req.brain.subpath);
     const bare = safePagePath(req.path);
-    if (!rel || !bare || bare.toLowerCase() === "log.md") {
+    if (!rel || !bare || bare.toLowerCase() === "log.md" || isRefreshPath(bare)) {
       return { ok: false, reason: "bad-path", detail: "that page name is not allowed" };
     }
     const opId = randomUUID();
@@ -428,7 +441,10 @@ export function createStore(o: StoreOptions) {
         }
         if (r === "retry") continue;
         await journal(opId, r.ok ? { status: "pushed", sha: r.sha } : { status: r.reason === "conflict" ? "conflict" : r.reason === "not-allowed" ? "abandoned" : "failed", detail: r.detail });
-        if (r.ok) log(`brains: ${req.brain.id} ${req.path} pushed ${r.sha.slice(0, 8)}${r.merged ? " (merged)" : ""}`);
+        if (r.ok) {
+          log(`brains: ${req.brain.id} ${req.path} pushed ${r.sha.slice(0, 8)}${r.merged ? " (merged)" : ""}`);
+          o.onPushed?.(req.brain);
+        }
         return r;
       }
       await journal(opId, { status: "failed", detail: "the brain kept changing under the write" });
@@ -489,11 +505,13 @@ export function createStore(o: StoreOptions) {
       await git(["add", "-A", "--", ...rels], wt);
       // Nothing changed (a re-run of something already filed): no commit, no log line, still a success.
       if ((await git(["diff", "--cached", "--quiet"], wt)).code === 0) return { ok: true, paths: req.files.map((f) => f.path), sha: null };
-      const logFile = path.join(wt, logRel);
-      const prior = await fs.readFile(logFile, "utf8").catch(() => "# Log\n\n");
-      await fs.mkdir(path.dirname(logFile), { recursive: true });
-      await fs.writeFile(logFile, prior + (prior.endsWith("\n") ? "" : "\n") + logLine(now(), req.files[0].path, req.note, req.who));
-      await git(["add", "--", logRel], wt);
+      if (!req.system) {
+        const logFile = path.join(wt, logRel);
+        const prior = await fs.readFile(logFile, "utf8").catch(() => "# Log\n\n");
+        await fs.mkdir(path.dirname(logFile), { recursive: true });
+        await fs.writeFile(logFile, prior + (prior.endsWith("\n") ? "" : "\n") + logLine(now(), req.files[0].path, req.note, req.who));
+        await git(["add", "--", logRel], wt);
+      }
       const msg = `${req.note.replace(/\s+/g, " ").trim().slice(0, 72) || "Filed by a Talent"}\n\nFor: ${req.who}\nTonoman-Op: ${opId}\n`;
       const c = await git(["commit", "-q", "-F", "-"], wt, msg);
       if (c.code !== 0) return { ok: false, reason: "push-failed", detail: c.out.slice(0, 300) };
@@ -521,7 +539,10 @@ export function createStore(o: StoreOptions) {
     for (const f of req.files) {
       const rel = safePagePath(f.path, req.brain.subpath);
       const bare = safePagePath(f.path);
-      if (!rel || !bare || bare.toLowerCase() === "log.md") return { ok: false, reason: "bad-path", detail: `"${f.path}" is not a page name that can be written` };
+      const refreshOwn = isRefreshPath(bare ?? "");
+      if (!rel || !bare || bare.toLowerCase() === "log.md" || refreshOwn !== !!req.system) {
+        return { ok: false, reason: "bad-path", detail: `"${f.path}" is not a page name that can be written` };
+      }
       rels.push(rel);
     }
     if (!rels.length) return { ok: false, reason: "bad-path", detail: "nothing to write" };
@@ -537,11 +558,29 @@ export function createStore(o: StoreOptions) {
         }
         if (r === "retry") continue;
         await journal(opId, r.ok ? { status: "pushed", sha: r.sha } : { status: r.reason === "not-allowed" ? "abandoned" : "failed", detail: r.detail });
+        if (r.ok && r.sha && !req.system) o.onPushed?.(req.brain);
         return r;
       }
       await journal(opId, { status: "failed", detail: "the brain kept changing under the write" });
       return { ok: false, reason: "push-failed", detail: "the brain kept changing under the write" };
     });
+  }
+
+  /** Run `fn` over a temporary checkout of the brain's pushed state, then remove it. The refresh reads
+   *  the brain this way; nothing written there is kept. */
+  async function withCheckout<T>(b: BrainRef, fn: (dir: string, revision: string) => Promise<T>): Promise<T> {
+    const dir = await serial(b, () => fetchNow(b));
+    if (!(await hasRemoteBranch(dir, b))) throw new Error("this brain has not been set up yet");
+    const revision = (await git(["rev-parse", remoteRef(b)], dir)).out.trim();
+    const wt = path.join(dir, `.tonoman-wt-read-${randomUUID().slice(0, 8)}`);
+    const add = await git(["worktree", "add", "--detach", wt, revision], dir);
+    if (add.code !== 0) throw new Error(`could not check out the brain: ${add.out.slice(0, 200)}`);
+    try {
+      return await fn(wt, revision);
+    } finally {
+      await git(["worktree", "remove", "--force", wt], dir);
+      await fs.rm(wt, { recursive: true, force: true });
+    }
   }
 
   /** Worktrees a crash left behind, in every clone. */
@@ -564,7 +603,7 @@ export function createStore(o: StoreOptions) {
     await journal(id, { status, ...(detail ? { detail } : {}) });
   }
 
-  return { read, list, search, write, writeFiles, interrupted, settle, cleanup, refresh, dirOf, fetchNow };
+  return { read, list, search, write, writeFiles, withCheckout, interrupted, settle, cleanup, refresh, dirOf, fetchNow };
 }
 
 export type BrainStore = ReturnType<typeof createStore>;
@@ -609,6 +648,8 @@ export function seedFiles(name: string): Record<string, string> {
       "- `index.md` is the map: every topic, and the page or hub that gathers it. Read it first.",
       "- A **hub** is a page that links the pages of one topic. Add a page to its hub.",
       "- `log.md` records every write: when, which page, what, for whom. It is kept by Tonoman.",
+      "- `.tonoman/` is Tonoman's map of this brain — topics, hub pages that gather them, pages nothing links to.",
+      "  It is rebuilt after changes and never edits your pages.",
       "- One topic per page. Name pages plainly (`AI/typesafe-ai.md`). Link related pages.",
       "- Write what the sources support; cite them. Never file a guess.",
       "",

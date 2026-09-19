@@ -6,6 +6,8 @@ export function registryClient(baseUrl: string, token: string, fetchImpl: typeof
   readableByAll(agentGuid: string, brainIds: string[], slackUserIds: string[]): Promise<string[]>;
   /** With nobody speaking: the agent's grants and the brains of the person a run is for (BRAIN-UNATTENDED-REACH). */
   reachUnattended(agentGuid: string, forSlackUserId: string | null): Promise<{ tenant: string; brains: Reach["brains"] }>;
+  /** What a refresh did (BRAIN-BACKGROUND-REFRESH). */
+  publishIndex(brainId: string, body: Record<string, unknown>): Promise<void>;
 } {
   const call = async <T>(method: string, pathname: string, body: unknown): Promise<T> => {
     const r = await fetchImpl(`${baseUrl}${pathname}`, {
@@ -20,6 +22,9 @@ export function registryClient(baseUrl: string, token: string, fetchImpl: typeof
     reach: (agentGuid, slackUserId) => call<Reach>("POST", `/v1/system/agents/${encodeURIComponent(agentGuid)}/brain-reach`, { slackUserId }),
     recordRepo: async (brainId, repoUrl, repoName) => {
       await call("PUT", `/v1/system/brains/${encodeURIComponent(brainId)}/repo`, { repoUrl, repoName });
+    },
+    publishIndex: async (brainId, body) => {
+      await call("PUT", `/v1/system/brains/${encodeURIComponent(brainId)}/index`, body);
     },
     reachUnattended: (agentGuid, forSlackUserId) =>
       call<{ tenant: string; brains: Reach["brains"] }>("POST", `/v1/system/agents/${encodeURIComponent(agentGuid)}/brain-reach-unattended`, { forSlackUserId }),

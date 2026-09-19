@@ -41,8 +41,10 @@ import {
 import { httpAuthOps, looksLoggedIn } from "../authflow";
 import * as gate from "./authgate";
 import * as secondbrain from "./secondbrain";
-import { createStore, type BrainStore } from "../brains/store";
+import { createStore, type BrainStore, type BrainRef } from "../brains/store";
 import { recoverWrites } from "../brains/recover";
+import { refreshBrain, createRefreshQueue, type RefreshPublish } from "../brains/refresh";
+import type { LlmProvider } from "../secondbrain/wiki-reindex/llm";
 import { createBroker, pickBrain, type Broker } from "../brains/broker";
 import { registryClient } from "../brains/registry";
 import { adoProvisioner } from "../brains/ado";
@@ -433,12 +435,32 @@ async function startBrains(): Promise<{ registry: ReturnType<typeof registryClie
   // One credential for the brains' git host, by reference (a mounted secret). Used per command.
   const gitSecret = process.env.TONOMAN_BRAIN_GIT_SECRET ?? "";
   const pat = async (): Promise<string> => (gitSecret ? resolveRef(gitSecret) : "");
-  const store = createStore({ root, token: async (b) => (/^https:\/\/dev\.azure\.com\//i.test(b.repoUrl) ? pat() : "") });
+  // Every push by a person or a Talent queues a refresh of that brain (BRAIN-BACKGROUND-REFRESH).
+  let pushed: (b: BrainRef) => void = () => {};
+  const store = createStore({
+    root,
+    token: async (b) => (/^https:\/\/dev\.azure\.com\//i.test(b.repoUrl) ? pat() : ""),
+    onPushed: (b) => pushed(b),
+  });
   const org = process.env.TONOMAN_BRAIN_ADO_ORG;
   const project = process.env.TONOMAN_BRAIN_ADO_PROJECT;
   const provisioner = org && project ? adoProvisioner({ org, project, suffix: process.env.TONOMAN_BRAIN_REPO_SUFFIX ?? "", pat }) : undefined;
   const broker = createBroker({ store, registry, provisioner, scratch: path.join(root, "_scratch") });
   await broker.start();
+  // The refresh runs on the LOCAL model only (BRAIN-LOCAL-MODEL): gemma4:e4b by default, at the URL
+  // given. With no URL, brains are still mapped, just not connected by topic.
+  const refreshUrl = (process.env.TONOMAN_BRAIN_REFRESH_URL ?? "").replace(/\/+$/, "");
+  const provider: LlmProvider | undefined = refreshUrl
+    ? { name: "brain-refresh", url: refreshUrl, model: process.env.TONOMAN_BRAIN_REFRESH_MODEL || "gemma4:e4b", timeoutMs: 180_000 }
+    : undefined;
+  const publish = (id: string, p: RefreshPublish) => registry.publishIndex(id, p as unknown as Record<string, unknown>);
+  const queue = createRefreshQueue({
+    run: (b) => refreshBrain({ store, provider, publish }, b, b.name ?? "Brain"),
+    stale: (b) => publish(b.id, { state: "stale", detail: "refreshing after a change" }),
+    delayMs: Number(process.env.TONOMAN_BRAIN_REFRESH_DELAY_MS ?? 60_000),
+  });
+  pushed = (b) => queue.touch(b);
+  console.log(`worker: brain refresh ${provider ? `on ${provider.model} at ${provider.url}` : "maps only — no local model set (TONOMAN_BRAIN_REFRESH_URL)"}`);
   console.log(`worker: brains on — ${provisioner ? `new brains go to Azure DevOps ${org}/${project}` : "no git host configured, so no new brains can be created"}`);
   return { registry, broker, store };
 }
@@ -1294,7 +1316,7 @@ export async function run(
               id: b.id,
               name: b.name,
               who: user ?? "a Talent",
-              brain: { id: b.id, tenant: r.tenant, repoUrl: ready.repoUrl, subpath: b.subpath ?? undefined, branch: b.branch ?? undefined },
+              brain: { id: b.id, name: b.name, tenant: r.tenant, repoUrl: ready.repoUrl, subpath: b.subpath ?? undefined, branch: b.branch ?? undefined },
               authorize: async () => (await brainsSys.registry.reachUnattended(guid, user ?? null)).brains.some((x) => x.id === b.id && x.mode === "write"),
             };
           },

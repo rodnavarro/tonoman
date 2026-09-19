@@ -130,6 +130,7 @@ export function createBroker(o: BrokerOptions) {
 
   const refOf = (tenant: string, b: Reachable): BrainRef => ({
     id: b.id,
+    name: b.name,
     tenant,
     repoUrl: b.repoUrl!,
     subpath: b.subpath ?? undefined,
@@ -184,6 +185,9 @@ export function createBroker(o: BrokerOptions) {
         await first(t, reach.tenant, b).catch(() => {});
         const idx = await o.store.read(refOf(reach.tenant, b), "index.md").catch(() => null);
         if (idx) parts.push(`index.md (start):\n${idx.content.slice(0, INDEX_HEAD_BYTES)}`);
+        // The refresh's map: topics, each linking to a hub page that gathers it (BRAIN-TRAVERSAL-FILES).
+        const map = await o.store.read(refOf(reach.tenant, b), ".tonoman/index.md").catch(() => null);
+        if (map) parts.push(`.tonoman/index.md — the map Tonoman keeps (start):\n${map.content.slice(0, INDEX_HEAD_BYTES)}`);
       }
       return { status: 200, text: charge(t, parts.join("\n\n")) };
     },

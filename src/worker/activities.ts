@@ -1278,7 +1278,8 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
 const BRAIN_GUIDANCE = [
   "You have a brain tool: brain_list, brain_search, brain_read, brain_write. Brains hold this person's",
   "knowledge — their own brain, and any shared with them. Nothing else of theirs is on this machine.",
-  "- Start with brain_list: it shows each brain and the start of its index.md. Follow the index and its hubs, then search.",
+  "- Start with brain_list: it shows each brain, its index.md, and the map Tonoman keeps (.tonoman/index.md: topics, each",
+  "  linking to a hub page under .tonoman/hubs/ that gathers the pages about it). Follow those, then search.",
   "- Answer questions about their work, people and decisions from the brains, and name the brain and page each fact came from.",
   "- To remember something: if you do not know what it is or where it belongs, ask — or research it when asked — and never file a guess.",
   "  Pick the best-fitting brain they can write to, and an existing page before a new one (brain_read it first and pass its revision).",
