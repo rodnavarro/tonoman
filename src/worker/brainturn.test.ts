@@ -33,6 +33,8 @@ interface Scenario {
   reachAtStart?: Record<string, string>;
   reachAtEnd?: Record<string, string>;
   dmWorks?: boolean;
+  /** The model works this long, saying nothing, before it answers. */
+  silentMs?: number;
 }
 
 function build(sc: Scenario, provenanceStore = new Map<string, string[]>()) {
@@ -92,6 +94,7 @@ function build(sc: Scenario, provenanceStore = new Map<string, string[]>()) {
       t.used.push(...sc.uses);
       if (sc.uses.length) await brains.remember("echo", t.key, sc.uses);
     }
+    if (sc.silentMs) await new Promise((r) => setTimeout(r, sc.silentMs));
     if (sc.fails) throw new Error(sc.fails);
     // Slow enough that a streaming turn would have shown partial text.
     for (const word of sc.answer.split(" ")) {
@@ -355,4 +358,17 @@ describe("files someone attaches", () => {
     await acts.runTurn({ ...turn("D1"), mediaPaths: [media] } as never);
     await expect(access(requests[0]!.cwd!)).rejects.toThrow();
   });
+});
+
+describe("while a turn works", () => {
+  it("CONVO-CUE-KEEPS-TIME a held turn that says nothing for a while still shows time passing, and none of its tools", async () => {
+    const { acts } = build({ audience: { kind: "public", name: "general" }, uses: ["b-ana"], answer: "Jev is TypeSafe's first model.", silentMs: 6500 });
+    await acts.runTurn(turn("T/C1/7"));
+    const notes = posted.filter((p) => p.op === "note" && p.text).map((p) => p.text!);
+    // More than one reading of the clock while it worked, each later than the last.
+    const seconds = notes.map((t) => Number(/(\d+)s\b/.exec(t)?.[1] ?? -1)).filter((n) => n >= 0);
+    expect(new Set(seconds).size).toBeGreaterThan(1);
+    expect(seconds.at(-1)!).toBeGreaterThanOrEqual(4);
+    expect(notes.join(" ")).not.toMatch(/brain_read|mcp__brain/);
+  }, 20_000);
 });

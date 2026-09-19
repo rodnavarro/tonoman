@@ -1014,8 +1014,8 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
     let lastTick = 0;
     const tick = async (): Promise<void> => {
       if (done || ctx.cancellationSignal.aborted) return;
-      // A held turn shows that it is working, and nothing of what it is working on.
-      if (held && noteId) return;
+      // A held turn shows that it is working, and nothing of what it is working on — but its clock
+      // keeps moving (CONVO-CUE-KEEPS-TIME): a line frozen at "2s" for a minute reads as stuck.
       if (posting) return;
       // Once the answer is streaming, do not CREATE a note: it would post below the reply and
       // read as a footnote. But an EXISTING one keeps ticking — freezing it is what made the
@@ -1033,7 +1033,7 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
       posting = true;
       try {
         const elapsed = now - started;
-        const text = worklog.liveNote(calls, elapsed, verb);
+        const text = worklog.liveNote(held ? [] : calls, elapsed, verb);
         if (text !== noteText) {
           noteText = text;
           noteId = (await reply.note?.(noteId || undefined, text)) ?? "";
@@ -1044,7 +1044,7 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
         // working…" under the composer of a thread that has already answered, and nothing ever
         // clears it: `working` and `settle` are the same Slack call, so the last writer wins.
         if (done || ctx.cancellationSignal.aborted) return;
-        await reply.working?.(worklog.statusFor(current, verb)).catch(() => {});
+        await reply.working?.(worklog.statusFor(held ? undefined : current, verb)).catch(() => {});
       } catch {
         /* a dropped work log must never cost a turn */
       } finally {
@@ -1323,10 +1323,12 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
 
 /** What a turn with the brain tool is told about it. The rules it restates are the brain object's. */
 const BRAIN_GUIDANCE = [
-  "You have a brain tool: brain_list, brain_search, brain_read, brain_write. Brains hold this person's",
+  "You have a brain tool: brain_list, brain_pages, brain_search, brain_read, brain_write. Brains hold this person's",
   "knowledge — their own brain, and any shared with them. Nothing else of theirs is on this machine.",
   "- Start with brain_list: it shows each brain, its index.md, and the map Tonoman keeps (.tonoman/index.md: topics, each",
   "  linking to a hub page under .tonoman/hubs/ that gathers the pages about it). Follow those, then search.",
+  "- To see what a folder holds, or the newest pages on something, use brain_pages with that folder — one call, never guess paths.",
+  "- Read only what the question needs: a page or two, not the whole brain.",
   "- Answer questions about their work, people and decisions from the brains, and name the brain and page each fact came from.",
   "- To remember something: if you do not know what it is or where it belongs, ask — or research it when asked — and never file a guess.",
   "  Pick the best-fitting brain they can write to, and an existing page before a new one (brain_read it first and pass its revision).",
