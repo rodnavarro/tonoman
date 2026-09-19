@@ -36,3 +36,19 @@ export function threadModels(): {
     },
   };
 }
+
+/** Anything an agent keeps for a conversation — its footer mode, its last turn's usage — kept per
+ *  AGENT as well as per conversation, so two agents in one thread never share it
+ *  (CONVO-EACH-AGENT-ITS-OWN). `idOf` turns an agent's name into its permanent id, so a rename keeps
+ *  what it had. */
+export function perAgentConversation<T>(idOf: (agent: string) => string): {
+  get(agent: string, conversation: string): T | undefined;
+  set(agent: string, conversation: string, value: T): void;
+} {
+  const m = new Map<string, T>();
+  const key = (agent: string, conversation: string) => `${idOf(agent)}\u0000${conversation}`;
+  return {
+    get: (agent, conversation) => m.get(key(agent, conversation)),
+    set: (agent, conversation, value) => void m.set(key(agent, conversation), value),
+  };
+}

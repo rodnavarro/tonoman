@@ -41,7 +41,7 @@ import {
 } from "../statusline";
 import { httpAuthOps, looksLoggedIn } from "../authflow";
 import * as gate from "./authgate";
-import { threadModels } from "./threadmodels";
+import { threadModels, perAgentConversation } from "./threadmodels";
 import * as secondbrain from "./secondbrain";
 import { createStore, type BrainStore, type BrainRef } from "../brains/store";
 import { recoverWrites } from "../brains/recover";
@@ -1213,11 +1213,14 @@ export async function run(
 
   /** The footer mode, per conversation. Process-local and deliberately so: it is a display
    *  preference for a thread somebody is looking at right now, not a fact about the tenant. */
-  const statusModes = new Map<string, StatusMode>();
+  // Per AGENT and conversation, by the agent's permanent id (CONVO-EACH-AGENT-ITS-OWN): two agents in
+  // one thread each keep their own footer, and a rename keeps it.
+  const agentId = (name: string): string => wired.get(name)?.cfg.guid ?? name;
+  const statusModes = perAgentConversation<StatusMode>(agentId);
   const defaultMode: StatusMode = parseStatusMode(process.env.TONOMAN_STATUSLINE ?? "") ?? "small";
-  const modeFor = (conversation: string): StatusMode => statusModes.get(conversation) ?? defaultMode;
-  /** The last turn's usage per conversation, so `!status` can report it without spending a turn. */
-  const lastUsage = new Map<string, TurnUsage>();
+  const modeFor = (name: string, conversation: string): StatusMode => statusModes.get(name, conversation) ?? defaultMode;
+  /** Each agent's last turn's usage per conversation, so `!status` can report it without spending a turn. */
+  const lastUsage = perAgentConversation<TurnUsage>(agentId);
   /** The model each conversation has chosen. Per conversation, NOT per process: this worker serves
    *  every agent in the tenant and every thread they are in, and the harness's own knob is a single
    *  variable — so `!model opus` in one thread moved everyone. */
@@ -1297,7 +1300,7 @@ export async function run(
   const deps = {
     agent: (name: string) => wired.get(name),
     voice: (name: string) => voiceCreds.get(name),
-    recordUsage: (conversation: string, u: TurnUsage) => lastUsage.set(conversation, u),
+    recordUsage: (name: string, conversation: string, u: TurnUsage) => lastUsage.set(name, conversation, u),
     // The conversation's own `!model` choice, else the agent's CURRENT default from the roster.
     // The fall-through is load-bearing: the runner also holds a model, but that one was baked in
     // at wire time, and a reload that changes only the default model is a plain cfg swap (no runner
@@ -1341,7 +1344,7 @@ export async function run(
         }
       : undefined,
     footer: async (name: string, conversation: string, u: TurnUsage | undefined): Promise<string | null> => {
-      const mode = modeFor(conversation);
+      const mode = modeFor(name, conversation);
       if (mode === "none" || !u) return null;
       // The windows are cached for two minutes, so this is a fetch at most once per window per
       // agent — an answer must never wait on the usage API to be delivered.
@@ -1698,8 +1701,8 @@ export async function run(
       }
     },
     getMode: modeFor,
-    setMode: (conversation, mode) => statusModes.set(conversation, mode),
-    lastUsage: (conversation) => lastUsage.get(conversation),
+    setMode: (name, conversation, mode) => statusModes.set(name, conversation, mode),
+    lastUsage: (name, conversation) => lastUsage.get(name, conversation),
     windows: windowsFor,
     // Which Claude account this agent is signed in as. Straight from `claude auth status` in the
     // agent's own credential directory, trimmed to its first line — the point is to make "whose

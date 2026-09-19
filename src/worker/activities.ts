@@ -108,7 +108,7 @@ export interface TurnDeps {
    *  occupancy, and how much of the Claude plan's 5h/7d windows is left. Null for none. */
   footer?(agent: string, conversation: string, usage: TurnUsage | undefined): Promise<string | null>;
   /** Remember the turn's usage, so `!status` can report it later without spending a turn. */
-  recordUsage?(conversation: string, usage: TurnUsage): void;
+  recordUsage?(agent: string, conversation: string, usage: TurnUsage): void;
   /** The model this conversation is set to, if it has chosen one.
    *
    *  Per CONVERSATION. The harness's own model knob is per process, so one worker serving two
@@ -1269,7 +1269,7 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
     // agent can repeat it later without looking again (BRAIN-USED-DECIDES).
     const used = brainTurn && brains ? brains.end(brainTurn.token) : [];
     const drawnOn = [...new Set([...prior, ...used])];
-    if (usage) deps.recordUsage?.(input.conversation, usage);
+    if (usage) deps.recordUsage?.(input.agent, input.conversation, usage);
     // Slack leaves "is thinking…" on screen until it is cleared, so an answered turn that
     // forgets this looks permanently busy.
     await settleCue();

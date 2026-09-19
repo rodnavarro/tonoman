@@ -5,7 +5,10 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { threadModels } from "./threadmodels";
+import { threadModels, perAgentConversation } from "./threadmodels";
+import { run } from "./commands";
+import type { StatusMode } from "../statusline";
+import type { TurnUsage } from "../core/contracts";
 import { sessionKeyOf } from "./activities";
 import { sessionStore } from "./worker";
 import { watchDeviceLogin, outcomeIsCurrent, handleInteraction, codeModal, registrationAfterLogin } from "./authgate";
@@ -39,6 +42,48 @@ describe("two agents, one thread", () => {
     await s.forget("echo", key); // what !new does
     expect(await s.claim("golf", key)).toEqual({ id: g.id, isNew: false });
     expect((await s.claim("echo", key)).isNew).toBe(true);
+  });
+});
+
+describe("two agents, one thread: the footer and !status", () => {
+  const u: TurnUsage = { inputTokens: 100, cacheWriteTokens: 0, cacheReadTokens: 900, outputTokens: 50 } as TurnUsage;
+  /** The command wiring as the worker builds it: both stores keyed by agent and conversation. */
+  const wiring = () => {
+    const modes = perAgentConversation<StatusMode>((a) => a);
+    const usage = perAgentConversation<TurnUsage>((a) => a);
+    return {
+      usage,
+      deps: {
+        getMode: (a: string, c: string) => modes.get(a, c) ?? "small",
+        setMode: (a: string, c: string, m: StatusMode) => modes.set(a, c, m),
+        lastUsage: (a: string, c: string) => usage.get(a, c),
+        windows: async () => [],
+        getModel: () => "sonnet",
+        setModel: () => {},
+      } as never,
+    };
+  };
+
+  it("CONVO-EACH-AGENT-ITS-OWN Echo's !statusline in a thread leaves Golf's footer as it was", async () => {
+    const { deps } = wiring();
+    await run(deps, "echo", THREAD, { name: "statusline", arg: "full" });
+    expect(await run(deps, "echo", THREAD, { name: "statusline", arg: "" })).toContain("*full*");
+    expect(await run(deps, "golf", THREAD, { name: "statusline", arg: "" })).toContain("*small*");
+  });
+
+  it("CONVO-EACH-AGENT-ITS-OWN Golf's !status in a thread never reports Echo's turn there", async () => {
+    const { deps, usage } = wiring();
+    usage.set("echo", THREAD, u); // Echo answered in this thread; Golf has not
+    expect(await run(deps, "golf", THREAD, { name: "status", arg: "" })).toMatch(/No turn has run in this thread yet/);
+    expect(await run(deps, "echo", THREAD, { name: "status", arg: "" })).toContain("Usage — this turn");
+  });
+
+  it("CONVO-EACH-AGENT-ITS-OWN what an agent keeps for a thread survives its rename (kept by its permanent id)", () => {
+    const ids: Record<string, string> = { echo: "g-1", "echo-renamed": "g-1", golf: "g-2" };
+    const m = perAgentConversation<StatusMode>((name) => ids[name] ?? name);
+    m.set("echo", THREAD, "full");
+    expect(m.get("echo-renamed", THREAD)).toBe("full");
+    expect(m.get("golf", THREAD)).toBeUndefined();
   });
 });
 

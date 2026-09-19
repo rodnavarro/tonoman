@@ -85,7 +85,7 @@ function deps(over: Partial<CommandDeps> = {}): CommandDeps {
   let mode: StatusMode = "small";
   return {
     getMode: () => mode,
-    setMode: (_c, m) => {
+    setMode: (_a, _c, m) => {
       mode = m;
     },
     lastUsage: () => undefined,
@@ -169,7 +169,7 @@ describe("run", () => {
   it("refuses an unknown mode rather than silently keeping the old one", async () => {
     const d = deps();
     expect(await run(d, "nelly", "c", { name: "statusline", arg: "loud" })).toContain("don't know");
-    expect(d.getMode("c")).toBe("small");
+    expect(d.getMode("nelly", "c")).toBe("small");
   });
 
   it("reports the model and sets it for THIS conversation only", async () => {

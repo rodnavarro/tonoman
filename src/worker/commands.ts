@@ -194,11 +194,11 @@ export interface CommandDeps {
     alias: string,
     conversation: string,
   ): Promise<{ url?: string; problem?: string }>;
-  /** The conversation's status-footer mode. */
-  getMode(conversation: string): StatusMode;
-  setMode(conversation: string, mode: StatusMode): void;
-  /** The last turn's usage in this conversation, if one has run. */
-  lastUsage(conversation: string): TurnUsage | undefined;
+  /** THIS agent's status-footer mode in the conversation (CONVO-EACH-AGENT-ITS-OWN). */
+  getMode(agent: string, conversation: string): StatusMode;
+  setMode(agent: string, conversation: string, mode: StatusMode): void;
+  /** THIS agent's last turn's usage in this conversation, if it has run one. */
+  lastUsage(agent: string, conversation: string): TurnUsage | undefined;
   /** Account headroom (5h / 7d). Fetched from the agent's own runtime; [] when unavailable. */
   windows(agent: string): Promise<UsageWindow[]>;
   /** Which inference account THIS agent runs on. Empty when the deployment cannot say.
@@ -466,7 +466,7 @@ export async function run(
       const account = (await deps.claudeAccount?.(agent, user).catch(() => "")) ?? "";
       const provider = deps.inferenceProvider?.(agent) ?? "Claude";
       const who = account ? `🔑 ${provider} account: ${account}` : `🔑 Inference provider: ${provider}`;
-      const u = deps.lastUsage(conversation);
+      const u = deps.lastUsage(agent, conversation);
       // Account headroom is always answerable; per-turn numbers only after a turn has run here.
       const body =
         u === undefined
@@ -477,11 +477,11 @@ export async function run(
 
     case "statusline": {
       if (!cmd.arg) {
-        return `📊 Status line is *${deps.getMode(conversation)}*. Set it with \`!statusline ${STATUS_MODES.join("|")}\`.`;
+        return `📊 Status line is *${deps.getMode(agent, conversation)}*. Set it with \`!statusline ${STATUS_MODES.join("|")}\`.`;
       }
       const mode = parseStatusMode(cmd.arg);
       if (!mode) return `I don't know the mode "${cmd.arg}". Use \`!statusline ${STATUS_MODES.join("|")}\`.`;
-      deps.setMode(conversation, mode);
+      deps.setMode(agent, conversation, mode);
       return `📊 Status line is now *${mode}*.`;
     }
 
