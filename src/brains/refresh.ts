@@ -31,7 +31,9 @@ export interface RefreshPublish {
 }
 
 export interface RefreshDeps {
-  store: Pick<BrainStore, "withCheckout" | "writeFiles">;
+  store: Pick<BrainStore, "withCheckout" | "writeFiles"> & Partial<Pick<BrainStore, "head">>;
+  /** Is the brain still active? Asked before the refresh and again before it writes or publishes. */
+  active?: (brain: BrainRef) => Promise<boolean>;
   /** The local model. Absent = no connections are made; the map is still built. */
   provider?: LlmProvider;
   /** One model call; defaults to the provider's chat endpoint. Injected in tests. */
@@ -149,31 +151,55 @@ export function renderIndex(g: Graph, notes: Map<string, PageNote>, topics: Map<
   return lines.join("\n");
 }
 
+/** What a refresh did, and when the queue should run it again: "soon" (more to read, or the brain
+ *  moved on while it worked), "later" (the model was not there, or it failed), "never" (the brain is
+ *  archived). None: it is done. */
+export type RefreshOutcome = RefreshPublish & { again?: "soon" | "later" | "never" };
+
+/** Git modes that are not ordinary files: a symlink and a submodule. Never read, never a page — a link
+ *  somebody committed must not steer the refresh into another brain's files or the worker's. */
+const NOT_A_FILE = new Set(["120000", "160000"]);
+
 /** Refresh one brain. Returns what it published. */
-export async function refreshBrain(d: RefreshDeps, brain: BrainRef, name: string): Promise<RefreshPublish> {
+export async function refreshBrain(d: RefreshDeps, brain: BrainRef, name: string): Promise<RefreshOutcome> {
   const now = d.now ?? (() => new Date());
   const log = d.log ?? ((s: string) => console.log(s));
   const budget = d.budget ?? 40;
   const sub = (brain.subpath ?? "").replace(/^\/+|\/+$/g, "");
   const within = (p: string) => (sub ? p.startsWith(`${sub}/`) : true);
   const strip = (p: string) => (sub ? p.slice(sub.length + 1) : p);
+  // An archived brain is not refreshed: its owner left (BRAIN-ARCHIVED-ON-LEAVE). Asked again right
+  // before anything is written or published, since that can happen while the model works.
+  const archived = async () => (d.active ? !(await d.active(brain).catch(() => true)) : false);
+  if (await archived()) {
+    log(`brains: ${brain.id} is archived, so it is not refreshed`);
+    return { state: "stale", detail: "archived", again: "never" };
+  }
 
   return d.store.withCheckout(brain, async (dir, revision) => {
-    // Everything the brain holds, by path and content id — never the refresh's own files.
+    // Everything the brain holds, by path, git mode and content id — never the refresh's own files as
+    // pages, and never anything that is not an ordinary file.
     const tree = await gitOut(dir, ["ls-tree", "-r", "-l", "-z", "HEAD"]);
     const pages: { path: string; size: number; blob: string }[] = [];
     const orderPaths: string[] = [];
+    const own = new Map<string, string>(); // the refresh's own files, by path under the brain → blob
     for (const rec of tree.split("\0")) {
       const tab = rec.indexOf("\t");
       if (tab < 0) continue;
-      const [, , blob, size] = rec.slice(0, tab).split(/\s+/);
+      const [mode, , blob, size] = rec.slice(0, tab).split(/\s+/);
       const full = rec.slice(tab + 1);
-      if (!within(full) || isRefreshPath(full)) continue;
+      if (!within(full) || NOT_A_FILE.has(mode ?? "")) continue;
       const p = strip(full);
+      if (isRefreshPath(full) || isRefreshPath(p)) {
+        own.set(p, blob ?? "");
+        continue;
+      }
       if (/^log\.md$/i.test(p)) continue; // the write log is not knowledge
       if (/\.md$/i.test(p)) pages.push({ path: p, size: Number(size) || 0, blob: blob ?? "" });
       else if (/(^|\/)\.order$/.test(p)) orderPaths.push(full);
     }
+    // Content is read by content id from git, never through the checkout's files.
+    const blobText = async (blob: string | undefined) => (blob ? await gitOut(dir, ["cat-file", "blob", blob]).catch(() => "") : "");
     const ids = new Set(pages.map((p) => p.path.replace(/\.md$/i, "")));
     const orders = readOrders(dir, orderPaths).map((o) => ({ folder: sub && o.folder.startsWith(`${sub}/`) ? o.folder.slice(sub.length + 1) : o.folder === sub ? "" : o.folder, children: o.children }));
     const content = await linkLines(dir, sub, ids);
@@ -181,14 +207,14 @@ export async function refreshBrain(d: RefreshDeps, brain: BrainRef, name: string
     const orphans = graph.nodes.filter((n) => n.degree === 0 && !n.stub).map((n) => n.id);
 
     // What the model has said before, by page content.
-    const cacheRel = path.join(dir, sub, ".tonoman", "pages.json");
     const cache = new Map<string, PageNote>(
-      Object.entries(JSON.parse(await fs.readFile(cacheRel, "utf8").catch(() => "{}")) as Record<string, PageNote>),
+      Object.entries(JSON.parse((await blobText(own.get(".tonoman/pages.json"))) || "{}") as Record<string, PageNote>),
     );
     for (const id of [...cache.keys()]) if (!ids.has(id)) cache.delete(id);
 
     let tagged = 0;
     let detail: string | undefined;
+    let again: RefreshOutcome["again"];
     if (d.provider || d.infer) {
       const up = d.available ? await d.available() : await modelUp(d.provider!);
       if (!up) {
@@ -196,19 +222,21 @@ export async function refreshBrain(d: RefreshDeps, brain: BrainRef, name: string
         const waiting: RefreshPublish = { state: "stale", revision, detail: "waiting for the local model" };
         await d.publish(brain.id, waiting);
         log(`brains: refresh of ${brain.id} is waiting for the local model`);
-        return waiting;
+        return { ...waiting, again: "later" };
       }
       const infer = d.infer ?? ((s: string, u: string) => inferChat(d.provider!, s, u));
       const degree = new Map(graph.nodes.map((n) => [n.id, n.degree]));
-      const todo = pages
+      // The brain's own guide and index are for finding things, not things to know: mapped, not read.
+      const readable = pages
         .map((p) => ({ id: p.path.replace(/\.md$/i, ""), blob: p.blob, size: p.size }))
-        // The brain's own guide and index are for finding things, not things to know: mapped, not read.
-        .filter((p) => p.size > 0 && !/^(brain|index)$/i.test(p.id) && cache.get(p.id)?.blob !== p.blob)
-        .sort((a, b) => (degree.get(b.id) ?? 0) - (degree.get(a.id) ?? 0))
-        .slice(0, budget);
+        .filter((p) => p.size > 0 && !/^(brain|index)$/i.test(p.id));
+      const unread = readable
+        .filter((p) => cache.get(p.id)?.blob !== p.blob)
+        .sort((a, b) => (degree.get(b.id) ?? 0) - (degree.get(a.id) ?? 0));
       let failures = 0;
-      for (const p of todo) {
-        const md = await fs.readFile(path.join(dir, sub, `${p.id}.md`), "utf8").catch(() => "");
+      let stopped = false;
+      for (const p of unread.slice(0, budget)) {
+        const md = await blobText(p.blob);
         if (!md.trim()) continue;
         try {
           const n = parseEnrichment(await infer(TAG_SYSTEM, pageExcerpt(p.id, md)));
@@ -218,10 +246,19 @@ export async function refreshBrain(d: RefreshDeps, brain: BrainRef, name: string
         } catch {
           // Three in a row means the model went away mid-refresh: keep what was tagged, try the rest later.
           if (++failures >= 3) {
-            detail = "the local model stopped answering; the rest will be tagged next time";
+            stopped = true;
             break;
           }
         }
+      }
+      const read = readable.filter((p) => cache.get(p.id)?.blob === p.blob).length;
+      if (stopped) {
+        detail = `the local model stopped answering; ${read} of ${readable.length} pages read, the rest later`;
+        again = "later";
+      } else if (unread.length > budget) {
+        // Not done: say how far it got, and carry on after this batch (BRAIN-BACKGROUND-REFRESH).
+        detail = `${read} of ${readable.length} pages read so far; still reading`;
+        again = "soon";
       }
     } else {
       detail = "no local model is set up, so pages are mapped but not connected";
@@ -250,17 +287,39 @@ export async function refreshBrain(d: RefreshDeps, brain: BrainRef, name: string
         ].join("\n"),
       })),
     ];
-    const prior = await fs.readFile(path.join(dir, sub, ".tonoman", "log.md"), "utf8").catch(() => "# Refresh log\n\n");
+    const prior = (await blobText(own.get(".tonoman/log.md"))) || "# Refresh log\n\n";
     const stats = { ...graphStats(graph), related: edges.length, topics: topics.size, tagged };
     files.push({
       path: ".tonoman/log.md",
       content: `${prior}${prior.endsWith("\n") ? "" : "\n"}- ${when.toISOString().slice(0, 16).replace("T", " ")} UTC · ${graph.nodes.length} pages · ${stats.links} links · ${edges.length} connections by topic · ${tagged} pages newly read · ${orphans.length} orphans\n`,
     });
-    const w = await d.store.writeFiles({ brain, files, note: "Refresh: map, hubs and connections", who: "Tonoman", system: true });
+    const superseded = async (): Promise<RefreshOutcome> => {
+      const s: RefreshPublish = { state: "stale", revision, detail: "refreshing after a newer change" };
+      await d.publish(brain.id, s);
+      log(`brains: refresh of ${brain.id} was overtaken by a newer push; going again`);
+      return { ...s, again: "soon" };
+    };
+    if (await archived()) return { state: "stale", detail: "archived", again: "never" };
+    // Written only on the revision it was worked out from: a map of an older state never lands on a newer one.
+    const w = await d.store.writeFiles({ brain, files, note: "Refresh: map, hubs and connections", who: "Tonoman", system: true, basedOn: revision });
     if (!w.ok) {
+      if (w.reason === "superseded") return superseded();
       const failed: RefreshPublish = { state: "failed", revision, detail: w.detail };
       await d.publish(brain.id, failed);
-      return failed;
+      return { ...failed, again: "later" };
+    }
+    // And published only if nothing was pushed since — someone's note may have landed after our write.
+    if (d.store.head) {
+      const tip = await d.store.head(brain).catch(() => null);
+      if (tip && tip !== revision && tip !== w.sha) return superseded();
+    }
+    if (await archived()) return { state: "stale", detail: "archived", again: "never" };
+    if (again) {
+      // Not finished: the Hub says how far it got; the last complete graph stays until it is.
+      const partial: RefreshPublish = { state: "stale", revision, detail };
+      await d.publish(brain.id, partial);
+      log(`brains: refresh of ${brain.id} — ${detail}`);
+      return { ...partial, again };
     }
     const done: RefreshPublish = { state: "fresh", revision, generatedAt: when.toISOString(), stats, graph: full, ...(detail ? { detail } : {}) };
     await d.publish(brain.id, done);
@@ -279,34 +338,62 @@ async function modelUp(p: LlmProvider): Promise<boolean> {
 }
 
 /** One refresh at a time (a small GPU serves one request at a time), a short wait after the last push
- *  so a burst of notes is refreshed once, and a longer one when the model was not there. */
+ *  so a burst of notes is refreshed once, backing off when the model was not there or a refresh failed.
+ *
+ *  What is waiting survives a restart: each queued brain is a file under `dir` until it is refreshed,
+ *  and `resume()` at start queues them all again. */
 export function createRefreshQueue(o: {
-  run: (brain: BrainRef) => Promise<RefreshPublish>;
+  run: (brain: BrainRef) => Promise<RefreshOutcome>;
   /** Mark a brain stale the moment it is queued, so the Hub says so. */
   stale?: (brain: BrainRef) => Promise<void>;
   delayMs?: number;
   retryMs?: number;
+  /** The longest a failing brain waits between tries. */
+  maxRetryMs?: number;
+  /** Where queued brains are kept across restarts. None: memory only. */
+  dir?: string;
   log?: (s: string) => void;
 }) {
   const delay = o.delayMs ?? 60_000;
   const retry = o.retryMs ?? 10 * 60_000;
+  const maxRetry = o.maxRetryMs ?? 6 * 60 * 60_000;
   const log = o.log ?? ((s: string) => console.log(s));
   const timers = new Map<string, ReturnType<typeof setTimeout>>();
   const pending = new Map<string, BrainRef>();
+  const tries = new Map<string, number>();
   let chain: Promise<void> = Promise.resolve();
+  const fileOf = (id: string) => path.join(o.dir!, `${id.replace(/[^A-Za-z0-9_-]/g, "_")}.json`);
+  const keep = (b: BrainRef) => (o.dir ? fs.mkdir(o.dir, { recursive: true }).then(() => fs.writeFile(fileOf(b.id), JSON.stringify(b))).catch(() => {}) : Promise.resolve());
+  const forget = (id: string) => (o.dir ? fs.rm(fileOf(id), { force: true }).catch(() => {}) : Promise.resolve());
+  const backoff = (id: string) => {
+    const n = (tries.get(id) ?? 0) + 1;
+    tries.set(id, n);
+    return Math.min(retry * 2 ** (n - 1), maxRetry);
+  };
   const schedule = (b: BrainRef, ms: number) => {
     clearTimeout(timers.get(b.id));
     pending.set(b.id, b);
+    void keep(b);
     const t = setTimeout(() => {
       timers.delete(b.id);
       const brain = pending.get(b.id)!;
       pending.delete(b.id);
       chain = chain.then(async () => {
+        // A push while this one waited or ran has already queued the brain again; that one decides.
+        const next = (ms: number) => (timers.has(brain.id) ? undefined : schedule(brain, ms));
         try {
           const r = await o.run(brain);
-          if (r.state === "stale") schedule(brain, retry);
+          if (r.again === "soon") next(delay);
+          else if (r.again === "later" || r.state !== "fresh") {
+            if (r.again !== "never") next(backoff(brain.id));
+          }
+          if (r.state === "fresh" || r.again === "never") {
+            tries.delete(brain.id);
+            if (!timers.has(brain.id)) await forget(brain.id);
+          }
         } catch (e) {
           log(`brains: refresh of ${brain.id} failed — ${(e as Error).message}`);
+          next(backoff(brain.id));
         }
       });
     }, ms);
@@ -317,6 +404,20 @@ export function createRefreshQueue(o: {
     touch(b: BrainRef): void {
       void o.stale?.(b).catch(() => {});
       schedule(b, delay);
+    },
+    /** At start: queue again whatever was waiting when the worker stopped, a refresh cut off halfway included. */
+    async resume(): Promise<number> {
+      if (!o.dir) return 0;
+      const names = await fs.readdir(o.dir).catch(() => [] as string[]);
+      let n = 0;
+      for (const f of names.filter((x) => x.endsWith(".json"))) {
+        const b = await fs.readFile(path.join(o.dir, f), "utf8").then((s) => JSON.parse(s) as BrainRef, () => null);
+        if (b?.id && b.repoUrl) {
+          schedule(b, delay);
+          n++;
+        }
+      }
+      return n;
     },
     /** For tests and shutdown: wait for whatever is running. */
     idle: () => chain,

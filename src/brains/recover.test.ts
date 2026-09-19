@@ -114,3 +114,16 @@ describe("a restart finds an unfinished Talent filing", () => {
     expect((redone[0] as { files: unknown[] }).files).toEqual(files);
   });
 });
+
+describe("a restart finds an unfinished refresh write", () => {
+  it("BRAIN-BACKGROUND-REFRESH the refresh's own interrupted map is dropped, not pushed: the refresh works it out again", async () => {
+    const f = fakes("no", true);
+    (f.d as { store: { interrupted: () => Promise<unknown> } }).store.interrupted = async () => [
+      { id: "op-9", entry: entry({ kind: "files", system: true, files: [{ path: ".tonoman/index.md", content: "old map" }] }), landed: "no" },
+    ];
+    await recoverWrites(f.d);
+    expect(f.writes).toEqual([]);
+    expect(f.settled).toEqual([["op-9", "abandoned"]]);
+    expect(f.told).toEqual([]);
+  });
+});

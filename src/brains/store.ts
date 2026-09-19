@@ -507,7 +507,11 @@ export function createStore(o: StoreOptions) {
       }
     }
     const logRel = safePagePath("log.md", b.subpath)!;
-    for (const rel of [...rels, logRel]) {
+    // The refresh owns `.tonoman/` outright and rewrites all of it: whatever is there — a link somebody
+    // committed included — is removed, never followed, and nothing else is touched.
+    const sub = (b.subpath ?? "").replace(/^\/+|\/+$/g, "");
+    const ownRel = req.system ? [sub, ".tonoman"].filter(Boolean).join("/") : null;
+    for (const rel of ownRel ? (sub ? [sub] : []) : [...rels, logRel]) {
       if (!(await plainPath(dir, remoteRef(b), rel))) return { ok: false, reason: "bad-path", detail: "a page sits behind a link in the brain" };
     }
     const wt = path.join(dir, `.tonoman-wt-${opId.slice(0, 8)}`);
@@ -517,13 +521,17 @@ export function createStore(o: StoreOptions) {
     if (add.code !== 0) return { ok: false, reason: "push-failed", detail: redact(add.out, token).slice(0, 300) };
     try {
       const root = await fs.realpath(wt);
+      if (ownRel) {
+        await git(["rm", "-r", "-q", "--cached", "--ignore-unmatch", "--", ownRel], wt);
+        await fs.rm(path.join(wt, ownRel), { recursive: true, force: true });
+      }
       for (let i = 0; i < rels.length; i++) {
         const target = path.join(wt, rels[i]);
         await fs.mkdir(path.dirname(target), { recursive: true });
         if (!(await fs.realpath(path.dirname(target))).startsWith(root)) return { ok: false, reason: "bad-path", detail: "a page resolves outside the brain" };
         await fs.writeFile(target, req.files[i].content);
       }
-      await git(["add", "-A", "--", ...rels], wt);
+      await git(["add", "-A", "--", ...rels, ...(ownRel ? [ownRel] : [])], wt);
       // Nothing changed (a re-run of something already filed): no commit, no log line, still a success.
       if ((await git(["diff", "--cached", "--quiet"], wt)).code === 0) return { ok: true, paths: req.files.map((f) => f.path), sha: null };
       if (!req.system) {

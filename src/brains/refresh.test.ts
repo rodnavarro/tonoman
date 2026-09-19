@@ -1,9 +1,12 @@
 // A brain organising itself: the map, connections by topic from a scripted model (FIX-SCRIPTED-MODEL)
 // over pages that never link to each other (FIX-UNLINKED-PAGES), and what happens when the model is not
 // there. Titles start with the rule they prove.
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+
+// Real git against real repos: slow when the whole suite runs at once, not wrong.
+vi.setConfig({ testTimeout: 30_000 });
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, readFileSync, existsSync } from "node:fs";
+import { mkdtempSync, rmSync, readFileSync, existsSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { createStore, seed, type BrainRef } from "./store";
@@ -169,5 +172,110 @@ describe("in the background", () => {
     await q.idle();
     expect(n).toBe(2);
     q.stop();
+  });
+});
+
+/** Commit to the remote as somebody with a plain git client would — a symlink included. */
+const commitRaw = (entries: { path: string; mode?: string; content: string }[]) => {
+  const d = mkdtempSync(path.join(tmp, "raw-"));
+  sh(["-c", "core.autocrlf=false", "clone", "-q", remote, d]);
+  sh(["config", "user.name", "x"], d);
+  sh(["config", "user.email", "x@x"], d);
+  for (const e of entries) {
+    const blob = execFileSync("git", ["hash-object", "-w", "--stdin"], { cwd: d, input: e.content, encoding: "utf8" }).trim();
+    sh(["update-index", "--add", "--cacheinfo", `${e.mode ?? "100644"},${blob},${e.path}`], d);
+  }
+  sh(["commit", "-q", "-m", "raw"], d);
+  sh(["push", "-q", "origin", "HEAD:main"], d);
+};
+
+describe("found in review (Astra, Sep 19)", () => {
+  it("BRAIN-NO-DISCLOSURE a committed symlink is never read, sent to the model, or remembered — not even the refresh's own cache", async () => {
+    const outside = path.join(tmp, "other-brain-secret.md");
+    writeFileSync(outside, "# Secret\n\nTOPSECRET other brain content\n");
+    commitRaw([
+      { path: "AI/leak.md", mode: "120000", content: outside },
+      { path: ".tonoman/pages.json", mode: "120000", content: outside },
+    ]);
+    const sent: string[] = [];
+    const r = await refreshBrain(deps({ infer: async (s, u) => (sent.push(u), JSON.stringify({ summary: "x", tags: ["misc"] })), available: async () => true }), brain, "Ana's brain");
+    expect(r.state).toBe("fresh");
+    expect(sent.join("\n")).not.toMatch(/leak|TOPSECRET|other-brain-secret/);
+    expect(r.graph!.nodes.map((n) => n.id)).not.toContain("AI/leak");
+    expect(remoteFile(".tonoman/pages.json")).not.toMatch(/leak|TOPSECRET/);
+  });
+
+  it("BRAIN-BACKGROUND-REFRESH a brain bigger than one batch shows how far it got, not fresh, and carries on until every page is read", async () => {
+    const published: RefreshPublish[] = [];
+    const first = await refreshBrain(deps({ infer: scripted([]), available: async () => true, budget: 1 }, published), brain, "Ana's brain");
+    expect(first).toMatchObject({ state: "stale", again: "soon" });
+    expect(first.detail).toMatch(/1 of 3 pages read so far/);
+    expect(published.map((p) => p.state)).toEqual(["stale"]);
+    await refreshBrain(deps({ infer: scripted([]), available: async () => true, budget: 1 }, published), brain, "Ana's brain");
+    const last = await refreshBrain(deps({ infer: scripted([]), available: async () => true, budget: 1 }, published), brain, "Ana's brain");
+    expect(last.state).toBe("fresh");
+    expect(last.again).toBeUndefined();
+  }, 60_000);
+
+  it("BRAIN-BACKGROUND-REFRESH a refresh overtaken by a newer push is not published as fresh, and goes again", async () => {
+    const published: RefreshPublish[] = [];
+    const other = createStore({ root: path.join(tmp, "w-other"), token: async () => "", fetchEveryMs: 0, log: () => {} });
+    let once = false;
+    const infer = async (s: string, u: string) => {
+      if (!once) {
+        once = true;
+        await other.write({ brain, path: "Team/new.md", content: "# New\n\nJust written.\n", note: "n", who: "Ben" });
+      }
+      return scripted([])(s, u);
+    };
+    const r = await refreshBrain(deps({ infer, available: async () => true }, published), brain, "Ana's brain");
+    expect(r).toMatchObject({ state: "stale", again: "soon" });
+    expect(published.map((p) => p.state)).not.toContain("fresh");
+    expect(remoteFile(".tonoman/index.md")).toBeNull(); // the older map was not written over the newer brain
+  }, 60_000);
+
+  it("BRAIN-ARCHIVED-ON-LEAVE an archived brain is not refreshed; one archived mid-refresh gets nothing written or published", async () => {
+    const before = commits();
+    const published: RefreshPublish[] = [];
+    const r = await refreshBrain(deps({ active: async () => false }, published), brain, "Ana's brain");
+    expect(r).toMatchObject({ again: "never" });
+    let asks = 0;
+    const midway = await refreshBrain(deps({ active: async () => asks++ === 0 }, published), brain, "Ana's brain");
+    expect(midway).toMatchObject({ again: "never" });
+    expect(published).toEqual([]);
+    expect(commits()).toBe(before);
+  });
+
+  it("BRAIN-BACKGROUND-REFRESH a refresh that fails or throws is tried again, waiting longer each time", async () => {
+    const at: number[] = [];
+    const outcomes: (() => Promise<RefreshPublish>)[] = [
+      async () => { throw new Error("boom"); },
+      async () => ({ state: "failed" }),
+      async () => ({ state: "fresh" }),
+    ];
+    const q = createRefreshQueue({ run: async () => (at.push(Date.now()), outcomes[at.length - 1]!()), delayMs: 5, retryMs: 30, log: () => {} });
+    q.touch(brain);
+    await new Promise((r) => setTimeout(r, 250));
+    await q.idle();
+    expect(at).toHaveLength(3);
+    expect(at[2]! - at[1]!).toBeGreaterThan(at[1]! - at[0]!); // backed off
+    q.stop();
+  });
+
+  it("BRAIN-BACKGROUND-REFRESH a refresh that was waiting when the worker stopped runs after it starts again", async () => {
+    const dir = path.join(tmp, "queue");
+    const first = createRefreshQueue({ run: async () => ({ state: "fresh" }), delayMs: 60_000, dir, log: () => {} });
+    first.touch(brain);
+    await new Promise((r) => setTimeout(r, 30)); // the file is written
+    first.stop(); // the worker stops before the refresh ran
+    const runs: string[] = [];
+    const second = createRefreshQueue({ run: async (b) => (runs.push(b.id), { state: "fresh" }), delayMs: 5, dir, log: () => {} });
+    expect(await second.resume()).toBe(1);
+    await new Promise((r) => setTimeout(r, 40));
+    await second.idle();
+    expect(runs).toEqual(["b-ana"]);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(await createRefreshQueue({ run: async () => ({ state: "fresh" }), dir }).resume()).toBe(0); // done: forgotten
+    second.stop();
   });
 });

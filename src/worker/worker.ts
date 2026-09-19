@@ -455,11 +455,14 @@ async function startBrains(): Promise<{ registry: ReturnType<typeof registryClie
     : undefined;
   const publish = (id: string, p: RefreshPublish) => registry.publishIndex(id, p as unknown as Record<string, unknown>);
   const queue = createRefreshQueue({
-    run: (b) => refreshBrain({ store, provider, publish }, b, b.name ?? "Brain"),
+    run: (b) => refreshBrain({ store, provider, publish, active: (x) => registry.brainActive(x.id) }, b, b.name ?? "Brain"),
     stale: (b) => publish(b.id, { state: "stale", detail: "refreshing after a change" }),
     delayMs: Number(process.env.TONOMAN_BRAIN_REFRESH_DELAY_MS ?? 60_000),
+    // Kept on disk, so a refresh waiting — or cut off halfway — when the worker stops runs after it starts.
+    dir: path.join(root, "_refresh"),
   });
   pushed = (b) => queue.touch(b);
+  void queue.resume().then((n) => n && console.log(`worker: ${n} brain refresh(es) carried over from before the restart`));
   console.log(`worker: brain refresh ${provider ? `on ${provider.model} at ${provider.url}` : "maps only — no local model set (TONOMAN_BRAIN_REFRESH_URL)"}`);
   console.log(`worker: brains on — ${provisioner ? `new brains go to Azure DevOps ${org}/${project}` : "no git host configured, so no new brains can be created"}`);
   return { registry, broker, store };

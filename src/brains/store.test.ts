@@ -1,7 +1,10 @@
 // The brain store against a throwaway local remote (FIX-GIT-REMOTE): reads at pushed revisions,
 // journaled writes, two writers, and what a restart finds. Rule names start each test title
 // (docs/definition/objects/brain.md in Tonoman Cloud).
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+
+// Real git against real repos: slow when the whole suite runs at once, not wrong.
+vi.setConfig({ testTimeout: 30_000 });
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, readFileSync, readdirSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";

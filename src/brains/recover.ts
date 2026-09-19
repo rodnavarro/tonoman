@@ -20,6 +20,8 @@ export interface RecoverDeps {
 
 interface Entry {
   kind?: "files";
+  /** The refresh writing its own files. */
+  system?: boolean;
   files?: { path: string; content: string }[];
   brain: BrainRef;
   path: string;
@@ -47,6 +49,12 @@ export async function recoverWrites(d: RecoverDeps): Promise<{ landed: number; r
       await d.store.settle(it.id, "pushed");
       await tell(`The note you asked me to save, \`${e.path}\`, is saved — I was restarted just as it went through.`);
       out.landed++;
+      continue;
+    }
+    // The refresh's own map is not finished here: it is worked out again from the brain as it is now,
+    // by the refresh the queue carries over a restart. Pushing an old one could land on newer pages.
+    if (e.system) {
+      await d.store.settle(it.id, "abandoned", "the refresh runs again after the restart");
       continue;
     }
     // A Talent's filing is re-checked against what the RUN may reach; a person's note against theirs.
