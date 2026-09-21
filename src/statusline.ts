@@ -129,7 +129,12 @@ function modelLabel(u: TurnUsage, model?: string): string | undefined {
 /** One compact status line. `now` drives the per-window time-to-reset (⏳). */
 export function renderSmall(u: TurnUsage, model: string | undefined, windows: UsageWindow[], now: number = Date.now()): string {
   const ml = modelLabel(u, model);
-  const parts = [`📊${ml ? " " + ml : ""}`, `${compactTokens(totalTokens(u))} tok`, `ctx ${contextPercent(u)}%`];
+  // No icon. This line sits under every answer the agent gives, so it is the most-repeated
+  // element in the whole product — and an emoji there reads as a label on the answer rather than
+  // as the quiet meter it is. The words carry it.
+  const parts = [ml, `${compactTokens(totalTokens(u))} tok`, `ctx ${contextPercent(u)}%`].filter(
+    (p): p is string => Boolean(p),
+  );
   // Agentic iterations the turn took (⟳ N), when the harness reports it — shows how hard the turn
   // worked and how close it ran to its step cap (gw-command-statusline / 40-turn cap).
   if (u.iterationsUsed != null) parts.push(`⟳ ${u.iterationsUsed}`);
@@ -205,10 +210,25 @@ export async function fetchAccountUsage(token: string): Promise<UsageWindow[]> {
 /** GETs a REMOTE agent runtime's /usage (claude-code-http, k8s split): the agent holds the
  * OAuth credential and reports its own 5h/7d windows, so the gateway — which can't podman-exec
  * across the split — pulls them over HTTP. Bearer-authed like /turn. Returns [] on any failure. */
-export async function fetchRemoteAccountUsage(url: string, token: string | undefined): Promise<UsageWindow[]> {
+export async function fetchRemoteAccountUsage(
+  url: string,
+  token: string | undefined,
+  agent?: string,
+  /** Whose login it is, where turns run as their own Linux users: the service reads it AS that user. */
+  who?: { uid: number; of?: string; harness?: string },
+  /** WHICH PERSON's login under that agent — set when the agent runs inference per person. Left
+   *  out there, the runtime reads the agent's own login, which nobody's turn runs on: it is stale
+   *  or absent, the answer is no windows, and the footer silently loses its 5h/7d. */
+  user?: string,
+): Promise<UsageWindow[]> {
   if (!url) return [];
   try {
-    const res = await fetch(`${url.replace(/\/$/, "")}/usage`, {
+    // Named, because the headroom is read with the ACCOUNT'S OWN token and each agent now has its
+    // own. Unnamed, every agent reports the same 5h/7d figures whoever they are actually running
+    // as — which is precisely the confusion per-agent credentials exist to remove, and it looks
+    // entirely plausible while being wrong.
+    const q = agent ? `?agent=${encodeURIComponent(agent)}${who ? `&uid=${who.uid}${who.of ? `&of=${encodeURIComponent(who.of)}` : ""}${who.harness ? `&harness=${encodeURIComponent(who.harness)}` : ""}` : ""}${user ? `&user=${encodeURIComponent(user)}` : ""}` : "";
+    const res = await fetch(`${url.replace(/\/$/, "")}/usage${q}`, {
       headers: token ? { Authorization: `Bearer ${token}`, Accept: "application/json" } : { Accept: "application/json" },
     });
     if (!res.ok) return [];
@@ -221,6 +241,15 @@ export async function fetchRemoteAccountUsage(url: string, token: string | undef
 
 const usageCache = new Map<string, { at: number; windows: UsageWindow[] }>();
 
+/** WHOSE login an allowance is read from, and the key it is cached under (CONVO-FOOTER-BOTH-PROVIDERS:
+ *  "the speaker's own login"). The same rule a turn follows for whose subscription it bills: the
+ *  speaker's on an agent that runs inference per person, the agent's one login otherwise. The key
+ *  carries the person, so two people on one agent are never shown each other's numbers. */
+export function usageLoginOf(agentKey: string, inferenceMode: string | undefined, speaker: string | undefined): { key: string; user?: string } {
+  const user = inferenceMode === "per_user" && speaker ? speaker : undefined;
+  return { key: user ? `agent:${agentKey}:user:${user}` : `agent:${agentKey}`, user };
+}
+
 /** Remote-agent account usage, cached under `key` (same store as the local path so the sync
  * `cachedAccountUsage(key)` footer read works identically). Degrades to [] (windows omitted). */
 export async function remoteAccountUsageCached(
@@ -229,10 +258,13 @@ export async function remoteAccountUsageCached(
   token: string | undefined,
   ttlMs = 120_000,
   now: number = Date.now(),
+  agent?: string,
+  who?: { uid: number; of?: string; harness?: string },
+  user?: string,
 ): Promise<UsageWindow[]> {
   const hit = usageCache.get(key);
   if (hit && now - hit.at < ttlMs) return hit.windows;
-  const windows = await fetchRemoteAccountUsage(url, token);
+  const windows = await fetchRemoteAccountUsage(url, token, agent, who, user);
   usageCache.set(key, { at: now, windows });
   return windows;
 }

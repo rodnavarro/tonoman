@@ -1,3 +1,4 @@
+import { FILE_DENY_RULES } from "./turnenv";
 import { describe, it, expect } from "vitest";
 import { Runner, spec, KIND, parseLine, decodeTrace, resolveTraceMode, localEnv, toolPreview } from "./claudecode";
 
@@ -24,11 +25,39 @@ describe("claudecode Runner.podmanArgs — model knob is per-turn (gw-command-mo
     expect(r.podmanArgs(req)).not.toContain("--model");
   });
 
-  it("emits --disallowedTools as a comma list to trim the context floor; omits it when empty/unset", () => {
+  it("emits --disallowedTools as a comma list to trim the context floor, always followed by the file-tool deny rules", () => {
     const r = new Runner({ container: "cody", disallowedTools: ["Task", "NotebookEdit", "TodoWrite"] });
-    expect(flagValue(r.podmanArgs(req), "--disallowedTools")).toBe("Task,NotebookEdit,TodoWrite");
-    expect(new Runner({ container: "cody" }).podmanArgs(req)).not.toContain("--disallowedTools");
-    expect(new Runner({ container: "cody", disallowedTools: [] }).podmanArgs(req)).not.toContain("--disallowedTools");
+    expect(flagValue(r.podmanArgs(req), "--disallowedTools")).toBe(["Task", "NotebookEdit", "TodoWrite", ...FILE_DENY_RULES].join(","));
+    // With nothing configured the deny rules are still there: no setting can take them away.
+    expect(flagValue(new Runner({ container: "cody" }).podmanArgs(req), "--disallowedTools")).toBe(FILE_DENY_RULES.join(","));
+    expect(flagValue(new Runner({ container: "cody", disallowedTools: [] }).podmanArgs(req), "--disallowedTools")).toBe(FILE_DENY_RULES.join(","));
+  });
+
+  it("BRAIN-WORKSPACE a full turn's file tools can never open brains, credentials or other people's histories", () => {
+    const deny = flagValue(new Runner({ container: "cody" }).podmanArgs(req), "--disallowedTools")!.split(",");
+    for (const rule of ["Read(//root/.tonoman/**)", "Read(//root/.claude/**)", "Read(//root/.codex/**)", "Read(//etc/tonoman/**)"]) {
+      expect(deny).toContain(rule);
+    }
+  });
+
+  it("BRAIN-EVERY-AGENT a full turn gets its MCP configuration file; a lean one never does", () => {
+    const r = new Runner({ container: "cody" });
+    expect(flagValue(r.podmanArgs({ prompt: "hi", mcpConfigFile: "/tmp/t/.mcp-tonoman.json" }), "--mcp-config")).toBe("/tmp/t/.mcp-tonoman.json");
+    expect(r.podmanArgs({ prompt: "hi", lean: true, mcpConfigFile: "/tmp/t/.mcp-tonoman.json" })).not.toContain("--mcp-config");
+    expect(r.podmanArgs({ prompt: "hi", mcpConfigFile: "/tmp/t/.mcp-tonoman.json" })).toContain("--strict-mcp-config");
+  });
+
+  it("a LEAN turn offers NO tools and caps to one turn, overriding the runner's own knobs", () => {
+    // Inference only: the agent reasons on its subscription and nothing else. `--tools ""` rather
+    // than a denylist, so a tool the CLI adds later (ToolSearch was one) cannot slip through.
+    const r = new Runner({ container: "cody", disallowedTools: ["Task"], maxTurns: 10 });
+    const lean = r.podmanArgs({ prompt: "hi", lean: true });
+    expect(flagValue(lean, "--tools")).toBe("");
+    expect(lean).not.toContain("--disallowedTools");
+    expect(flagValue(lean, "--max-turns")).toBe("1");
+    // A non-lean turn is unchanged — the runner's own disallow list and cap still apply.
+    expect(flagValue(r.podmanArgs({ prompt: "hi" }), "--disallowedTools")).toBe(["Task", ...FILE_DENY_RULES].join(","));
+    expect(flagValue(r.podmanArgs({ prompt: "hi" }), "--max-turns")).toBe("10");
   });
 
   it("emits --max-turns N to cap the agentic loop; omits it when uncapped (0/undefined)", () => {
@@ -213,7 +242,7 @@ describe("parseLine usage — result line → TurnUsage (gw-command-statusline)"
 
   it("toolPreview picks the primary arg, collapses whitespace, and bounds length", () => {
     expect(toolPreview("Bash", { command: "rn  wiki   sync" })).toBe("rn wiki sync");
-    expect(toolPreview("Read", { file_path: "/root/files/wiki-p/x.md" })).toBe("/root/files/wiki-p/x.md");
+    expect(toolPreview("Read", { file_path: "/root/files/team-wiki/x.md" })).toBe("/root/files/team-wiki/x.md");
     expect(toolPreview("Grep", { pattern: "TODO", path: "/src" })).toBe("TODO");
     expect(toolPreview("X", {}).length).toBe(0);
     expect(toolPreview("Bash", { command: "x".repeat(200) }).length).toBe(60);
@@ -294,5 +323,33 @@ describe("localEnv — backend-aware child env (backend-*)", () => {
   it("undefined backend leaves the pod env's backend as-is (back-compat)", () => {
     const e = localEnv({ ...base, CLAUDE_CODE_USE_BEDROCK: "1" } as NodeJS.ProcessEnv);
     expect(e.CLAUDE_CODE_USE_BEDROCK).toBe("1");
+  });
+});
+
+describe("tonoman, the only command (Tonoman Cloud docs/definition/objects/cli.md)", () => {
+  const cli = { binDir: "/srv/tonoman/bin", env: { TONOMAN_BRAIN_URL: "http://127.0.0.1:9", TONOMAN_BRAIN_TOKEN: "t" } };
+
+  it("CLI-ONLY-THIS-COMMAND a turn with tonoman runs with permissions on, allowing the shell only for tonoman", () => {
+    const args = new Runner({ container: "cody", disallowedTools: ["Bash", "Write", "Edit"] }).podmanArgs({ prompt: "hi", cli } as never);
+    expect(args).not.toContain("--dangerously-skip-permissions");
+    expect(flagValue(args, "--permission-mode")).toBe("default");
+    expect(flagValue(args, "--allowedTools")!.split(",")).toEqual(["Bash(tonoman:*)", "WebSearch"]);
+    const deny = flagValue(args, "--disallowedTools")!.split(",");
+    expect(deny).not.toContain("Bash");
+    expect(deny).toEqual(expect.arrayContaining(["Write", "Edit", ...FILE_DENY_RULES]));
+    expect(args).not.toContain("--mcp-config");
+  });
+
+  it("CLI-CLOSED-WHATEVER-FAILS a turn that was given no tonoman (the brain service is down) has no shell at all, whatever the deny list says", () => {
+    const args = new Runner({ container: "cody", closedShell: true, disallowedTools: ["Write"] }).podmanArgs(req);
+    expect(flagValue(args, "--disallowedTools")!.split(",")).toContain("Bash");
+  });
+
+  it("CLI-SHELL-SETTING an agent set to a full shell has it; nobody else does", () => {
+    const full = new Runner({ container: "cody", closedShell: true, disallowedTools: ["Bash", "Write"] }).podmanArgs({ ...req, cli, shell: "full" } as never);
+    expect(full).toContain("--dangerously-skip-permissions");
+    expect(flagValue(full, "--disallowedTools")!.split(",")).not.toContain("Bash");
+    const unset = new Runner({ container: "cody", closedShell: true, disallowedTools: ["Bash", "Write"] }).podmanArgs({ ...req, cli } as never);
+    expect(unset).not.toContain("--dangerously-skip-permissions");
   });
 });

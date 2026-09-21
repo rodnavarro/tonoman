@@ -11,7 +11,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { Server } from "node:http";
 import { serveRuntime } from "./server";
-import { httpAuthOps } from "../authflow";
+import { httpAuthOps, transportFailure } from "../authflow";
 
 const TOKEN = "test-token";
 const URL_IN_LOGIN = "https://claude.com/cai/oauth/authorize?code=true&client_id=abc&state=xyz";
@@ -89,7 +89,7 @@ const ops = (): ReturnType<typeof httpAuthOps> => httpAuthOps(base, TOKEN);
 
 describe("roster-auth-remote — headless login over the agent's own HTTP runtime", () => {
   it("URL out, code in: the operator gets the OAuth URL and the code completes the login", async () => {
-    const url = await ops().startHeadless();
+    const { url } = await ops().startHeadless();
     expect(url).toBe(URL_IN_LOGIN);
 
     // the credential does not exist until the code lands — the login is genuinely pending
@@ -132,7 +132,111 @@ describe("roster-auth-remote — headless login over the agent's own HTTP runtim
 
   it("a second login supersedes a pending one (the stale PKCE verifier is dead anyway)", async () => {
     await ops().startHeadless();
-    const url = await ops().startHeadless(); // must not hang or 409
+    const { url } = await ops().startHeadless(); // must not hang or 409
     expect(url).toBe(URL_IN_LOGIN);
+  });
+
+  // A runtime that is NOT THERE is the failure a person actually meets: the sidecar is down, or
+  // the worker is running somewhere the sidecar isn't. It reached Slack as "fetch failed".
+  it("names the address and the reason when the runtime cannot be reached", async () => {
+    // A real connection attempt to a port nothing is listening on - not a mock, and not one of
+    // undici's BLOCKED ports (1, 7, 9, 11 ...), which fail with "bad port" before any connect.
+    await expect(httpAuthOps("http://127.0.0.1:49999", TOKEN).startHeadless()).rejects.toThrow(
+      /couldn't reach the agent runtime at http:\/\/127\.0\.0\.1:49999 \((ECONNREFUSED|ECONNRESET)\)/,
+    );
+  });
+});
+
+describe("a login whose account state lands after its credential", () => {
+  // The real CLI writes `.credentials.json` first and what `auth status` reads a moment later. A
+  // single check 4.5s in reported `loggedIn: false` for two logins that had worked.
+  let slowDir: string;
+  let slowServer: Server;
+  let slowBase: string;
+
+  beforeAll(async () => {
+    slowDir = sh(await fs.mkdtemp(path.join(os.tmpdir(), "tonoman-authslow-")));
+    const cred = sh(path.join(slowDir, ".credentials.json"));
+    const ready = sh(path.join(slowDir, "account-ready"));
+    const login = sh(path.join(slowDir, "login.sh"));
+    const status = sh(path.join(slowDir, "status.sh"));
+    await fs.writeFile(
+      login,
+      `#!/bin/sh
+echo "${URL_IN_LOGIN}"
+read code
+printf '%s' '{"claudeAiOauth":{"accessToken":"fake"}}' > "${cred}"
+sleep 1
+touch "${ready}"
+echo "Login successful."
+`,
+      { mode: 0o755 },
+    );
+    await fs.writeFile(
+      status,
+      `#!/bin/sh
+if [ -f "${ready}" ]; then echo '{"loggedIn": true}'; else echo '{"loggedIn": false}'; fi
+`,
+      { mode: 0o755 },
+    );
+    slowServer = serveRuntime({
+      port: 0,
+      token: TOKEN,
+      credFile: cred,
+      loginArgs: ["sh", login],
+      statusArgs: ["sh", status],
+      authLog: sh(path.join(slowDir, "auth.log")),
+      authSettleMs: 8000,
+      ptyArgv: (cmd, log) => ["sh", "-c", `${cmd} > ${log} 2>&1`],
+    });
+    await new Promise((r) => slowServer.once("listening", r));
+    const addr = slowServer.address();
+    slowBase = `http://127.0.0.1:${typeof addr === "object" && addr ? addr.port : 0}`;
+  });
+
+  afterAll(async () => {
+    slowServer.close();
+    await fs.rm(slowDir, { recursive: true, force: true });
+  });
+
+  it("waits for status to agree instead of reporting a working login as failed", async () => {
+    const auth = httpAuthOps(slowBase, TOKEN);
+    await auth.startHeadless();
+    const r = await auth.submitCode(GOOD_CODE);
+    expect(r.ok).toBe(true);
+    expect(r.status).toContain('"loggedIn": true');
+  }, 15_000);
+});
+
+describe("transportFailure", () => {
+  it("digs the code out of a bare fetch failure", () => {
+    const e = Object.assign(new TypeError("fetch failed"), {
+      cause: Object.assign(new Error("connect ECONNREFUSED"), { code: "ECONNREFUSED" }),
+    });
+    expect(transportFailure(e, "http://host:8080")).toBe(
+      "couldn't reach the agent runtime at http://host:8080 (ECONNREFUSED)",
+    );
+  });
+
+  it("digs it out of an AggregateError, whose own code is undefined", () => {
+    // Node tries every resolved address - IPv6 first - and reports the set. Reading `cause.code`
+    // alone would have produced "(undefined)", which is worse than the message it replaced.
+    const agg = Object.assign(new AggregateError([], "all attempts failed"), {
+      errors: [Object.assign(new Error("connect ECONNREFUSED ::1:8080"), { code: "ECONNREFUSED" })],
+    });
+    const e = Object.assign(new TypeError("fetch failed"), { cause: agg });
+    expect(transportFailure(e, "http://host:8080")).toMatch(/\(ECONNREFUSED\)$/);
+  });
+
+  it("prefers the innermost message over the wrapper's own, when there is no code", () => {
+    // undici rejects a reserved port before it ever connects, and says so only on the cause.
+    const e = Object.assign(new TypeError("fetch failed"), { cause: new Error("bad port") });
+    expect(transportFailure(e, "http://host:1")).toBe("couldn't reach the agent runtime at http://host:1 (bad port)");
+  });
+
+  it("falls back to the wrapper rather than saying undefined", () => {
+    expect(transportFailure(new TypeError("fetch failed"), "http://host:8080")).toBe(
+      "couldn't reach the agent runtime at http://host:8080 (fetch failed)",
+    );
   });
 });
