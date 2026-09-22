@@ -216,3 +216,13 @@ export function describe(v: VoiceSettings): string {
     : "Meetings/ (no routing)";
   return `announcing in ${where}; filing under ${filing}; every ${v.pollSeconds}s`;
 }
+
+/** The names to spell right for THIS agent (TENANT-VOCABULARY-IS-THE-TENANTS). An agent served from
+ *  the registry (it has a guid) uses its tenant's list and nothing else — an empty list is "none",
+ *  never "use the worker's own": one worker serves several tenants, and a shared hint would spell
+ *  one customer's names into another's meetings. Only a file roster, which has no registry to ask,
+ *  takes a list from the worker's environment; and the open-source default is none. */
+export function vocabularyFor(cfg: { guid?: string; vocabulary?: string }, env: { GROQ_PROMPT?: string } = process.env): string {
+  if (cfg.guid) return (cfg.vocabulary ?? "").trim();
+  return (env.GROQ_PROMPT ?? "").trim();
+}

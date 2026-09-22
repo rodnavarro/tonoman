@@ -65,7 +65,7 @@ import type { Audience } from "../brains/delivery";
 import * as recapFloor from "./recap";
 import { recordingKey } from "./recordingkey";
 import { withAuthRaceRetry } from "./authrace";
-import { describe as describeVoice, voiceSettings } from "./flowcfg";
+import { describe as describeVoice, voiceSettings, vocabularyFor } from "./flowcfg";
 import * as flowcfg from "./flowcfg";
 import * as inference from "./inference";
 import * as calendar from "./calendar";
@@ -1419,9 +1419,7 @@ export async function run(
       // The Talent this voice flow runs — its name and pinned version, recorded onto every run.
       talent: voiceSkill ? { name: voiceSkill.name, version: voiceSkill.version } : undefined,
       floorMs,
-      vocab:
-        process.env.GROQ_PROMPT ??
-        "Tonoman, Tonoman Cloud, Plaud, agentic AI, Slack, Temporal.",
+      vocab: vocabularyFor(a.cfg),
     });
     console.log(
       // A connected account IS a credential, so the line must not still read "waiting for a login"
