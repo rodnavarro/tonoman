@@ -36,6 +36,7 @@ import * as plaudgate from "./plaudgate";
 import * as icsgate from "./icsgate";
 import * as lorealistargate from "./lorealistargate";
 import { channelResolver } from "./channelsay";
+import { isPoolCredential, startHeartbeat } from "./heartbeat";
 import { cloudDropStore, dropWatcher, memoryDropStore } from "./lorealistar";
 import { siteOver } from "../lorealistar/watch";
 import { dropWatch, dropEveryMinutes, dropChannel } from "./talents/drop-watch";
@@ -2470,6 +2471,11 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
   });
   const serving = worker.run();
   console.log(`worker: tonoman ${process.env.TONOMAN_VERSION || "dev"} serving ${o.taskQueue} on ${o.address}/${o.namespace} — ${wired.size} agent(s)`);
+  // A pool says it is alive every minute, with its release (POOL-HEARTBEATS): only on a pool's own
+  // credential — the platform's fleet holds the platform token and is watched by the cluster.
+  if (isPoolCredential(process.env.TONOMANCLOUD_API_TOKEN) && process.env.TONOMANCLOUD_API_URL) {
+    startHeartbeat({ baseUrl: process.env.TONOMANCLOUD_API_URL, token: process.env.TONOMANCLOUD_API_TOKEN!, version: process.env.TONOMAN_VERSION || "dev" });
+  }
   // The map from the guid keys (what every other log line and workflow id now carries) back to the
   // names a person recognises. Printed once, so a `f89e0934-…` anywhere below can be read.
   for (const [key, a] of wired) {
