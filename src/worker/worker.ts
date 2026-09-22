@@ -36,6 +36,7 @@ import * as plaudgate from "./plaudgate";
 import * as icsgate from "./icsgate";
 import * as lorealistargate from "./lorealistargate";
 import { channelResolver } from "./channelsay";
+import { isPoolCredential, startHeartbeat } from "./heartbeat";
 import { cloudDropStore, dropWatcher, memoryDropStore } from "./lorealistar";
 import { siteOver } from "../lorealistar/watch";
 import { dropWatch, dropEveryMinutes, dropChannel } from "./talents/drop-watch";
@@ -65,7 +66,7 @@ import type { Audience } from "../brains/delivery";
 import * as recapFloor from "./recap";
 import { recordingKey } from "./recordingkey";
 import { withAuthRaceRetry } from "./authrace";
-import { describe as describeVoice, voiceSettings } from "./flowcfg";
+import { describe as describeVoice, voiceSettings, vocabularyFor } from "./flowcfg";
 import * as flowcfg from "./flowcfg";
 import * as inference from "./inference";
 import * as calendar from "./calendar";
@@ -1044,6 +1045,12 @@ export async function registerBuiltinTalents(): Promise<void> {
   const baseUrl = process.env.TONOMANCLOUD_API_URL;
   if (!baseUrl) return; // a self-hosted / file-roster worker has no catalogue to register into
   const token = process.env.TONOMANCLOUD_API_TOKEN ?? "";
+  // The catalogue is the platform's (TALENT-CATALOGUE-FROM-CODE): the platform's own fleet keeps it
+  // current, and a pool — somebody's computer — registers nothing into it (POOL-SEES-ONLY-ITS-OWN).
+  if (isPoolCredential(token)) {
+    console.log("worker: on a pool credential; the Talent catalogue is the platform's to register");
+    return;
+  }
   for (const t of BUILTIN_TALENTS) {
     try {
       const r = await fetch(`${baseUrl}/v1/system/talents/${encodeURIComponent(t.name)}`, {
@@ -1419,9 +1426,7 @@ export async function run(
       // The Talent this voice flow runs — its name and pinned version, recorded onto every run.
       talent: voiceSkill ? { name: voiceSkill.name, version: voiceSkill.version } : undefined,
       floorMs,
-      vocab:
-        process.env.GROQ_PROMPT ??
-        "Tonoman, Tonoman Cloud, Plaud, agentic AI, Slack, Temporal.",
+      vocab: vocabularyFor(a.cfg),
     });
     console.log(
       // A connected account IS a credential, so the line must not still read "waiting for a login"
@@ -2471,7 +2476,12 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
     maxConcurrentActivityTaskExecutions: o.maxConcurrentTurns ?? 2,
   });
   const serving = worker.run();
-  console.log(`worker: serving ${o.taskQueue} on ${o.address}/${o.namespace} — ${wired.size} agent(s)`);
+  console.log(`worker: tonoman ${process.env.TONOMAN_VERSION || "dev"} serving ${o.taskQueue} on ${o.address}/${o.namespace} — ${wired.size} agent(s)`);
+  // A pool says it is alive every minute, with its release (POOL-HEARTBEATS): only on a pool's own
+  // credential — the platform's fleet holds the platform token and is watched by the cluster.
+  if (isPoolCredential(process.env.TONOMANCLOUD_API_TOKEN) && process.env.TONOMANCLOUD_API_URL) {
+    startHeartbeat({ baseUrl: process.env.TONOMANCLOUD_API_URL, token: process.env.TONOMANCLOUD_API_TOKEN!, version: process.env.TONOMAN_VERSION || "dev" });
+  }
   // The map from the guid keys (what every other log line and workflow id now carries) back to the
   // names a person recognises. Printed once, so a `f89e0934-…` anywhere below can be read.
   for (const [key, a] of wired) {
