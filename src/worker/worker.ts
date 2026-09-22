@@ -1045,6 +1045,12 @@ export async function registerBuiltinTalents(): Promise<void> {
   const baseUrl = process.env.TONOMANCLOUD_API_URL;
   if (!baseUrl) return; // a self-hosted / file-roster worker has no catalogue to register into
   const token = process.env.TONOMANCLOUD_API_TOKEN ?? "";
+  // The catalogue is the platform's (TALENT-CATALOGUE-FROM-CODE): the platform's own fleet keeps it
+  // current, and a pool — somebody's computer — registers nothing into it (POOL-SEES-ONLY-ITS-OWN).
+  if (isPoolCredential(token)) {
+    console.log("worker: on a pool credential; the Talent catalogue is the platform's to register");
+    return;
+  }
   for (const t of BUILTIN_TALENTS) {
     try {
       const r = await fetch(`${baseUrl}/v1/system/talents/${encodeURIComponent(t.name)}`, {

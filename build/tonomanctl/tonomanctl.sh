@@ -11,6 +11,9 @@
 # Checks first, changes nothing on a machine that cannot run the agent (POOL-INSTALLER-CHECKS-FIRST).
 # Never updates on its own (POOL-SURVIVES-REBOOT). The pool's credential lives in ~/.tonoman/pool.env,
 # readable by you alone.
+#
+# For a platform on this same machine (a dev stack): TONOMAN_API_URL_INSIDE is what the pod uses to reach
+# the API (host.containers.internal:…), TONOMAN_POD_NETWORK a podman network the pod joins.
 set -euo pipefail
 
 TONOMAN_HOME="${TONOMAN_HOME:-$HOME/.tonoman}"
@@ -77,7 +80,7 @@ enrol() {
   ( umask 077
     cat > "$POOL_ENV" <<EOF
 # Written by tonomanctl enrol. This is your computer's credential to Tonoman Cloud: keep it to yourself.
-TONOMANCLOUD_API_URL=$api
+TONOMANCLOUD_API_URL=${TONOMAN_API_URL_INSIDE:-$api}
 TONOMANCLOUD_API_TOKEN=$credential
 TEMPORAL_ADDRESS=$temporal
 TEMPORAL_NAMESPACE=$namespace
@@ -98,14 +101,16 @@ up() {
   # shellcheck disable=SC1090
   . "$POOL_ENV"
   local image="$IMAGE_REPO:${TONOMAN_RELEASE:-latest}"
-  say "Pulling $image …"
-  "$PODMAN" pull -q "$image" >/dev/null
+  # A release that is already here is used as it is: an update is explicit (`tonomanctl update`), and
+  # a machine that is offline can still come back up.
+  if "$PODMAN" image exists "$image" 2>/dev/null; then say "Using $image (already here)."; else say "Pulling $image …"; "$PODMAN" pull -q "$image" >/dev/null; fi
   if "$PODMAN" pod exists "$POD" 2>/dev/null; then
     say "Stopping the previous pod …"
     "$PODMAN" pod rm -f "$POD" >/dev/null
   fi
   for v in tonoman-claude tonoman-codex tonoman-homes tonoman-state; do "$PODMAN" volume exists "$v" 2>/dev/null || "$PODMAN" volume create "$v" >/dev/null; done
-  "$PODMAN" pod create --name "$POD" >/dev/null
+  # TONOMAN_POD_NETWORK: a podman network to join — a dev stack on this machine; unset for the Cloud.
+  "$PODMAN" pod create --name "$POD" ${TONOMAN_POD_NETWORK:+--network "$TONOMAN_POD_NETWORK"} >/dev/null
   # The auth sidecar: holds the logins, answers the worker over the pod's loopback.
   "$PODMAN" run -d --pod "$POD" --name tonoman-auth --init --restart=always \
     -e AGENT_RUNTIME_TOKEN="$AGENT_RUNTIME_TOKEN" -e CLAUDE_CONFIG_ROOT=/root/.claude -e CODEX_HOME=/root/.codex -e TONOMAN_TURN_USERS=on \

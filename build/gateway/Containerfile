@@ -71,6 +71,10 @@ COPY package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 
 COPY --from=build /src/dist /opt/tonoman/dist
+# What a turn runs it may read and must not change (TURNUSER-CANNOT-REACH). A context built on
+# Windows can carry world-writable modes; the worker refuses to start turns as their own users while
+# any of this is open, so close it here, once, whatever the build machine did.
+RUN chmod -R go-w /opt/tonoman
 
 WORKDIR /opt/tonoman
 CMD ["node", "/opt/tonoman/dist/cli.js", "runtime"]
