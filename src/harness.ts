@@ -20,6 +20,38 @@ export interface TelemetrySpec {
   register(ctx: { configDir: string; cliPath: string; sink: Sink }): Promise<void> | void;
 }
 
+/** WHICH provider answers an agent's turns, as the roster names it. The registry's word; the
+ * worker translates it into a harness. */
+export type InferenceProvider = "claude" | "codex";
+
+/** The harness kind that provider runs on — the word that travels on the wire to the agent
+ * runtime (`harness` in a /turn body, `?harness=` on the /auth endpoints). */
+export type HarnessKind = "claude-code" | "codex";
+
+/** PURE: provider → harness. Anything that is not codex is claude, so an unset field, an older
+ * roster, and a value nobody recognises all keep answering the way they did before. */
+export function harnessForProvider(p: string | null | undefined): HarnessKind {
+  return p === "codex" ? "codex" : "claude-code";
+}
+
+/** PURE: harness → provider, the same rule read the other way. */
+export function providerForHarness(h: string | null | undefined): InferenceProvider {
+  return h === "codex" ? "codex" : "claude";
+}
+
+/** How a provider is NAMED to a person: the word in "Connect your ___ subscription". The gate
+ * used to say "Claude" unconditionally, which on a codex agent sent people to sign in to the
+ * wrong account entirely. */
+export function providerLabel(p: string | null | undefined): string {
+  return p === "codex" ? "Codex" : "Claude";
+}
+
+/** The subscription a provider's login actually signs into — a Codex login is a ChatGPT account,
+ * which is not something a person can be expected to infer from the word "Codex". */
+export function providerAccountLabel(p: string | null | undefined): string {
+  return p === "codex" ? "ChatGPT subscription (Codex)" : "Claude subscription";
+}
+
 /** Per-agent inputs a harness needs to build its turn-runner. */
 export interface RunnerParams {
   container: string;
@@ -31,6 +63,22 @@ export interface RunnerParams {
   /** initial auth backend (backend-*): "subscription" | "bedrock". The gateway's backend knob
    * flips it live thereafter. */
   backend?: "subscription" | "bedrock";
+  /** Harness-specific tool names to drop from every turn. Harness-specific by nature — Claude
+   *  Code's taxonomy is not Codex's — so a harness that does not understand a name ignores it. */
+  disallowedTools?: string[];
+  /** Tonoman Cloud's floor (CLI-CLOSED-WHATEVER-FAILS): every turn of this runner has its shell closed
+   *  — `tonoman` only when it has `tonoman`, nothing otherwise — unless the turn says `shell: "full"`.
+   *  A self-hosted agent, which codes in a container of its own, leaves it unset. */
+  closedShell?: boolean;
+  /** Which agent this runner serves, when one process serves several. Decides whose Claude
+   *  subscription the turn runs on — a subscription belongs to a person, and a pool that shares
+   *  one login has every agent answering on whoever authenticated most recently. */
+  agent?: string;
+  /** Which PROVIDER this agent answers on, as a harness kind. Carried by a runner that drives a
+   *  REMOTE runtime (claude-code-http): the runtime holds both CLIs and both credentials, so the
+   *  turn has to say which one it means or it runs on the pod's env default — the wrong account
+   *  and the wrong bill. A local runner already IS the right harness and ignores it. */
+  harness?: HarnessKind;
 }
 
 /** Inputs for an EPHEMERAL turn-runner (gw-command-btw): a throwaway sandbox spun from

@@ -11,6 +11,7 @@ import {
   renderStatus,
   fetchRemoteAccountUsage,
   remoteAccountUsageCached,
+  usageLoginOf,
 } from "./statusline";
 import type { TurnUsage } from "./core/contracts";
 
@@ -78,7 +79,9 @@ describe("statusline pure helpers (gw-command-statusline)", () => {
       { key: "7d", usedPct: 19, resetAt: "2026-06-23T03:00:00Z" },
     ];
     const line = renderSmall(U, "sonnet", w, now);
-    expect(line).toContain("📊");
+    // No icon, and no orphaned separator where it used to be.
+    expect(line).not.toContain("📊");
+    expect(line.startsWith("sonnet")).toBe(true);
     expect(line).toContain("sonnet"); // model shown (falls back to the passed model)
     expect(line).toContain("21.1k tok");
     expect(line).toContain("ctx 11%");
@@ -127,7 +130,7 @@ describe("statusline pure helpers (gw-command-statusline)", () => {
   it("renderStatus: none → null, small/full → text; null usage → null", () => {
     expect(renderStatus("none", U, "sonnet", [], 0)).toBeNull();
     expect(renderStatus("small", undefined, "sonnet", [], 0)).toBeNull();
-    expect(renderStatus("small", U, "sonnet", [], 0)).toContain("📊");
+    expect(renderStatus("small", U, "sonnet", [], 0)).toContain("sonnet");
     expect(renderStatus("full", U, "sonnet", [], 0)).toContain("Usage — this turn");
   });
 });
@@ -170,5 +173,45 @@ describe("remote account usage over the k8s split (gw-command-statusline)", () =
     const c = await remoteAccountUsageCached(key, "http://agent:8080", "t", 1000, 3_000); // past TTL
     expect(calls).toBe(2);
     expect(c[0].usedPct).toBe(2);
+  });
+});
+
+describe("whose allowance the footer shows (CONVO-FOOTER-BOTH-PROVIDERS)", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("CONVO-FOOTER-BOTH-PROVIDERS: on a per-person agent the allowance is the speaker's own login, not the agent's", () => {
+    expect(usageLoginOf("7a93", "per_user", "U0PRIYA")).toEqual({ key: "agent:7a93:user:U0PRIYA", user: "U0PRIYA" });
+    // Two people on one agent are two subscriptions: one must never be served the other's cached numbers.
+    expect(usageLoginOf("7a93", "per_user", "U0ROD").key).not.toBe(usageLoginOf("7a93", "per_user", "U0PRIYA").key);
+  });
+
+  it("CONVO-FOOTER-BOTH-PROVIDERS: a shared agent has one login whoever speaks, and a per-person agent with no speaker falls to the agent's", () => {
+    expect(usageLoginOf("3566", "shared", "U0ROD")).toEqual({ key: "agent:3566", user: undefined });
+    expect(usageLoginOf("3566", undefined, "U0ROD")).toEqual({ key: "agent:3566", user: undefined });
+    expect(usageLoginOf("7a93", "per_user", undefined)).toEqual({ key: "agent:7a93", user: undefined });
+  });
+
+  it("CONVO-FOOTER-BOTH-PROVIDERS: the runtime is told WHOSE login to read, or it reads the agent's unused one and the footer shows none", async () => {
+    let seen = "";
+    vi.stubGlobal("fetch", async (url: string) => {
+      seen = url;
+      return { ok: true, json: async () => ({ windows: [{ key: "5h", usedPct: 14 }] }) };
+    });
+    const w = await fetchRemoteAccountUsage("http://127.0.0.1:8080", "t", "7a93", undefined, "U0 PRIYA");
+    expect(seen).toBe("http://127.0.0.1:8080/usage?agent=7a93&user=U0%20PRIYA");
+    expect(w).toEqual([{ key: "5h", usedPct: 14 }]);
+    // With turn users on, the user's uid still travels alongside.
+    await fetchRemoteAccountUsage("http://127.0.0.1:8080", "t", "7a93", { uid: 2001, of: "person", harness: "claude-code" }, "U0PRIYA");
+    expect(seen).toBe("http://127.0.0.1:8080/usage?agent=7a93&uid=2001&of=person&harness=claude-code&user=U0PRIYA");
+  });
+
+  it("CONVO-FOOTER-BOTH-PROVIDERS: the cache passes the speaker on to the fetch", async () => {
+    let seen = "";
+    vi.stubGlobal("fetch", async (url: string) => {
+      seen = url;
+      return { ok: true, json: async () => ({ windows: [] }) };
+    });
+    await remoteAccountUsageCached("agent:zz:user:U1", "http://a:8080", "t", 1000, 5, "zz", undefined, "U1");
+    expect(seen).toBe("http://a:8080/usage?agent=zz&user=U1");
   });
 });

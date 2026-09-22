@@ -38,3 +38,6 @@ Thumbs.db
 .vscode/
 *.swp
 *~
+
+# Harness test results from the container run (scripts/test-harness-in-container.sh)
+/artifacts/

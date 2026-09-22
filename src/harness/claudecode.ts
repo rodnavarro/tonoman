@@ -11,10 +11,15 @@
 // object split across stdout chunks is never mis-parsed.
 
 import { spawn } from "node:child_process";
+import { promises as fsp } from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import * as readline from "node:readline";
 import type { TurnEvent, TurnRequest, TurnRunner } from "../core/contracts";
 import type { Spec, RunnerParams, EphemeralParams } from "../harness";
 import { registerClaudeHook } from "../telemetry";
+import { FILE_DENY_RULES, runOnly, scrubEnv, withCli, writeMcpConfig } from "./turnenv";
+import { commandFor, ownGroup, runBegan, stopAll } from "./launch";
 
 /** The harness key used in agent config. */
 export const KIND = "claude-code";
@@ -28,7 +33,101 @@ export const IMAGE = "localhost/tonoman/claudecode:latest";
 
 // Where Claude Code keeps its state inside the sandbox; the per-agent config
 // volume is bind-mounted here so the OAuth credential store persists (A11).
-export const CONFIG_HOME = "/root/.claude";
+/** Where every agent's Claude credential directory lives.
+ *
+ *  `/root/.claude` in the pod, which is where the config volume is mounted. Overridable because the
+ *  worker is not always in that pod: running it on a workstation to iterate (architecture.md §11)
+ *  needs somewhere writable that is not the machine's own Claude login — mixing those would have a
+ *  developer's personal subscription answering as a customer's agent. */
+export const CONFIG_HOME = process.env.CLAUDE_CONFIG_ROOT || "/root/.claude";
+
+/** One agent's Claude credential directory, under the shared config volume.
+ *
+ *  A subscription belongs to a PERSON, and one worker pod runs every agent a deployment has. With
+ *  a single CLAUDE_CONFIG_DIR they all shared one login: the second person to sign in replaced the
+ *  first, and every agent then answered — and billed — on whoever had authenticated most recently.
+ *  Priya's assistant must run on Priya's subscription and Rod's on Rod's, and where that is true
+ *  is here.
+ *
+ *  The name is sanitised because it arrives over the wire on the login endpoints. Anything that is
+ *  not a plain name would let a caller choose a path, and this path is where credentials live. */
+export function configHomeFor(
+  agent: string | undefined,
+  user?: string,
+  root: string = CONFIG_HOME,
+): string {
+  // No agent named at all: a self-hosted roster with one login, which should not grow a directory
+  // level for a distinction it does not have.
+  if (!agent) return root;
+  const safe = agent.replace(/[^A-Za-z0-9_-]/g, "");
+  // A name that was GIVEN but sanitises away is not the same thing as no name. Falling back to the
+  // shared home there would hand the pool's credential to whatever nonsense was supplied — so it
+  // gets a directory of its own that is nobody's and works for nothing.
+  const agentHome = `${root}/agents/${safe || "_invalid"}`;
+  // No user: the agent's ONE shared login — every agent today, and the default. A user names a
+  // PER-PERSON login under that agent, so each teammate answers on their own subscription. Same
+  // sanitisation and same "given-but-empty gets its own nowhere dir" rule, because the user id
+  // also arrives over the wire (a Slack user id on the connect endpoints and in a turn).
+  if (!user) return agentHome;
+  const safeUser = user.replace(/[^A-Za-z0-9_-]/g, "");
+  return `${agentHome}/users/${safeUser || "_invalid"}`;
+}
+
+/** Make a per-person login share its AGENT's conversation history.
+ *
+ *  Claude Code keeps a session's transcript under `<CLAUDE_CONFIG_DIR>/projects`, so with per-person
+ *  logins each person's turns resumed only the sessions THEY had started. A thread two people talk
+ *  in has one session id, and whoever did not start it failed to resume — the worker then started a
+ *  fresh session and the agent forgot the thread, back and forth between them. The conversation is
+ *  the agent's; only the subscription paying for a turn is the person's.
+ *
+ *  So a person's `projects` is a symlink to the agent's. A person who already has transcripts has
+ *  them moved in first; anything whose name is already taken at the agent level is kept aside as
+ *  `projects.unshared-<time>`, never deleted. Idempotent and cheap: one lstat once shared.
+ *  A home that is not `<agent>/users/<user>` is left alone. */
+export async function shareConversationHistory(userHome: string): Promise<void> {
+  if (path.basename(path.dirname(userHome)) !== "users") return;
+  const agentProjects = path.join(path.dirname(path.dirname(userHome)), "projects");
+  const userProjects = path.join(userHome, "projects");
+  const st = await fsp.lstat(userProjects).catch(() => undefined);
+  if (st?.isSymbolicLink()) return;
+  await fsp.mkdir(agentProjects, { recursive: true });
+  if (st?.isDirectory()) {
+    await moveMissing(userProjects, agentProjects);
+    const left = await fsp.readdir(userProjects);
+    if (left.length) await fsp.rename(userProjects, `${userProjects}.unshared-${Date.now()}`);
+    else await fsp.rmdir(userProjects);
+  }
+  await fsp.mkdir(userHome, { recursive: true });
+  // Relative on Linux (the pod), so the link holds wherever the volume is mounted. Windows cannot
+  // create a directory symlink without privileges, so it gets a junction, which must be absolute.
+  const link =
+    process.platform === "win32"
+      ? fsp.symlink(agentProjects, userProjects, "junction")
+      : fsp.symlink(path.join("..", "..", "projects"), userProjects, "dir");
+  await link.catch((e: NodeJS.ErrnoException) => {
+    // Two turns for the same person can race here; the other one already made it.
+    if (e.code !== "EEXIST") throw e;
+  });
+}
+
+/** Move every entry of `from` into `to` that `to` does not already have, merging directories. */
+async function moveMissing(from: string, to: string): Promise<void> {
+  for (const name of await fsp.readdir(from)) {
+    const src = path.join(from, name);
+    const dst = path.join(to, name);
+    const there = await fsp.lstat(dst).catch(() => undefined);
+    if (!there) {
+      await fsp.rename(src, dst);
+      continue;
+    }
+    const here = await fsp.lstat(src);
+    if (here.isDirectory() && there.isDirectory()) {
+      await moveMissing(src, dst);
+      if ((await fsp.readdir(src)).length === 0) await fsp.rmdir(src);
+    }
+  }
+}
 
 /** Where the per-agent identity dir (AGENTS.md/persona) bind-mounts READ-ONLY; the
  * turn-runner injects it via --append-system-prompt-file <identity>/AGENTS.md (A2). */
@@ -46,8 +145,17 @@ export interface RunnerOptions {
   // OWN tool taxonomy + its own knob, so this deliberately lives on the claude-code harness, not in
   // the harness-neutral roster. (`--allowedTools` is NOT used: it keeps schemas and ADDS guidance.)
   disallowedTools?: string[];
+  /** Where THIS runner's Claude credential lives. Defaults to the shared home, which is right for
+   *  a self-hosted roster with one login; a multi-tenant pool passes one per agent. */
+  configHome?: string;
   extraArgs?: string[]; // MUST NOT include --bare or --resume
-  settingSources?: string; // default "user" (discovers the preset skill, A2)
+  settingSources?: string;
+  /** Let the account's own MCP configuration through — claude.ai connectors included.
+   *
+   *  Off by default and it should stay off for anything serving a tenant: those connectors belong
+   *  to the account holding the credential, not to the customer. Present so a single-tenant or
+   *  developer deployment can opt back in deliberately rather than by forgetting. */
+  allowAmbientMcp?: boolean; // default "user" (discovers the preset skill, A2)
   // Ephemeral mode (gw-command-btw): instead of `podman exec <container>`, run a throwaway
   // `podman run --rm --volumes-from <caller>` sandbox from the harness image and tear it
   // down after the turn. Inherits the caller's mounts (shared credential, identity, skills).
@@ -57,6 +165,8 @@ export interface RunnerOptions {
   // boundary. Used by the agent runtime server (src/agent/server.ts); the gateway reaches it
   // over HTTP (src/harness/httpRunner.ts), never by exec. `container` is not required here.
   local?: boolean;
+  /** Tonoman Cloud's floor: the shell is closed unless the turn says `shell: "full"` (see RunnerParams). */
+  closedShell?: boolean;
   // Auth backend for THIS turn (backend-*): "bedrock" runs on AWS Bedrock (sets
   // CLAUDE_CODE_USE_BEDROCK; region/model come from the pod env), "subscription" runs on the
   // Claude OAuth credential (bedrock flags cleared). Only meaningful for local-exec (the pod
@@ -75,8 +185,12 @@ export type BackendMode = "subscription" | "bedrock";
  *  - "subscription": clear CLAUDE_CODE_USE_BEDROCK / CLAUDE_CODE_USE_MANTLE / ANTHROPIC_MODEL so the
  *    OAuth credential resolves and no Bedrock model id leaks onto the subscription path.
  *  - undefined: leave whatever backend the pod env declares (back-compat). */
-export function localEnv(base: NodeJS.ProcessEnv, backend?: BackendMode): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { ...base, IS_SANDBOX: "1", CLAUDE_CONFIG_DIR: CONFIG_HOME };
+export function localEnv(
+  base: NodeJS.ProcessEnv,
+  backend?: BackendMode,
+  configHome: string = CONFIG_HOME,
+): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...base, IS_SANDBOX: "1", CLAUDE_CONFIG_DIR: configHome };
   delete env.ANTHROPIC_API_KEY;
   if (backend === "bedrock") {
     env.CLAUDE_CODE_USE_BEDROCK = "1";
@@ -86,6 +200,12 @@ export function localEnv(base: NodeJS.ProcessEnv, backend?: BackendMode): NodeJS
     delete env.ANTHROPIC_MODEL;
   }
   return env;
+}
+
+/** PURE: this turn's shell runs `tonoman` and nothing else — it has `tonoman`, and its agent is not
+ *  set to a full shell. A lean turn has no tools, so no shell to speak of. */
+function tonomanOnly(req: TurnRequest): boolean {
+  return !req.lean && !!req.cli && req.shell !== "full";
 }
 
 export class Runner implements TurnRunner {
@@ -124,19 +244,66 @@ export class Runner implements TurnRunner {
       "--verbose",
       "--setting-sources",
       this.o.settingSources ?? "user",
-      "--dangerously-skip-permissions",
+      // With `tonoman` the shell is on, and Claude Code itself refuses every command but `tonoman`
+      // before it runs — compound commands and substitutions included (CLI-ONLY-THIS-COMMAND). That
+      // needs permissions ON: headless, anything not allowed is refused, never asked. A turn that
+      // lost `tonoman` has no shell at all (below); only an agent set to a full shell runs unasked.
+      ...(tonomanOnly(req) ? ["--permission-mode", "default", "--allowedTools", "Bash(tonoman:*),WebSearch"] : ["--dangerously-skip-permissions"]),
+      // NO MCP SERVER THIS AGENT WAS NOT EXPLICITLY GIVEN.
+      //
+      // `--setting-sources user` reads the account's own configuration, and on a claude.ai
+      // subscription that includes its CONNECTORS — Google Calendar, Gmail, Microsoft 365. They
+      // arrive as tools, so an agent serving a customer silently gains tools bound to whichever
+      // account holds its credential. That is one person's account answering on another's behalf,
+      // which is the single thing this platform exists to make impossible.
+      //
+      // It also made capability nondeterministic: the same agent reported 22 tools on one turn and
+      // 33 on the next, so what it could do changed between messages for reasons nothing recorded.
+      //
+      // And it produced a confidently wrong answer. Asked about calendars, the agent said Google
+      // Calendar "needs to be authorized via claude.ai connector settings" — true of the connector
+      // it could see, and nothing to do with the three Google calendars the TENANT had connected.
+      //
+      // `--strict-mcp-config` with no `--mcp-config` means none. A tenant that genuinely needs an
+      // MCP server gets it passed here, from the registry, per agent — which is the only way it can
+      // belong to the tenant rather than to whoever logged in.
+      ...(this.o.allowAmbientMcp ? [] : ["--strict-mcp-config"]),
     ];
-    // Drop tools this agent never uses, so their schemas leave the context floor (claude-code-only).
-    if (this.o.disallowedTools && this.o.disallowedTools.length) {
-      args.push("--disallowedTools", this.o.disallowedTools.join(","));
+    // A LEAN turn (Talent `infer`) has NO tools: `--tools ""` offers none, whatever the CLI adds
+    // next. It was a hand-kept denylist, and the CLI grew tools the list did not name — with a
+    // one-turn cap, a single stray `ToolSearch` call spent the turn and the recap came back empty,
+    // six times on one meeting. Connectors are already out (strict-mcp).
+    if (req.lean) {
+      args.push("--tools", "");
+    } else {
+      // Drop tools this agent never uses, so their schemas leave the context floor (claude-code-only),
+      // and ALWAYS keep the file tools out of brains, credentials and other people's histories —
+      // added on top of the configurable list, so no environment setting can take them away.
+      // The shell: open to `tonoman` alone, open in full for an agent set so, and otherwise shut —
+      // whatever the configurable list says (CLI-CLOSED-WHATEVER-FAILS).
+      // A self-hosted runner (no `closedShell`) keeps what its own list says.
+      const shellOpen = tonomanOnly(req) || req.shell === "full";
+      const listed = this.o.disallowedTools ?? [];
+      const deny = this.o.closedShell
+        ? [...(shellOpen ? [] : ["Bash"]), ...listed.filter((t) => t !== "Bash"), ...FILE_DENY_RULES]
+        : [...listed.filter((t) => !(shellOpen && t === "Bash")), ...FILE_DENY_RULES];
+      args.push("--disallowedTools", deny.join(","));
     }
+    // The turn's MCP servers (the brain tool), from a file in its own folder. `--strict-mcp-config`
+    // above still keeps every server the account happens to have out.
+    if (!req.lean && req.mcpConfigFile) args.push("--mcp-config", req.mcpConfigFile);
     if (req.systemPromptFile) args.push("--append-system-prompt-file", req.systemPromptFile);
-    if (this.model) args.push("--model", this.model); // mutable: /model switches it per turn
+    // Per-TURN model first, then the process-wide knob. The knob is right for a single-agent
+    // gateway and wrong for a worker serving many conversations at once.
+    const model = req.model ?? this.model;
+    if (model) args.push("--model", model);
     // Cap the internal agentic tool-loop so one open-ended turn (e.g. a research rabbit hole)
     // can't loop unbounded and drain the account's usage window. Hitting the cap exits with an
     // error result (subtype "error_max_turns") — parseLine treats that as DONE so the partial
     // answer still lands rather than surfacing as a failure.
-    if (this.o.maxTurns && this.o.maxTurns > 0) args.push("--max-turns", String(this.o.maxTurns));
+    // A lean inference turn is ONE turn — a completion, not an agentic loop.
+    const maxTurns = req.lean ? 1 : this.o.maxTurns ?? 0;
+    if (maxTurns > 0) args.push("--max-turns", String(maxTurns));
     // Session mode (opt-in, session-persist agents): resume the harness's OWN session so the
     // conversation history is cached across turns instead of re-sent on stdin every turn — only
     // the new message rides in req.prompt. First turn CREATES it (--session-id); later turns
@@ -176,16 +343,66 @@ export class Runner implements TurnRunner {
     return this.claudeTail(req);
   }
 
+  /** One turn. However the caller stops listening — to the end, on an error it was handed, or by
+   *  simply walking away — the program does not outlive it (TURNUSER-DIES-WITH-THE-TURN): a caller
+   *  that abandons the stream takes its cancel signal with it, and nothing else would stop the program. */
   async *run(req: TurnRequest, signal?: AbortSignal): AsyncIterable<TurnEvent> {
+    let born: { child: { pid?: number; exitCode: number | null; signalCode: NodeJS.Signals | null; kill(s?: NodeJS.Signals): boolean }; grouped: boolean } | undefined;
+    try {
+      yield* this.running(req, signal, (child, grouped) => void (born = { child, grouped }));
+    } finally {
+      if (born && born.child.exitCode === null && born.child.signalCode === null) stopAll(born.child, born.grouped);
+    }
+  }
+
+  private async *running(req: TurnRequest, signal: AbortSignal | undefined, born: (child: import("node:child_process").ChildProcess, grouped: boolean) => void): AsyncIterable<TurnEvent> {
     const bin = this.o.bin ?? "claude";
     // Local-exec (k8s): spawn `claude` directly, setting the sandbox env the podman `-e` flags
     // used to inject. Explicitly drop ANTHROPIC_API_KEY so it can never outrank the OAuth cred.
     // Otherwise: `podman exec` (or ephemeral `podman run`) into the agent container.
     let child;
+    // Reserved before it starts and released exactly once — on a start that failed as on an exit —
+    // so a user's last run ending is always noticed (TURNUSER-DIES-WITH-THE-TURN).
+    let release: () => void = () => {};
     if (this.o.local) {
       // Backend-aware env (backend-*): bedrock sets CLAUDE_CODE_USE_BEDROCK, subscription clears it.
-      const env = localEnv(process.env, this.o.backend);
-      child = spawn(bin, this.localArgs(req), { windowsHide: true, env });
+      // `req.configHome` overrides the runner's per-agent default for THIS turn only — set when the
+      // agent runs inference per person, so the speaker's own login answers. Unset (every agent
+      // today) keeps the one shared per-agent login.
+      // The worker's secrets never reach a turn (AWS stays for a Bedrock backend, which needs it).
+      const base = localEnv(
+        scrubEnv(process.env, (k) => this.o.backend === "bedrock" && k.startsWith("AWS_")),
+        this.o.backend,
+        req.configHome ?? this.o.configHome ?? CONFIG_HOME,
+      );
+      const env = req.cli && !req.lean ? withCli(base, req.cli) : base;
+      // History is no longer shared between people (D-THREAD-HISTORY): each person's login keeps
+      // its own sessions, so `shareConversationHistory` is not called for a per-person turn.
+      let turnReq = req;
+      // Its configuration would be written by the worker, as root, into a folder that is the turn
+      // user's by now — where a link could turn that write into an overwrite of anything. Tonoman
+      // Cloud gives Claude `tonoman` as a command, not as an MCP server, so this is never needed there.
+      if (req.runAs && !req.lean && req.mcpServers?.length) throw new Error("an MCP server cannot be given to a Claude turn that runs as its own user");
+      if (!req.lean && req.mcpServers?.length) {
+        const mcpConfigFile = await writeMcpConfig(req.cwd ?? path.join(os.tmpdir(), `tonoman-mcp-${process.pid}`), req.mcpServers);
+        turnReq = { ...req, mcpConfigFile };
+      }
+      // As the turn's own Linux user when it has one (TURNUSER-NOTHING-AS-ROOT), never as the worker;
+      // and what this run is given — its login's folder, the turn's own `tonoman` credential — is
+      // handed over by name, not picked out of the worker's environment (TURNUSER-ONLY-WHAT-IT-NEEDS).
+      // It goes to its folder itself, AFTER it has become the user: the worker does not go there first.
+      const start = commandFor(req.runAs, bin, this.localArgs(turnReq), env, { ...runOnly(env), ...(req.cli && !req.lean ? req.cli.env : {}) }, req.cwd);
+      const hold = await runBegan(req.runAs);
+      release = hold.release;
+      try {
+        child = spawn(start.cmd, start.args, { windowsHide: true, env: start.env, ...(req.cwd && !req.runAs ? { cwd: req.cwd } : {}), ...ownGroup(req.runAs) });
+      } catch (e) {
+        release();
+        throw e;
+      }
+      // A program that never started emits `error` and no `exit`.
+      child.once("error", release);
+      hold.started(child.pid);
     } else {
       const podman = this.o.podman ?? "podman";
       child = spawn(podman, this.podmanArgs(req), { windowsHide: true });
@@ -204,7 +421,16 @@ export class Runner implements TurnRunner {
       if (trace !== "off") process.stderr.write(`[${label}:stderr] ${s}`);
     });
 
-    const onAbort = () => child.kill("SIGTERM");
+    // Everything the turn started stops with it (TURNUSER-DIES-WITH-THE-TURN), not only the program.
+    const grouped = !!ownGroup(req.runAs).detached;
+    const onAbort = () => stopAll(child, grouped);
+    // On `exit`, not `close`: something the program left running can hold its pipes open for ever.
+    // What it left behind is stopped as its user, by descent — not by root signalling a group number
+    // that, now the program has ended, may already be somebody else's.
+    child.once("exit", release);
+    born(child, grouped);
+    // Asked to stop before it had even started.
+    if (signal?.aborted) onAbort();
     signal?.addEventListener("abort", onAbort, { once: true });
 
     // Wait for process exit alongside reading stdout.
@@ -479,7 +705,21 @@ export function spec(): Spec {
     // Keep ALL Claude Code state in the config volume (incl. the sibling ~/.claude.json
     // profile), so a destroy+recreate comes back fully configured (A2/A11).
     runEnv: { CLAUDE_CONFIG_DIR: CONFIG_HOME },
-    newRunner: (p: RunnerParams) => new Runner({ container: p.container, model: p.model, maxTurns: p.maxTurns }),
+    // No container configured means THIS pod is the sandbox (local-exec): `claude` is spawned as a
+    // direct child instead of through `podman exec`. That is what a Tonoman Cloud gateway does —
+    // an agent is a row, so there is no per-agent container to exec into, and the pod boundary is
+    // the isolation the container used to provide. A self-hosted roster still names a container
+    // and still goes through podman, unchanged.
+    newRunner: (p: RunnerParams) =>
+      new Runner({
+        container: p.container,
+        local: !p.container,
+        model: p.model,
+        maxTurns: p.maxTurns,
+        disallowedTools: p.disallowedTools,
+        closedShell: p.closedShell,
+        configHome: configHomeFor(p.agent),
+      }),
     newEphemeralRunner: (p: EphemeralParams) =>
       new Runner({ container: p.volumesFrom, model: p.model, ephemeral: { volumesFrom: p.volumesFrom, image: p.image, env: p.env } }),
     loginArgs: ["claude", "auth", "login", "--claudeai"],

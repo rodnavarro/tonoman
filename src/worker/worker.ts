@@ -1,0 +1,3077 @@
+// `tonoman worker` — the durable runtime.
+//
+// It is the same runtime as `tonoman up`, with Temporal between the message and the turn. The
+// connectors are the same connectors and the harness is the same harness; what changes is that a
+// turn is a workflow, so it survives a restart, it has an identity, and it can be interrupted
+// rather than raced.
+//
+// This lives in Tonoman OSS on purpose. Durable turns and interruption are runtime concerns — an
+// operator running Tonoman on their own machine wants both. Multi-tenancy is what Tonoman Cloud
+// adds, and all it changes here is where the roster came from.
+//
+// One process holds the connectors AND serves the task queue. Socket Mode is a long-lived outbound
+// WebSocket that something has to hold anyway; making that the same process that runs turns removes
+// a hop and a deployment.
+
+import { asUser, homeIn, homeOf, canDrop, openToOthers, fileAsUser, readAsUser, removeAsUser, type TurnUser } from "../harness/launch";
+import { turnUsers } from "../harness/turnusers";
+import { sentFiles } from "./sentfiles";
+import { Client, Connection, ScheduleOverlapPolicy } from "@temporalio/client";
+import type { Duration } from "@temporalio/common";
+import { NativeConnection, Worker } from "@temporalio/worker";
+import { randomUUID } from "node:crypto";
+import * as os from "node:os";
+import * as path from "node:path";
+import type { Config, AgentConfig } from "../config";
+import type { Connector, TurnEvent, TurnRunner, TurnUsage } from "../core/contracts";
+import { SlackConnector } from "../connector/slack";
+import { threadOwners, type ThreadOwners } from "../connector/threadowners";
+import * as cmds from "./commands";
+import * as plaudcli from "./plaudcli";
+import * as claudecode from "../harness/claudecode";
+import * as codexharness from "../harness/codex";
+import * as plaudauth from "./plaudauth";
+import * as tokenstore from "./tokenstore";
+import * as plaudgate from "./plaudgate";
+import * as icsgate from "./icsgate";
+import * as lorealistargate from "./lorealistargate";
+import { channelResolver } from "./channelsay";
+import { cloudDropStore, dropWatcher, memoryDropStore } from "./lorealistar";
+import { siteOver } from "../lorealistar/watch";
+import { dropWatch, dropEveryMinutes, dropChannel } from "./talents/drop-watch";
+import { BUILTIN_TALENTS, getTalent } from "./talents/registry";
+import { meetingRecap } from "./talents/meeting-recap";
+import {
+  parseStatusMode,
+  remoteAccountUsageCached,
+  usageLoginOf,
+  renderStatus,
+  type StatusMode,
+  type UsageWindow,
+} from "../statusline";
+import { httpAuthOps, looksLoggedIn } from "../authflow";
+import * as gate from "./authgate";
+import { threadModels, perAgentConversation } from "./threadmodels";
+import * as secondbrain from "./secondbrain";
+import { brainCredential, makesBrains, type LegacySource } from "../brains/credential";
+import { createStore, type BrainStore, type BrainRef } from "../brains/store";
+import { recoverWrites } from "../brains/recover";
+import { refreshBrain, createRefreshQueue, type RefreshPublish } from "../brains/refresh";
+import type { LlmProvider } from "../secondbrain/wiki-reindex/llm";
+import { createBroker, pickBrain, type Broker, type ConversationRun } from "../brains/broker";
+import { registryClient } from "../brains/registry";
+import { adoProvisioner } from "../brains/ado";
+import type { Audience } from "../brains/delivery";
+import * as recapFloor from "./recap";
+import { recordingKey } from "./recordingkey";
+import { withAuthRaceRetry } from "./authrace";
+import { describe as describeVoice, voiceSettings } from "./flowcfg";
+import * as flowcfg from "./flowcfg";
+import * as inference from "./inference";
+import * as calendar from "./calendar";
+import * as googlecal from "./googlecal";
+import { serialReload } from "./reloadgate";
+import { serveWake } from "./wake";
+import { promises as fsp } from "node:fs";
+import { defaultHarnesses } from "../gateway";
+import { parseMountRef, parseRef, registrySecretPath } from "../core/secretref";
+import { harnessForProvider, providerAccountLabel, providerLabel, type HarnessKind, type InferenceProvider } from "../harness";
+import { accountsFromUsers, makeActivities, type TurnRunReq, type VoiceConfig, type TurnBrains } from "./activities";
+import { startCapabilityPlane, type CapabilityPlane } from "./capability-plane";
+import { agendaTickWorkflow, conversationWorkflow, dropsPollWorkflow, messageSignal, plaudPollWorkflow, runTalentWorkflow, type AgendaTickInput, type DropsPollInput, type Inbound, type PollInput } from "./workflows";
+import { agendaBrief, parseAgendaTimes } from "./talents/agenda-brief";
+import { WorkflowExecutionAlreadyStartedError } from "@temporalio/common";
+import { planReload } from "./reload";
+
+export interface WorkerOptions {
+  address: string;
+  namespace: string;
+  taskQueue: string;
+  maxConcurrentTurns?: number;
+  /** Where the compiled workflows live. Overridable for tests. */
+  workflowsPath?: string;
+}
+
+export function workerOptionsFrom(env: NodeJS.ProcessEnv): WorkerOptions {
+  return {
+    address: env.TEMPORAL_ADDRESS ?? "127.0.0.1:7233",
+    namespace: env.TEMPORAL_NAMESPACE ?? "default",
+    taskQueue: env.TEMPORAL_TASK_QUEUE ?? "tonoman-turns",
+    // One or two turns per worker. Each spawns a claude process; admitting more trades a queue for
+    // OOM kills on a small node, and Temporal already holds the excess safely.
+    maxConcurrentTurns: Number(env.MAX_CONCURRENT_TURNS ?? 2),
+    // Where Temporal loads the workflow code from. It defaults beside this file, which is right in
+    // the image — `dist/worker/workflows.js` sits next to `dist/worker/worker.js`.
+    //
+    // Running from SOURCE it is wrong: the sibling is `workflows.ts`, and Temporal's bundler is
+    // handed a path that does not exist. That failure reads as a Temporal problem rather than as a
+    // path one, so this is an env var rather than something to rediscover.
+    workflowsPath: env.TEMPORAL_WORKFLOWS_PATH || undefined,
+  };
+}
+
+/** Resolve a credential ref. TWO SCHEMES, and which one is in play is the ref's own business:
+ *
+ *   `<secret>:<key>`   a MOUNTED Kubernetes secret — the original contract, unchanged.
+ *   `registry:<ref>`   a row in the registry's `secret` table, fetched over the system-token API
+ *                      and decrypted on the far side, so this worker never holds the key.
+ *
+ *  The second is how a Slack bot token pasted into the Hub reaches a running worker: the API stores
+ *  it encrypted and puts a `registry:…` ref on the channel row. A mounted path cannot serve that —
+ *  a path is a property of the POD, and one pod serves every tenant it has agents for, so a
+ *  self-service token would mean a redeploy and a secret in a cluster manifest.
+ *
+ *  Returns "" when absent, whichever scheme: the caller decides whether that is fatal, and a 404
+ *  (nothing stored yet) reads the same as an unmounted file, which is the honest answer for both.
+ *  A ref comes from a database edited through a web form, so anything that could climb out of the
+ *  mount is still refused rather than read. */
+export async function resolveRef(
+  ref: string | null | undefined,
+  /** The agent the ref belongs to. The registry scheme is scoped per agent — a secret is a
+   *  tenant's, and reading one without saying whose would be the cross-tenant read this whole
+   *  arrangement exists to prevent. A `registry:` ref with no guid resolves to "". */
+  guid?: string,
+  fetchImpl?: typeof fetch,
+): Promise<string> {
+  const p = parseRef(ref);
+  if (!p) return "";
+  if (p.kind === "registry") return registrySecret(guid, p.ref, fetchImpl);
+
+  const m = parseMountRef(p.ref);
+  if (!m) return ""; // refuses anything that could climb out of the mount
+  const dir = process.env.TONOMAN_SECRETS_DIR ?? "/etc/tonoman/secrets";
+  try {
+    return (await fsp.readFile(path.join(dir, m.secret, m.key), "utf8")).trim();
+  } catch {
+    return "";
+  }
+}
+
+const GROQ_V1 = "https://api.groq.com/openai/v1";
+const trimSlash = (u: string): string => u.replace(/[/]+$/, "");
+
+/** The registry's provider rows, with each key ref resolved. The ONLY place a ref becomes a
+ *  credential, which is what lets `providerSpecs` stay pure.
+ *
+ *  A row whose `key_ref` is named but resolves to nothing is DROPPED, not sent unauthenticated. An
+ *  unmounted secret is a deployment fault, and turning it into a 401 from Groq spends an attempt to
+ *  produce a message that blames the wrong thing. */
+async function providersFrom(specs: flowcfg.ProviderSpec[], who: string, guid?: string): Promise<inference.Provider[]> {
+  const out: inference.Provider[] = [];
+  for (const sp of specs) {
+    const apiKey = sp.keyRef ? await resolveRef(sp.keyRef, guid) : "";
+    if (sp.keyRef && !apiKey) {
+      console.log(`worker: ${who} provider ${sp.name} skipped — ${sp.keyRef} is empty or unmounted`);
+      continue;
+    }
+    out.push({
+      name: sp.name,
+      baseUrl: sp.url,
+      model: sp.model,
+      apiKey: apiKey || undefined,
+      timeoutMs: sp.timeoutMs,
+      maxChars: sp.maxChars,
+      biasesWithPrompt: sp.biases,
+    });
+  }
+  return out;
+}
+
+/** What a tenant with no provider rows gets. GROQ, AND GROQ ONLY.
+ *
+ *  This is the line where a product differs from one person's setup. A local server at
+ *  `host.containers.internal:8181` is meaningful on exactly one laptop, resolves nowhere in a
+ *  cluster, and would be somebody else's meetings going to a machine they have never heard of — so
+ *  it is included only when a deployment explicitly names one, and a tenant that wants it puts it
+ *  in its own rows. */
+function envTranscribe(env: NodeJS.ProcessEnv): inference.Provider[] {
+  const model = env.GROQ_MODEL || "whisper-large-v3-turbo";
+  const out: inference.Provider[] = [];
+  // A SECOND key is not redundancy for its own sake: a rotated or exhausted first key otherwise
+  // kills every meeting while a working key sits unused in the same deployment.
+  for (const [name, apiKey] of [
+    ["groq", env.GROQ_API_KEY],
+    ["groq-2", env.GROQ_API_KEY_2],
+  ] as const) {
+    if (apiKey) out.push({ name, baseUrl: GROQ_V1, model, apiKey, biasesWithPrompt: true });
+  }
+  if (env.WHISPER_LOCAL_URL) {
+    out.push({
+      name: env.WHISPER_LOCAL_NAME || "local-whisper",
+      baseUrl: trimSlash(env.WHISPER_LOCAL_URL),
+      model: env.WHISPER_LOCAL_MODEL || "whisper-1",
+      // faster-whisper's OpenAI-compatible server accepts `prompt` and ignores it. Saying so here is
+      // what stops the recap page claiming a vocabulary-corrected transcript it never got.
+      biasesWithPrompt: false,
+    });
+  }
+  return out;
+}
+
+/** Who summarises. A SEPARATE list from transcription, because the constraint is different: the
+ *  transcription tier's 8000-token context cannot summarise a 62-minute meeting at any price, and
+ *  that is the 413 that made yesterday's longest recordings impossible rather than slow.
+ *
+ *  Groq stays BEHIND whatever is configured, so a deployment that sets nothing keeps working
+ *  exactly as it did. */
+function envSummarize(env: NodeJS.ProcessEnv): inference.Provider[] {
+  const out: inference.Provider[] = [];
+  if (env.SUMMARY_BASE_URL && env.SUMMARY_MODEL) {
+    out.push({
+      name: env.SUMMARY_NAME || "summary",
+      baseUrl: trimSlash(env.SUMMARY_BASE_URL),
+      model: env.SUMMARY_MODEL,
+      apiKey: env.SUMMARY_API_KEY || undefined,
+    });
+  }
+  if (env.GROQ_API_KEY) {
+    out.push({
+      name: "groq",
+      baseUrl: GROQ_V1,
+      model: env.GROQ_TEXT_MODEL || "openai/gpt-oss-120b",
+      apiKey: env.GROQ_API_KEY,
+    });
+  }
+  return out;
+}
+
+/**
+ * One credential out of the registry, by ref, as a raw string.
+ *
+ * `resolveRef` reads a MOUNTED Kubernetes secret, which is the arrangement customer credentials
+ * were moved off — a path is a property of the pod, and one pod serves every tenant it has agents
+ * for. A connection's `secret_ref` names a row in the registry's `secret` table instead, and the
+ * decryption happens on the far side of this call: the worker never holds the key.
+ *
+ * Empty rather than throwing. A connection whose credential cannot be read is one calendar that
+ * will not match, and the recap still has to be filed.
+ */
+export async function registrySecret(
+  guid: string | undefined,
+  ref: string | undefined,
+  /** Injectable transport, so the request this makes is testable without a registry. */
+  fetchImpl?: typeof fetch,
+): Promise<string> {
+  const baseUrl = process.env.TONOMANCLOUD_API_URL;
+  if (!baseUrl || !guid || !ref) return "";
+  try {
+    const r = await (fetchImpl ?? fetch)(`${baseUrl.replace(/[/]+$/, "")}${registrySecretPath(guid, ref)}`, {
+      headers: { authorization: `Bearer ${process.env.TONOMANCLOUD_API_TOKEN ?? ""}` },
+    });
+    // 404 is "not connected", which is a state rather than a failure. Anything else is worth a line
+    // — a 500 here means the KEK is wrong or the row is unreadable, and silently treating that as
+    // "no calendar" would hide a real fault behind a plausible absence.
+    if (r.status === 404) return "";
+    if (!r.ok) {
+      console.error(`registry: secret ${ref} for ${guid} returned HTTP ${r.status}`);
+      return "";
+    }
+    const j = (await r.json()) as { value?: string };
+    return j.value ?? "";
+  } catch (e) {
+    console.error(`registry: secret ${ref} for ${guid} failed — ${(e as Error).message}`);
+    return "";
+  }
+}
+
+/** POST one inference-credential outcome to the registry (W3).
+ *
+ *  TWO ROUTES, because they answer two different questions. A shared agent has one login and one
+ *  `auth_state`, on the agent row. A per-person agent's login belongs to a PERSON — and writing one
+ *  person's outcome to the agent row marked the whole agent `error` in the Hub while everybody else
+ *  went on answering perfectly. So `user` picks the principal route and the agent row is left alone.
+ *
+ *  Split out and exported so the routing and the body are testable without a worker, a roster or a
+ *  Temporal client: the shape of this request is a contract with the Cloud API, and a contract that
+ *  only a running system can check is one nobody checks.
+ *
+ *  Never throws. Both callers are places where throwing would make something worse: a login gate
+ *  that has just succeeded, and the tail of a turn that has already failed. `ok` and `status` are
+ *  returned instead, so the caller can log what happened — a 404 on the principal route means the
+ *  person is not registered with the tenant yet, which is information, not a fault. */
+export async function postAuthState(o: {
+  api: string;
+  token: string;
+  guid: string;
+  state: "ok" | "error" | "expired" | "unconfigured";
+  provider: "claude" | "codex";
+  /** The Slack user id whose own login this was — the per-person route. Absent = the agent's. */
+  user?: string;
+  fetchImpl?: typeof fetch;
+}): Promise<{ ok: boolean; status?: number; route: string; error?: string }> {
+  const base = o.api.replace(/[/]+$/, "");
+  const route = o.user
+    ? `${base}/v1/system/agents/${o.guid}/principals/${encodeURIComponent(o.user)}/auth-state`
+    : `${base}/v1/system/agents/${o.guid}/auth-state`;
+  try {
+    const r = await (o.fetchImpl ?? fetch)(route, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${o.token}`,
+      },
+      body: JSON.stringify({ authState: o.state, provider: o.provider }),
+    });
+    return { ok: r.ok, status: r.status, route };
+  } catch (e) {
+    return { ok: false, route, error: (e as Error).message };
+  }
+}
+
+/** Tell the registry what one PERSON's inference credential is worth, through `register-member`
+ *  (W3b).
+ *
+ *  A different route from `postAuthState`'s principal one, and deliberately: that one UPDATES a
+ *  principal the tenant already knows and 404s for anybody else, which is exactly wrong for a scan
+ *  that runs before anyone has logged in through this build. `register-member` upserts, and takes
+ *  the auth state alongside the profile — so this needs no name or email and does not touch either.
+ *
+ *  Never throws. It runs at wire time and must not be able to stop an agent being served. */
+export async function postMemberAuthState(o: {
+  api: string;
+  token: string;
+  guid: string;
+  user: string;
+  state: "ok" | "error" | "expired" | "unconfigured";
+  provider: "claude" | "codex";
+  fetchImpl?: typeof fetch;
+}): Promise<{ ok: boolean; status?: number; error?: string }> {
+  try {
+    const r = await (o.fetchImpl ?? fetch)(`${o.api.replace(/[/]+$/, "")}/v1/system/agents/${o.guid}/register-member`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${o.token}` },
+      body: JSON.stringify({ slackUserId: o.user, authState: o.state, authProvider: o.provider }),
+    });
+    return { ok: r.ok, status: r.status };
+  } catch (e) {
+    return { ok: false, error: (e as Error).message };
+  }
+}
+
+/** The Slack user ids among an agent's roster principals. The roster's Slack principals carry kind
+ *  `slack_user_id`; a few older paths use `slack` or leave it unset. PURE and exported precisely
+ *  because the scan that reads it was silently empty for a whole release when this filter looked for
+ *  the wrong kind. */
+export function principalUserIds(principals: { kind?: string; value: string }[] | undefined): string[] {
+  return (principals ?? [])
+    .filter((p) => p.kind === "slack_user_id" || p.kind === "slack" || !p.kind)
+    .map((p) => p.value)
+    .filter(Boolean);
+}
+
+/** One agent, as the per-person auth-state scan needs to see it. */
+export interface PrincipalScanAgent {
+  name: string;
+  guid?: string;
+  /** `per_user` is the only mode with per-person credentials to report on. */
+  inferenceMode?: string;
+  provider: "claude" | "codex";
+  /** Slack user ids the registry says this agent recognises. */
+  principals: string[];
+}
+
+/** Make the Hub's per-person picture TRUE on day one (W3b).
+ *
+ *  `agent_principal.auth_state` was only ever written by a login OUTCOME, so an agent migrated to
+ *  per-person inference showed every teammate as `unconfigured` — including people who had signed
+ *  in perfectly well and were being answered every day. The Hub's per-user badge lied and its Run
+ *  button was dead for all of them, until each person happened to sign in again, which nobody had
+ *  any reason to do.
+ *
+ *  So the worker states what it can already see: for each principal with a credential directory, it
+ *  asks the harness (in THAT person's config dir, through the same `/auth/status` a turn would use)
+ *  and reports the answer. A person with no directory is SKIPPED rather than reported
+ *  `unconfigured` — the row may already say something truer than a filesystem check can, and this
+ *  scan exists to fix wrong answers, not to add confident new ones.
+ *
+ *  Injected deps throughout, so the decision this makes is testable without a roster, a runtime or
+ *  a registry. Best-effort per principal: one unreachable runtime must not silence the rest. */
+export async function syncPrincipalAuthStates(o: {
+  agents: PrincipalScanAgent[];
+  /** Does this person have a credential directory for this agent's provider at all? */
+  hasLoginDir(agent: string, user: string): Promise<boolean>;
+  /** What the harness reports in THAT person's config dir. */
+  authStatus(agent: string, user: string): Promise<string>;
+  report(guid: string, user: string, state: "ok" | "unconfigured", provider: "claude" | "codex"): Promise<void>;
+  log?: (s: string) => void;
+}): Promise<number> {
+  let reported = 0;
+  for (const a of o.agents) {
+    if (a.inferenceMode !== "per_user" || !a.guid) continue;
+    for (const user of a.principals) {
+      if (!user) continue;
+      try {
+        if (!(await o.hasLoginDir(a.name, user))) continue;
+        // `looksLoggedIn` is the ONE place that judgement is made — which matters more than usual
+        // here, since `codex login status` prints "Not logged in" and a naive check reads that as a
+        // yes, turning this scan from a correction into a fresh set of wrong answers.
+        const state = looksLoggedIn(await o.authStatus(a.name, user)) ? "ok" : "unconfigured";
+        await o.report(a.guid, user, state, a.provider);
+        reported++;
+        o.log?.(`worker: ${a.name} auth_state[${user}] seeded -> ${state} (${a.provider})`);
+      } catch (e) {
+        // One person, one agent. A runtime that is briefly unreachable must not stop the scan.
+        o.log?.(`worker: ${a.name} could not seed auth_state for ${user} — ${(e as Error).message}`);
+      }
+    }
+  }
+  return reported;
+}
+
+/** Tools withheld from every turn this worker runs.
+ *
+ *  The default is not empty, deliberately. The pod is the sandbox AND it holds the credential that
+ *  buys the inference, so anything that can execute or write is a way for a customer-facing turn to
+ *  reach the platform's own secrets. Reading and searching are what a second brain needs; a shell
+ *  is not. Override with CLAUDE_CODE_DISALLOWED_TOOLS when an agent genuinely needs more, and
+ *  understand what is being handed over. */
+const DEFAULT_DISALLOWED = ["Bash", "Write", "Edit", "NotebookEdit", "WebFetch", "Task"];
+
+function disallowedTools(): string[] {
+  const env = (process.env.CLAUDE_CODE_DISALLOWED_TOOLS ?? "").trim();
+  if (!env) return DEFAULT_DISALLOWED;
+  // An explicit "none" is how an operator says they mean it, rather than an empty string that
+  // could just as easily be an unset variable.
+  if (env.toLowerCase() === "none") return [];
+  return env.split(",").map((s) => s.trim()).filter(Boolean);
+}
+
+
+// --- Brains (docs/definition/objects/brain.md in Tonoman Cloud) -------------------------------------
+
+/** The brain store and tool, when this worker has a registry to ask. Off with TONOMAN_BRAINS=off. */
+/** Every wired agent's second-brain sources, with whose they are: what a brain ADOPTED from one is
+ *  bound to when its credential is chosen. Rewritten on every sync pass, so a source added or
+ *  repointed in the Hub is followed without a restart. */
+let legacySources: LegacySource[] = [];
+
+async function startBrains(): Promise<{ registry: ReturnType<typeof registryClient>; broker: Broker; store: BrainStore } | undefined> {
+  const base = process.env.TONOMANCLOUD_API_URL;
+  if (!base || process.env.TONOMAN_BRAINS === "off") return undefined;
+  const registry = registryClient(base, process.env.TONOMANCLOUD_API_TOKEN ?? "");
+  const root = path.join(process.env.TONOMAN_STATE_ROOT ?? "/root/.tonoman", "brains");
+  // One credential for the brains' git host, by reference (a mounted secret). Used per command.
+  const gitSecret = process.env.TONOMAN_BRAIN_GIT_SECRET ?? "";
+  const pat = async (): Promise<string> => (gitSecret ? resolveRef(gitSecret) : "");
+  // Every push by a person or a Talent queues a refresh of that brain (BRAIN-BACKGROUND-REFRESH).
+  let pushed: (b: BrainRef) => void = () => {};
+  const store = createStore({
+    root,
+    // BRAIN-REACHED-WITH-ITS-OWN-CREDENTIAL. This used to give a credential to a dev.azure.com address
+    // and to nothing else, so a brain on GitHub was cloned with none and nobody could open it. A brain
+    // with no credential is not tried without one: the fault is said, not discovered by a failed clone.
+    token: async (b) => {
+      const c = brainCredential(
+        { tenant: b.tenant, repoUrl: b.repoUrl, kind: b.kind, slug: b.slug, branch: b.branch, subpath: b.subpath },
+        legacySources,
+        { secret: gitSecret, org: process.env.TONOMAN_BRAIN_ADO_ORG, project: process.env.TONOMAN_BRAIN_ADO_PROJECT },
+      );
+      if ("fault" in c) throw new Error(`this brain has no credential to be reached with: ${c.fault}`);
+      return resolveRef(c.ref, c.guid);
+    },
+    onPushed: (b) => pushed(b),
+  });
+  const org = process.env.TONOMAN_BRAIN_ADO_ORG;
+  const project = process.env.TONOMAN_BRAIN_ADO_PROJECT;
+  const provisioner = org && project && makesBrains(process.env) ? adoProvisioner({ org, project, suffix: process.env.TONOMAN_BRAIN_REPO_SUFFIX ?? "", pat }) : undefined;
+  // A Talent working in a conversation records each thing it does as a run begun by the conversation,
+  // for the person speaking, with no content (RUN-FROM-CONVERSATION): opened and closed at once.
+  const recordRun = async (r: ConversationRun): Promise<void> => {
+    const base = process.env.TONOMANCLOUD_API_URL;
+    if (!base) return;
+    const call = (method: string, body: Record<string, unknown>) =>
+      fetch(`${base}/v1/system/agents/${encodeURIComponent(r.agentGuid)}/talent-runs`, {
+        method,
+        headers: { authorization: `Bearer ${process.env.TONOMANCLOUD_API_TOKEN ?? ""}`, "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+    const opened = await call("POST", { talent: r.talent, itemKey: r.itemKey, version: r.version, trigger: "conversation", forUser: r.slackUserId });
+    if (!opened.ok) return console.error(`worker: ${r.talent} run from a conversation not recorded (${opened.status})`);
+    const closed = await call("PATCH", { talent: r.talent, itemKey: r.itemKey, status: r.status, result: { summary: r.summary } });
+    if (!closed.ok) console.error(`worker: ${r.talent} run from a conversation not closed (${closed.status})`);
+  };
+  const broker = createBroker({ store, registry, provisioner, scratch: path.join(root, "_scratch"), toolsDir: turnUsersOn() ? TOOLS_DIR : undefined, recordRun });
+  await broker.start();
+  // The refresh runs on the LOCAL model only (BRAIN-LOCAL-MODEL): gemma4:e4b by default, at the URL
+  // given. With no URL, brains are still mapped, just not connected by topic.
+  const refreshUrl = (process.env.TONOMAN_BRAIN_REFRESH_URL ?? "").replace(/\/+$/, "");
+  const provider: LlmProvider | undefined = refreshUrl
+    ? { name: "brain-refresh", url: refreshUrl, model: process.env.TONOMAN_BRAIN_REFRESH_MODEL || "gemma4:e4b-it-qat", timeoutMs: 180_000 }
+    : undefined;
+  const publish = (id: string, p: RefreshPublish) => registry.publishIndex(id, p as unknown as Record<string, unknown>);
+  const queue = createRefreshQueue({
+    run: (b) => refreshBrain({ store, provider, publish, active: (x) => registry.brainActive(x.id) }, b, b.name ?? "Brain"),
+    stale: (b) => publish(b.id, { state: "stale", detail: "refreshing after a change" }),
+    delayMs: Number(process.env.TONOMAN_BRAIN_REFRESH_DELAY_MS ?? 60_000),
+    // Kept on disk, so a refresh waiting — or cut off halfway — when the worker stops runs after it starts.
+    dir: path.join(root, "_refresh"),
+  });
+  pushed = (b) => queue.touch(b);
+  void queue.resume().then((n) => n && console.log(`worker: ${n} brain refresh(es) carried over from before the restart`));
+  console.log(`worker: brain refresh ${provider ? `on ${provider.model} at ${provider.url}` : "maps only — no local model set (TONOMAN_BRAIN_REFRESH_URL)"}`);
+  console.log(`worker: brains on — ${provisioner ? `new brains go to Azure DevOps ${org}/${project}` : "no git host configured, so no new brains can be created"}`);
+  return { registry, broker, store };
+}
+
+/** One wired agent: the roster row, its channel, its harness, and the second-brain note the turn
+ *  is given. The runner is kept alongside `run` because the model knob (`!model`) lives on it. */
+interface Wired {
+  cfg: AgentConfig;
+  conn: Connector;
+  context?: string;
+  runner: TurnRunner;
+  run: (r: TurnRunReq) => AsyncIterable<TurnEvent>;
+  /** Stops THIS agent's ingress pump on its own, chained to the worker-wide signal so shutdown still
+   *  stops everything. Live reload aborts it to retire a removed agent's connector without touching
+   *  any other; undefined until the pump is started. */
+  abort?: AbortController;
+}
+
+/** The human-facing name for an agent whose stable key (`cfg.name`) is now a guid: the tenant-
+ *  prefixed display name a person reads in a log or types into TONOMAN_AGENTS. Falls back to the
+ *  bare name for a file roster with no tenant. */
+function agentLabel(a: AgentConfig): string {
+  return a.tenant ? `${a.tenant}-${a.displayName ?? a.name}` : (a.displayName ?? a.name);
+}
+
+/** Builds one connector + runner per agent in the roster. An agent whose channel has no connector
+ *  is skipped with a reason rather than failing the worker — one bad row must not silence the rest. */
+/** PURE: which agents this process is willing to serve.
+ *
+ *  Empty means all of them, which is every deployment today. A list means THIS worker takes only
+ *  those, and it exists for one reason: to make a worker runnable on a laptop against the real
+ *  cluster without stealing another tenant's agent.
+ *
+ *  Two workers cannot share an agent. Slack delivers a Socket Mode event to exactly ONE of the
+ *  connections holding that app token, so two processes with the same agent answer alternately and
+ *  unpredictably — which looks like a flaky bug rather than like two workers. Splitting by agent is
+ *  what makes "run the one I am changing locally, leave the customer's on the cluster" safe rather
+ *  than a coin flip.
+ *
+ *  Names are the tenant-prefixed display names — `acme-sapien`, `initech-nelly` — because that is
+ *  what the logs say and what somebody will copy. `wire()` also matches an agent's guid and its bare
+ *  display name, so the guid a boot log prints works here too. */
+export function agentsAllowed(names: string | undefined): Set<string> {
+  return new Set(
+    (names ?? "")
+      .split(",")
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean),
+  );
+}
+
+/** WHICH provider answers this agent's turns (W1). The roster's word, defaulted to claude so every
+ *  agent that predates the field is untouched. */
+export function providerOf(a: AgentConfig | undefined): InferenceProvider {
+  return a?.inference_provider === "codex" ? "codex" : "claude";
+}
+
+/** The harness kind that provider runs on — the word sent to the agent runtime on every call. */
+export function harnessOf(a: AgentConfig | undefined): HarnessKind {
+  return harnessForProvider(a?.inference_provider);
+}
+
+/** WHOSE credential directory a turn of this agent runs in, for a given speaker. The DIRECTORY
+ *  differs per provider (`/root/.claude/...` vs `/root/.codex/...`) and so does the env var that
+ *  points a child at it — resolving it here, once, is what keeps a codex per-person login from
+ *  being written into Claude's tree and then reported as a success. */
+export function configHomeOf(a: AgentConfig, user?: string): string {
+  return providerOf(a) === "codex"
+    ? codexharness.configHomeFor(a.name, user)
+    : claudecode.configHomeFor(a.name, user);
+}
+
+/** Every place a login for this agent and person may be on disk. When turns run as their own Linux
+ *  users it is in that user's home — and, until its first turn brings it over, still where logins
+ *  used to live (TURNUSER-MOVE-ONCE-SAFELY): a gate that looked in one place only would ask someone
+ *  who is signed in to sign in again. When the user cannot be had, only the old place is known. */
+/** One place a login may be: a file, and — when it is inside a turn user's home — the user it is
+ *  looked at and deleted AS. The worker does not open, test or delete by a path inside a user's home
+ *  itself (TURNUSER-ROOT-STAYS-OUT): a link there would make it answer about, or delete, a file of
+ *  its own. */
+export interface LoginPlace {
+  file: string;
+  as?: TurnUser;
+}
+async function credFilesNow(a: AgentConfig, user?: string): Promise<LoginPlace[]> {
+  const users = usersOfThisWorker();
+  if (!users) return [{ file: credFileOf(a, user) }];
+  const who = await users.for(a.guid ?? a.name, user || undefined).catch(() => undefined);
+  if (!who) return [{ file: credFileOf(a, user) }];
+  // Whose OLD login counts follows whose user the Cloud says this is, exactly as the move does: for
+  // someone who runs as the agent's user it is the agent's old login, never their own.
+  const old = credFileOf(a, who.of === "person" ? user : undefined);
+  const as = { uid: who.uid, home: who.home };
+  return [{ file: path.join(homeIn(as, a.name, providerOf(a)), path.basename(old)), as }, { file: old }];
+}
+const anyExists = async (places: LoginPlace[]): Promise<boolean> =>
+  (await Promise.all(places.map((p) => (p.as ? fileAsUser(p.as, p.file) : fsp.access(p.file).then(() => true, () => false))))).some(Boolean);
+/** Delete a login wherever it is — as its user where it is that user's. */
+const forget = async (places: LoginPlace[]): Promise<void> => {
+  for (const p of places) await (p.as ? removeAsUser(p.as, [p.file]) : fsp.rm(p.file, { force: true }).catch(() => {}));
+};
+
+// Which turn folders have been handed to a user, so that what deletes one afterwards does it AS that
+// user and not as the worker (TURNUSER-ROOT-STAYS-OUT).
+const handedOver = new Map<string, TurnUser>();
+/** Delete a turn's folder that was handed to a user, as that user. False when it never was — it is
+ *  still the worker's own, and the worker deletes it itself. */
+export async function dropTurnDir(dir: string): Promise<boolean> {
+  const user = handedOver.get(dir);
+  if (!user) return false;
+  // Forgotten only once it is gone: until then the folder is still that user's, and anything asking
+  // in the meantime must not take "not remembered" to mean "the worker's own".
+  // …and only if it really went: a folder that could not be deleted is still that user's, and stays
+  // remembered as such, so nothing later takes it for the worker's own and deletes it as root.
+  if (await removeAsUser(user, [dir]).catch(() => false)) handedOver.delete(dir);
+  return true;
+}
+
+/** Where turns' folders are made when turns run as their own users: a folder only root can write.
+ *  A turn's folder becomes its user's — and in a folder everyone can write, like /tmp, its owner could
+ *  then rename it away and put a link in its place, for the worker to follow. Here its owner can
+ *  change what is IN it and nothing about where it is. */
+// One folder PER WORKER (its host name — a pod's own): what is left in it at start is this worker's
+// own, from before it restarted, never another worker's live turns on a volume they happen to share.
+export const TURNS_ROOT = path.join(process.env.TONOMAN_TURNS_ROOT || "/srv/tonoman/turns", os.hostname().replace(/[^A-Za-z0-9._-]/g, "_") || "worker");
+async function turnsRootReady(): Promise<string> {
+  await fsp.mkdir(TURNS_ROOT, { recursive: true, mode: 0o711 });
+  for (const d of [path.dirname(TURNS_ROOT), TURNS_ROOT]) {
+    const st = await fsp.lstat(d);
+    if (!st.isDirectory() || st.uid !== 0) throw new Error(`${d} must be a folder of root's own`);
+    await fsp.chmod(d, 0o711);
+  }
+  // Left by turns that were cut short when the worker last stopped. Each is looked at only as an
+  // entry of this folder — which nobody else can change — and deleted AS whoever owns it.
+  for (const name of await fsp.readdir(TURNS_ROOT)) {
+    const p = path.join(TURNS_ROOT, name);
+    const e = await fsp.lstat(p).catch(() => null);
+    if (!e) continue;
+    if (e.uid === 0) await fsp.rm(p, { recursive: true, force: true }).catch(() => {});
+    else if (e.isDirectory() && e.uid >= 20000) {
+      await removeAsUser({ uid: e.uid, home: homeOf(e.uid) }, [p]);
+      await fsp.rmdir(p).catch(() => {});
+    }
+  }
+  return TURNS_ROOT;
+}
+
+/** The credential file a login for this agent writes — the per-person gate's file check. */
+export function credFileOf(a: AgentConfig, user?: string): string {
+  return providerOf(a) === "codex"
+    ? path.join(configHomeOf(a, user), "auth.json")
+    : path.join(configHomeOf(a, user), ".credentials.json");
+}
+
+/** Build a new runner for one agent. Split out because live reload rebuilds a runner in place — when
+ *  `max_turns` or the runtime `url` changes, both of which the harness bakes in at construction — while
+ *  keeping the agent's connector, so no socket reconnects. */
+function newRunnerFor(a: AgentConfig, harnesses: ReturnType<typeof defaultHarnesses>): TurnRunner | null {
+  // `harness` is the TRANSPORT (how this gateway reaches the agent: local exec, podman, HTTP);
+  // `inference_provider` is WHO ANSWERS. They are different questions, and only the second one is
+  // set in the Hub. A codex agent on the default local transport therefore has to be routed to the
+  // codex runner here — the roster still says "claude-code", because that is its transport.
+  const configured = a.harness ?? "claude-code";
+  const kind = configured === "claude-code" ? harnessOf(a) : configured;
+  const spec = harnesses.lookup(kind);
+  if (!spec?.newRunner) return null;
+  // No container: the pod is the sandbox (an agent is a row, not a container).
+  //
+  // And because the pod is the sandbox, the tools it hands the model are the security boundary.
+  // This pod holds the operator's Claude subscription credential, so a shell here can read the
+  // account behind it — which is exactly what happened: asked who it was talking to, the agent
+  // ran Bash, found the operator's email in the runtime, and told a customer about it. An agent
+  // that answers from meetings and notes has no use for a shell anyway.
+  return spec.newRunner({
+    agent: a.name,
+    container: a.container,
+    model: a.model,
+    maxTurns: a.max_turns,
+    url: a.url,
+    disallowedTools: disallowedTools(),
+    // The shell is closed on every turn this worker runs, whatever else fails (CLI-CLOSED-WHATEVER-FAILS).
+    closedShell: true,
+    // Carried for the REMOTE transport, whose runtime holds both CLIs and both credentials: a turn
+    // that does not say which provider it means runs on the pod's env default.
+    harness: harnessOf(a),
+  });
+}
+
+/** Wrap a runner in the `run` closure the ingress uses — the model comes per turn (`!model`), so a
+ *  reload that changes only the default model never has to touch the runner.
+ *
+ *  It is also where PER-PERSON inference is resolved: when the agent's `inference_mode` is
+ *  `per_user`, the speaker's own credential directory overrides the runner's per-agent default for
+ *  that turn, so each teammate answers on their own subscription. `shared` (the default, every agent
+ *  today) passes nothing and the one per-agent login answers — which is exactly the runner's
+ *  existing behaviour, so a shared agent is untouched. Resolved here rather than in the runner
+ *  because the runner is harness-agnostic and this dir is Claude Code's. */
+/** Turns run as their own Linux users (turn-user.md) when this is `on`. Asked for where the worker
+ *  cannot do it — not Linux, not root, no `setpriv` — it refuses to start rather than run turns as
+ *  itself while saying otherwise. */
+export function turnUsersOn(): boolean {
+  return (process.env.TONOMAN_TURN_USERS ?? "").toLowerCase() === "on";
+}
+const TOOLS_DIR = process.env.TONOMAN_TOOLS_DIR || "/srv/tonoman/tools";
+
+/** Before serving anyone as their own Linux user, try the worker's own doors as a plain user: the
+ *  tenant's secrets, the worker's state (brains' checkouts, sessions, files people sent), and where
+ *  logins used to live. Any that opens stops the worker — running turns as their own users while a
+ *  secrets folder is open to all of them would only look like isolation (TURNUSER-CANNOT-REACH). */
+const doorsOfThisWorker = (): string[] => [
+  process.env.TONOMAN_SECRETS_DIR ?? "/etc/tonoman/secrets",
+  process.env.TONOMAN_STATE_ROOT ?? "/root/.tonoman",
+  process.env.CLAUDE_CONFIG_ROOT ?? "/root/.claude",
+  process.env.CODEX_HOME ?? "/root/.codex",
+];
+async function closedDoorsOrRefuse(): Promise<void> {
+  if (!turnUsersOn()) return;
+  usersOfThisWorker(); // throws here, at start, when this worker cannot start a program as another user
+  const doors = doorsOfThisWorker();
+  // What a turn runs — the worker's own code, `tonoman` — it may read and must not be able to change.
+  const runs = [path.resolve(__dirname, "..", ".."), TOOLS_DIR];
+  await turnsRootReady();
+  const open = await openToOthers(doors, runs);
+  if (open.length) {
+    throw new Error(
+      `TONOMAN_TURN_USERS=on, but a plain user can get into: ${open.join(", ")}. Close them (root-only, or mounted behind a root-only folder; what a turn runs, read-only) before turns run as their own users.`,
+    );
+  }
+  console.log(`worker: tried its own doors as a plain user — ${doors.length + runs.length} closed`);
+}
+
+let sharedUsers: TurnUsers | undefined;
+/** The one `TurnUsers` this worker's agents share, or undefined when turns run as the worker. */
+function usersOfThisWorker(): TurnUsers | undefined {
+  if (!turnUsersOn()) return undefined;
+  if (sharedUsers) return sharedUsers;
+  if (!canDrop()) throw new Error("TONOMAN_TURN_USERS=on, but this worker cannot start a program as another user (it needs Linux, root and setpriv)");
+  const api = process.env.TONOMANCLOUD_API_URL;
+  if (!api) throw new Error("TONOMAN_TURN_USERS=on needs TONOMANCLOUD_API_URL: the Cloud allots each user's number");
+  // The doors were tried at start as a throwaway plain user. A door can be open to one number and
+  // shut to another, so each real user tries them too, once, before anything runs as it.
+  const tried = new Map<number, Promise<void>>();
+  const doorsTriedAs = (user: TurnUser): Promise<void> => {
+    let t = tried.get(user.uid);
+    if (!t) {
+      t = openToOthers(doorsOfThisWorker(), [path.resolve(__dirname, "..", ".."), TOOLS_DIR, TURNS_ROOT], { as: user, shallow: true }).then((open) => {
+        if (open.length) throw new Error(`user ${user.uid} can get into: ${open.join(", ")}; nothing is run as it`);
+      });
+      tried.set(user.uid, t);
+      t.catch(() => tried.delete(user.uid));
+    }
+    return t;
+  };
+  sharedUsers = turnUsers({
+    api,
+    token: process.env.TONOMANCLOUD_API_TOKEN ?? "",
+    make: async (uid) => {
+      const user = await asUser(uid);
+      await doorsTriedAs(user);
+      return user;
+    },
+  });
+  console.log("worker: turns run as their own Linux users (turn-user.md)");
+  return sharedUsers;
+}
+
+/** Who a run goes out as, and the handing-over that must happen before it starts (turn-user.md). */
+export interface TurnUsers {
+  /** The user this run goes out as: asked of the Cloud by the agent and who is speaking, then made
+   *  and proven here. Throws rather than fall back to the worker's own user. */
+  for(agentGuid: string, speaker: string | undefined): Promise<{ uid: number; home: string; of: "person" | "agent" }>;
+  /** Give the user what the worker made for this run — the turn's folder, its prompt file — make its
+   *  login's folder, and bring over a login kept where logins used to live. */
+  handOver(user: { uid: number; home: string }, what: { cwd?: string; cwdIsUsers?: boolean; configHome: string; oldConfigHome?: string; credName?: string }): Promise<void>;
+}
+
+function runClosure(runner: TurnRunner, cfg: AgentConfig, users?: TurnUsers): Wired["run"] {
+  // Wrapped HERE, at the one place every harness run of this agent passes through — a person's
+  // turn, a recap's inference, its announcement — because that is exactly the set of processes
+  // that race each other for the agent's one credential file. See authrace.ts.
+  return (r: TurnRunReq, signal?: AbortSignal) => {
+    const perPerson = cfg.inference_mode === "per_user" && !!r.user;
+    // WHOSE subscription this run bills, said once per run. Without it the only way to tell was
+    // which login folder a session file happened to land in — and with shared history, none.
+    console.log(
+      `worker: ${cfg.displayName ?? cfg.name} ${r.lean ? "inference" : "turn"} on ` +
+        `${perPerson ? `${r.user}'s login` : "the agent's login"} ` +
+        `(${cfg.inference_mode ?? "shared"}, ${providerOf(cfg)})`,
+    );
+    const go = (runAs?: { uid: number; home: string }, systemPrompt?: string) =>
+     withAuthRaceRetry(() =>
+      runner.run(
+        {
+          prompt: r.prompt,
+          systemPromptFile: r.systemPromptFile,
+          systemPrompt,
+          model: r.model,
+          mediaPaths: r.mediaPaths,
+          sessionId: r.sessionId,
+          sessionNew: r.sessionNew,
+          lean: r.lean,
+          // The PROVIDER's own tree, not Claude's. A codex per-person login lives under
+          // /root/.codex/agents/<agent>/users/<user>, and pointing a codex turn at Claude's
+          // directory would find no credential there and fail while the login sat right beside it.
+          // As its turn's user, the login lives in that user's home instead (TURNUSER-HOME-PRIVATE).
+          configHome: runAs ? homeIn(runAs, cfg.name, providerOf(cfg)) : perPerson ? configHomeOf(cfg, r.user) : undefined,
+          runAs,
+          mcpServers: r.lean ? undefined : r.mcpServers,
+          // `tonoman` and the agent's shell setting. Left out here, no real turn ever had either:
+          // the harness tests passed and the path turns take dropped them (CLI-CLOSED-WHATEVER-FAILS).
+          cli: r.lean ? undefined : r.cli,
+          shell: cfg.shell === "full" ? "full" : "tonoman",
+          cwd: r.cwd,
+        },
+        signal,
+      ),
+     );
+    if (!users) return go();
+    // A runner that starts its program somewhere else — another container, over HTTP — cannot be
+    // started as a user from here, so with turn users on it is not started at all.
+    if (cfg.container) throw new Error(`${cfg.name} runs in a container of its own; with turns running as their own users only an agent run by this worker can be started`);
+    // The same for one reached over HTTP: whatever answers there starts the program as itself.
+    if (cfg.url || (cfg.harness && cfg.harness !== "claude-code" && cfg.harness !== "codex")) throw new Error(`${cfg.name} is run somewhere else (${cfg.harness ?? "over HTTP"}); with turns running as their own users only an agent run by this worker can be started`);
+    // Every run of this agent — a person's turn, a Talent's inference, an announcement — goes out
+    // as its turn's user, or not at all: never as the worker's own (TURNUSER-NOTHING-AS-ROOT).
+    return (async function* () {
+      // The Cloud decides whose user it is from who is speaking (TURNUSER-WHOSE); the worker only asks.
+      const who = await users.for(cfg.guid ?? cfg.name, r.user || undefined);
+      const runAs = { uid: who.uid, home: who.home };
+      // The prompt's words, read NOW: once the folder it is in is the user's, the worker does not
+      // open a file there. A folder handed over on an earlier try of this same turn is not read
+      // again either — the words are asked for as the user.
+      const already = r.cwd ? handedOver.get(r.cwd) : undefined;
+      const systemPrompt = !r.systemPromptFile ? undefined : already ? ((await readAsUser(already, r.systemPromptFile, 1 << 20)) ?? "") : await fsp.readFile(r.systemPromptFile, "utf8").catch(() => "");
+      if (already && already.uid !== runAs.uid) throw new Error("this turn's folder was handed to another user; it is not run again as someone else");
+      await users.handOver(runAs, {
+        cwd: r.cwd,
+        cwdIsUsers: !!already,
+        configHome: homeIn(runAs, cfg.name, providerOf(cfg)),
+        // Whose old login may come into this home follows whose user the Cloud says this is — not what
+        // the agent is set to. A person who has left the tenant runs as the agent's user, and their own
+        // login must never be brought into a home other people's turns run in.
+        oldConfigHome: who.of === "person" ? (r.user ? configHomeOf(cfg, r.user) : undefined) : configHomeOf(cfg, undefined),
+        credName: path.basename(credFileOf(cfg)),
+      });
+      if (r.cwd) handedOver.set(r.cwd, runAs);
+      yield* go(runAs, systemPrompt);
+    })();
+  };
+}
+
+/** Channels each agent WATCHES for Wave 6's reply-in-thread mode, keyed by agent name. Module-level
+ *  because the connector (built in `wireOne`) and the voice wiring (`wireVoice`, which knows the
+ *  Talent config) live in different scopes but must share one source of truth. The connector reads
+ *  it PER MESSAGE, and `wireVoice` rewrites it on every (re)wire, so turning the toggle on or off,
+ *  or moving the output channel, takes effect on the next message without a restart. Empty for every
+ *  agent until one enables the toggle — which is every agent today. */
+const voiceWatch = new Map<string, Set<string>>();
+
+/** Which agent last answered each thread, shared by every agent this worker serves, so a bare
+ *  `!command` in a shared thread goes to that one (CONVO-WHO-IS-ADDRESSED). Made on first use, in the
+ *  state root, and kept across restarts. */
+let owners: ThreadOwners | undefined;
+const sharedThreadOwners = (): ThreadOwners =>
+  (owners ??= threadOwners({ file: path.join(process.env.TONOMAN_STATE_ROOT ?? "/root/.tonoman", "thread-owners.json") }));
+
+/** Build the connector + runner for ONE agent, or return null with a logged reason. Shared by the
+ *  boot wiring and by live reload (which wires a newly-added or structurally-changed agent), so the
+ *  skip rules — channel, tokens, harness — are decided in exactly one place. The `only` filter is
+ *  NOT here: it is a boot-time concern of `wire()`, and reload applies it separately. */
+function wireOne(a: AgentConfig, harnesses: ReturnType<typeof defaultHarnesses>): Wired | null {
+  const label = agentLabel(a);
+  const channel = a.channel ?? (a.slack ? "slack" : a.teams ? "teams" : "telegram");
+  if (channel !== "slack") {
+    console.error(`worker: skipping ${label} — channel "${channel}" has no worker connector yet`);
+    return null;
+  }
+  const appToken = a.slack?.app_token || process.env.SLACK_APP_TOKEN || "";
+  const botToken = a.slack?.bot_token || process.env.SLACK_BOT_TOKEN || "";
+  if (!appToken || !botToken) {
+    console.error(`worker: skipping ${label} — missing ${!botToken ? "bot" : "app"} token`);
+    return null;
+  }
+  // Where this agent's inbound attachments land, on the shared state volume so the process that runs
+  // `claude` (this same pod, local-exec) can read them. Per agent, so one tenant's receipts are never
+  // in another's directory — the same rule as every other per-agent path here.
+  const mediaDir = path.join(process.env.TONOMAN_STATE_ROOT ?? "/root/.tonoman", "media", a.name);
+  const conn = new SlackConnector({
+    appToken,
+    botToken,
+    allowedUsers: a.slack?.allowed_users,
+    mediaDir,
+    mediaMount: mediaDir,
+    // Read live per message: `wireVoice` keeps this set in step with the agent's Talent config.
+    watchedChannels: () => voiceWatch.get(a.name) ?? new Set<string>(),
+    // Another agent served here watches the same channel: a plain message there is answered only
+    // when it names one of them (CONVO-WHO-IS-ADDRESSED). Agents on another worker are not seen.
+    sharedWatch: (channel: string) => [...voiceWatch].some(([other, set]) => other !== a.name && set.has(channel)),
+    threadOwners: sharedThreadOwners(),
+  });
+
+  const runner = newRunnerFor(a, harnesses);
+  if (!runner) {
+    console.error(`worker: skipping ${label} — harness "${a.harness}" cannot run turns`);
+    return null;
+  }
+  return { cfg: a, conn, runner, run: runClosure(runner, a, usersOfThisWorker()) };
+}
+
+function wire(cfg: Config, only: Set<string> = new Set()): Map<string, Wired> {
+  const harnesses = defaultHarnesses();
+  const out = new Map<string, Wired>();
+  for (const a of cfg.agents ?? []) {
+    // `a.name` is now the stable guid (registry roster). What a person reads in a log or types into
+    // TONOMAN_AGENTS is the tenant-prefixed display name (`label`) while the machine keys off `a.name`.
+    const label = agentLabel(a);
+    if (
+      only.size > 0 &&
+      !only.has(a.name.toLowerCase()) &&
+      !only.has(label.toLowerCase()) &&
+      !only.has((a.displayName ?? "").toLowerCase())
+    ) {
+      // Said out loud rather than skipped quietly: "why is my agent not answering" is otherwise
+      // answered only by remembering an environment variable somebody set days ago.
+      console.log(`worker: not serving ${label} — TONOMAN_AGENTS does not list it`);
+      continue;
+    }
+    const w = wireOne(a, harnesses);
+    if (w) out.set(a.name, w);
+  }
+  return out;
+}
+
+/** The harness session each conversation is continuing in.
+ *
+ *  Keyed by AGENT and conversation, not by conversation alone. A Slack conversation key is a thread
+ *  timestamp: unique inside one workspace and nowhere else — and this worker serves two tenants in
+ *  two different workspaces. Keyed by the thread alone, Sapien would eventually resume Nelly's
+ *  conversation, which is the same shape of mistake as a worker-wide notify channel, with a
+ *  customer's transcript on the other end of it.
+ *
+ *  In memory, deliberately. The session's transcript is a file on THIS pod's disk, so the id and
+ *  the thing it names have one lifetime; persisting the id would only outlive the file it points
+ *  at, and turn a restart from "forgets" into "fails". What it costs is memory across a deploy —
+ *  the next message in a thread starts fresh, which is exactly today's behaviour and no worse. */
+export function sessionStore(
+  dir: string = path.join(process.env.TONOMAN_STATE_ROOT ?? "/root/.tonoman", "sessions"),
+  newId: () => string = randomUUID,
+): {
+  claim: (agent: string, conversation: string) => Promise<{ id: string; isNew: boolean }>;
+  reset: (agent: string, conversation: string) => Promise<{ id: string; isNew: boolean }>;
+  forget: (agent: string, conversation: string) => Promise<void>;
+  provenance: (agent: string, conversation: string) => Promise<string[]>;
+  remember: (agent: string, conversation: string, brains: string[]) => Promise<void>;
+} {
+  /** One file per conversation, under the agent that owns it — which is also what keeps two agents
+   *  in two workspaces from colliding on a thread timestamp that is only unique within one of
+   *  them. The conversation key is encoded because it contains `/`. */
+  const fileFor = (agent: string, conversation: string): string =>
+    path.join(dir, encodeURIComponent(agent), `${encodeURIComponent(conversation)}.json`);
+
+  /** Hand out this conversation's session AND record that it is now in use — so `--session-id`
+   *  (create) is used exactly once per id and every later turn resumes it. Claiming rather than
+   *  peeking is what keeps that invariant true even for a turn that dies before writing anything;
+   *  the resume miss that follows is repairable, a duplicate create is not. */
+  const claim = async (agent: string, conversation: string): Promise<{ id: string; isNew: boolean }> => {
+    const f = fileFor(agent, conversation);
+    try {
+      const j = JSON.parse(await fsp.readFile(f, "utf8")) as { uuid?: string };
+      if (j.uuid) return { id: j.uuid, isNew: false };
+    } catch {
+      /* no pointer yet, or an unreadable one → mint a new session rather than fail the turn */
+    }
+    const made = { id: newId(), isNew: true };
+    try {
+      await fsp.mkdir(path.dirname(f), { recursive: true });
+      await fsp.writeFile(f, JSON.stringify({ uuid: made.id, started: true }), "utf8");
+    } catch (e) {
+      // A pointer we could not persist is this pod's problem only: the turn still runs, and the
+      // next one starts a fresh session. Losing memory is the old behaviour; losing the turn is
+      // not, so this never throws.
+      console.error(`worker: could not persist session for ${agent} — ${(e as Error).message}`);
+    }
+    return made;
+  };
+  return {
+    claim,
+    /** Abandon this conversation's session and hand back a fresh one — the resume-miss repair, for a
+     *  turn that runs immediately on the id it gets back. The transcript itself is left alone. */
+    reset: async (agent: string, conversation: string) => {
+      await fsp.rm(fileFor(agent, conversation), { force: true }).catch(() => {});
+      return claim(agent, conversation);
+    },
+    /** Abandon this conversation's session WITHOUT claiming a new one — what `!new` does. `reset`
+     *  claimed a fresh id that no turn ever created, so the next message tried to resume a session
+     *  that did not exist, failed, and was repaired: a spurious resume failure on every `!new`. With
+     *  no pointer at all, the next turn simply creates its session. */
+    forget: async (agent: string, conversation: string) => {
+      await fsp.rm(fileFor(agent, conversation), { force: true }).catch(() => {});
+    },
+    /** The brains this history has drawn on (BRAIN-USED-DECIDES). Kept with the session pointer, so it
+     *  lives and dies with the history it describes: `!new` and a resume repair clear both. */
+    provenance: async (agent: string, conversation: string) => {
+      try {
+        const j = JSON.parse(await fsp.readFile(fileFor(agent, conversation), "utf8")) as { brains?: unknown };
+        return Array.isArray(j.brains) ? j.brains.filter((x): x is string => typeof x === "string") : [];
+      } catch {
+        return [];
+      }
+    },
+    remember: async (agent: string, conversation: string, brains: string[]) => {
+      const f = fileFor(agent, conversation);
+      let j: Record<string, unknown> = {};
+      try {
+        j = JSON.parse(await fsp.readFile(f, "utf8")) as Record<string, unknown>;
+      } catch {
+        /* no pointer yet: the provenance starts one */
+      }
+      const had = Array.isArray(j.brains) ? (j.brains as string[]) : [];
+      j.brains = [...new Set([...had, ...brains])];
+      await fsp.mkdir(path.dirname(f), { recursive: true });
+      await fsp.writeFile(f, JSON.stringify(j), "utf8");
+    },
+  };
+}
+
+/** Report the built-in Talents to the Cloud catalogue — the one OSS→Cloud bridge for what a Talent
+ *  IS. Git is the source of truth; this makes each `talent` row mirror the loaded manifest (version,
+ *  requires, configSchema), replacing the seed's guess. Best-effort and idempotent: a file roster
+ *  (no registry) is a no-op, and a registry that is briefly unreachable leaves the catalogue stale
+ *  rather than stopping the worker — exactly like the talent_run rows. */
+export async function registerBuiltinTalents(): Promise<void> {
+  const baseUrl = process.env.TONOMANCLOUD_API_URL;
+  if (!baseUrl) return; // a self-hosted / file-roster worker has no catalogue to register into
+  const token = process.env.TONOMANCLOUD_API_TOKEN ?? "";
+  for (const t of BUILTIN_TALENTS) {
+    try {
+      const r = await fetch(`${baseUrl}/v1/system/talents/${encodeURIComponent(t.name)}`, {
+        method: "PUT",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+        // Bounded: registration is on the BOOT path (unlike the talent_run rows), so an API that is
+        // up-but-hung, or a DNS blip, must not stall the worker for undici's ~5-minute default.
+        signal: AbortSignal.timeout(5000),
+        body: JSON.stringify({
+          version: t.version,
+          description: t.description,
+          requires: t.requires,
+          configSchema: t.configSchema,
+          schedule: t.schedule ?? null,
+        }),
+      });
+      if (!r.ok) console.error(`worker: register Talent ${t.name}@${t.version} → ${r.status}`);
+      else console.log(`worker: registered Talent ${t.name}@${t.version}`);
+    } catch (e) {
+      console.error(`worker: register Talent ${t.name} failed: ${String(e)}`);
+    }
+  }
+}
+
+export async function run(
+  cfg: Config,
+  o: WorkerOptions,
+  signal: AbortSignal,
+  /** Re-fetch the roster from the same control plane the boot used, applying the same env overrides.
+   *  Provided by the CLI; when absent (a test, or a caller that opts out) the worker serves the boot
+   *  roster forever, exactly as it did before live reload. */
+  reloadRoster?: () => Promise<Config>,
+): Promise<void> {
+  const only = agentsAllowed(process.env.TONOMAN_AGENTS);
+  if (only.size > 0) {
+    console.log(`worker: serving only ${[...only].join(", ")} (TONOMAN_AGENTS)`);
+  }
+  // Register the built-in Talent catalogue before serving, so the Hub reads what this code actually
+  // loaded (version, requires, configSchema) rather than the seed's placeholder. Best-effort.
+  await registerBuiltinTalents();
+  const wired = wire(cfg, only);
+  if (wired.size === 0) {
+    // Loudly: a worker with no connectors looks perfectly healthy while answering nobody.
+    console.error("worker: NO agents have a usable channel binding — nothing will be answered.");
+  }
+
+  // Where connected-account credentials live, decided once, here. Cloud when there is a registry
+  // to talk to; the volume otherwise, so a self-hosted install does not change by upgrading.
+  //
+  // The guid lookup is the whole reason this is installed at boot rather than resolved per call:
+  // the API addresses secrets by agent and derives the TENANT itself, so a worker can never name a
+  // tenant it does not belong to. An agent with no guid has no registry, and falls through to the
+  // volume rather than failing.
+  const store = tokenstore.chooseStore(process.env, (name) => wired.get(name)?.cfg.guid);
+  tokenstore.useStore(store);
+  console.log(`worker: connected-account credentials live in ${store.where}`);
+
+  /** Pull every granted source and refresh the agent's context note.
+   *
+   *  Run once before serving, then on a timer. The timer is not a nicety: the whole point of the
+   *  voice flow is that a meeting recorded minutes ago is something the agent can talk about, and a
+   *  checkout taken only at boot would mean the answer is "I don't know" until somebody restarts a
+   *  pod. */
+  // Brains are on when the worker has a registry to ask; decided before the first sync below.
+  const brainsOn = !!process.env.TONOMANCLOUD_API_URL && process.env.TONOMAN_BRAINS !== "off";
+  const syncAll = async (): Promise<void> => {
+    // Whose sources these are, for the brains adopted from them (BRAIN-REACHED-WITH-ITS-OWN-CREDENTIAL).
+    legacySources = [...wired.values()].flatMap((a) =>
+      (a.cfg.secondbrain ?? [])
+        .map((s) => ({ id: s.id, tenant: a.cfg.tenant ?? "", repoUrl: s.repo_url, branch: s.branch, subpath: s.subpath, secretRef: s.secret_ref ?? "", guid: a.cfg.guid, readOnly: s.read_only }))
+        .filter((s) => s.tenant && s.secretRef),
+    );
+    for (const [name, a] of wired) {
+    const sources = (a.cfg.secondbrain ?? []).map((s) => ({
+      id: s.id,
+      label: s.label,
+      repoUrl: s.repo_url,
+      branch: s.branch,
+      subpath: s.subpath,
+      authKind: s.auth_kind,
+      secretRef: s.secret_ref,
+      readOnly: s.read_only,
+    }));
+      if (sources.length === 0) continue;
+      const ready = await secondbrain
+        .sync(sources, {
+          root: path.join(process.env.TONOMAN_STATE_ROOT ?? "/root/.tonoman", "secondbrain", name),
+          // Bound to THIS agent, because a `registry:` ref is scoped to the agent that owns it —
+          // resolving one without saying whose is the cross-tenant read the scheme exists to avoid.
+          resolveRef: (ref) => resolveRef(ref, a.cfg.guid),
+          // Quiet on the timer: one line per source per minute is noise, and a failure still logs.
+          log: (s) => {
+            if (!a.context || /failed/.test(s)) console.log(s);
+          },
+        })
+        .catch((e) => {
+          console.error(`worker: ${name} second-brain sync failed: ${(e as Error).message}`);
+          return [] as { dir: string; label: string }[];
+        });
+      a.context = secondbrain.contextNote(
+        ready,
+        a.cfg.timezone ?? "UTC",
+        (a.cfg.credentials ?? []).map((c) => ({
+          kind: c.kind,
+          alias: c.alias,
+          label: c.label,
+          status: c.status,
+        })),
+        a.cfg.displayName ?? "",
+        brainsOn,
+      );
+    }
+  };
+
+  await syncAll();
+  const syncEvery = Number(process.env.SECONDBRAIN_SYNC_SECONDS ?? 60) * 1000;
+  // One sync at a time. A first clone of a large wiki takes longer than the interval, so the timer
+  // fired again into a checkout git was still building and the two processes collided on
+  // `.git/shallow.lock` — reported as "failed to sync" for a repository that was in fact fine.
+  // Skipping a tick is free; the next one is a minute away.
+  // One background mutation of `wired` at a time. syncAll clones checkouts and reads `a.cfg`; reload
+  // (below) swaps `a.cfg` and rebuilds runners. Sharing one flag keeps a reload from swapping config
+  // out from under a clone mid-iteration, and keeps two clones off the same `.git/shallow.lock` (the
+  // collision that first taught the guard). A skipped tick is free; the next is a minute away.
+  let busy = false;
+  const syncTimer = setInterval(() => {
+    if (busy) return;
+    busy = true;
+    void syncAll()
+      .catch(() => {})
+      .finally(() => {
+        busy = false;
+      });
+  }, syncEvery);
+  signal.addEventListener("abort", () => clearInterval(syncTimer), { once: true });
+
+  // Open (or reuse) a DM and return the connector's conversation key. Shared by the wake endpoint
+  // and by the voice flow — both need to address a person the agent has no inbound message from.
+  const dmFor = async (name: string, userId: string): Promise<string | undefined> => {
+    const a = wired.get(name);
+    if (!a) return undefined;
+    const j = await (a.conn as SlackConnector).call<{ channel?: { id?: string } }>("conversations.open", {
+      users: userId,
+    });
+    const channel = j.channel?.id;
+    return channel ? `${a.cfg.slack?.team_id ?? ""}/${channel}` : undefined;
+  };
+
+  // The Temporal client is needed by the activities (a woken turn is a signal), so it is created
+  // before them rather than alongside the worker.
+  const conn = await Connection.connect({ address: o.address });
+  const client = new Client({ connection: conn, namespace: o.namespace });
+
+  // The git push credential, resolved once at boot. Held in memory only; the checkout's remote on
+  // disk stays credential-free.
+  const voiceCreds = new Map<string, VoiceConfig>();
+  /** Agents whose voice flow is off, so their schedule can be paused rather than left ticking. */
+  const disabledFlows = new Set<string>();
+  /** Work out one agent's voice configuration and record it, or say plainly why there is none.
+   *
+   *  A FUNCTION, not the body of the boot loop it used to be, because connecting an account is not
+   *  a boot-time event. `!connect plaud` wrote a credential nine hours after this had already run,
+   *  answered "connected", and then nothing polled: the flow had been filed under "waiting for a
+   *  login" at boot and there was no second look until the process restarted. In the cluster that
+   *  reads as a customer connecting their account and hearing nothing until the next deploy.
+   *
+   *  So the connect path calls this too. Idempotent by construction — it only writes the two
+   *  collections above. */
+  async function wireVoice(name: string, a: Wired): Promise<void> {
+    // A recompute, not an accumulation: this runs again when an account is connected, and an
+    // agent that has just stopped being "waiting for a login" must not stay in disabledFlows.
+    voiceCreds.delete(name);
+    disabledFlows.delete(name);
+    const src = a.cfg.secondbrain?.[0];
+    // Per agent, from the REGISTRY: which channel, which folder, which routes. The environment is
+    // only a fallback for a tenant that has no rows yet — a deployment is the wrong place for
+    // "where do Priya's meetings go".
+    const voice = voiceSettings(a.cfg.flows?.voice, process.env);
+    if (!voice.enabled) {
+      console.log(`worker: ${name} voice flow is switched off (flow_property enabled=false)`);
+      // Switching the flow off has to switch the SCHEDULE off. Left running it keeps firing into an
+      // agent with no voice configuration — harmless, because the activity finds nothing to do, but
+      // it fills the schedule list with executions that look like work and reports "off" in one
+      // place while ticking in another.
+      disabledFlows.add(name);
+      return;
+    }
+    // Whose Plaud account this agent watches — from the registry, per tenant. An agent with no
+    // credential is not misconfigured; it is a tenant whose person has not logged in yet, and
+    // saying that plainly is the difference between "waiting for Priya" and "broken".
+    // Whose Plaud account(s) this agent watches. Two modes, from the voice flow's `plaud_scope`:
+    //  • shared (default, and Sapien's): ONE account for the tenant — a mounted secret or one account
+    //    connected through `!connect`. Unchanged from before per-person existed.
+    //  • per_person: each member signs in their own, and the poll fans out over them. The shared
+    //    secret and `credential_ref` are ignored here on purpose, so a per-person tenant is never
+    //    also polling a stray shared account (which would process a meeting twice).
+    const perPerson = voice.plaudScope === "per_person";
+    let tokenJson = "";
+    let viaCli = false;
+    let members: { user: string; connectedAt?: number }[] = [];
+    if (perPerson) {
+      members = await tokenstore.tokens().listUsers(name).catch(() => []);
+      if (members.length === 0) {
+        // The same shape as "waiting for a Plaud login" below: nothing to poll, so pause the
+        // schedule rather than tick against an empty account list.
+        console.log(`worker: ${name} voice flow (per-person) is waiting for a member to connect their Plaud account`);
+        disabledFlows.add(name);
+        return;
+      }
+      console.log(`worker: ${name} voice flow (per-person) — ${members.length} member account(s) connected`);
+    } else {
+      tokenJson = await resolveRef(voice.credentialRef, a.cfg.guid);
+      // Either credential counts. An agent that connected its own account through !connect needs no
+      // mounted secret at all — which is the whole point of the connect flow, and the state every
+      // tenant should end up in.
+      viaCli = await plaudcli.connected(name);
+      if (!tokenJson && !viaCli) {
+        console.log(
+          `worker: ${name} voice flow is waiting for a Plaud login` +
+            `${voice.credentialRef ? ` (credential ${voice.credentialRef} is empty or unmounted)` : " (no credential_ref row)"}`,
+        );
+        disabledFlows.add(name);
+        return;
+      }
+    }
+    // WHO transcribes and WHO summarises, per tenant. Registry rows win outright; the environment
+    // is the fallback for a tenant that has no rows yet. That order is the whole point: a
+    // deployment stops being where "which model hears my meetings" lives.
+    const rows = a.cfg.flows?.voice ?? {};
+    const rowTranscribe = flowcfg.providerSpecs(rows, "transcribe");
+    const rowSummarize = flowcfg.providerSpecs(rows, "summarize");
+    const transcribe = rowTranscribe.length
+      ? await providersFrom(rowTranscribe, name, a.cfg.guid)
+      : envTranscribe(process.env);
+    const summarize = rowSummarize.length ? await providersFrom(rowSummarize, name, a.cfg.guid) : envSummarize(process.env);
+    if (transcribe.length === 0 || !src) {
+      console.log(
+        `worker: ${name} has no voice flow (needs a transcription provider — transcribe.* rows or GROQ_API_KEY — and a second-brain source)`,
+      );
+      return;
+    }
+    if (summarize.length === 0) {
+      console.log(`worker: ${name} has no voice flow (needs a summariser — summarize.* rows or GROQ_API_KEY)`);
+      return;
+    }
+    console.log(
+      `worker: ${name} voice inference — transcribe ${transcribe.map((x) => x.name).join(" → ")}` +
+        `, summarize ${summarize.map((x) => x.name).join(" → ")}`,
+    );
+    // How far back the poll may reach. "Not in the second brain" is NOT the same question as
+    // "should be transcribed": without a floor the first poll backfills the customer's entire
+    // Plaud history and announces each old meeting in Slack as if it had just happened.
+    // Unset means "from today onwards" in the pod's own timezone, which is what switching the
+    // feature on is meant to mean.
+    // THE TENANT'S timezone, not the pod's. `-new Date().getTimezoneOffset()` read the worker's own
+    // clock, so one pod's timezone silently decided what "from today onwards" meant for every
+    // tenant on it — a deployment-wide default standing in for a customer's fact, which is exactly
+    // the pattern this product exists to delete.
+    const tzOffset = recapFloor.offsetMinutesFor(a.cfg.timezone ?? "UTC", Date.now());
+    const floorMs = recapFloor.floorFor(voice.since || undefined, Date.now(), tzOffset);
+    // Calendars this agent has been granted. `(kind, alias)` is the identity: the KIND is what
+    // the platform knows how to read, the ALIAS is which one of them this is — so a work calendar
+    // and a personal one coexist without either becoming a second connector.
+    //
+    // Only `connected` ones, and only those whose URL actually resolves. A calendar listed but
+    // unreadable must not silently become "no calendar": it is logged by alias, never by URL,
+    // because a published feed's link IS its credential.
+    const calendars: calendar.CalendarFeed[] = [];
+    for (const c of a.cfg.credentials ?? []) {
+      if (c.kind !== "ics" && c.kind !== "google") continue; // outlook: connect-only for now
+      if (c.status && c.status !== "connected") {
+        console.log(`worker: ${name} calendar ${c.kind}/${c.alias} is ${c.status}, skipping`);
+        continue;
+      }
+      // Google has no URL to resolve: its events are read through the registry's token refresh at
+      // the time they are needed (deps.googleCalendar), so the feed only names the connection.
+      if (c.kind === "google") {
+        calendars.push({ kind: "google", alias: c.alias, url: "" });
+        continue;
+      }
+      const url = await registrySecret(a.cfg.guid, c.secret_ref);
+      if (!url) {
+        console.log(`worker: ${name} calendar ${c.kind}/${c.alias} has no readable URL, skipping`);
+        continue;
+      }
+      calendars.push({ kind: c.kind, alias: c.alias, url });
+    }
+
+    const token = await resolveRef(src.secret_ref, a.cfg.guid);
+    const pushUrl = token ? src.repo_url.replace("https://", `https://x-access-token:${token}@`) : src.repo_url;
+    const dir = path.join(process.env.TONOMAN_STATE_ROOT ?? "/root/.tonoman", "secondbrain", name, src.id);
+    // The installed Talent that drives the voice flow, if any — the built-in Plaud reference Talent,
+    // found by NAME. A Talent is CODE behind a manifest: the worker resolves name→implementation
+    // from its own registry rather than reading steps off the wire. Any granted Talent the worker
+    // has no code for is logged and skipped (the day-2 marketplace case, surfaced honestly).
+    for (const t of a.cfg.talents ?? []) {
+      if (!getTalent(t.name)) {
+        console.warn(`worker: ${name} granted Talent '${t.name}' has no loaded implementation — skipping`);
+      }
+    }
+    const voiceGrant = (a.cfg.talents ?? []).find((t) => t.name === meetingRecap.name);
+    // Pin the loaded CODE's version, not the roster's — a run is recorded against the code that ran.
+    const voiceSkill = voiceGrant
+      ? { name: voiceGrant.name, version: getTalent(voiceGrant.name)?.version ?? voiceGrant.version }
+      : undefined;
+    // Wave 4: the output channel is now a Talent CONFIG value (`output_channel`, a Slack channel id),
+    // set per-agent in the Hub and carried on the roster grant. It takes precedence over the legacy
+    // `voice.notify_channel` flow property, which stays as the fallback so an agent whose Talent
+    // config is unset behaves exactly as before. A blank config value is not a value — it falls
+    // through rather than silently sending recaps nowhere.
+    const configChannel =
+      typeof voiceGrant?.config?.output_channel === "string" ? voiceGrant.config.output_channel.trim() : "";
+    if (configChannel)
+      console.log(`worker: ${name} voice output channel from Talent config: ${configChannel}`);
+
+    // Wave 6: watch the output channel for reply-in-thread mode when the Talent config turns it on.
+    // Rewritten on every (re)wire so a toggle or a channel move is picked up without a restart; the
+    // connector reads `voiceWatch` per message. The resolved channel is the same one recaps land in
+    // (config first, legacy flow property as fallback) — you answer questions where you posted.
+    const replyInThread = voiceGrant?.config?.reply_in_thread === true;
+    const watchChannel = configChannel || voice.notifyChannel || "";
+    if (replyInThread && watchChannel) {
+      voiceWatch.set(name, new Set([watchChannel]));
+      console.log(`worker: ${name} watching ${watchChannel} for in-thread replies`);
+    } else {
+      voiceWatch.delete(name);
+    }
+    // Per-person: one account per member who connected, each reading from their own login and
+    // floored at their own connect time. Empty on the shared path, where `creds` below is the one
+    // account and `accountsOf` collapses to it — so a shared tenant is byte-identical.
+    // Per-member floor overrides (`plaud_floor.<slack-id>`), for backfilling the recordings somebody
+    // already had when they connected. Read here rather than baked in, so turning a backfill on and
+    // off is a registry row and not a deploy — and scoped to the one member the key names.
+    const floorOverrides: Record<string, number> = {};
+    for (const mem of members) {
+      const raw = rows[`plaud_floor.${mem.user}`];
+      if (raw === undefined || raw === null || String(raw).trim() === "") continue;
+      const t = Date.parse(String(raw));
+      if (Number.isNaN(t)) {
+        console.error(`worker: ${name} plaud_floor.${mem.user} is not a date — ignoring "${String(raw).slice(0, 40)}"`);
+        continue;
+      }
+      floorOverrides[mem.user] = t;
+      console.log(`worker: ${name} plaud_floor override — ${mem.user} floored at ${new Date(t).toISOString()}`);
+    }
+    const accounts = perPerson ? accountsFromUsers(name, members, floorMs, floorOverrides) : undefined;
+    voiceCreds.set(name, {
+      notifyChannel: configChannel || voice.notifyChannel || undefined,
+      notifyUser: voice.notifyUser || undefined,
+      journal: voice.journal,
+      pollSeconds: voice.pollSeconds,
+      // An agent that has connected its own account through !connect reads from the third-party
+      // API; one that has not is still on the mounted bearer. Per agent, so the two tenants can be
+      // on different halves of this migration at the same time. On the per-person path `creds` is
+      // required but unread — the poll iterates `accounts` — so it is the first member's account.
+      creds: accounts ? accounts[0].creds : { tokenJson, cliAgent: viaCli ? name : undefined },
+      accounts,
+      calendars,
+      calendarExclude: (voice.calendarExclude ?? []).filter(Boolean),
+      calendarRoutes: voice.calendarRoutes,
+      calendarPadMinutes: voice.calendarPadMinutes,
+      brainDir: src.subpath ? path.join(dir, src.subpath) : dir,
+      // The state volume, not /tmp: a retry that resumes has to survive a pod restart, and /tmp in
+      // a container does not. Per agent, because a recording id is only unique within an account.
+      chunkCacheDir: path.join(process.env.TONOMAN_STATE_ROOT ?? "/root/.tonoman", "chunks", name),
+      pushUrl,
+      transcribe,
+      summarize,
+      // From the registry, per tenant. The roster already carries it, so this is not a second
+      // round trip that can be stale on its own.
+      mission: a.cfg.mission ?? "",
+      timezone: a.cfg.timezone ?? "UTC",
+      // The Talent this voice flow runs — its name and pinned version, recorded onto every run.
+      talent: voiceSkill ? { name: voiceSkill.name, version: voiceSkill.version } : undefined,
+      floorMs,
+      vocab:
+        process.env.GROQ_PROMPT ??
+        "Tonoman, Tonoman Cloud, Plaud, agentic AI, Slack, Temporal.",
+    });
+    console.log(
+      // A connected account IS a credential, so the line must not still read "waiting for a login"
+      // for an agent that is about to start polling. A flow reporting the opposite of what it is
+      // doing is the failure mode this whole boot line exists to prevent.
+      `worker: ${name} voice flow ready — ${
+        accounts
+          ? `per-person, ${accounts.length} member account(s)`
+          : describeVoice(viaCli ? { ...voice, credentialRef: `plaud-cli:${name}` } : voice)
+      }` +
+        `${viaCli && !accounts ? " [connected account]" : ""}; ` +
+        `brain at ${dir}; only recordings from ${new Date(floorMs).toISOString()} onwards` +
+        // Said out loud, because a flow with no calendar and a flow whose calendar failed to
+        // resolve look identical from the outside and are entirely different problems.
+        (calendars.length
+          ? `; calendars: ${calendars.map((c) => `${c.kind}/${c.alias}`).join(", ")}`
+          : "; no calendars attached"),
+    );
+  }
+
+  for (const [name, a] of wired) await wireVoice(name, a);
+
+  // --- the status bar -------------------------------------------------------------------------
+  // Per-turn tokens and context occupancy come from the harness result; the 5h/7d windows are the
+  // Claude subscription's own account-wide numbers, which only the process HOLDING the credential
+  // can read. In this split that process is the auth sidecar sharing /root/.claude, so we ask it
+  // over loopback (`GET /usage`) rather than reading the credential here. The podman-exec path in
+  // statusline.ts is for the single-machine deployment and has no podman to exec in a pod.
+  const runtimeUrl = process.env.AGENT_RUNTIME_URL ?? "http://127.0.0.1:8080";
+  const runtimeToken = process.env.AGENT_RUNTIME_TOKEN;
+  const windowsFor = async (name: string, speaker?: string): Promise<UsageWindow[]> => {
+    // Where turns run as their own users the login is in a user's home, and the service reads it as
+    // that user — so it has to be told whose: the agent's own, for the agent's headroom.
+    const users = usersOfThisWorker();
+    const cfg = wired.get(name)?.cfg;
+    // WHOSE login: the speaker's own where the agent runs inference per person — the login the turn
+    // just ran on. Asked for the agent's there, the runtime reads a login no turn uses and the footer
+    // came back with no 5h/7d at all (Nelly, in production).
+    const login = usageLoginOf(name, cfg?.inference_mode, speaker);
+    const who = users && cfg ? await users.for(cfg.guid ?? cfg.name, login.user).catch(() => undefined) : undefined;
+    if (users && !who) return [];
+    return remoteAccountUsageCached(login.key, runtimeUrl, runtimeToken, undefined, undefined, name, who ? { uid: who.uid, of: who.of, harness: cfg ? harnessOf(cfg) : undefined } : undefined, login.user);
+  };
+
+  /** The footer mode, per conversation. Process-local and deliberately so: it is a display
+   *  preference for a thread somebody is looking at right now, not a fact about the tenant. */
+  // Per AGENT and conversation, by the agent's permanent id (CONVO-EACH-AGENT-ITS-OWN): two agents in
+  // one thread each keep their own footer, and a rename keeps it.
+  const agentId = (name: string): string => wired.get(name)?.cfg.guid ?? name;
+  const statusModes = perAgentConversation<StatusMode>(agentId);
+  const defaultMode: StatusMode = parseStatusMode(process.env.TONOMAN_STATUSLINE ?? "") ?? "small";
+  const modeFor = (name: string, conversation: string): StatusMode => statusModes.get(name, conversation) ?? defaultMode;
+  /** Each agent's last turn's usage per conversation, so `!status` can report it without spending a turn. */
+  const lastUsage = perAgentConversation<TurnUsage>(agentId);
+  /** The model each conversation has chosen. Per conversation, NOT per process: this worker serves
+   *  every agent in the tenant and every thread they are in, and the harness's own knob is a single
+   *  variable — so `!model opus` in one thread moved everyone. */
+  // A thread's `!model`, per agent and per provider (CONVO-EACH-AGENT-ITS-OWN, INFER-SWITCH-COUNTS-CURRENT).
+  const models = threadModels();
+  const { claim: claimSession, reset: resetSession, forget: forgetSession, provenance, remember } = sessionStore();
+  await closedDoorsOrRefuse();
+  const brainsSys = await startBrains().catch((e: Error) => {
+    console.error(`worker: brains are off — ${e.message}`);
+    return undefined;
+  });
+
+  /** Where THIS agent's voice flow speaks: its configured channel, else a DM with the recipient.
+   *
+   *  A channel because a recap is team news; a DM makes it one person's news that everyone else has
+   *  to be told about again — and from the outside there is no way to tell whether it went to Rod
+   *  or to Priya. */
+  const channelOf = channelResolver();
+  const voiceConversation = async (name: string, user: string): Promise<string | undefined> => {
+    const a = wired.get(name);
+    if (!a) return undefined;
+    const channel = voiceCreds.get(name)?.notifyChannel;
+    if (channel) return `${a.cfg.slack?.team_id ?? ""}/${channel}`;
+    return dmFor(name, user);
+  };
+
+  /** What a conversation turn needs from the brains, bound to this worker's agents. */
+  /** What a conversation turn needs from the brains, bound to this worker's agents. With no brain
+   *  service (it failed to start), turns still run FAIL-CLOSED: no brain tool, but a history that drew
+   *  on a brain is still held and routed as if nobody else could read it. */
+  const turnBrains = (b?: { registry: ReturnType<typeof registryClient>; broker: Broker }): TurnBrains => ({
+    start: (agent, user, who, key, opts) => {
+      const g = wired.get(agent)?.cfg.guid;
+      // Each use is saved with the session the moment it happens (BRAIN-USED-DECIDES).
+      return b && g ? b.broker.startTurn({ agentGuid: g, slackUserId: user, who, receipts: opts?.receipts }, { onUse: (id) => remember(agent, key, [id]) }) : undefined;
+    },
+    bind: (token, cwd) => b?.broker.bindFolder(token, cwd),
+    attach: (token, files) => b?.broker.attach(token, files),
+    end: (token) => (b ? b.broker.endTurn(token).used : []),
+    provenance: (agent, key) => provenance(agent, key),
+    remember: (agent, key, used) => remember(agent, key, used),
+    audience: async (agent, conversation, user) => {
+      const conn = wired.get(agent)?.conn as { audience?: (c: string, u: string) => Promise<Audience> } | undefined;
+      return conn?.audience ? conn.audience(conversation, user) : { kind: "unknown", why: "this channel cannot say who is in it" };
+    },
+    reach: async (agent, user) => {
+      const g = wired.get(agent)?.cfg.guid;
+      if (!b || !g) return null;
+      const r = await b.registry.reach(g, user);
+      return new Map(r.brains.map((x) => [x.id, x.name]));
+    },
+    readableByAll: async (agent, ids, members) => {
+      const g = wired.get(agent)?.cfg.guid;
+      return b && g ? b.registry.readableByAll(g, ids, members) : null;
+    },
+    dm: async (agent, user, text) => {
+      const a = wired.get(agent);
+      const conv = a ? await dmFor(agent, user) : undefined;
+      if (!a || !conv) return false;
+      await a.conn.reply(conv).send(text);
+      return true;
+    },
+  });
+
+  // Finish the writes a restart interrupted, telling each person privately (BRAIN-WRITE-SURVIVES-RESTART).
+  if (brainsSys) {
+    const b = brainsSys;
+    void recoverWrites({
+      store: b.store,
+      registry: b.registry,
+      tell: async (agentGuid, user, text) => {
+        const name = [...wired.entries()].find(([, w]) => w.cfg.guid === agentGuid)?.[0];
+        const conv = name ? await dmFor(name, user) : undefined;
+        if (!name || !conv) return false;
+        await wired.get(name)!.conn.reply(conv).send(text);
+        return true;
+      },
+    }).catch((e: Error) => console.error(`worker: brain write recovery failed — ${e.message}`));
+  }
+
+  // The LOREALISTAR drop watcher's runtime half (drop-watch.md in Tonoman Cloud): each person's login
+  // and what they have been told, sealed in the Cloud as Plaud's tokens are. With no registry to
+  // keep them in, they are kept in memory and gone at a restart — a developer's machine.
+  const drops = dropWatcher({
+    site: siteOver(),
+    store: process.env.TONOMANCLOUD_API_URL
+      ? cloudDropStore({ baseUrl: process.env.TONOMANCLOUD_API_URL, token: process.env.TONOMANCLOUD_API_TOKEN ?? "", guidOf: (name) => wired.get(name)?.cfg.guid })
+      : memoryDropStore(),
+  });
+
+  const deps = {
+    agent: (name: string) => wired.get(name),
+    voice: (name: string) => voiceCreds.get(name),
+    recordUsage: (name: string, conversation: string, u: TurnUsage) => lastUsage.set(name, conversation, u),
+    // The conversation's own `!model` choice, else the agent's CURRENT default from the roster.
+    // The fall-through is load-bearing: the runner also holds a model, but that one was baked in
+    // at wire time, and a reload that changes only the default model is a plain cfg swap (no runner
+    // rebuild) on the promise that the model is read per turn. Without this a Hub edit to "opus"
+    // saved, reloaded, and every new conversation still opened on the old default.
+    modelFor: (agent: string, conversation: string) =>
+      models.get(agent, conversation, providerOf(wired.get(agent)?.cfg)) ?? wired.get(agent)?.cfg.model,
+    claimSession,
+    resetSession,
+    brains: turnBrains(brainsSys),
+    // A Talent's program goes out as the run's own Linux user too (TURNUSER-NOTHING-AS-ROOT).
+    turnUser: usersOfThisWorker()
+      ? async (agent: string, user: string | undefined) => {
+          const users = usersOfThisWorker()!;
+          const who = await users.for(wired.get(agent)?.cfg.guid ?? agent, user || undefined);
+          const runAs = { uid: who.uid, home: who.home };
+          await users.handOver(runAs, { configHome: homeIn(runAs, agent, "talents") });
+          return runAs;
+        }
+      : undefined,
+    lorealistar: drops,
+    dm: async (name: string, user: string, text: string) => {
+      const conv = await dmFor(name, user);
+      if (conv) await wired.get(name)?.conn.reply(conv).send(text);
+    },
+    timezoneOf: (name: string) => wired.get(name)?.cfg.timezone || undefined,
+    dropTurnDir,
+    turnsRoot: turnUsersOn() ? TURNS_ROOT : undefined,
+    sentFiles: sentFiles(path.join(process.env.TONOMAN_STATE_ROOT ?? "/root/.tonoman", "sent")),
+    // Where a Talent files (BRAIN-TALENT-TARGET): the brain its settings name, else the personal brain
+    // of the person the run is for. An agent that already files into a second brain keeps doing so
+    // (BRAIN-MIGRATION). The run must be able to write there, now and again right before the push.
+    talentBrain: brainsSys
+      ? {
+          store: brainsSys.store,
+          target: async (agentName: string, user: string | undefined, talent: string) => {
+            const a = wired.get(agentName);
+            if (!a?.cfg.guid) return undefined;
+            const named = (a.cfg.talents ?? []).find((t) => t.name === talent)?.config?.brain;
+            if (!(typeof named === "string" && named.trim()) && (a.cfg.secondbrain ?? []).length) return undefined;
+            const guid = a.cfg.guid;
+            const r = await brainsSys.registry.reachUnattended(guid, user ?? null);
+            const b =
+              typeof named === "string" && named.trim()
+                ? pickBrain(r.brains, named)
+                : r.brains.find((x) => x.kind === "personal" && x.own);
+            if (!b) return { error: typeof named === "string" && named.trim() ? `the brain "${named}" is not one this run can reach` : "the person this run is for has no brain in this tenant" };
+            if (b.mode !== "write") return { error: `this run cannot write to ${b.name}` };
+            const ready = await brainsSys.broker.ensureRepo(r.tenant, b).catch(() => null);
+            if (!ready?.repoUrl) return { error: `${b.name} could not be set up yet` };
+            return {
+              agentGuid: guid,
+              id: b.id,
+              name: b.name,
+              who: user ?? "a Talent",
+              brain: { id: b.id, name: b.name, tenant: r.tenant, repoUrl: ready.repoUrl, subpath: b.subpath ?? undefined, branch: b.branch ?? undefined },
+              authorize: async () => (await brainsSys.registry.reachUnattended(guid, user ?? null)).brains.some((x) => x.id === b.id && x.mode === "write"),
+            };
+          },
+        }
+      : undefined,
+    footer: async (name: string, conversation: string, u: TurnUsage | undefined, speaker?: string): Promise<string | null> => {
+      const mode = modeFor(name, conversation);
+      if (mode === "none" || !u) return null;
+      // The windows are cached for two minutes, so this is a fetch at most once per window per
+      // agent — an answer must never wait on the usage API to be delivered.
+      // A Codex turn read its own login's allowance from its rollout (CONVO-FOOTER-BOTH-PROVIDERS);
+      // the account usage API is Anthropic's and would say nothing true about it.
+      const windows = u.accountWindows?.length ? u.accountWindows : await windowsFor(name, speaker).catch(() => [] as UsageWindow[]);
+      return renderStatus(mode, u, wired.get(name)?.runner.getModel?.(), windows, Date.now());
+    },
+    say: async (name: string, user: string, text: string) => {
+      const conv = await voiceConversation(name, user);
+      if (conv) await wired.get(name)?.conn.reply(conv).send(text);
+    },
+    // In a CHANNEL a Talent's settings name — its id, or its name looked up among what the agent can
+    // see (DROPS-IN-A-CHANNEL). Never through `say`, which takes a person and opens a DM with them.
+    sayIn: async (name: string, channel: string, text: string): Promise<boolean> => {
+      const a = wired.get(name);
+      const conn = a?.conn as SlackConnector | undefined;
+      if (!a || !conn?.call) return false;
+      try {
+        const id = await channelOf(name, (m, b) => conn.call(m, b), channel);
+        if (!id) {
+          console.error(`worker: ${name} failed to find the channel ${channel} — it sees none by that name`);
+          return false;
+        }
+        await a.conn.reply(`${a.cfg.slack?.team_id ?? ""}/${id}`).send(text);
+        return true;
+      } catch (e) {
+        console.error(`worker: ${name} failed to post in ${channel} — ${(e as Error).message}`);
+        return false;
+      }
+    },
+    ask: async (name: string, user: string, text: string, drewOn?: string[]) => {
+      const conv = await voiceConversation(name, user);
+      if (!conv) return;
+      await client.workflow.signalWithStart(conversationWorkflow, {
+        workflowId: `${name}:slack:${conv}`,
+        taskQueue: o.taskQueue,
+        args: [{ agent: name, conversation: conv, channel: "slack" }],
+        signal: messageSignal,
+        // The platform's words (a recap steer), for `user` and on their subscription — not typed by them.
+        signalArgs: [{ text, user, ts: String(Date.now()), fromSystem: true, ...(drewOn?.length ? { drewOn } : {}) }],
+      });
+    },
+    // Inference on the AGENT'S OWN provider — a headless harness turn, captured not posted. The
+    // recap is the agent reasoning about the meeting on its own subscription, which is why this runs
+    // the same runner that answers messages rather than a side model with its own key. No
+    // systemPromptFile: the identity/persona is for conversation; a recap wants the agent's model,
+    // not its voice. Dispatches on the harness the agent runs — claude-code today; a second provider
+    // (codex, an OpenAI subscription) slots in here without the Talent ever knowing.
+    // A Google calendar's events, through the registry: it refreshes the access token with the client
+    // secret this worker never holds, and hands back only the short-lived access token.
+    googleCalendar: async (
+      name: string,
+      feed: calendar.CalendarFeed,
+      from: number,
+      to: number,
+    ): Promise<calendar.CalEvent[]> => {
+      const guid = wired.get(name)?.cfg.guid;
+      const baseUrl = process.env.TONOMANCLOUD_API_URL;
+      if (!guid || !baseUrl) return [];
+      const r = await fetch(
+        `${baseUrl}/v1/system/agents/${guid}/oauth/google/${encodeURIComponent(feed.alias)}/access-token`,
+        {
+          method: "POST",
+          headers: { authorization: `Bearer ${process.env.TONOMANCLOUD_API_TOKEN ?? ""}` },
+          signal: AbortSignal.timeout(20_000),
+        },
+      );
+      const j = (await r.json().catch(() => ({}))) as { accessToken?: string; error?: string };
+      if (!r.ok || !j.accessToken) throw new Error(`google/${feed.alias}: ${j.error ?? `registry answered ${r.status}`}`);
+      return googlecal.eventsFromGoogle(await googlecal.listEvents(j.accessToken, from, to), {
+        kind: feed.kind,
+        alias: feed.alias,
+      });
+    },
+    // W3: what a failed turn learned about the credential, recorded where it belongs — the speaker's
+    // own row on a per-person agent, the agent's otherwise. Best-effort by contract.
+    reportAuthState: (name: string, state: "ok" | "error" | "expired" | "unconfigured", user?: string, provider?: InferenceProvider) =>
+      reportAuthState(name, state, user, provider).catch((e) =>
+        console.error(`worker: ${name} auth-state report failed — ${(e as Error).message}`),
+      ),
+    providerLabel: (name: string): string => providerLabel(providerOf(wired.get(name)?.cfg)),
+    talentConfig: (name: string, talent: string): Record<string, unknown> =>
+      wired.get(name)?.cfg.talents?.find((t) => t.name === talent)?.config ?? {},
+    infer: async (name: string, p: { system: string; user: string }, owner?: string): Promise<string> => {
+      const a = wired.get(name);
+      if (!a) throw new Error(`infer: ${name} is not a wired agent`);
+      let out = "";
+      // lean: no tools, no connectors, one turn — a completion, not an agent session. `user` is the
+      // item's owner, so a per-person agent summarises a recording on its owner's subscription; the
+      // run closure ignores it for a shared agent.
+      for await (const ev of a.run({ prompt: `${p.system}\n\n${p.user}`, lean: true, user: owner })) {
+        // The COMPLETE reply rides the `done` event's `final` (the agent's full answer for memory +
+        // render); `text` is only the streaming delta and `err` carries an error — reading `text`
+        // here is why the first cut saw "no text" while the model had plainly answered.
+        if (ev.kind === "done" && ev.final) out = ev.final;
+        else if (ev.kind === "error") throw ev.err ?? new Error("infer: the harness returned an error");
+      }
+      if (!out.trim()) throw new Error("infer: the harness returned no text");
+      return out;
+    },
+    // The durable record of one item of one skill, over the same system-token API the worker uses
+    // for everything else — the worker holds no database connection string.
+    //
+    // BEST-EFFORT, ALWAYS. This row is observability: it is what answers "is this failing, or has
+    // nobody looked at it". A registry that is briefly unreachable must never be the reason a
+    // recording is not processed, so every failure here is logged and swallowed — the run proceeds,
+    // the row is simply missing. Dedup does not depend on it (the git checkout still answers "already
+    // published"); this makes a failing run visible, which nothing did before.
+    talentRun: {
+      open: async (
+        name: string,
+        talentName: string,
+        itemKey: string,
+        version: number,
+        o?: { trigger?: "schedule" | "command" | "hub"; requestedBy?: string; forUser?: string },
+      ) => {
+        const baseUrl = process.env.TONOMANCLOUD_API_URL;
+        const guid = wired.get(name)?.cfg.guid;
+        if (!baseUrl || !guid) return; // a file roster has no registry to record into
+        try {
+          const r = await fetch(`${baseUrl}/v1/system/agents/${guid}/talent-runs`, {
+            method: "POST",
+            headers: {
+              authorization: `Bearer ${process.env.TONOMANCLOUD_API_TOKEN ?? ""}`,
+              "content-type": "application/json",
+            },
+            // `trigger` and `requestedBy` are what make "why did this run, and who asked" answerable
+            // after the fact — a Talent failing on its schedule and one a person keeps re-running by
+            // hand are very different situations that used to leave identical rows.
+            body: JSON.stringify({
+              talent: talentName,
+              itemKey,
+              version,
+              trigger: o?.trigger ?? "schedule",
+              ...(o?.requestedBy ? { requestedBy: o.requestedBy } : {}),
+              // WHO it is for, which the Hub renders as "for <name>" — and which is a different
+              // person from `requestedBy` the moment somebody runs a teammate's recording.
+              ...(o?.forUser ? { forUser: o.forUser } : {}),
+            }),
+          });
+          if (!r.ok) console.error(`worker: ${name} talent_run open ${talentName}/${itemKey} → ${r.status}`);
+        } catch (e) {
+          console.error(`worker: ${name} talent_run open ${talentName}/${itemKey} failed: ${String(e)}`);
+        }
+      },
+      close: async (
+        name: string,
+        talentName: string,
+        itemKey: string,
+        status: "done" | "failed",
+        error?: string,
+        result?: { summary: string; links?: { label: string; url: string }[] },
+      ) => {
+        const baseUrl = process.env.TONOMANCLOUD_API_URL;
+        const guid = wired.get(name)?.cfg.guid;
+        if (!baseUrl || !guid) return;
+        try {
+          const r = await fetch(`${baseUrl}/v1/system/agents/${guid}/talent-runs`, {
+            method: "PATCH",
+            headers: {
+              authorization: `Bearer ${process.env.TONOMANCLOUD_API_TOKEN ?? ""}`,
+              "content-type": "application/json",
+            },
+            // `result` is WHAT the run produced, not just that it finished. Trimmed to 2000 chars at
+            // the activity that produced it; trimmed again here because this is the last place before
+            // the wire and a field length is a contract, not a hope.
+            body: JSON.stringify({
+              talent: talentName,
+              itemKey,
+              status,
+              error,
+              ...(result?.summary
+                ? { result: { summary: result.summary.slice(0, 2000), ...(result.links?.length ? { links: result.links } : {}) } }
+                : {}),
+            }),
+          });
+          if (!r.ok) console.error(`worker: ${name} talent_run close ${talentName}/${itemKey} → ${r.status}`);
+        } catch (e) {
+          console.error(`worker: ${name} talent_run close ${talentName}/${itemKey} failed: ${String(e)}`);
+        }
+      },
+      status: async (name: string, talentName: string, itemKey: string) => {
+        const baseUrl = process.env.TONOMANCLOUD_API_URL;
+        const guid = wired.get(name)?.cfg.guid;
+        if (!baseUrl || !guid) return undefined; // a file roster has no registry to ask
+        try {
+          const qs = `talent=${encodeURIComponent(talentName)}&itemKey=${encodeURIComponent(itemKey)}`;
+          const r = await fetch(`${baseUrl}/v1/system/agents/${guid}/talent-runs?${qs}`, {
+            headers: { authorization: `Bearer ${process.env.TONOMANCLOUD_API_TOKEN ?? ""}` },
+          });
+          if (!r.ok) {
+            // 404 (no such agent/talent) and every other non-OK read FAIL OPEN: the guard's only job
+            // is to skip an item that is already done, so "can't tell" must mean "go ahead".
+            return undefined;
+          }
+          const body = (await r.json()) as { status?: string | null; attempts?: number };
+          // `attempts` counts LAUNCHES (each open bumps it), which is what the poll's give-up budget
+          // is measured in. Absent on an older API → 0, which only ever errs towards trying again.
+          return body.status === "running" || body.status === "done" || body.status === "failed"
+            ? { status: body.status as "running" | "done" | "failed", attempts: Number(body.attempts ?? 0) }
+            : undefined;
+        } catch (e) {
+          console.error(`worker: ${name} talent_run status ${talentName}/${itemKey} failed: ${String(e)}`);
+          return undefined;
+        }
+      },
+    },
+  };
+
+  // The capability plane — a localhost server a spawned Talent CLI calls for transcription,
+  // inference and publishing. Started once, closed over `deps` (so it resolves each run's VoiceConfig
+  // live, across reloads), and attached to `deps` so the `runTalent` activity can spawn through it.
+  // Best-effort: a failure here must not stop the worker from answering messages.
+  let talentPlane: CapabilityPlane | undefined;
+  try {
+    talentPlane = await startCapabilityPlane(deps as unknown as Parameters<typeof startCapabilityPlane>[0]);
+    (deps as { talentPlane?: CapabilityPlane }).talentPlane = talentPlane;
+    console.log(`worker: capability plane listening on ${talentPlane.url}`);
+    signal.addEventListener("abort", () => void talentPlane?.close());
+  } catch (e) {
+    console.error(`worker: capability plane failed to start: ${String(e)}`);
+  }
+
+  const activities = makeActivities(deps);
+
+  // Auto-register a Slack person into Tonoman Cloud the moment they connect an integration. The
+  // connect path (Claude/Plaud login) already existed; what was missing was the write that makes a
+  // NEW user real to the tenant — so a genuinely new person was neither RECOGNISED by the agent
+  // (no `agent_principal`, hence "who am I speaking with?") nor VISIBLE in the Hub (no
+  // `account`/`membership`). We resolve their real name (and email, for the Hub) from Slack and let
+  // the registry upsert all three, idempotently.
+  //
+  // Best-effort and awaited (not fire-and-forget): it is one `users.info` call plus one fetch, and
+  // awaiting means the `agent_principal` row exists before the "✅ connected" reply — so the next
+  // 30s roster reload deterministically teaches the agent the name before the first recap lands.
+  // Any failure is logged and swallowed; connecting must never break because registration did.
+  const autoRegisterMember = async (
+    name: string,
+    user: string | undefined,
+    /** The login outcome that brought them here, when there is one. The register-member route takes
+     *  it alongside the profile, so a first-time sign-in is one call rather than a register followed
+     *  by a per-principal update that would have 404'd a moment earlier. */
+    auth?: { authState: "ok" | "error" | "expired" | "unconfigured"; authProvider: string },
+  ): Promise<void> => {
+    if (!user) return;
+    const a = wired.get(name);
+    const guid = a?.cfg.guid;
+    const baseUrl = process.env.TONOMANCLOUD_API_URL;
+    if (!guid || !baseUrl) return;
+    let profileName: string | undefined;
+    let email: string | undefined;
+    try {
+      const conn = a?.conn as SlackConnector | undefined;
+      // users.info reads `user` from the QUERY STRING, not a JSON body — posting it in the body
+      // (which conn.call does by default) silently returns user_not_found. So put it in the URL.
+      const info = await conn?.call<{
+        user?: { real_name?: string; profile?: { real_name?: string; display_name?: string; email?: string } };
+      }>(`users.info?user=${encodeURIComponent(user)}`);
+      const p = info?.user;
+      profileName = p?.profile?.real_name || p?.real_name || p?.profile?.display_name || undefined;
+      email = p?.profile?.email || undefined;
+    } catch (e) {
+      console.error(`worker: ${name} users.info failed for ${user}: ${(e as Error).message}`);
+    }
+    try {
+      await fetch(`${baseUrl}/v1/system/agents/${guid}/register-member`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${process.env.TONOMANCLOUD_API_TOKEN ?? ""}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ slackUserId: user, name: profileName, email, ...(auth ?? {}) }),
+      });
+    } catch (e) {
+      console.error(`worker: ${name} register-member failed for ${user}: ${(e as Error).message}`);
+    }
+  };
+
+  // In-channel commands. They read and write the same maps the status footer uses, so what
+  // `!status` reports is exactly what the footer would have shown.
+  const commandDeps: cmds.CommandDeps = {
+    // Straight off the roster this worker already holds, rather than a call back to the registry.
+    // The roster IS the worker's view of an agent, and answering from anything else would let
+    // `!connections` disagree with what the flow is actually using — which is precisely the
+    // question somebody types it to settle.
+    // Start a three-legged login. The registry owns the whole flow — it holds the client secret,
+    // the pending state and the PKCE verifier, and it is what the provider redirects back to. The
+    // worker's only job is to carry the URL into the channel, which is why nothing about Google or
+    // Microsoft appears in this process at all.
+    beginOauth: async (name, provider, alias, conversation) => {
+      const baseUrl = process.env.TONOMANCLOUD_API_URL;
+      const guid = wired.get(name)?.cfg.guid;
+      if (!baseUrl || !guid) return { problem: "this deployment has no registry behind it" };
+      try {
+        const r = await fetch(`${baseUrl}/v1/system/agents/${guid}/oauth/${encodeURIComponent(provider)}/begin`, {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${process.env.TONOMANCLOUD_API_TOKEN ?? ""}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({ alias, conversation }),
+        });
+        const j = (await r.json()) as { url?: string; error?: string; available?: string[] };
+        if (!r.ok || !j.url) {
+          // The registry's own words. It knows which providers are configured on this deployment
+          // and this process does not, so paraphrasing would replace a specific answer with a vague
+          // one — "Outlook isn't set up here" versus "that didn't work".
+          const avail = j.available?.length ? ` (available: ${j.available.join(", ")})` : "";
+          return { problem: `${j.error ?? `HTTP ${r.status}`}${avail}` };
+        }
+        return { url: j.url };
+      } catch (e) {
+        return { problem: (e as Error).message };
+      }
+    },
+    connections: async (name) =>
+      (wired.get(name)?.cfg.credentials ?? []).map((c) => ({
+        kind: c.kind,
+        alias: c.alias,
+        label: c.label,
+        status: c.status,
+        externalAccount: c.external_account,
+      })),
+    // On-demand: start the SAME per-item workflow the poll starts, so an on-demand run and a
+    // scheduled one dedup against each other (the deterministic id). AlreadyStarted is the normal
+    // answer for an item in flight or already done — reported, not an error.
+    runTalent: async (name, talent, item, user, force, how) => {
+      const tdef = getTalent(talent);
+      if (!tdef) return { started: false, message: `I don't run a Talent called "${talent}".` };
+      // Keyed on the recording's KEY, exactly as the poll keys it, so an on-demand run of an item
+      // the poll knows under a renamed id is the same item — same workflow id, same run record.
+      // A brief is about NOW, not an item: every ask is its own run, never deduped against the last.
+      if (talent === agendaBrief.name) item = `now-${Date.now()}`;
+      const key = recordingKey(item);
+      const wfId = user ? `talent:${name}:${user}:${key}` : `talent:${name}:${key}`;
+      try {
+        await client.workflow.start(runTalentWorkflow, {
+          workflowId: wfId,
+          taskQueue: o.taskQueue,
+          args: [
+            {
+              agent: name,
+              talent,
+              itemKey: key,
+              recordingId: item,
+              version: tdef.version,
+              notify: user ?? "",
+              user,
+              force,
+              // `command` is the default because the two callers of this function are `!talent` and
+              // the Hub endpoint; a schedule starts the workflow directly and says so itself.
+              trigger: how?.trigger ?? "command",
+              requestedBy: how?.requestedBy,
+            },
+          ],
+        });
+        // The workflow id goes back to the caller (W4): it is the one handle the Hub can use to
+        // follow the run it just started, and it was being computed here and thrown away.
+        if (talent === agendaBrief.name) {
+          return { started: true, message: "Looking at today's calendar now — the brief follows in a moment.", workflowId: wfId };
+        }
+        return {
+          started: true,
+          workflowId: wfId,
+          message: force
+            ? `Re-running *${talent}* on \`${item}\` now — a fresh recap, even though it was already filed.`
+            : `Running *${talent}* on \`${item}\` now — I'll post the recap when it's done.`,
+        };
+      } catch (e) {
+        if (e instanceof WorkflowExecutionAlreadyStartedError) {
+          return { started: false, workflowId: wfId, message: `\`${item}\` is already being processed (or was already done).` };
+        }
+        throw e;
+      }
+    },
+    getMode: modeFor,
+    setMode: (name, conversation, mode) => statusModes.set(name, conversation, mode),
+    lastUsage: (name, conversation) => lastUsage.get(name, conversation),
+    windows: windowsFor,
+    // Which Claude account this agent is signed in as. Straight from `claude auth status` in the
+    // agent's own credential directory, trimmed to its first line — the point is to make "whose
+    // subscription is this?" answerable from Slack, which it has never been.
+    inferenceProvider: (name) => providerLabel(providerOf(wired.get(name)?.cfg)),
+    claudeAccount: async (name, user) => {
+      // `claude auth status` answers in JSON — { loggedIn, email, subscriptionType, ... } — so the
+      // first line of it is "{". Parsed, not scanned: reading this as text printed a lone brace
+      // into Slack, which told Rod nothing except that something was wrong.
+      // Per-person agent: report the SPEAKER's own login; shared: the agent's one login (user ignored).
+      const u = wired.get(name)?.cfg.inference_mode === "per_user" ? user : undefined;
+      const ops = authDeps.ops(name, u);
+      const raw = (await ops?.status?.().catch(() => "")) ?? "";
+      try {
+        const j = JSON.parse(raw) as { loggedIn?: boolean; email?: string; subscriptionType?: string };
+        if (!j.loggedIn) return "not signed in";
+        return [j.email, j.subscriptionType && `(${j.subscriptionType})`].filter(Boolean).join(" ") || "signed in";
+      } catch {
+        // A harness that answers in PROSE rather than JSON still gets to say something. codex is
+        // one: `codex login status` prints "Logged in using ChatGPT" or "Not logged in", and the
+        // second has to read as not-signed-in here or `!connections` lists an account that is not
+        // there. `looksLoggedIn` is the one place that judgement is made.
+        const line = raw.split(/\r?\n/).find((l) => l.trim())?.trim() ?? "";
+        if (!line) return "";
+        return looksLoggedIn(line) ? line.slice(0, 120) : "not signed in";
+      }
+    },
+    // `!new` forgets the person's session on either provider (INFER-SWITCH-COUNTS-CURRENT keys a
+    // Codex session apart), so it always means "start over", whatever the agent was on before.
+    resetSession: (name, conversation) => {
+      void forgetSession(name, conversation).catch(() => {});
+      void forgetSession(name, `${conversation}@codex`).catch(() => {});
+    },
+    plaudConnected: (name, user) => {
+      // Per-person: is the SPEAKER's own account connected. Shared: the tenant's one account, and the
+      // user is ignored — same question either way for a shared agent.
+      const u = flowcfg.plaudPerPerson(wired.get(name)?.cfg.flows?.voice) ? user : undefined;
+      return plaudcli.connected(name, u);
+    },
+    // `!connect claude`, typed on purpose. The SAME offer the auth gate makes on its own when a
+    // turn finds no credential - one mechanism, not two, so what a person is shown is identical
+    // whether they asked for it or we volunteered it.
+    //
+    // This existed as `!disconnect claude` with no counterpart, which meant the notice told people
+    // to send `!connect claude` and the command then said there was no such connector.
+    connectClaude: async (name, conversation, user) => {
+      const a = wired.get(name);
+      if (!a) return "I don't know that agent here.";
+      // The moment Rod pointed at: connecting Claude is where a new person first identifies
+      // themselves, so register them into the tenant now (recognises them + puts them in the Hub).
+      await autoRegisterMember(name, user);
+      // ask() returns false both when it POSTED a reason and when there was nothing to post, and
+      // those need different answers. The second case is exactly this one, checked here so the
+      // command never ends in silence.
+      if (!authDeps.ops(name)) return `I can't start a ${providerLabel(providerOf(a.cfg))} login on this deployment.`;
+      // Per-person agent: sign in the SPEAKER's own subscription (their own credential dir); shared:
+      // the agent's one login, and the user is ignored — same offer either way.
+      const u = a.cfg.inference_mode === "per_user" ? user : undefined;
+      await gate.ask(authDeps, name, a.cfg.displayName ?? a.cfg.name ?? name, conversation, u, user).catch((e) => {
+        console.error(`worker: ${name} connect claude failed: ${(e as Error).message}`);
+        return false;
+      });
+      // The blocks ARE the message; returning text as well would post the whole thing twice, and
+      // ask() has already said why on the paths where it could not offer a login.
+      return "";
+    },
+    // A published calendar address. The blocks ARE the message; see connectClaude.
+    connectLorealistar: async (name, conversation) => {
+      const asked = await lorealistargate.ask(lorealistarDeps, name, conversation).catch((e) => {
+        console.error(`worker: ${name} connect lorealistar failed: ${(e as Error).message}`);
+        return false;
+      });
+      return asked ? "" : "I can't post a dialog in this conversation.";
+    },
+    disconnectLorealistar: async (name, user) => {
+      if (!user) return "I don't know who is asking.";
+      await drops.disconnect(name, user);
+      await ensureDropSchedule(name).catch(() => {});
+      return "🔓 I have forgotten your LOREALISTAR login and stopped watching for you. `!connect lorealistar` starts it again.";
+    },
+    connectIcs: async (name, conversation) => {
+      const asked = await icsgate.ask(icsDeps, name, conversation).catch((e) => {
+        console.error(`worker: ${name} connect ics failed: ${(e as Error).message}`);
+        return false;
+      });
+      return asked ? "" : "I can't post a dialog in this conversation.";
+    },
+    disconnectClaude: async (name, user) => {
+      // Removing the credential IS the sign-out: the harness reads it from this directory on every
+      // turn, so a deleted file means the next message finds no login and the connect gate offers
+      // one. Only THIS agent's directory, so signing Nelly out never touches Sapien — and on a
+      // per-person agent only the SPEAKER's own dir, so one teammate signing out never touches
+      // another's.
+      const a = wired.get(name);
+      if (!a) return "I don't know that agent here.";
+      const u = a.cfg.inference_mode === "per_user" ? user : undefined;
+      await forget(await credFilesNow(a.cfg, u));
+      // So the gate offers a login on the very next message rather than after a restart. On a
+      // per-person agent the gate is per-speaker (a file check), so there is no shared flag to flip.
+      if (a.cfg.inference_mode !== "per_user") a.cfg.auth_state = "unconfigured";
+      return `🔓 Signed out of ${providerLabel(providerOf(a.cfg))}. Send me anything and I'll offer you a fresh login.`;
+    },
+    disconnectPlaud: async (name, user) => {
+      // Per-person: forget only the SPEAKER's own account, so one teammate signing out never touches
+      // another's. Shared: the tenant's one account.
+      const u = flowcfg.plaudPerPerson(wired.get(name)?.cfg.flows?.voice) ? user : undefined;
+      await plaudauth.disconnect(name, u);
+      // And STOP POLLING. This used to end "the running flow finishes its current cycle first",
+      // which was a polite way of saying the credential stayed resolved in memory until the next
+      // restart — so a disconnected account kept being read, potentially for days. Re-working the
+      // flow puts the agent back in disabledFlows, and pausing the schedule is what makes that
+      // true rather than merely recorded.
+      const a = wired.get(name);
+      if (a) {
+        await wireVoice(name, a);
+        if (!voiceCreds.has(name)) await pauseVoiceSchedule(name, DISCONNECTED_NOTE);
+      }
+      return "Disconnected - I've forgotten your Plaud account and asked Plaud to revoke it. Nothing is polling it any more.";
+    },
+    finishPlaud: async (name, pasted, user) => {
+      // Per-person: store the SPEAKER's tokens under their own scope; the secrets-list route is what
+      // makes the account visible to the poll, so no connection row is needed here.
+      const u = flowcfg.plaudPerPerson(wired.get(name)?.cfg.flows?.voice) ? user : undefined;
+      const r = await plaudauth.complete(name, pasted, u);
+      if (!r.ok) return `That didn't work - ${r.problem}.`;
+      // The `!code plaud <address>` completion path — register the connecting person into the tenant.
+      await autoRegisterMember(name, user);
+      // THE SECOND COMPLETION PATH. The dialog is not the only way in — `!connect plaud <code>`
+      // lands here — and a fix applied to one of two doors is not a fix. Starting the poll has to
+      // happen wherever a credential arrives, not wherever it was convenient to add it.
+      const caveat = await plaudDeps.onConnected?.(name).catch((e) => `I couldn't start the poll - ${(e as Error).message}`);
+      if (caveat) return `✅ Your Plaud account is connected, but ${caveat}.
+
+Nothing will be picked up until that is sorted.`;
+      const where = voiceCreds.get(name)?.notifyChannel;
+      return (
+        "✅ Your Plaud account is connected." +
+        `
+
+Record something and I'll pick it up within a couple of minutes - I'll post what I find ${where ? `in <#${where}>` : "here"}.`
+      );
+    },
+    connectPlaud: async (name, conversation, user) => {
+      // Per-person: begin a login for the SPEAKER, whose tokens land in their own scope.
+      const u = flowcfg.plaudPerPerson(wired.get(name)?.cfg.flows?.voice) ? user : undefined;
+      // Buttons and a private dialog, the same shape as connecting Claude. Two mechanisms for
+      // one idea is something a person has to learn twice, and the typed version put an
+      // authorization code into channel history.
+      const asked = await plaudgate.ask(plaudDeps, name, conversation, u).catch(() => false);
+      // The blocks ARE the message. Returning text as well would post the whole thing twice.
+      if (asked) return "";
+      // A client that cannot render blocks still gets a working, if wordier, flow.
+      const p = await plaudauth.begin(name, u);
+      return (
+        `Let's connect your Plaud account. Open this and sign in as yourself:\n\n${p.url}` +
+        `\n\n*Then:* the page it sends you to will fail to load - that is expected. Copy the whole address 
+         out of your browser bar and send it back as \`!code plaud <address>\``
+      );
+    },
+    // What THIS conversation runs: its own choice, else whatever the roster row says.
+    getModel: (name, conversation) => models.get(name, conversation, providerOf(wired.get(name)?.cfg)) ?? wired.get(name)?.cfg.model,
+    setModel: (name, conversation, model) => models.set(name, conversation, model),
+  };
+
+  // --- adding a calendar by its published address -------------------------------------------------
+  //
+  // CHECKED BEFORE IT IS STORED. A URL that cannot be read produces a connection row the matcher
+  // silently gets nothing from — "connected" on screen and empty in practice, which is the exact
+  // state every failure this week wore as a disguise. So the feed is fetched and parsed first, and
+  // only a feed that answers is saved.
+  const lorealistarDeps: lorealistargate.LorealistarGateDeps = {
+    conn: (name) => wired.get(name)?.conn as SlackConnector | undefined,
+    save: async (name, user, email, password) => {
+      const r = await drops.connect(name, user, email, password);
+      // The watch starts with the first login, not at the next restart.
+      if (r.ok) await ensureDropSchedule(name).catch((e) => console.error(`worker: ${name} drop schedule failed — ${(e as Error).message}`));
+      return r;
+    },
+    // To that person, privately: what came of trying their login is theirs to hear. Only when no DM
+    // can be opened is it said where they asked — and it never holds the login either way.
+    tell: async (name, user, conversation, text) => {
+      const dm = await dmFor(name, user).catch(() => undefined);
+      const where = dm ?? conversation;
+      if (where) await wired.get(name)?.conn.reply(where).send(text);
+    },
+  };
+
+  const icsDeps: icsgate.IcsGateDeps = {
+    conn: (name) => wired.get(name)?.conn as SlackConnector | undefined,
+    save: async (name, alias, url) => {
+      const guid = wired.get(name)?.cfg.guid;
+      const baseUrl = process.env.TONOMANCLOUD_API_URL;
+      if (!guid || !baseUrl) return { ok: false, message: "⚠️ This deployment has no registry to store that in." };
+
+      const health = await calendar.checkIcs(url).catch((e) => ({ ok: false as const, problem: (e as Error).message }));
+      if (!health.ok) {
+        return {
+          ok: false,
+          message:
+            `⚠️ I couldn't read that calendar — ${health.problem}
+` +
+            "Nothing has been saved. Check the link is the *ICS* one and that it is published to *Can view all details*.",
+        };
+      }
+
+      const ref = `ics.url:${alias}`;
+      const auth = { authorization: `Bearer ${process.env.TONOMANCLOUD_API_TOKEN ?? ""}`, "content-type": "application/json" };
+      try {
+        // The URL goes into the secret store, sealed, and the connection row only ever names the
+        // ref — the same rule as every other credential. It is the calendar's password.
+        const put = await fetch(`${baseUrl}/v1/system/agents/${guid}/secrets/${encodeURIComponent(ref)}`, {
+          method: "PUT",
+          headers: auth,
+          body: JSON.stringify({ value: url }),
+        });
+        if (!put.ok) return { ok: false, message: `⚠️ I couldn't store that — the registry said HTTP ${put.status}.` };
+
+        const attach = await fetch(
+          `${baseUrl}/v1/system/agents/${guid}/credentials/ics/${encodeURIComponent(alias)}`,
+          { method: "PUT", headers: auth, body: JSON.stringify({ secretRef: ref, label: alias }) },
+        );
+        if (!attach.ok) return { ok: false, message: `⚠️ I stored it but couldn't attach it — HTTP ${attach.status}.` };
+      } catch (e) {
+        return { ok: false, message: `⚠️ I couldn't reach the registry — ${(e as Error).message.slice(0, 160)}` };
+      }
+
+      // TAKE EFFECT NOW. This used to end "it takes effect on my next restart", which was honest
+      // about a limitation nobody should have had to live with: connecting a calendar and then
+      // waiting for a deploy is the same "connected, but not really" this whole path exists to
+      // stop. The roster is the worker's cached view, so the new connection is reflected into it
+      // the same way an auth_state change is, and the flow is worked out again.
+      const a = wired.get(name);
+      if (a) {
+        const conns = (a.cfg.credentials ??= []);
+        const at = conns.findIndex((c) => c.kind === "ics" && c.alias === alias);
+        const row = { kind: "ics" as const, alias, secret_ref: ref, status: "connected" as const, label: alias };
+        if (at >= 0) conns[at] = { ...conns[at], ...row };
+        else conns.push(row as (typeof conns)[number]);
+        await wireVoice(name, a);
+        const v = voiceCreds.get(name);
+        if (v) await ensureVoiceSchedule(name, v);
+        await ensureAgendaSchedule(name).catch(() => {});
+      }
+
+      // What it FOUND, not that it succeeded. "Connected" on its own is the claim that has been
+      // wrong all week; a count and the next meeting are checkable by the person reading them.
+      return {
+        ok: true,
+        message: `✅ ${calendar.healthLine(alias, health)}`,
+      };
+    },
+  };
+
+  // The agent asks for its OWN credential, through its own runtime. The login endpoints live in
+  // the sidecar sharing this pod's credential volume, so the code goes from a Slack modal to the
+  // process that owns the credential and nowhere else — it never transits the control plane.
+  const authBase = process.env.AGENT_RUNTIME_URL ?? "http://127.0.0.1:8080";
+  const authDeps: gate.AuthGateDeps = {
+    // Named, so the login lands in THIS agent's credential directory. Without the name every
+    // agent in the pool shares one Claude subscription and the last person to sign in owns them.
+    // `user`, when the caller passes it (a per-person agent), lands the login in the speaker's own
+    // dir under the agent — so two teammates on one agent sign into their own subscriptions.
+    ops: (name, user) => {
+      const a = wired.get(name);
+      // `harness` says WHICH provider's login this is. One runtime holds both CLIs and both
+      // credential stores, so an unqualified call signs the person into whichever the pod's
+      // TONOMAN_HARNESS names — the wrong account, reported as a success.
+      if (!a) return undefined;
+      // A sign-in is the provider's own program too: it runs as the same user the agent's turns for
+      // this person do, in that user's home (TURNUSER-NOTHING-AS-ROOT). The Cloud decides whose.
+      const users = usersOfThisWorker();
+      const uidOf = users
+        ? async () => {
+            const who = await users.for(a.cfg.guid ?? a.cfg.name, user || undefined);
+            return { uid: who.uid, of: who.of };
+          }
+        : undefined;
+      return httpAuthOps(authBase, process.env.AGENT_RUNTIME_TOKEN, name, user, harnessOf(a.cfg), uidOf);
+    },
+    conn: (name) => wired.get(name)?.conn as SlackConnector | undefined,
+    provider: (name) => providerOf(wired.get(name)?.cfg),
+    setAuthState: (name, state, user, provider) => reportAuthState(name, state, user, provider),
+    // The gate-offered login is how a NEW person first arrives (Priya's path): the `!connect claude`
+    // command hook never fires for them, so register here too — before their first real turn.
+    // Seeded with the outcome: the row is created (or refreshed) ALREADY carrying the auth state,
+    // so the per-principal update that follows is a confirmation rather than the only chance.
+    onLogin: (name, user, loginProvider) =>
+      autoRegisterMember(name, user, gate.registrationAfterLogin(loginProvider, providerOf(wired.get(name)?.cfg))),
+  };
+
+  /** Tell the registry what this agent's — or this PERSON's — inference credential is now worth.
+   *
+   *  TWO ROUTES, because they answer two different questions. A shared agent has one login and one
+   *  `auth_state`; a per-person agent's login belongs to a person, and writing one person's outcome
+   *  to the agent row marked the whole agent `error` in the Hub while everybody else went on
+   *  answering perfectly. So the per-person case reports against the PRINCIPAL instead, and the
+   *  agent row is left alone.
+   *
+   *  The per-person route is BEST-EFFORT and never throws: it is called from a login gate and from
+   *  the tail of a failed turn, and neither of those should acquire a new way to fail because the
+   *  Hub is briefly unreachable. (The agent-level route keeps throwing — its one caller catches, and
+   *  the gate wants to know.) It also only ever UPDATES a principal the tenant already knows, and
+   *  answers 404 for somebody it does not — which is why every caller registers the person first. */
+  const reportAuthState = async (
+    name: string,
+    state: "ok" | "error" | "expired" | "unconfigured",
+    user?: string,
+    forProvider?: InferenceProvider,
+  ): Promise<void> => {
+    const a = wired.get(name);
+    const api = process.env.TONOMANCLOUD_API_URL;
+    if (!a?.cfg.guid || !api) return; // a file roster has no registry to tell
+    const provider = providerOf(a.cfg);
+    // A login or turn that started on the provider the agent has since been switched away from:
+    // its outcome is about a login nobody uses now, and must not move the new badge.
+    if (!gate.outcomeIsCurrent(forProvider, provider)) {
+      console.log(`worker: ${name} dropped a late ${forProvider} ${state} — the agent now runs on ${provider}`);
+      return;
+    }
+
+    const token = process.env.TONOMANCLOUD_API_TOKEN ?? "";
+
+    if (a.cfg.inference_mode === "per_user") {
+      // Nobody to attribute it to: a per-person outcome with no person is not an agent-level fact,
+      // and writing it as one is the bug this branch exists to prevent.
+      if (!user) return;
+      const r = await postAuthState({ api, token, guid: a.cfg.guid, state, provider, user });
+      // 404 is "this person is not registered with the tenant yet", which is information rather than
+      // a fault — still said out loud, because it means a login outcome went unrecorded.
+      if (!r.ok) console.error(`worker: ${name} auth-state for ${user} -> ${state} ${r.error ?? `returned HTTP ${r.status}`}`);
+      else console.log(`worker: ${name} auth_state[${user}] -> ${state} (${provider})`);
+      return;
+    }
+
+    const r = await postAuthState({ api, token, guid: a.cfg.guid, state, provider });
+    if (!r.ok) throw new Error(`auth-state ${r.error ?? r.status}`);
+    // Reflect it locally too, so the very next message is not gated again while the roster
+    // cache is still warm.
+    a.cfg.auth_state = state === "ok" ? "ok" : state === "expired" ? "expired" : "error";
+    console.log(`worker: ${name} auth_state -> ${state} (${provider})`);
+  };
+
+  /** The wire-time seed of every per-person auth state (W3b), bound to this worker's live roster.
+   *  Fire-and-forget by contract: it asks the runtime once per principal and must never be able to
+   *  delay — let alone block — an agent being wired and answering. */
+  const seedPrincipalAuthStates = async (only?: Set<string>): Promise<void> => {
+    const api = process.env.TONOMANCLOUD_API_URL;
+    if (!api) return; // a file roster has no registry to tell
+    const token = process.env.TONOMANCLOUD_API_TOKEN ?? "";
+    const agents: PrincipalScanAgent[] = [];
+    for (const [name, a] of wired) {
+      if (only && !only.has(name)) continue;
+      agents.push({
+        name,
+        guid: a.cfg.guid,
+        inferenceMode: a.cfg.inference_mode,
+        provider: providerOf(a.cfg),
+        // The registry's own list of who this agent recognises — the same rows the badge is drawn
+        // from, so the scan can only ever correct a row that already exists.
+        principals: principalUserIds(a.cfg.principals),
+      });
+    }
+    const n = await syncPrincipalAuthStates({
+      agents,
+      hasLoginDir: async (name, user) => {
+        const a = wired.get(name);
+        if (!a) return false;
+        return anyExists(await credFilesNow(a.cfg, user));
+      },
+      // The SAME `/auth/status` a turn's gate would use, so this reports what the agent would
+      // actually find rather than a second opinion about the filesystem.
+      authStatus: async (name, user) => (await authDeps.ops(name, user)?.status?.()) ?? "",
+      report: async (guid, user, state, provider) => {
+        const r = await postMemberAuthState({ api, token, guid, user, state, provider });
+        if (!r.ok) throw new Error(r.error ?? `register-member returned HTTP ${r.status}`);
+      },
+      log: (s) => console.log(s),
+    }).catch((e) => {
+      console.error(`worker: seeding per-person auth states failed — ${(e as Error).message}`);
+      return 0;
+    });
+    if (n) console.log(`worker: seeded ${n} per-person auth state(s)`);
+  };
+
+  const plaudDeps: plaudgate.PlaudGateDeps = {
+    conn: (name) => wired.get(name)?.conn as SlackConnector | undefined,
+    // `user` arrives already gated by scope from the caller (connectPlaud / the dialog), so these
+    // just pass it through — the pending login and its completion share the same scope.
+    begin: async (name, user) => (await plaudauth.begin(name, user)).url,
+    // The dialog/button completion path (the one Rod's Broker Test used). Register on success, before
+    // the "✅ connected" reply, so the agent knows the speaker's name by the time the first recap posts.
+    complete: async (name, pasted, user) => {
+      const r = await plaudauth.complete(name, pasted, user);
+      if (r.ok) await autoRegisterMember(name, user);
+      return r;
+    },
+    notifyChannel: (name) => voiceCreds.get(name)?.notifyChannel,
+    // The half that was missing. Storing the credential was never the end of connecting an account
+    // — the flow has to be worked out again and the schedule created, both of which only happened
+    // at boot.
+    onConnected: async (name) => {
+      const a = wired.get(name);
+      if (!a) return `I don't serve ${name} in this process`;
+      await wireVoice(name, a);
+      const v = voiceCreds.get(name);
+      // wireVoice says WHY in the log; this says it where the person asking can read it.
+      if (!v) return "this agent has no voice flow configured yet, so there is nothing to poll with";
+      await ensureVoiceSchedule(name, v);
+      await ensureAgendaSchedule(name).catch(() => {});
+      return undefined;
+    },
+  };
+
+  // Interactions are wired per connector below, at construction.
+  for (const [name, a] of wired) {
+    // Slash commands answer through the SAME dispatcher as `!` — the connector hands us the
+    // `!`-prefixed line, we parse and run it, and hand back the text for it to post ephemerally.
+    // A slash always parses to a known command (Slack only delivers ones we registered), so it can
+    // never fall through to a turn — unlike routing it as an envelope would risk.
+    (a.conn as SlackConnector).setSlashHandler?.(async ({ text, conversation, user }) => {
+      // `/sapien-connect` arrives as `!sapien-connect`; the app's name comes off before parsing.
+      const cmd = cmds.parse(cmds.unprefixSlash(text));
+      if (!cmd) return null;
+      return cmds.run(commandDeps, name, conversation, cmd, user).catch((e) => {
+        console.error(`worker: ${name} slash ${cmd.name} failed: ${(e as Error).message}`);
+        return `I couldn't run that — ${String((e as Error)?.message ?? e).slice(0, 150)}`;
+      });
+    });
+    (a.conn as SlackConnector).setInteractionHandler?.((it) => {
+      // Two gates now, and each claims only what it recognises: connecting Claude and connecting
+      // Plaud both end in a dialog, so the router asks the Plaud one first and falls through when
+      // the interaction is not its own.
+      // THREE gates now, each claiming only what it recognises, and the auth gate LAST because it
+      // is the one with no namespace of its own — it accepts an undefined callbackId, so anything
+      // routed to it by default would be tried as a Claude authorization code.
+      const claims = (id: string) => it.actionId?.startsWith(id) || it.callbackId === id;
+      const run = claims(plaudgate.PLAUD_CONNECT_ACTION)
+        ? plaudgate.handleInteraction(plaudDeps, name, it)
+        : claims(icsgate.ICS_CONNECT_ACTION)
+          ? icsgate.handleInteraction(icsDeps, name, it)
+          : claims(lorealistargate.LOREALISTAR_CONNECT_ACTION)
+            ? lorealistargate.handleInteraction(lorealistarDeps, name, it)
+            : gate.handleInteraction(authDeps, name, it);
+      void run
+        .then((msg) => console.log(`worker: ${name} interaction — ${msg}`))
+        .catch((e) => console.error(`worker: ${name} interaction failed: ${(e as Error).message}`));
+    });
+  }
+
+  const nativeConn = await NativeConnection.connect({ address: o.address });
+  const worker = await Worker.create({
+    connection: nativeConn,
+    namespace: o.namespace,
+    taskQueue: o.taskQueue,
+    workflowsPath: o.workflowsPath ?? path.join(__dirname, "workflows.js"),
+    activities,
+    maxConcurrentActivityTaskExecutions: o.maxConcurrentTurns ?? 2,
+  });
+  const serving = worker.run();
+  console.log(`worker: serving ${o.taskQueue} on ${o.address}/${o.namespace} — ${wired.size} agent(s)`);
+  // The map from the guid keys (what every other log line and workflow id now carries) back to the
+  // names a person recognises. Printed once, so a `f89e0934-…` anywhere below can be read.
+  for (const [key, a] of wired) {
+    const label = a.cfg.tenant ? `${a.cfg.tenant}-${a.cfg.displayName ?? key}` : (a.cfg.displayName ?? key);
+    if (key !== label) console.log(`worker:   ${label} = ${key}`);
+  }
+
+  // Ingress: each connector yields envelopes; each becomes a signal. The connector does nothing
+  // else — the durability boundary starts at signalWithStart.
+  //
+  // One pump per agent, each on its OWN abort chained to the worker signal, so live reload can retire
+  // one agent's connector without disturbing another's. Extracted from the boot loop for the same
+  // reason wireOne was: reload starts a pump for a newly-added or rebuilt agent, and the ingress
+  // logic must be identical whether it is boot or reload that starts it.
+  const pumps: Promise<void>[] = [];
+  const startPump = (name: string, a: Wired): Promise<void> => {
+    const ac = new AbortController();
+    signal.addEventListener("abort", () => ac.abort(), { once: true });
+    a.abort = ac;
+    const pump = (async () => {
+      for await (const env of a.conn.receive(ac.signal)) {
+        // Commands are answered HERE, before the durability boundary: `!status` is a read of
+        // state this process already holds, and routing it through a workflow would queue it
+        // behind — or interrupt — the very turn it is asking about. They are also answered
+        // before the auth gate, so `!help` still works on an agent that cannot yet run turns.
+        const cmd = cmds.parse(env.text);
+        if (cmd) {
+          const out = await cmds.run(commandDeps, name, env.conversation, cmd, env.user).catch((e) => {
+            console.error(`worker: ${name} command ${cmd.name} failed: ${(e as Error).message}`);
+            return `I couldn't run that — ${String((e as Error)?.message ?? e).slice(0, 150)}`;
+          });
+          // Null means it is not one of ours. An unknown `!word` is far more likely to be
+          // ordinary emphasis than a typo'd command, so it falls through to a real turn.
+          if (out !== null) {
+            // An EMPTY string means the command already said its piece another way - `!connect
+            // plaud` posts Block Kit buttons itself. Sending "" on top would post a blank
+            // message under them.
+            if (out !== "") await a.conn.reply(env.conversation).send(out).catch(() => {});
+            continue;
+          }
+        }
+        // Whether inference is ready is a different question per mode. A SHARED agent's login is a
+        // FACT the registry tracks (auth_state), so ask in the channel rather than spend a turn to
+        // discover the same thing. A PER-PERSON agent's is per-speaker — has THIS person signed in
+        // their own subscription yet — which only their credential dir can answer, so here (and only
+        // here) a file check is the right gate: it is a fact about a person, not a probe standing in
+        // for the registry's word about the agent.
+        if (a.cfg.inference_mode === "per_user") {
+          // The provider's own credential file (`auth.json` for codex), in the provider's own tree.
+          const hasOwn = await anyExists(await credFilesNow(a.cfg, env.user));
+          if (!hasOwn) {
+            const asked = await gate
+              .ask(authDeps, name, a.cfg.displayName ?? a.cfg.name ?? name, env.conversation, env.user)
+              .catch((e) => {
+                console.error(`worker: auth prompt failed for ${name}: ${(e as Error).message}`);
+                return false;
+              });
+            if (asked) console.log(`worker: ${name} asked ${env.user} to connect their own ${providerLabel(providerOf(a.cfg))} (per_user)`);
+            continue;
+          }
+        } else if (a.cfg.auth_state && a.cfg.auth_state !== "ok") {
+          const asked = await gate
+            .ask(authDeps, name, a.cfg.displayName ?? a.cfg.name ?? name, env.conversation, undefined, env.user)
+            .catch((e) => {
+              console.error(`worker: auth prompt failed for ${name}: ${(e as Error).message}`);
+              return false;
+            });
+          if (asked) console.log(`worker: ${name} asked for an inference login (auth_state=${a.cfg.auth_state})`);
+          continue;
+        }
+        const first: Inbound = {
+          text: env.text,
+          user: env.user,
+          ts: String(Date.now()),
+          ...(env.mediaPaths.length ? { mediaPaths: env.mediaPaths } : {}),
+        };
+        try {
+          // One call whether or not the conversation is already running. Temporal serializes
+          // signals per workflow id, so ordering is free and two people typing at once cannot
+          // interleave two turns.
+          // `first` is deliberately NOT in args. signalWithStart on a workflow that does not yet
+          // exist does BOTH things: it starts the workflow with `args` and delivers the signal.
+          // Passing the message in both places queued it twice and answered every first message
+          // of a conversation twice — observed, not theorised. The signal is the only carrier.
+          await client.workflow.signalWithStart(conversationWorkflow, {
+            workflowId: `${name}:${env.channel}:${env.conversation}`,
+            taskQueue: o.taskQueue,
+            args: [{ agent: name, conversation: env.conversation, channel: env.channel }],
+            signal: messageSignal,
+            signalArgs: [first],
+          });
+        } catch (e) {
+          console.error(`worker: signal failed for ${env.conversation}: ${(e as Error).message}`);
+        }
+      }
+    })();
+    return pump;
+  };
+  for (const [name, a] of wired) pumps.push(startPump(name, a));
+
+  // Live roster reload (A11, hot-reload). The worker used to read the roster once and never again,
+  // so a Hub edit — a new default model, a granted skill, a rename — reached the running agent only
+  // on a restart. On a timer it re-fetches the roster and applies the DIFFERENCE: an unchanged agent
+  // is left strictly alone (no socket touched), a config change is swapped in for the next turn, and
+  // only a change to a connector's own inputs reconnects anything.
+  // Run a reload now if one is not already in flight, sharing the `busy` guard with syncAll and the
+  // reload timer. Assigned only when reload is enabled; the wake endpoint calls it so a Hub write can
+  // reach the running agent in about a second instead of at the next poll tick. Undefined (a no-op
+  // through the wake 404) when reload is off.
+  let triggerReload: (() => void) | undefined;
+
+  const reloadEvery = Number(process.env.ROSTER_RELOAD_SECONDS ?? 30) * 1000;
+  if (reloadRoster && reloadEvery > 0) {
+    const harnesses = defaultHarnesses();
+    const doReload = async (): Promise<void> => {
+      const next = await reloadRoster();
+      const nextAgents = next.agents ?? [];
+      // A roster that came back empty while we are serving agents is an upstream failure, never an
+      // instruction to tear the fleet down. Keep what we have and wait for the next tick.
+      if (nextAgents.length === 0 && wired.size > 0) {
+        console.error("worker: roster reload returned 0 agents — keeping current wiring");
+        return;
+      }
+      // Compare like with like: `wired` holds only servable agents, so filter the incoming roster by
+      // the same TONOMAN_AGENTS allowlist wire() applies at boot before diffing.
+      const servable = nextAgents.filter((a) => {
+        if (only.size === 0) return true;
+        const label = agentLabel(a);
+        return (
+          only.has(a.name.toLowerCase()) ||
+          only.has(label.toLowerCase()) ||
+          only.has((a.displayName ?? "").toLowerCase())
+        );
+      });
+      const current = [...wired.values()].map((w) => w.cfg);
+      const plan = planReload(current, servable);
+      // Losing more than half the fleet in one tick is degradation upstream (a partial roster, a
+      // flaky join), not a mass delete somebody asked for. Refuse it and log loudly.
+      //
+      // DELIBERATELY off for a single-agent worker (`wired.size > 1`): with one agent, "more than
+      // half" is the agent itself, and there is no majority to compare it against. The empty-roster
+      // guard above still catches `agents: []`, but a roster that comes back non-empty yet without
+      // this one agent (its channel join momentarily invisible) WOULD retire it here. Acceptable
+      // today — Sapien and Nelly make two — and the reload after the hiccup wires it straight back.
+      // A single-agent self-hosted worker that wants belt-and-braces should pin ROSTER_RELOAD_SECONDS
+      // higher or disable reload.
+      if (wired.size > 1 && plan.removed.length > wired.size / 2 && servable.length < current.length) {
+        console.error(
+          `worker: roster reload would remove ${plan.removed.length}/${wired.size} agents — ` +
+            `ignoring as likely upstream degradation`,
+        );
+        return;
+      }
+      if (plan.added.length === 0 && plan.removed.length === 0 && plan.updated.length === 0) return;
+
+      const byKey = new Map(servable.map((a) => [a.name, a] as const));
+
+      // Removed: stop its pump (its own abort), pause its poll, drop it. A turn in flight dies with
+      // the connector — the same as a restart, and acceptable for a disabled or deleted agent.
+      for (const key of plan.removed) {
+        const a = wired.get(key);
+        if (!a) continue;
+        a.abort?.abort();
+        await pauseVoiceSchedule(key, "agent left the roster").catch(() => {});
+        wired.delete(key);
+        // Drop the Wave-6 watched-channel entry with the agent. Its connector is aborted above, so a
+        // stale key would never be read — but clearing it keeps the map exactly the set of live
+        // agents, and a re-add rebuilds it from the fresh config anyway.
+        voiceWatch.delete(key);
+        console.log(`worker: reload — retired ${agentLabel(a.cfg)} (${key})`);
+      }
+
+      // Added: wire it, start its pump, wire its voice. A newly created agent appears here the reload
+      // after its Slack setup completes — the roster lists only enabled, channel-bound agents.
+      for (const key of plan.added) {
+        const cfg2 = byKey.get(key);
+        if (!cfg2) continue;
+        const w = wireOne(cfg2, harnesses);
+        if (!w) continue; // wireOne logged why (channel, tokens, harness)
+        wired.set(key, w);
+        pumps.push(startPump(key, w));
+        await wireVoice(key, w).catch((e) => console.error(`worker: reload — wireVoice ${key} failed: ${(e as Error).message}`));
+        const vAdded = voiceCreds.get(key);
+        if (vAdded) await ensureVoiceSchedule(key, vAdded).catch((e) => console.error(`worker: reload — voice schedule ${key} failed: ${(e as Error).message}`));
+        await ensureAgendaSchedule(key).catch((e) => console.error(`worker: reload — agenda schedule ${key} failed: ${(e as Error).message}`));
+        await ensureDropSchedule(key).catch((e) => console.error(`worker: reload — drop schedule ${key} failed: ${(e as Error).message}`));
+        console.log(`worker: reload — added ${agentLabel(cfg2)} (${key})`);
+      }
+
+      // Updated: swap the config in place so the next turn reads it (the model per turn; the persona
+      // through the identity file the roster fetch just rewrote). Rebuild the runner if a baked-in
+      // field changed (max_turns / url), keeping the connector so no socket reconnects. Rebuild the
+      // whole entry only if a connector input changed (harness / token / channel / allowed-users).
+      for (const d of plan.updated) {
+        const cfg2 = byKey.get(d.key);
+        const a = wired.get(d.key);
+        if (!cfg2 || !a) continue;
+        if (d.rebuildConn) {
+          a.abort?.abort();
+          const w = wireOne(cfg2, harnesses);
+          if (!w) {
+            wired.delete(d.key);
+            voiceWatch.delete(d.key); // agent no longer servable — drop its watched-channel entry too
+            continue;
+          }
+          wired.set(d.key, w);
+          pumps.push(startPump(d.key, w));
+          console.log(`worker: reload — reconnected ${agentLabel(cfg2)} (${d.key})`);
+        } else {
+          a.cfg = cfg2;
+          if (d.rebuildRunner) {
+            const runner = newRunnerFor(cfg2, harnesses);
+            if (runner) {
+              a.runner = runner;
+              a.run = runClosure(runner, cfg2, usersOfThisWorker());
+            }
+          }
+          console.log(`worker: reload — updated ${agentLabel(cfg2)} (${d.key})${d.rebuildRunner ? " — new runner" : ""}`);
+        }
+        // Re-derive the voice flow from the new config — idempotent (ensureVoiceSchedule updates in
+        // place), and how a newly granted skill or a changed cadence reaches the poll.
+        const w = wired.get(d.key);
+        if (w) await wireVoice(d.key, w).catch((e) => console.error(`worker: reload — wireVoice ${d.key} failed: ${(e as Error).message}`));
+        // The schedules too, not only the flow: a grant's schedule switch (or cadence) changes here.
+        const vUpdated = voiceCreds.get(d.key);
+        if (vUpdated) await ensureVoiceSchedule(d.key, vUpdated).catch((e) => console.error(`worker: reload — voice schedule ${d.key} failed: ${(e as Error).message}`));
+        await ensureAgendaSchedule(d.key).catch((e) => console.error(`worker: reload — agenda schedule ${d.key} failed: ${(e as Error).message}`));
+        await ensureDropSchedule(d.key).catch((e) => console.error(`worker: reload — drop schedule ${d.key} failed: ${(e as Error).message}`));
+      }
+
+      // Refresh checkouts and context notes against the swapped configs. We hold `busy`, so syncAll's
+      // own timer is not also running; call its body directly.
+      await syncAll().catch(() => {});
+
+      // An agent that JUST became per-person (or just arrived) has a Hub badge saying `unconfigured`
+      // for people who are signed in perfectly well, until each of them happens to log in again.
+      // Seed them now — but only for the agents this reload actually touched, so a 30-second timer
+      // does not become a 30-second scan of every principal in the tenant.
+      const touched = new Set([...plan.added, ...plan.updated.map((d) => d.key)]);
+      if (touched.size) void seedPrincipalAuthStates(touched);
+    };
+
+    // One reconcile at a time, whether it was the timer or a poke that asked for it. A poke during a
+    // reload asks for one more afterwards (reloadgate.ts): a write that lands after the running reload
+    // fetched the roster would otherwise wait for the next timer tick.
+    triggerReload = serialReload(
+      async () => {
+        // A checkout sync holds the same flag; wait for it rather than swap config under a clone.
+        while (busy) await new Promise((r) => setTimeout(r, 250));
+        busy = true;
+        try {
+          await doReload();
+        } finally {
+          busy = false;
+        }
+      },
+      (e) => console.error(`worker: roster reload failed — ${(e as Error).message}`),
+    );
+
+    const reloadTimer = setInterval(() => triggerReload!(), reloadEvery);
+    signal.addEventListener("abort", () => clearInterval(reloadTimer), { once: true });
+    console.log(`worker: roster reload every ${reloadEvery / 1000}s (and on demand via /api/reload)`);
+  }
+
+  // gw-wake: a system can start the conversation. This is what lets the voice flow say "I've got
+  // your meeting" without anybody asking — the beat the whole pipeline exists to produce.
+  // W3b: say what is already true about each person's login, before anybody has to log in again.
+  // Fire-and-forget: it asks the runtime once per principal, and an agent must be answering long
+  // before that finishes.
+  void seedPrincipalAuthStates();
+
+  const wakeToken = process.env.TONOMAN_WAKE_TOKEN ?? "";
+  const wakeServing = serveWake(
+    {
+      port: Number(process.env.TONOMAN_WAKE_PORT ?? 3980),
+      token: wakeToken,
+      deps: {
+        has: (name) => wired.has(name),
+        // The Hub names an agent by its registry GUID. On a registry roster that IS the worker's own
+        // key (`cfg.name` is the guid), so the common case is a straight hit — but a file roster has
+        // no guid at all, and a person reading a log will type the tenant-prefixed display name. All
+        // three resolve here, once, so the endpoint can answer a clean 404 for an agent this worker
+        // genuinely does not serve rather than start a workflow nothing will pick up.
+        resolveAgent: (nameOrGuid) => {
+          if (wired.has(nameOrGuid)) return nameOrGuid;
+          const want = nameOrGuid.toLowerCase();
+          for (const [key, w] of wired) {
+            if (
+              (w.cfg.guid ?? "").toLowerCase() === want ||
+              (w.cfg.displayName ?? "").toLowerCase() === want ||
+              agentLabel(w.cfg).toLowerCase() === want
+            ) {
+              return key;
+            }
+          }
+          return undefined;
+        },
+        // The SAME function `!talent` calls, so a run started from the Hub and one typed in Slack
+        // are one mechanism — same per-item workflow id, same dedup, same `talent_run` row.
+        runTalent: (name, talent, item, user, force, how) =>
+          commandDeps.runTalent!(name, talent, item, user, force, how),
+        // Present only when reload is enabled; the wake endpoint answers 404 otherwise, so the API
+        // learns "reload off" rather than silently believing a poke landed.
+        reload: triggerReload,
+        dmFor,
+        say: async (name, conversation, text) => {
+          await wired.get(name)?.conn.reply(conversation).send(text);
+        },
+        ask: async (name, conversation, text, user, files) => {
+          // Through the same workflow as a typed message, so a woken turn has the same history,
+          // the same ordering and the same interruption behaviour as any other.
+          //
+          // `user` is the RECIPIENT. A placeholder here made the agent believe it was addressing a
+          // stranger, and it refused to discuss the meeting it had just been asked to summarise —
+          // which was the right call on its part and the wrong input from ours.
+          await client.workflow.signalWithStart(conversationWorkflow, {
+            workflowId: `${name}:slack:${conversation}`,
+            taskQueue: o.taskQueue,
+            args: [{ agent: name, conversation, channel: "slack" }],
+            signal: messageSignal,
+            signalArgs: [{ text, user: user ?? "", ts: String(Date.now()), ...(files?.length ? { mediaPaths: files } : {}) }],
+          });
+        },
+      },
+    },
+    signal,
+  );
+  if (!wakeServing) {
+    console.log("worker: TONOMAN_WAKE_TOKEN is unset — /api/wake is NOT served (no agent can speak first)");
+  }
+
+  // The voice flow, watching by itself. One long-lived workflow per agent, started idempotently:
+  // `WorkflowExecutionAlreadyStarted` is the expected answer on every restart after the first, and
+  // means the poll survived the deploy rather than that something is wrong.
+  // The voice flow runs on a SCHEDULE, not a timer loop inside a workflow.
+  //
+  // A schedule is what this always should have been: the cadence is visible on a page and editable
+  // without a deploy, pausing is a button rather than terminating a running execution and
+  // restarting a pod, and `overlapPolicy: SKIP` is the "do not double-process" guarantee that
+  // otherwise has to be written by hand. The loop only made sense if the workflow carried state
+  // between ticks, and it never did — what has been published is answered from the git checkout.
+  /** The note this worker writes when it pauses a schedule BECAUSE THE REGISTRY SAYS SO. It is
+   *  what tells our own pause apart from a person's, and the difference is not cosmetic: resuming
+   *  on `enabled=true` is correct, and resuming a pause somebody made by hand is a restart quietly
+   *  undoing an operator's decision. That is how a paused backlog re-enabled itself and published
+   *  recaps nobody had approved. */
+  const DISABLED_NOTE = "flow_property enabled=false";
+
+  /** The note this worker writes when it pauses a schedule because the account was disconnected.
+   *  Like DISABLED_NOTE it is OUR pause, not a person's — reconnecting an account is the explicit
+   *  action that undoes it, so `ensureVoiceSchedule` auto-resumes it. Without this, disconnecting
+   *  one member (e.g. to switch Plaud accounts) paused the schedule and reconnecting left it paused,
+   *  so the poll never ran again and nothing was ever picked up. */
+  const DISCONNECTED_NOTE = "the Plaud account was disconnected";
+
+  /** The voice schedule's id, keyed by the agent's STABLE guid rather than its (mutable) name.
+   *  Renaming an agent must not re-key its schedule: the old one would be left polling in parallel
+   *  with the new — the double-process this whole flow guards against, in a rename's costume. Falls
+   *  back to the name for a file roster, which has no guid. */
+  function voiceScheduleId(name: string): string {
+    return `voice:${wired.get(name)?.cfg.guid ?? name}`;
+  }
+
+  /** Stop one agent's poll. Best effort and idempotent: a flow that was never scheduled has
+   *  nothing to pause, which is the normal case for a flow that was never on. */
+  async function pauseVoiceSchedule(name: string, why: string): Promise<void> {
+    try {
+      const h = client.schedule.getHandle(voiceScheduleId(name));
+      if (!(await h.describe()).state.paused) {
+        await h.pause(why);
+        console.log(`worker: ${name} voice schedule paused — ${why}`);
+      }
+    } catch {
+      /* no schedule under that id */
+    }
+  }
+
+  for (const name of disabledFlows) await pauseVoiceSchedule(name, DISABLED_NOTE);
+
+  /** The note this worker writes when a Talent's schedule is switched off in the registry. OUR pause,
+   *  like the two above, so switching it back on resumes it; a pause with any other note is a person's
+   *  and is left alone. */
+  const SCHEDULE_OFF_NOTE = "the Talent's schedule is switched off";
+
+  /** Whether an agent's grant for a Talent has its schedule on. Absent means on. */
+  function scheduleOn(name: string, talent: string): boolean {
+    return wired.get(name)?.cfg.talents?.find((t) => t.name === talent)?.schedule_enabled !== false;
+  }
+
+  /** Make a Talent's Temporal schedule match its switch: pause it when off, resume it when on but
+   *  only from our own off-pause. On-demand runs (`!talent`) never go through the schedule, so they
+   *  keep working while it is paused. */
+  async function applyScheduleSwitch(name: string, scheduleId: string, on: boolean, what: string): Promise<void> {
+    const h = client.schedule.getHandle(scheduleId);
+    const state = (await h.describe()).state;
+    if (!on && !state.paused) {
+      await h.pause(SCHEDULE_OFF_NOTE);
+      console.log(`worker: ${name} ${what} schedule paused — switched off; on demand only`);
+    } else if (on && state.paused && state.note === SCHEDULE_OFF_NOTE) {
+      await h.unpause("the Talent's schedule was switched back on");
+      console.log(`worker: ${name} ${what} schedule resumed — switched back on`);
+    }
+  }
+
+  /** Create, update or resume one agent's poll schedule. Separated from the loop for the same
+   *  reason as wireVoice: a flow that becomes ready AFTER boot has to get a schedule then, not at
+   *  the next restart. Safe to call repeatedly — "already exists" is the normal answer. */
+  async function ensureVoiceSchedule(name: string, v: VoiceConfig): Promise<void> {
+    const recipient = v.notifyUser ?? "";
+    if (!recipient && !v.notifyChannel) {
+      // Nowhere to send a recap is not a state to run in: the pipeline would transcribe, summarise,
+      // commit and then have nobody to tell.
+      console.log(`worker: ${name} voice flow not scheduled — nobody to tell (set notify_channel or notify_user)`);
+      return;
+    }
+    const scheduleId = voiceScheduleId(name);
+    // Cadence is configuration: a positive interval polls every N seconds; zero (or less) means OFF
+    // — the Talent runs ON DEMAND only (invoked like a tool), with no schedule at all. Removing any
+    // existing schedule makes "set the cadence to 0" actually stop the polling rather than leave a
+    // stale one running.
+    const secs = v.pollSeconds ?? 300;
+    if (secs <= 0) {
+      try {
+        await client.schedule.getHandle(scheduleId).delete();
+        console.log(`worker: ${name} voice poll disabled (cadence 0) — on-demand only`);
+      } catch {
+        /* no schedule to remove, which is the normal case when it was never scheduled */
+      }
+      return;
+    }
+    const every: Duration = `${secs} seconds`;
+    const action = {
+      type: "startWorkflow" as const,
+      workflowType: plaudPollWorkflow,
+      taskQueue: o.taskQueue,
+      args: [{ agent: name, notify: recipient ?? "" }] as [PollInput],
+    };
+
+    // One-time migration off the old NAME-keyed id. An earlier build scheduled `voice:<tenant>-<name>`;
+    // left in place it keeps polling alongside the new guid-keyed schedule — the double-process this
+    // change exists to prevent. Delete it when the id has actually moved (guid rosters only).
+    if (scheduleId !== `voice:${name}`) {
+      try {
+        await client.schedule.getHandle(`voice:${name}`).delete();
+        console.log(`worker: ${name} removed the legacy name-keyed voice schedule (now ${scheduleId})`);
+      } catch {
+        /* no legacy schedule under the old id, which is the normal case after the first migration */
+      }
+    }
+
+    // The loop's execution, if this pod is the one replacing it. Left running it would poll in
+    // parallel with the schedule and announce everything twice — the double-answer bug in a
+    // different costume.
+    try {
+      const old = client.workflow.getHandle(scheduleId);
+      const d = await old.describe();
+      if (d.status.name === "RUNNING") {
+        await old.terminate("superseded by the voice schedule");
+        console.log(`worker: ${name} terminated the old polling workflow — a schedule drives it now`);
+      }
+    } catch {
+      /* nothing running under that id, which is the normal case */
+    }
+
+    try {
+      await client.schedule.create({
+        scheduleId,
+        spec: { intervals: [{ every }] },
+        // SKIP, not BUFFER: a tick that lands while the previous one is still transcribing has
+        // nothing new to say, and queueing it would only guarantee a pile-up behind a slow meeting.
+        policies: { overlap: ScheduleOverlapPolicy.SKIP },
+        action,
+      });
+      console.log(`worker: ${name} voice schedule created — every ${every}`);
+    } catch (e) {
+      if (!/already exists/i.test((e as Error).message ?? "")) throw e;
+      // Update rather than leave it: the interval and the recipient come from the registry, and a
+      // schedule that silently keeps yesterday's configuration is the staleness this design was
+      // meant to remove.
+      const h = client.schedule.getHandle(scheduleId);
+      await h.update((prev) => ({
+        ...prev,
+        spec: { intervals: [{ every }] },
+        action,
+      }));
+      // And UNPAUSE it — but ONLY the pause this worker wrote. Turning the flow off pauses the
+      // schedule, so skipping this entirely would make the switch work in one direction only: a row
+      // set back to enabled=true would look on in the registry and in the boot log while the
+      // schedule sat paused and nothing ever ran.
+      //
+      // Unpausing UNCONDITIONALLY is the other half of the same mistake, and it is the one that
+      // actually cost something: every restart resumed a schedule a person had paused on purpose,
+      // so a backlog held back for inspection drained itself the next time the pod came up.
+      const state = (await h.describe()).state;
+      if (state.paused) {
+        if (scheduleOn(name, meetingRecap.name) && (state.note === DISABLED_NOTE || state.note === DISCONNECTED_NOTE)) {
+          // Both are OUR pauses, and we only reach here with live creds in hand — the account is
+          // connected and the flow is enabled — so the reason for either pause no longer holds.
+          await h.unpause(state.note === DISCONNECTED_NOTE ? "a member reconnected their Plaud account" : "flow_property enabled=true");
+          console.log(`worker: ${name} voice schedule resumed`);
+        } else if (state.note !== SCHEDULE_OFF_NOTE) {
+          // The switch's own pause is settled by applyScheduleSwitch below, not reported as a person's.
+          console.log(
+            `worker: ${name} voice schedule LEFT PAUSED — ${state.note || "paused outside the registry"}`,
+          );
+        }
+      }
+      console.log(`worker: ${name} voice schedule updated — every ${every}`);
+    }
+    await applyScheduleSwitch(name, scheduleId, scheduleOn(name, meetingRecap.name), "voice");
+  }
+
+  /** The agenda brief's schedule: time-of-day, in the tenant's timezone, one Temporal schedule per
+   *  agent (`agenda:<guid>`). It exists only while the agent holds the `agenda-brief` grant AND has a
+   *  working flow to read calendars and announce through; otherwise any schedule is removed, so
+   *  revoking the grant actually stops the briefs. Safe to call repeatedly. */
+  async function ensureAgendaSchedule(name: string): Promise<void> {
+    const a = wired.get(name);
+    const scheduleId = `agenda:${a?.cfg.guid ?? name}`;
+    const grant = a?.cfg.talents?.find((t) => t.name === agendaBrief.name);
+    const v = voiceCreds.get(name);
+    const times = grant ? parseAgendaTimes(grant.config?.times) : [];
+    const recipient = v?.notifyUser ?? "";
+    if (!a || !grant || !v || !times.length || (!recipient && !v.notifyChannel)) {
+      try {
+        await client.schedule.getHandle(scheduleId).delete();
+        console.log(`worker: ${name} agenda schedule removed`);
+      } catch {
+        /* never scheduled — the normal case for an agent without the grant */
+      }
+      if (grant && !v) console.log(`worker: ${name} agenda brief not scheduled — no flow to read calendars through`);
+      return;
+    }
+    const timezone = a.cfg.timezone || "UTC";
+    const spec = { calendars: times.map((t) => ({ hour: t.hour, minute: t.minute })), timezone };
+    const action = {
+      type: "startWorkflow" as const,
+      workflowType: agendaTickWorkflow,
+      taskQueue: o.taskQueue,
+      args: [{ agent: name, notify: recipient, version: agendaBrief.version }] as [AgendaTickInput],
+    };
+    // A brief is about the moment it was due. After downtime, a 07:00 brief delivered at 15:00 is noise:
+    // catch up for half an hour, then skip. SKIP overlap, as for the poll.
+    const policies = { overlap: ScheduleOverlapPolicy.SKIP, catchupWindow: "30 minutes" as Duration };
+    const when = times.map((t) => `${String(t.hour).padStart(2, "0")}:${String(t.minute).padStart(2, "0")}`).join(", ");
+    try {
+      await client.schedule.create({ scheduleId, spec, policies, action });
+      console.log(`worker: ${name} agenda schedule created — ${when} ${timezone}`);
+    } catch (e) {
+      if (!/already exists/i.test((e as Error).message ?? "")) throw e;
+      await client.schedule.getHandle(scheduleId).update((prev) => ({ ...prev, spec, action, policies: { ...prev.policies, ...policies } }));
+      console.log(`worker: ${name} agenda schedule updated — ${when} ${timezone}`);
+    }
+    await applyScheduleSwitch(name, scheduleId, grant.schedule_enabled !== false, "agenda");
+  }
+
+  /** The drop watcher's timer (drop-watch.md): while the agent holds the grant and somebody has
+   *  connected a login, it looks every few minutes — not on the minute: each look is put off by a
+   *  random part of a minute (DROPS-HOW-OFTEN) — and a look that comes round while the last is still
+   *  going is skipped (TALENT-NO-OVERLAP). No grant, or nobody connected: no timer. */
+  async function ensureDropSchedule(name: string): Promise<void> {
+    const a = wired.get(name);
+    const scheduleId = `drops:${a?.cfg.guid ?? name}`;
+    const grant = a?.cfg.talents?.find((t) => t.name === dropWatch.name);
+    const connected = a && grant ? await drops.users(name).catch(() => []) : [];
+    if (!a || !grant || !connected.length) {
+      try {
+        await client.schedule.getHandle(scheduleId).delete();
+        console.log(`worker: ${name} drop schedule removed`);
+      } catch {
+        /* never scheduled — the normal case */
+      }
+      return;
+    }
+    const minutes = dropEveryMinutes(grant.config?.every_minutes);
+    const spec = { intervals: [{ every: `${minutes} minutes` as Duration }], jitter: "60 seconds" as Duration };
+    const action = { type: "startWorkflow" as const, workflowType: dropsPollWorkflow, taskQueue: o.taskQueue, args: [{ agent: name, version: dropWatch.version, channel: dropChannel(grant.config?.output_channel) }] as [DropsPollInput] };
+    // A look is about now: after downtime nothing is caught up, the next look simply happens.
+    const policies = { overlap: ScheduleOverlapPolicy.SKIP, catchupWindow: "1 minute" as Duration };
+    try {
+      await client.schedule.create({ scheduleId, spec, policies, action });
+      console.log(`worker: ${name} drop schedule created — every ${minutes} min, ${connected.length} connected`);
+    } catch (e) {
+      if (!/already exists/i.test((e as Error).message ?? "")) throw e;
+      await client.schedule.getHandle(scheduleId).update((prev) => ({ ...prev, spec, action, policies: { ...prev.policies, ...policies } }));
+      console.log(`worker: ${name} drop schedule updated — every ${minutes} min, ${connected.length} connected`);
+    }
+    await applyScheduleSwitch(name, scheduleId, grant.schedule_enabled !== false, "drops");
+  }
+
+  for (const [name, v] of voiceCreds) await ensureVoiceSchedule(name, v);
+  for (const name of wired.keys()) await ensureDropSchedule(name).catch((e) => console.error(`worker: ${name} drop schedule failed — ${(e as Error).message}`));
+  for (const name of wired.keys()) await ensureAgendaSchedule(name).catch((e) => console.error(`worker: ${name} agenda schedule failed — ${(e as Error).message}`));
+
+  signal.addEventListener("abort", () => worker.shutdown(), { once: true });
+  await Promise.all([serving, ...pumps]);
+  await conn.close();
+  await nativeConn.close();
+  console.log("worker: stopped");
+}
+
+/** Pure helpers exposed for tests. Not part of the module's contract. */
+export const __testing = { disallowedTools, DEFAULT_DISALLOWED, runClosure };

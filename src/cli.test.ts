@@ -219,8 +219,8 @@ describe("resolveAuthOps — transport by harness (roster-auth-remote)", () => {
     const { port } = srv.address() as AddressInfo;
     try {
       const cfg = agent({ harness: "claude-code-http", url: `http://127.0.0.1:${port}` });
-      const url = await resolveAuthOps(cfg, "atlas").startHeadless();
-      expect(url).toContain("oauth/authorize");
+      const started = await resolveAuthOps(cfg, "atlas").startHeadless();
+      expect(started.url).toContain("oauth/authorize");
       expect(hits).toEqual(["POST /auth/login"]); // it went over HTTP, to the agent
     } finally {
       srv.close();
