@@ -2469,7 +2469,7 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
     maxConcurrentActivityTaskExecutions: o.maxConcurrentTurns ?? 2,
   });
   const serving = worker.run();
-  console.log(`worker: serving ${o.taskQueue} on ${o.address}/${o.namespace} — ${wired.size} agent(s)`);
+  console.log(`worker: tonoman ${process.env.TONOMAN_VERSION || "dev"} serving ${o.taskQueue} on ${o.address}/${o.namespace} — ${wired.size} agent(s)`);
   // The map from the guid keys (what every other log line and workflow id now carries) back to the
   // names a person recognises. Printed once, so a `f89e0934-…` anywhere below can be read.
   for (const [key, a] of wired) {
