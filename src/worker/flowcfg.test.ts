@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { describe as describeVoice, voiceSettings, plaudPerPerson } from "./flowcfg";
+import { describe as describeVoice, voiceSettings, plaudPerPerson, vocabularyFor } from "./flowcfg";
 
 describe("voiceSettings — the registry decides", () => {
   it("reads the channel and the recipient from the tenant's own rows", () => {
@@ -186,5 +186,20 @@ describe("voiceSettings — Plaud scope (per-person)", () => {
     // Anything else is shared — a typo can never move a tenant off their one working account.
     expect(voiceSettings({ plaud_scope: "each" }, {}).plaudScope).toBe("shared");
     expect(plaudPerPerson({ plaud_scope: "each" })).toBe(false);
+  });
+});
+
+describe("whose names an agent spells (tenant.md in Tonoman Cloud)", () => {
+  it("TENANT-VOCABULARY-IS-THE-TENANTS an agent from the registry spells with its tenant's list and nothing else — an empty list is none, never the worker's own", () => {
+    const env = { GROQ_PROMPT: "Acme, Globex" };
+    expect(vocabularyFor({ guid: "g-1", vocabulary: "Initech, Nova, Plaud." }, env)).toBe("Initech, Nova, Plaud.");
+    expect(vocabularyFor({ guid: "g-1", vocabulary: "" }, env)).toBe("");
+    expect(vocabularyFor({ guid: "g-1" }, env)).toBe("");
+    // Two agents of two tenants on one worker: each its own.
+    expect(vocabularyFor({ guid: "g-2", vocabulary: "Acme." }, env)).toBe("Acme.");
+  });
+  it("TENANT-VOCABULARY-IS-THE-TENANTS only a worker with no registry takes a list from its own configuration, and the open-source default is none", () => {
+    expect(vocabularyFor({ vocabulary: undefined }, { GROQ_PROMPT: "Acme, Globex" })).toBe("Acme, Globex");
+    expect(vocabularyFor({}, {})).toBe("");
   });
 });

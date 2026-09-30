@@ -1,0 +1,2 @@
+# The installer is fetched raw and run by bash: it must never pick up CRLF from a checkout.
+build/tonomanctl/*.sh text eol=lf

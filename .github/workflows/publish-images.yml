@@ -1,0 +1,109 @@
+name: publish-image
+
+# Build the Tonoman runtime image — the one image that runs as the worker and as the auth sidecar,
+# on the Cloud's pool and on a person's own machine alike — and publish it to GHCR, the free public
+# GitHub Container Registry, as ghcr.io/<owner>/tonoman. Auth is the built-in GITHUB_TOKEN
+# (permissions.packages: write): no registry credential is stored anywhere in this public repo.
+#
+# Customer and employer names must never ride into a published artifact. The denylist that knows
+# those names is not in this repo — it arrives as the LEAK_GUARD_BUNDLE secret (built by the private
+# config repo's ci/bundle-to-github.sh) and the scan runs in --ci mode, which prints only file:line,
+# never a term. The publish job runs the guard as a HARD gate and only pushes when the tree is clean.
+#
+# Tags:
+#   v1.2.3 tag push  → :v1.2.3 and :latest        (a release: what `tonomanctl` installs)
+#   push to main     → :<short sha>                (every merge is pullable; latest does not move)
+#   same-repo PR     → :pr-<n>                     (a preview for testing; never latest)
+#   fork PR          → nothing is built or pushed  (no secret, no write token)
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  publish:
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Fail closed: a missing denylist means "cannot prove clean", which blocks a publish.
+      - name: Leak guard (required before publish)
+        env:
+          LEAK_GUARD_BUNDLE: ${{ secrets.LEAK_GUARD_BUNDLE }}
+        run: |
+          set -euo pipefail
+          if [ -z "${LEAK_GUARD_BUNDLE:-}" ]; then
+            echo "::error::LEAK_GUARD_BUNDLE secret missing — refusing to publish an unscanned image."
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/lg"
+          printf '%s' "$LEAK_GUARD_BUNDLE" | base64 -d | tar -xz -C "$RUNNER_TEMP/lg"
+          node "$RUNNER_TEMP/lg/ci/scan.mjs" --tree --profile public --ci
+
+      - name: Compute image ref and tag
+        id: meta
+        run: |
+          set -euo pipefail
+          owner="${GITHUB_REPOSITORY_OWNER,,}"   # GHCR requires a lowercase owner
+          echo "image=${REGISTRY}/${owner}/tonoman" >> "$GITHUB_OUTPUT"
+          if [ "${GITHUB_EVENT_NAME}" = "pull_request" ]; then
+            echo "tag=pr-${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
+            echo "latest=0" >> "$GITHUB_OUTPUT"
+          elif [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            echo "latest=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+            echo "latest=0" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # The same file production is built from, with the same context (the repo root). The version
+      # baked into the image is the tag, so `tonoman --version` on a laptop says what was installed.
+      - name: Build
+        run: |
+          set -euo pipefail
+          docker build -f build/gateway/Containerfile \
+            --build-arg "TONOMAN_VERSION=${{ steps.meta.outputs.tag }}" \
+            --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --label "org.opencontainers.image.version=${{ steps.meta.outputs.tag }}" \
+            -t "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}" .
+
+      - name: Push
+        run: |
+          set -euo pipefail
+          docker push "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}"
+          if [ "${{ steps.meta.outputs.latest }}" = "1" ]; then
+            docker tag "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}" "${{ steps.meta.outputs.image }}:latest"
+            docker push "${{ steps.meta.outputs.image }}:latest"
+          fi
+
+      - name: Summary
+        run: |
+          {
+            echo "### Published"
+            echo "- \`${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}\`"
+            [ "${{ steps.meta.outputs.latest }}" = "1" ] && echo "- \`${{ steps.meta.outputs.image }}:latest\`"
+            echo ""
+            echo "First publish only: set the package's visibility to Public under the repository's Packages settings."
+          } >> "$GITHUB_STEP_SUMMARY"

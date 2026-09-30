@@ -198,6 +198,11 @@ export interface AgentConfig {
   /** IANA timezone for DISPLAY, from the tenant. "America/New_York", never an offset. Empty or
    *  "UTC" means render in UTC, which is what every recap did before this existed. */
   timezone?: string;
+  /** The names the tenant's transcriber must spell right, as ONE list the registry assembled —
+   *  the tenant's own words, then its name and its agents' — already cut to fit a transcriber's
+   *  hint. The worker never assembles or extends it: the words are the tenant's knowledge
+   *  (TENANT-VOCABULARY-IS-THE-TENANTS), and an empty list from the registry means none. */
+  vocabulary?: string;
   /** Talents GRANTED and enabled for this agent, from the registry — the catalogue row plus the
    *  attachment's `config` values. A Talent is CODE behind a manifest, not interpreted steps: only
    *  the grant travels (`name`, its pinned `version`, this agent's `config`), and the worker resolves
