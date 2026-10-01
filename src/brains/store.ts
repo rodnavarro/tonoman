@@ -382,8 +382,10 @@ export function createStore(o: StoreOptions) {
     if (add.code !== 0) return { ok: false, reason: "push-failed", detail: redact(add.out, token).slice(0, 300) };
     try {
       // First, before anything else looks at the path: no link or submodule anywhere along it.
+      // A brain kept as it is gets no log.md line (BRAIN-AS-IS) — the same as writeFiles.
+      const logs = !b.asIs;
       const logRel = safePagePath("log.md", b.subpath)!;
-      if (!(await plainPath(dir, remoteRef(b), rel)) || !(await plainPath(dir, remoteRef(b), logRel))) {
+      if (!(await plainPath(dir, remoteRef(b), rel)) || (logs && !(await plainPath(dir, remoteRef(b), logRel)))) {
         return { ok: false, reason: "bad-path", detail: "that page sits behind a link in the brain, so it cannot be written" };
       }
       const target = path.join(wt, rel);
@@ -418,12 +420,16 @@ export function createStore(o: StoreOptions) {
       const inside = async (f: string) => (await fs.realpath(path.dirname(f))).startsWith(root);
       if (!(await inside(target))) return { ok: false, reason: "bad-path", detail: "that page resolves outside the brain" };
       await fs.writeFile(target, content);
-      const logFile = path.join(wt, logRel);
-      const prior = await fs.readFile(logFile, "utf8").catch(() => "# Log\n\n");
-      await fs.mkdir(path.dirname(logFile), { recursive: true });
-      if (!(await inside(logFile))) return { ok: false, reason: "bad-path", detail: "the brain's log resolves outside the brain" };
-      await fs.writeFile(logFile, prior + (prior.endsWith("\n") ? "" : "\n") + logLine(now(), req.path, req.note, req.who));
-      await git(["add", "-A", "--", rel, path.relative(wt, logFile).replace(/\\/g, "/")], wt);
+      const staged = [rel];
+      if (logs) {
+        const logFile = path.join(wt, logRel);
+        const prior = await fs.readFile(logFile, "utf8").catch(() => "# Log\n\n");
+        await fs.mkdir(path.dirname(logFile), { recursive: true });
+        if (!(await inside(logFile))) return { ok: false, reason: "bad-path", detail: "the brain's log resolves outside the brain" };
+        await fs.writeFile(logFile, prior + (prior.endsWith("\n") ? "" : "\n") + logLine(now(), req.path, req.note, req.who));
+        staged.push(path.relative(wt, logFile).replace(/\\/g, "/"));
+      }
+      await git(["add", "-A", "--", ...staged], wt);
       const msg = `${req.note.replace(/\s+/g, " ").trim().slice(0, 72) || `Update ${req.path}`}\n\nFor: ${req.who}\nTonoman-Op: ${opId}\n`;
       const c = await git(["commit", "-q", "-F", "-"], wt, msg);
       if (c.code !== 0 && !/nothing to commit/.test(c.out)) {
