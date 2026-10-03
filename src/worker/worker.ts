@@ -1633,7 +1633,7 @@ export async function run(
               agentGuid: guid,
               id: b.id,
               name: b.name,
-              who: user ?? "a Talent",
+              who: user ?? "a skill",
               brain: { id: b.id, name: b.name, tenant: r.tenant, repoUrl: ready.repoUrl, subpath: b.subpath ?? undefined, branch: b.branch ?? undefined },
               authorize: async () => (await brainsSys.registry.reachUnattended(guid, user ?? null)).brains.some((x) => x.id === b.id && x.mode === "write"),
             };
@@ -1971,7 +1971,7 @@ export async function run(
     // answer for an item in flight or already done — reported, not an error.
     runTalent: async (name, talent, item, user, force, how) => {
       const tdef = getTalent(talent);
-      if (!tdef) return { started: false, message: `I don't run a Talent called "${talent}".` };
+      if (!tdef) return { started: false, message: `I don't run a skill called "${talent}".` };
       // Keyed on the recording's KEY, exactly as the poll keys it, so an on-demand run of an item
       // the poll knows under a renamed id is the same item — same workflow id, same run record.
       // A brief is about NOW, not an item: every ask is its own run, never deduped against the last.
@@ -2882,7 +2882,7 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
   /** The note this worker writes when a Talent's schedule is switched off in the registry. OUR pause,
    *  like the two above, so switching it back on resumes it; a pause with any other note is a person's
    *  and is left alone. */
-  const SCHEDULE_OFF_NOTE = "the Talent's schedule is switched off";
+  const SCHEDULE_OFF_NOTE = "the skill's schedule is switched off";
 
   /** Whether an agent's grant for a Talent has its schedule on. Absent means on. */
   function scheduleOn(name: string, talent: string): boolean {
@@ -2899,7 +2899,7 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
       await h.pause(SCHEDULE_OFF_NOTE);
       console.log(`worker: ${name} ${what} schedule paused — switched off; on demand only`);
     } else if (on && state.paused && state.note === SCHEDULE_OFF_NOTE) {
-      await h.unpause("the Talent's schedule was switched back on");
+      await h.unpause("the skill's schedule was switched back on");
       console.log(`worker: ${name} ${what} schedule resumed — switched back on`);
     }
   }

@@ -75,7 +75,7 @@ const GROUPS = {
     },
   },
   receipts: {
-    about: "file receipts and read the year's totals (Receipts Talent)",
+    about: "file receipts and read the year's totals (Receipts skill)",
     needs: "receipts",
     commands: {
       file: { route: "receipts/file", args: ["--file", "--vendor", "--date YYYY-MM-DD", "--amount", "--category", "--entity", "[--doc-type]", "[--year]", "[--note]", "[--extra]"], about: "File a receipt the person attached (a file in this turn's folder) with its row in the ledger. Every field comes from the document or the person: never guess one — ask. --extra keeps another photo of a receipt already filed: it needs only --file, --vendor, --date and --amount (no category, no entity — it adds no row)." },
@@ -83,7 +83,7 @@ const GROUPS = {
     },
   },
   site: {
-    about: "read and change the tenant's website: drafts, a preview link, publish on an owner's word (Website Talent)",
+    about: "read and change the tenant's website: drafts, a preview link, publish on an owner's word (Website skill)",
     needs: "site",
     commands: {
       pages: { route: "site/pages", args: [], about: "Every page: its address in each language, its title, and whether it is published, a draft, or published with changes waiting. Run this first." },

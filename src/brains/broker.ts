@@ -281,7 +281,7 @@ export function createBroker(o: BrokerOptions) {
       secret = {};
     }
     if (typeof secret.apiKey !== "string" || !secret.apiKey || typeof secret.previewSecret !== "string" || !secret.previewSecret) {
-      return { status: 409, text: "The site is not connected yet: the agent has no key for it. Tell the person an owner must connect the site in the Hub (Website, in the agent's Talents)." };
+      return { status: 409, text: "The site is not connected yet: the agent has no key for it. Tell the person an owner must connect the site in the Hub (Website, in the agent's skills)." };
     }
     return { site: payloadSite({ url: t.site.url, api: t.site.api, apiKey: secret.apiKey, previewSecret: secret.previewSecret }, o.fetch) };
   }
