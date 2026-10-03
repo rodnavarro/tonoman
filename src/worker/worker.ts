@@ -37,6 +37,7 @@ import * as icsgate from "./icsgate";
 import * as lorealistargate from "./lorealistargate";
 import { channelResolver } from "./channelsay";
 import { isPoolCredential, startHeartbeat } from "./heartbeat";
+import { knowsSpeaker, noticeLimiter, unknownSpeakerNotice } from "./speakergate";
 import { cloudDropStore, dropWatcher, memoryDropStore } from "./lorealistar";
 import { siteOver } from "../lorealistar/watch";
 import { dropWatch, dropEveryMinutes, dropChannel } from "./talents/drop-watch";
@@ -2500,6 +2501,7 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
   // reason wireOne was: reload starts a pump for a newly-added or rebuilt agent, and the ingress
   // logic must be identical whether it is boot or reload that starts it.
   const pumps: Promise<void>[] = [];
+  const unknownNotice = noticeLimiter();
   const startPump = (name: string, a: Wired): Promise<void> => {
     const ac = new AbortController();
     signal.addEventListener("abort", () => ac.abort(), { once: true });
@@ -2525,6 +2527,19 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
             if (out !== "") await a.conn.reply(env.conversation).send(out).catch(() => {});
             continue;
           }
+        }
+        // Someone the agent does not know starts no turn (AGENTACCOUNT-UNKNOWN-NO-TURN): whether
+        // they are known is a registry fact, so it is checked here and costs nothing. Commands above
+        // still answer — connecting an account is how a person becomes known.
+        if (!knowsSpeaker(a.cfg.principals, env.user)) {
+          if (unknownNotice.shouldSay(name, env.conversation, env.user)) {
+            const text = unknownSpeakerNotice(a.cfg.displayName ?? a.cfg.name ?? name);
+            const conn = a.conn as SlackConnector;
+            const privately = await conn.postEphemeral(env.conversation, env.user, text).catch(() => false);
+            if (!privately) await a.conn.reply(env.conversation).send(text).catch(() => {});
+          }
+          console.log(`worker: ${name} — ${env.user} is not known to this agent; no turn`);
+          continue;
         }
         // Whether inference is ready is a different question per mode. A SHARED agent's login is a
         // FACT the registry tracks (auth_state), so ask in the channel rather than spend a turn to
