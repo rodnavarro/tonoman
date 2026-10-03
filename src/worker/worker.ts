@@ -37,6 +37,7 @@ import * as icsgate from "./icsgate";
 import * as lorealistargate from "./lorealistargate";
 import { channelResolver } from "./channelsay";
 import { isPoolCredential, startHeartbeat } from "./heartbeat";
+import { knowsSpeaker, noticeLimiter, unknownSpeakerNotice } from "./speakergate";
 import { cloudDropStore, dropWatcher, memoryDropStore } from "./lorealistar";
 import { siteOver } from "../lorealistar/watch";
 import { dropWatch, dropEveryMinutes, dropChannel } from "./talents/drop-watch";
@@ -491,7 +492,10 @@ async function startBrains(): Promise<{ registry: ReturnType<typeof registryClie
     const closed = await call("PATCH", { talent: r.talent, itemKey: r.itemKey, status: r.status, result: { summary: r.summary } });
     if (!closed.ok) console.error(`worker: ${r.talent} run from a conversation not closed (${closed.status})`);
   };
-  const broker = createBroker({ store, registry, provisioner, scratch: path.join(root, "_scratch"), toolsDir: turnUsersOn() ? TOOLS_DIR : undefined, recordRun });
+  // The Website connection's secret is read by reference, for the agent it belongs to, when a
+  // `tonoman site` command runs (SITE-CONNECTED-ONCE).
+  const siteSecret = (guid: string, ref: string): Promise<string> => resolveRef(ref, guid);
+  const broker = createBroker({ store, registry, provisioner, scratch: path.join(root, "_scratch"), toolsDir: turnUsersOn() ? TOOLS_DIR : undefined, recordRun, siteSecret });
   await broker.start();
   // The refresh runs on the LOCAL model only (BRAIN-LOCAL-MODEL): gemma4:e4b by default, at the URL
   // given. With no URL, brains are still mapped, just not connected by topic.
@@ -822,6 +826,8 @@ function runClosure(runner: TurnRunner, cfg: AgentConfig, users?: TurnUsers): Wi
           // the harness tests passed and the path turns take dropped them (CLI-CLOSED-WHATEVER-FAILS).
           cli: r.lean ? undefined : r.cli,
           shell: cfg.shell === "full" ? "full" : "tonoman",
+          // Carried like `cli`: dropped here, no real turn would ever have it switched off (TOOL-WEB-SEARCH).
+          webSearch: r.webSearch,
           cwd: r.cwd,
         },
         signal,
@@ -1515,7 +1521,7 @@ export async function run(
     start: (agent, user, who, key, opts) => {
       const g = wired.get(agent)?.cfg.guid;
       // Each use is saved with the session the moment it happens (BRAIN-USED-DECIDES).
-      return b && g ? b.broker.startTurn({ agentGuid: g, slackUserId: user, who, receipts: opts?.receipts }, { onUse: (id) => remember(agent, key, [id]) }) : undefined;
+      return b && g ? b.broker.startTurn({ agentGuid: g, slackUserId: user, who, receipts: opts?.receipts, site: opts?.site, webFetch: opts?.webFetch }, { onUse: (id) => remember(agent, key, [id]) }) : undefined;
     },
     bind: (token, cwd) => b?.broker.bindFolder(token, cwd),
     attach: (token, files) => b?.broker.attach(token, files),
@@ -1629,7 +1635,7 @@ export async function run(
               agentGuid: guid,
               id: b.id,
               name: b.name,
-              who: user ?? "a Talent",
+              who: user ?? "a skill",
               brain: { id: b.id, name: b.name, tenant: r.tenant, repoUrl: ready.repoUrl, subpath: b.subpath ?? undefined, branch: b.branch ?? undefined },
               authorize: async () => (await brainsSys.registry.reachUnattended(guid, user ?? null)).brains.some((x) => x.id === b.id && x.mode === "write"),
             };
@@ -1967,7 +1973,7 @@ export async function run(
     // answer for an item in flight or already done — reported, not an error.
     runTalent: async (name, talent, item, user, force, how) => {
       const tdef = getTalent(talent);
-      if (!tdef) return { started: false, message: `I don't run a Talent called "${talent}".` };
+      if (!tdef) return { started: false, message: `I don't run a skill called "${talent}".` };
       // Keyed on the recording's KEY, exactly as the poll keys it, so an on-demand run of an item
       // the poll knows under a renamed id is the same item — same workflow id, same run record.
       // A brief is about NOW, not an item: every ask is its own run, never deduped against the last.
@@ -2497,6 +2503,7 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
   // reason wireOne was: reload starts a pump for a newly-added or rebuilt agent, and the ingress
   // logic must be identical whether it is boot or reload that starts it.
   const pumps: Promise<void>[] = [];
+  const unknownNotice = noticeLimiter();
   const startPump = (name: string, a: Wired): Promise<void> => {
     const ac = new AbortController();
     signal.addEventListener("abort", () => ac.abort(), { once: true });
@@ -2522,6 +2529,19 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
             if (out !== "") await a.conn.reply(env.conversation).send(out).catch(() => {});
             continue;
           }
+        }
+        // Someone the agent does not know starts no turn (AGENTACCOUNT-UNKNOWN-NO-TURN): whether
+        // they are known is a registry fact, so it is checked here and costs nothing. Commands above
+        // still answer — connecting an account is how a person becomes known.
+        if (!knowsSpeaker(a.cfg.principals, env.user)) {
+          if (unknownNotice.shouldSay(name, env.conversation, env.user)) {
+            const text = unknownSpeakerNotice(a.cfg.displayName ?? a.cfg.name ?? name);
+            const conn = a.conn as SlackConnector;
+            const privately = await conn.postEphemeral(env.conversation, env.user, text).catch(() => false);
+            if (!privately) await a.conn.reply(env.conversation).send(text).catch(() => {});
+          }
+          console.log(`worker: ${name} — ${env.user} is not known to this agent; no turn`);
+          continue;
         }
         // Whether inference is ready is a different question per mode. A SHARED agent's login is a
         // FACT the registry tracks (auth_state), so ask in the channel rather than spend a turn to
@@ -2864,7 +2884,7 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
   /** The note this worker writes when a Talent's schedule is switched off in the registry. OUR pause,
    *  like the two above, so switching it back on resumes it; a pause with any other note is a person's
    *  and is left alone. */
-  const SCHEDULE_OFF_NOTE = "the Talent's schedule is switched off";
+  const SCHEDULE_OFF_NOTE = "the skill's schedule is switched off";
 
   /** Whether an agent's grant for a Talent has its schedule on. Absent means on. */
   function scheduleOn(name: string, talent: string): boolean {
@@ -2881,7 +2901,7 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
       await h.pause(SCHEDULE_OFF_NOTE);
       console.log(`worker: ${name} ${what} schedule paused — switched off; on demand only`);
     } else if (on && state.paused && state.note === SCHEDULE_OFF_NOTE) {
-      await h.unpause("the Talent's schedule was switched back on");
+      await h.unpause("the skill's schedule was switched back on");
       console.log(`worker: ${name} ${what} schedule resumed — switched back on`);
     }
   }

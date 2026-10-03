@@ -115,6 +115,9 @@ export interface TurnRequest {
    *  unset included, is `tonoman` only. The shell is closed whether or not `cli` came with the turn
    *  (CLI-CLOSED-WHATEVER-FAILS): a turn that lost `tonoman` has less, never more. */
   shell?: "tonoman" | "full";
+  /** Web search this turn (TOOL-WEB-SEARCH): on unless the agent is known not to have it — false only
+   *  for an agent whose registry grants omit `web-search`. */
+  webSearch?: boolean;
   /** The Linux user this run's program is started as (turn-user.md in Tonoman Cloud): its number and
    *  its home, already made and proven by the worker. Absent on a self-hosted agent, which codes in a
    *  container of its own. */

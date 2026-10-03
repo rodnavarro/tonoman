@@ -123,6 +123,22 @@ describe("writing", () => {
     expect(logLine(at, "a.md", "n", "Ana")).toBe("- 2026-09-18 17:53 UTC · `a.md` · n · for Ana\n");
   });
 
+  it("BRAIN-AS-IS a write to a brain kept as it is adds the file and no log.md line", async () => {
+    // A site's repository: it has no log.md, and must not grow one (the as-is brain found on its
+    // first real use, 2026-10-01: three new files, three log lines in the website's repo).
+    const other = mkdtempSync(path.join(tmp, "other-"));
+    sh(["clone", "-q", remote, other]);
+    sh(["rm", "-q", "log.md", "BRAIN.md", "index.md"], other);
+    sh(["-c", "user.name=x", "-c", "user.email=x@x", "commit", "-q", "-m", "a site, not a brain"], other);
+    sh(["push", "-q", "origin", "main"], other);
+    const site: BrainRef = { ...brain, id: "b-site", asIs: true };
+    const r = await storeAt("w1").write({ brain: site, path: "app/newsletter/page.tsx", content: "export default () => null;\n", note: "Add the newsletter route", who: "Rod" });
+    expect(r).toMatchObject({ ok: true, path: "app/newsletter/page.tsx" });
+    expect(remoteFile("app/newsletter/page.tsx")).toBe("export default () => null;\n");
+    expect(remoteFile("log.md")).toBeNull();
+    expect(remoteLog()).toContain("Add the newsletter route");
+  });
+
   it("BRAIN-TWO-WRITERS two workers writing different pages at once both land", async () => {
     const [s1, s2] = [storeAt("w1"), storeAt("w2")];
     const [a, b] = await Promise.all([

@@ -262,6 +262,11 @@ export class Runner implements TurnRunner {
     // A self-hosted runner (no `closedShell`) closes it only for a turn that came with `tonoman`.
     const closed = this.o.closedShell ? req?.lean || req?.shell !== "full" : !!req && !req.lean && !!req.cli && req.shell !== "full";
     if (closed) for (const f of CLOSED_FEATURES) args.push("-c", `features.${f}=false`);
+    // The web (CLI-WEB-ON-BOTH-PROVIDERS): Codex's live web search, which also opens pages. OpenAI does
+    // the fetching, not this worker, so nothing on the platform's network is reachable through it.
+    // Not for a lean turn — a Talent's single completion has no tools at all.
+    // Only for an agent granted `web-search` (TOOL-WEB-SEARCH); otherwise switched off outright.
+    if (!req?.lean) args.push("-c", req?.webSearch === false ? 'web_search="disabled"' : 'web_search="live"');
     // The turn's MCP server: `tonoman` as one tool (or, before it, the brain tool).
     if (req && !req.lean && !inContainer && req.mcpServers?.length) args.push(...codexMcpOverrides(req.mcpServers));
     // Photos the person attached go with the prompt (CONVO-ATTACHED-FILES): without a shell, Codex has

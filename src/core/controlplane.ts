@@ -279,6 +279,8 @@ export class RegistryControlPlane implements ControlPlane {
         // here: dropped from this map, a provider set in the Hub would silently do nothing.
         inference_provider: a.inferenceProvider === "codex" ? "codex" : "claude",
         principals: a.principals ?? [],
+        // The tools granted to the agent (TOOL-WEB-SEARCH, TOOL-WEB-FETCH). Mapped explicitly like the rest.
+        granted_tools: a.tools ?? [],
         flows: a.flows ?? {},
         // Mapped EXPLICITLY, like everything else here. This mapping is a whitelist by design — the
         // runtime takes only what it understands — and the cost of that is real: a field added to

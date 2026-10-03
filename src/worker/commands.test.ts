@@ -498,6 +498,14 @@ describe("run — !model normalises the marketing name", () => {
   });
 });
 
+describe("!skill — talents are called skills now", () => {
+  it("TALENT-NAME-IS-IDENTITY `!skill` is the same command as `!talent`, which keeps working", () => {
+    expect(parse("!skill meeting-recap REC1")).toEqual({ name: "talent", arg: "meeting-recap REC1" });
+    expect(parse("!talent meeting-recap REC1")).toEqual({ name: "talent", arg: "meeting-recap REC1" });
+    expect(parse("!Skill agenda-brief now")).toEqual({ name: "talent", arg: "agenda-brief now" });
+  });
+});
+
 describe("!talent — on-demand run, with `again` to bypass the idempotency guard", () => {
   it("runs a Talent on one item, force off by default", async () => {
     const runTalent = vi.fn(async () => ({ started: true, message: "Running." }));
