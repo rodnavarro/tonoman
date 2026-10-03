@@ -21,6 +21,8 @@ import { seed, seedFiles, safePagePath } from "./store";
 import { brainFailureText, isSetupFault, SETUP_FAULT_TEXT } from "./credential";
 import { cliSource, toolShimSource } from "./cli";
 import { checkReceipt, documentTrouble, planReceipt, reportOf, totals, type FiledOutcome, type Plan } from "../receipts/receipts";
+import { runSite } from "../site/commands";
+import { payloadSite, type PayloadSite } from "../site/payload";
 
 export interface Reachable {
   id: string;
@@ -41,7 +43,8 @@ export interface Reachable {
 
 export interface Reach {
   tenant: string;
-  speaker: { accountId: string | null; name: string | null; member: boolean };
+  /** `role` is the speaker's role in the tenant (owner, admin, member), when the registry says it. */
+  speaker: { accountId: string | null; name: string | null; member: boolean; role?: string | null };
   brains: Reachable[];
 }
 
@@ -67,6 +70,10 @@ export interface TurnSpec {
   /** The Receipts Talent, when it is on for the agent: the brain it files into (TALENT-BRAIN-SETTING)
    *  and the tenant's legal entities. Absent = `tonoman receipts` says it is off (CLI-GRANTED-GROUPS). */
   receipts?: { brainId: string; entities?: string[]; version?: number };
+  /** The Website Talent, when it is on for the agent and its site is connected (SITE-IS-A-TALENT):
+   *  where the site is, where its content API is, and the reference to the agent's key there.
+   *  Absent = `tonoman site` says it is off. */
+  site?: { url: string; api?: string; secretRef: string; version?: number };
 }
 
 /** A run of a Talent begun by a conversation (RUN-FROM-CONVERSATION), content-free. */
@@ -127,6 +134,11 @@ export interface BrokerOptions {
   node?: string;
   /** Record a Talent's run begun by a conversation (best-effort). */
   recordRun?: (run: ConversationRun) => Promise<void>;
+  /** The Website connection's secret for this agent, by reference: JSON `{"apiKey","previewSecret"}`.
+   *  Read when a `tonoman site` command runs, never kept. */
+  siteSecret?: (agentGuid: string, ref: string) => Promise<string>;
+  /** For the site's content API; the platform's `fetch` unless a test gives its own. */
+  fetch?: typeof fetch;
 }
 
 const INDEX_HEAD_BYTES = 4000;
@@ -258,7 +270,36 @@ export function createBroker(o: BrokerOptions) {
 
   type Handler = (t: Turn, reach: Reach, body: Record<string, unknown>) => Promise<{ status: number; text: string }>;
 
+  /** This turn's site, with the agent's key — or why there is none (SITE-IS-A-TALENT, SITE-CONNECTED-ONCE). */
+  async function siteOf(t: Turn): Promise<{ site: PayloadSite } | { status: number; text: string }> {
+    if (!t.site) return { status: 403, text: "Website is not on for this agent, so `tonoman site` does nothing here." };
+    const raw = o.siteSecret ? await o.siteSecret(t.agentGuid, t.site.secretRef).catch(() => "") : "";
+    let secret: { apiKey?: unknown; previewSecret?: unknown } = {};
+    try {
+      secret = raw ? (JSON.parse(raw) as typeof secret) : {};
+    } catch {
+      secret = {};
+    }
+    if (typeof secret.apiKey !== "string" || !secret.apiKey || typeof secret.previewSecret !== "string" || !secret.previewSecret) {
+      return { status: 409, text: "The site is not connected yet: the agent has no key for it. Tell the person an owner must connect the site in the Hub (Website, in the agent's Talents)." };
+    }
+    return { site: payloadSite({ url: t.site.url, api: t.site.api, apiKey: secret.apiKey, previewSecret: secret.previewSecret }, o.fetch) };
+  }
+
+  const siteCommand = (command: string): Handler => async (t, reach, body) => {
+    const s = await siteOf(t);
+    if ("status" in s) return s;
+    return runSite(command, s.site, body, { member: reach.speaker.member, role: reach.speaker.role, name: reach.speaker.name });
+  };
+
   const handlers: Record<string, Handler> = {
+    "site.pages": siteCommand("pages"),
+    "site.read": siteCommand("read"),
+    "site.sections": siteCommand("sections"),
+    "site.edit": siteCommand("edit"),
+    "site.save": siteCommand("save"),
+    "site.preview": siteCommand("preview"),
+    "site.publish": siteCommand("publish"),
     async list(t, reach) {
       if (!reach.speaker.member) return { status: 200, text: "This person is not a member of the tenant, so they reach no brains." };
       if (reach.brains.length === 0) return { status: 200, text: "This person reaches no brains." };
@@ -552,7 +593,7 @@ export function createBroker(o: BrokerOptions) {
     const t = turns.get(auth.startsWith("Bearer ") ? auth.slice(7) : "");
     if (!t || t.expiresAt < Date.now()) return send(401, "this turn's brain access has ended");
     const url = (req.url ?? "").replace(/\?.*$/, "");
-    const name = url.startsWith("/receipts/") ? `receipts.${url.slice("/receipts/".length)}` : url.replace(/^\/brain\//, "");
+    const name = url.startsWith("/receipts/") ? `receipts.${url.slice("/receipts/".length)}` : url.startsWith("/site/") ? `site.${url.slice("/site/".length)}` : url.replace(/^\/brain\//, "");
     const h = Object.prototype.hasOwnProperty.call(handlers, name) ? handlers[name] : undefined;
     if (req.method !== "POST" || !h) return send(404, "no such tool");
     const chunks: Buffer[] = [];
@@ -617,7 +658,7 @@ export function createBroker(o: BrokerOptions) {
     startTurn(spec: TurnSpec, hooks: TurnHooks = {}): { token: string; mcp: McpServerSpec; cli: TurnCli } {
       const token = randomBytes(24).toString("hex");
       turns.set(token, { ...spec, used: new Set(), fetched: new Set(), bytes: 0, expiresAt: Date.now() + 2 * 60 * 60 * 1000, onUse: hooks.onUse });
-      const env = { TONOMAN_BRAIN_URL: baseUrl, TONOMAN_BRAIN_TOKEN: token, ...(spec.receipts ? { TONOMAN_RECEIPTS: "1" } : {}) };
+      const env = { TONOMAN_BRAIN_URL: baseUrl, TONOMAN_BRAIN_TOKEN: token, ...(spec.receipts ? { TONOMAN_RECEIPTS: "1" } : {}), ...(spec.site ? { TONOMAN_SITE: "1" } : {}) };
       return {
         token,
         mcp: { name: "tonoman", command: o.node ?? process.execPath, args: [shimPath], env: { ...env, TONOMAN_CLI_PATH: cliPath } },

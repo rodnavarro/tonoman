@@ -491,7 +491,10 @@ async function startBrains(): Promise<{ registry: ReturnType<typeof registryClie
     const closed = await call("PATCH", { talent: r.talent, itemKey: r.itemKey, status: r.status, result: { summary: r.summary } });
     if (!closed.ok) console.error(`worker: ${r.talent} run from a conversation not closed (${closed.status})`);
   };
-  const broker = createBroker({ store, registry, provisioner, scratch: path.join(root, "_scratch"), toolsDir: turnUsersOn() ? TOOLS_DIR : undefined, recordRun });
+  // The Website connection's secret is read by reference, for the agent it belongs to, when a
+  // `tonoman site` command runs (SITE-CONNECTED-ONCE).
+  const siteSecret = (guid: string, ref: string): Promise<string> => resolveRef(ref, guid);
+  const broker = createBroker({ store, registry, provisioner, scratch: path.join(root, "_scratch"), toolsDir: turnUsersOn() ? TOOLS_DIR : undefined, recordRun, siteSecret });
   await broker.start();
   // The refresh runs on the LOCAL model only (BRAIN-LOCAL-MODEL): gemma4:e4b by default, at the URL
   // given. With no URL, brains are still mapped, just not connected by topic.
@@ -1515,7 +1518,7 @@ export async function run(
     start: (agent, user, who, key, opts) => {
       const g = wired.get(agent)?.cfg.guid;
       // Each use is saved with the session the moment it happens (BRAIN-USED-DECIDES).
-      return b && g ? b.broker.startTurn({ agentGuid: g, slackUserId: user, who, receipts: opts?.receipts }, { onUse: (id) => remember(agent, key, [id]) }) : undefined;
+      return b && g ? b.broker.startTurn({ agentGuid: g, slackUserId: user, who, receipts: opts?.receipts, site: opts?.site }, { onUse: (id) => remember(agent, key, [id]) }) : undefined;
     },
     bind: (token, cwd) => b?.broker.bindFolder(token, cwd),
     attach: (token, files) => b?.broker.attach(token, files),

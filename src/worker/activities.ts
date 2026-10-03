@@ -413,7 +413,7 @@ export interface TurnBrains {
     user: string,
     who: string,
     key: string,
-    opts?: { receipts?: { brainId: string; entities?: string[]; version?: number } },
+    opts?: { receipts?: { brainId: string; entities?: string[]; version?: number }; site?: { url: string; api?: string; secretRef: string; version?: number } },
   ): { token: string; mcp: McpServerSpec; cli: { binDir: string; env: Record<string, string> } } | undefined;
   /** The turn's own folder, once it exists: the only place a file it files may come from. */
   bind?(token: string, cwd: string): void;
@@ -1051,6 +1051,8 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
     let brainTurn: { token: string; mcp: McpServerSpec; cli: { binDir: string; env: Record<string, string> } } | undefined;
     // The Receipts Talent, when it is on for this agent with a brain set (TALENT-IN-CONVERSATION).
     const receipts = receiptsOf(found.cfg.talents);
+    // The Website Talent, when it is on for this agent and its site is connected (SITE-IS-A-TALENT).
+    const site = siteOf(found.cfg.talents, found.cfg.credentials);
     let staleHistory = false;
     // This turn is about a finance document: whatever it says goes to the sender privately.
     let finance = false;
@@ -1085,7 +1087,7 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
         }
       }
       if (receipts && prior.includes(receipts.brainId)) finance = true;
-      brainTurn = brains.start(input.agent, input.user, input.user, key, { receipts });
+      brainTurn = brains.start(input.agent, input.user, input.user, key, { receipts, site });
       // Outside the speaker's own DM, a turn that can reach brains — or remembers one — is held. An
       // announcement is held even in their DM: it is posted only after the reach is checked again.
       held = (audience.kind !== "self" && (!!brainTurn || prior.length > 0 || finance)) || !!input.drewOn?.length;
@@ -1262,11 +1264,11 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
     if (brainTurn && brains && known?.label) {
       // Re-open with the person's name for log.md; the first token is closed unused.
       brains.end(brainTurn.token);
-      brainTurn = brains.start(input.agent, input.user, known.label, key, { receipts });
+      brainTurn = brains.start(input.agent, input.user, known.label, key, { receipts, site });
     }
     const parts = [
       found.context ?? "",
-      brainTurn ? guidanceFor(provider, receipts) : "",
+      brainTurn ? guidanceFor(provider, receipts, !!site) : "",
       input.afterInterruption
         ? "(your previous answer was interrupted by a new message; continue from what the user now says)"
         : "",
@@ -1557,8 +1559,22 @@ export function receiptsOf(talents: { name: string; version?: number; config?: R
   return { brainId, ...(entities.length ? { entities } : {}), version: t.version };
 }
 
+/** PURE: the Website Talent as this agent has it — where its site is and the reference to its key —
+ *  or nothing when the Talent is off, has no address, or the site is not connected. */
+export function siteOf(
+  talents: { name: string; version?: number; config?: Record<string, unknown> }[] | undefined,
+  credentials: { kind: string; secret_ref?: string }[] | undefined,
+): { url: string; api?: string; secretRef: string; version?: number } | undefined {
+  const t = (talents ?? []).find((x) => x.name === "website");
+  const url = typeof t?.config?.site === "string" ? t.config.site.trim().replace(/\/+$/, "") : "";
+  const secretRef = (credentials ?? []).find((c) => c.kind === "website" && c.secret_ref)?.secret_ref ?? "";
+  if (!t || !/^https?:\/\//.test(url) || !secretRef) return undefined;
+  const api = typeof t.config?.api === "string" ? t.config.api.trim().replace(/\/+$/, "") : "";
+  return { url, ...(api ? { api } : {}), secretRef, version: t.version };
+}
+
 /** What the turn is told about `tonoman` (CLI-SMALL-CONTEXT), and how to use brains well. */
-function guidanceFor(provider: "claude" | "codex", receipts?: { entities?: string[] }): string {
+function guidanceFor(provider: "claude" | "codex", receipts?: { entities?: string[] }, siteOn = false): string {
   const receiptsOn = !!receipts;
   const how =
     provider === "codex"
@@ -1574,8 +1590,20 @@ function guidanceFor(provider: "claude" | "codex", receipts?: { entities?: strin
     "  Prefer an existing page (read it first and pass its revision); add a new page to the index or its topic's hub. Say which brain and page, and only once the write says it is saved.",
     "- If a brain is read only, say so. If something was cut or could not be reached, say what you could not look at.",
     ...(receiptsOn ? ["", RECEIPTS_NOTE, receipts?.entities?.length ? `This tenant's legal entities, one of which every receipt names: ${receipts.entities.join(", ")}. If it is not clear which, ask — naming these.` : ""] : []),
+    ...(siteOn ? ["", SITE_NOTE] : []),
   ].join("\n");
 }
+
+/** The Website Talent's short note (the details are in `tonoman site --help`). */
+const SITE_NOTE = [
+  "Website is on: you can change the tenant's website with `tonoman site`. Its pages are data — words and sections — each with a draft and a published version.",
+  "- Look first: `tonoman site pages`, then `tonoman site read` the page (a section at a time). For anything new, `tonoman site sections` says what a page can be made of.",
+  "- A word, a line, a name: `tonoman site edit`. A section or a whole page: `tonoman site save`. Make the change in every language the page has unless told otherwise; a new page gets every language the site has (`--same-as` ties them together).",
+  "- A new page needs a title (the page's own name — the site adds its name after it), a description of about 150 characters and a summary of what the page answers, in each language, and exactly one main heading (its first section's).",
+  "- Everything you save is a DRAFT. Answer with what you changed and the preview link, and say it is a draft awaiting approval. Never say it is live.",
+  "- Publish only when the person says to: `tonoman site publish`. It works only for an owner or admin; pass on exactly what it answers, and say “live” only if it said so.",
+  "- Behaviour — checkout, sign-in, a new kind of section — is the site's code, not content: say so, and offer what the sections can do instead.",
+].join("\n");
 
 /** The Receipts Talent's short note (the details are in `tonoman receipts --help`). */
 const RECEIPTS_NOTE = [
