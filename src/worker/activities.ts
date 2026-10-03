@@ -1598,6 +1598,7 @@ function guidanceFor(provider: "claude" | "codex", receipts?: { entities?: strin
 const SITE_NOTE = [
   "Website is on: you can change the tenant's website with `tonoman site`. Its pages are data — words and sections — each with a draft and a published version.",
   "- Look first: `tonoman site pages`, then `tonoman site read` the page (a section at a time). For anything new, `tonoman site sections` says what a page can be made of.",
+  "- A page may already have changes waiting from an earlier request. `read` shows the draft and says what it changes against the live page: tell the person, and when they ask about what the site shows now, answer from `read --live`.",
   "- A word, a line, a name: `tonoman site edit`. A section or a whole page: `tonoman site save`. Make the change in every language the page has unless told otherwise; a new page gets every language the site has (`--same-as` ties them together).",
   "- A new page needs a title (the page's own name — the site adds its name after it), a description of about 150 characters and a summary of what the page answers, in each language, and exactly one main heading (its first section's).",
   "- Everything you save is a DRAFT. Answer with what you changed and the preview link, and say it is a draft awaiting approval. Never say it is live.",

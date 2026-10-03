@@ -72,7 +72,8 @@ function fakeSite() {
         return json(200, { docs: docs.filter((d) => !onlyLive || d.mainStatus === "published").map((d) => all(d, draft, url)) });
       }
       const wanted = url.searchParams.get("where[path][equals]");
-      return json(200, { docs: docs.filter((d) => (draft ? d.latest : d.main)[lang]?.path === wanted).map((d) => view(d, lang, draft)) });
+      const liveOnly = url.searchParams.get("where[_status][equals]") === "published";
+      return json(200, { docs: docs.filter((d) => (draft ? d.latest : d.main)[lang]?.path === wanted && (!liveOnly || d.mainStatus === "published")).map((d) => view(d, lang, draft)) });
     }
     if (rest === "" && method === "POST") {
       const problem = pathProblem(body.path, lang);
@@ -232,6 +233,31 @@ describe("reading", () => {
     const one = await run(t, "read", { path: "/team", lang: "en", section: "2" });
     expect(JSON.parse(one.text.slice(one.text.indexOf("{")))).toEqual({ blockType: "text", heading: "Priya Raman", body: "Priya sets the direction. Priya also builds." });
     expect((await run(t, "read", { path: "/nope" })).status).toBe(404);
+  });
+
+  it("SITE-READS-A-PAGE a draft waiting from an earlier request is said first, with what it changes; --live shows what visitors see", async () => {
+    // What happened on Oct 3: a person was taken off the team page in a draft, and later asked about
+    // their bio. The agent read the draft, found nobody, and said they were not on the page.
+    site.live(TEAM);
+    const t = turn(MEMBER);
+    await run(t, "save", { path: "/team", lang: "en", remove: "2" });
+    const draft = await run(t, "read", { path: "/team", lang: "en" });
+    expect(draft.text).toContain("published, with changes waiting as a draft");
+    expect(draft.text).toContain("CHANGES WAITING");
+    expect(draft.text).toContain("sections: 2 live → 1 in the draft");
+    expect(draft.text).toContain("removed in the draft: “Priya Raman”");
+    expect(draft.text).toContain("--live");
+    const live = await run(t, "read", { path: "/team", lang: "en", live: true });
+    expect(live.text).toContain("the LIVE version, as visitors see it now");
+    expect(live.text).toContain("2. text — Priya Raman");
+    expect(live.text).not.toContain("CHANGES WAITING");
+    // The draft is the whole page's; a language it did not change says so, with no warning.
+    const es = (await run(t, "read", { path: "/es/equipo", lang: "es" })).text;
+    expect(es).not.toContain("CHANGES WAITING");
+    expect(es).toContain("Nothing is waiting in es");
+    // A page that was never published has no live version to show.
+    await run(t, "save", { path: "/news", lang: "en", json: JSON.stringify({ title: "News", meta: { description: "d" }, layout: [{ blockType: "text", body: "x" }] }) });
+    expect((await run(t, "read", { path: "/news", lang: "en", live: true })).text).toContain("is not published; it exists only as a draft");
   });
 
   it("SITE-TELLS-ITS-SECTIONS the kinds of section and their fields come from the site itself", async () => {

@@ -90,6 +90,41 @@ export function occurrences(page: Pick<SitePage, "title" | "summary" | "meta" | 
   return hits;
 }
 
+/** PURE: the names a version of a page shows — people, titles, headings, questions — for saying in
+ *  a line what a waiting draft changes. */
+function labels(page: Pick<SitePage, "title" | "layout">): string[] {
+  const out: string[] = [];
+  const walk = (v: unknown) => {
+    if (Array.isArray(v)) v.forEach(walk);
+    else if (v && typeof v === "object") {
+      for (const [k, x] of Object.entries(v as Record<string, unknown>)) {
+        if (["name", "title", "heading", "question"].includes(k) && typeof x === "string" && x.trim()) out.push(x.trim());
+        else walk(x);
+      }
+    }
+  };
+  if (page.title) out.push(page.title);
+  walk(page.layout ?? []);
+  return out;
+}
+
+/** PURE: what a waiting draft changes against the live page, in a few lines a person can follow. */
+export function draftChanges(live: Pick<SitePage, "title" | "summary" | "meta" | "layout">, draft: Pick<SitePage, "title" | "summary" | "meta" | "layout">): string[] {
+  const out: string[] = [];
+  const [a, b] = [live.layout ?? [], draft.layout ?? []];
+  const same = (x: unknown, y: unknown) => JSON.stringify(tidy(x)) === JSON.stringify(tidy(y));
+  if (!same(live.title, draft.title)) out.push(`title: “${live.title ?? ""}” → “${draft.title ?? ""}”`);
+  if (!same(live.meta, draft.meta) || !same(live.summary, draft.summary)) out.push("description or summary changed");
+  if (a.length !== b.length) out.push(`sections: ${a.length} live → ${b.length} in the draft`);
+  for (let i = 0; i < Math.min(a.length, b.length); i++) if (!same(a[i], b[i])) out.push(`section ${i + 1} (${String(b[i]!.blockType)}) changed`);
+  const [la, lb] = [labels(live), labels(draft)];
+  const gone = la.filter((x) => !lb.includes(x));
+  const added = lb.filter((x) => !la.includes(x));
+  if (gone.length) out.push(`removed in the draft: ${gone.map((x) => `“${x}”`).join(", ")}`);
+  if (added.length) out.push(`added in the draft: ${added.map((x) => `“${x}”`).join(", ")}`);
+  return out;
+}
+
 /** PURE: what is wrong with a section, by the site's own description of its sections — or null. */
 export function sectionProblem(b: unknown, shape: SiteShape): string | null {
   if (!b || typeof b !== "object" || Array.isArray(b)) return "a section is an object with a blockType";
@@ -194,10 +229,34 @@ export async function runSite(command: string, site: PayloadSite, a: Args, who: 
         const path = normPath(a.path);
         if (!path) return no(400, "Say which page: --path <its address>.");
         const shape = await site.shape();
-        const found = await findPage(site, path, str(a.lang), shape.languages);
+        let found = await findPage(site, path, str(a.lang), shape.languages);
         if (!found) return notFound(path, str(a.lang));
+        // `--live`: the page as visitors see it now, not its waiting draft.
+        if (a.live !== undefined && a.live !== false) {
+          const live = await site.published(path, found.lang);
+          if (!live) return no(404, `${path} (${found.lang}) is not published; it exists only as a draft.`);
+          found = { page: { ...live, _status: "published" }, lang: found.lang };
+        }
         const { page, lang } = found;
         const layout = page.layout ?? [];
+        const state = a.live !== undefined && a.live !== false ? "published" : await site.stateOf(page);
+        // A draft waiting from an earlier request is said FIRST, with what it changes: the agent reads
+        // the draft, and without this a person asking about the live page is told something the live
+        // page does not show.
+        let waiting: string[] = [];
+        if (state === "changes") {
+          const live = await site.published(path, lang);
+          const changes = live ? draftChanges(live, page) : [];
+          if (live && !changes.length) {
+            waiting = [`Nothing is waiting in ${lang}: this language of the draft is the same as the live page (the waiting changes are in another language).`];
+          } else if (live) {
+            waiting = [
+              "⚠ This page has CHANGES WAITING as a draft, not live yet. What follows is the DRAFT. Against the live page:",
+              ...changes.map((l) => `  - ${l}`),
+              `  The live version: tonoman site read --path ${path} --lang ${lang} --live. Tell the person about these waiting changes before building on them.`,
+            ];
+          }
+        }
         if (a.section !== undefined) {
           const n = Number(a.section);
           if (!Number.isInteger(n) || n < 1 || n > layout.length) return no(400, `The page has ${layout.length} section(s); --section takes 1 to ${layout.length}.`);
@@ -211,7 +270,8 @@ export async function runSite(command: string, site: PayloadSite, a: Args, who: 
         }
         return ok(
           [
-            `${path} (${lang}) — ${STATE_WORDS[await site.stateOf(page)]}`,
+            `${path} (${lang}) — ${a.live !== undefined && a.live !== false ? "the LIVE version, as visitors see it now" : STATE_WORDS[state]}`,
+            ...waiting,
             ...(others.length ? [`Other languages — ${others.join(" · ")}`] : []),
             `title: ${page.title ?? ""}`,
             ...(page.meta?.titleTag ? [`search title: ${page.meta.titleTag}`] : []),

@@ -129,6 +129,12 @@ export function payloadSite(conn: SiteConnection, fetchImpl: typeof fetch = fetc
     return r.docs[0] ?? null;
   }
 
+  /** The page at this address as visitors see it now — its published version — or null. */
+  async function published(path: string, lang: string): Promise<SitePage | null> {
+    const r = await call<{ docs: SitePage[] }>("GET", `/pages?${q({ locale: lang, depth: "0", limit: "1", "where[path][equals]": path, "where[_status][equals]": "published" })}`);
+    return r.docs[0] ?? null;
+  }
+
   /** The same page in another language (its latest version), or null when it is not written there. */
   async function latestById(id: string | number, lang: string): Promise<SitePage | null> {
     const p = await call<SitePage>("GET", `/pages/${encodeURIComponent(String(id))}?${q({ locale: lang, draft: "true", depth: "0" })}`).catch((e) => {
@@ -153,6 +159,7 @@ export function payloadSite(conn: SiteConnection, fetchImpl: typeof fetch = fetc
     site,
     shape,
     latest,
+    published,
     latestById,
     stateOf,
 
