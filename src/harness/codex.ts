@@ -265,7 +265,8 @@ export class Runner implements TurnRunner {
     // The web (CLI-WEB-ON-BOTH-PROVIDERS): Codex's live web search, which also opens pages. OpenAI does
     // the fetching, not this worker, so nothing on the platform's network is reachable through it.
     // Not for a lean turn — a Talent's single completion has no tools at all.
-    if (!req?.lean) args.push("-c", 'web_search="live"');
+    // Only for an agent granted `web-search` (TOOL-WEB-SEARCH); otherwise switched off outright.
+    if (!req?.lean) args.push("-c", req?.webSearch === false ? 'web_search="disabled"' : 'web_search="live"');
     // The turn's MCP server: `tonoman` as one tool (or, before it, the brain tool).
     if (req && !req.lean && !inContainer && req.mcpServers?.length) args.push(...codexMcpOverrides(req.mcpServers));
     // Photos the person attached go with the prompt (CONVO-ATTACHED-FILES): without a shell, Codex has

@@ -340,6 +340,12 @@ describe("tonoman, the only command (Tonoman Cloud docs/definition/objects/cli.m
     expect(args).not.toContain("--mcp-config");
   });
 
+  it("TOOL-WEB-SEARCH a Claude agent not granted web search has it neither allowed nor available", () => {
+    const args = new Runner({ container: "cody", disallowedTools: ["Bash"] }).podmanArgs({ prompt: "hi", cli, webSearch: false } as never);
+    expect(flagValue(args, "--allowedTools")!.split(",")).toEqual(["Bash(tonoman:*)"]);
+    expect(flagValue(args, "--disallowedTools")!.split(",")).toContain("WebSearch");
+  });
+
   it("CLI-CLOSED-WHATEVER-FAILS a turn that was given no tonoman (the brain service is down) has no shell at all, whatever the deny list says", () => {
     const args = new Runner({ container: "cody", closedShell: true, disallowedTools: ["Write"] }).podmanArgs(req);
     expect(flagValue(args, "--disallowedTools")!.split(",")).toContain("Bash");

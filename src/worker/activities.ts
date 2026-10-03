@@ -384,6 +384,8 @@ export interface TurnRunReq {
   mcpServers?: McpServerSpec[];
   /** `tonoman`, the turn's one command (cli.md in Tonoman Cloud). */
   cli?: { binDir: string; env: Record<string, string> };
+  /** Web search for this turn (TOOL-WEB-SEARCH); false only for an agent not granted it. */
+  webSearch?: boolean;
   /** The turn's own working folder. */
   cwd?: string;
 }
@@ -413,7 +415,7 @@ export interface TurnBrains {
     user: string,
     who: string,
     key: string,
-    opts?: { receipts?: { brainId: string; entities?: string[]; version?: number }; site?: { url: string; api?: string; secretRef: string; version?: number } },
+    opts?: { receipts?: { brainId: string; entities?: string[]; version?: number }; site?: { url: string; api?: string; secretRef: string; version?: number }; webFetch?: boolean },
   ): { token: string; mcp: McpServerSpec; cli: { binDir: string; env: Record<string, string> } } | undefined;
   /** The turn's own folder, once it exists: the only place a file it files may come from. */
   bind?(token: string, cwd: string): void;
@@ -1053,6 +1055,10 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
     const receipts = receiptsOf(found.cfg.talents);
     // The Website Talent, when it is on for this agent and its site is connected (SITE-IS-A-TALENT).
     const site = siteOf(found.cfg.talents, found.cfg.credentials);
+    // The web tools (TOOL-WEB-SEARCH, TOOL-WEB-FETCH). An agent with no registry keeps web search.
+    const granted = found.cfg.granted_tools;
+    const webSearch = granted === undefined || granted.includes("web-search");
+    const webFetch = !!granted?.includes("web-fetch");
     let staleHistory = false;
     // This turn is about a finance document: whatever it says goes to the sender privately.
     let finance = false;
@@ -1087,7 +1093,7 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
         }
       }
       if (receipts && prior.includes(receipts.brainId)) finance = true;
-      brainTurn = brains.start(input.agent, input.user, input.user, key, { receipts, site });
+      brainTurn = brains.start(input.agent, input.user, input.user, key, { receipts, site, webFetch });
       // Outside the speaker's own DM, a turn that can reach brains — or remembers one — is held. An
       // announcement is held even in their DM: it is posted only after the reach is checked again.
       held = (audience.kind !== "self" && (!!brainTurn || prior.length > 0 || finance)) || !!input.drewOn?.length;
@@ -1264,11 +1270,11 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
     if (brainTurn && brains && known?.label) {
       // Re-open with the person's name for log.md; the first token is closed unused.
       brains.end(brainTurn.token);
-      brainTurn = brains.start(input.agent, input.user, known.label, key, { receipts, site });
+      brainTurn = brains.start(input.agent, input.user, known.label, key, { receipts, site, webFetch });
     }
     const parts = [
       found.context ?? "",
-      brainTurn ? guidanceFor(provider, receipts, !!site) : "",
+      brainTurn ? guidanceFor(provider, receipts, !!site, { search: webSearch, fetch: webFetch }) : "",
       input.afterInterruption
         ? "(your previous answer was interrupted by a new message; continue from what the user now says)"
         : "",
@@ -1377,6 +1383,7 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
           // `tonoman` (cli.md): on Claude a command its shell may run and nothing else; on Codex,
           // whose shell is switched off for it, the same command as its one tool.
           cli: brainTurn?.cli,
+          webSearch,
           mcpServers: brainTurn && provider === "codex" ? [brainTurn.mcp] : undefined,
           cwd: turnDir,
         },
@@ -1574,15 +1581,15 @@ export function siteOf(
 }
 
 /** What the turn is told about `tonoman` (CLI-SMALL-CONTEXT), and how to use brains well. */
-function guidanceFor(provider: "claude" | "codex", receipts?: { entities?: string[] }, siteOn = false): string {
+function guidanceFor(provider: "claude" | "codex", receipts?: { entities?: string[] }, siteOn = false, web: { search: boolean; fetch: boolean } = { search: true, fetch: false }): string {
   const receiptsOn = !!receipts;
   const how =
     provider === "codex"
-      ? "Besides web search, you have one tool, `tonoman`: pass the command's arguments as a list, e.g. [\"brain\",\"list\"]. Start with [\"--help\"] to see its groups, and [\"brain\",\"--help\"] for a group's commands."
+      ? (web.search ? "Besides web search, you" : "You") + " have one tool, `tonoman`: pass the command's arguments as a list, e.g. [\"brain\",\"list\"]. Start with [\"--help\"] to see its groups, and [\"brain\",\"--help\"] for a group's commands."
       : CLI_NOTE;
   return [
     how,
-    WEB_NOTE,
+    ...webNotes(web),
     "Brains hold this person's knowledge — their own brain and any shared with them. Nothing else of theirs is on this machine.",
     "- Start with `tonoman brain list`: each brain, its index.md, and the map Tonoman keeps (topics and their hub pages). Follow those, then search.",
     "- For what a folder holds, or the newest pages on something, use `tonoman brain pages` with that folder — one call, never guess paths.",
@@ -1597,8 +1604,14 @@ function guidanceFor(provider: "claude" | "codex", receipts?: { entities?: strin
 
 /** The web (CLI-WEB-ON-BOTH-PROVIDERS): said every turn, because an agent whose history says it could
  *  not reach the web goes on believing it unless told otherwise. */
-const WEB_NOTE =
-  "You can search the web and open public pages (your web search tool). Use it when asked about something that is not in the brains — a person's public profile, a company, a page someone links. Some sites (LinkedIn among them) refuse to be read; then say so and ask the person for what you need. Never say you cannot reach the web.";
+function webNotes(web: { search: boolean; fetch: boolean }): string[] {
+  const out: string[] = [];
+  if (web.search) out.push("You can search the web and open public pages (your web search tool). Use it when asked about something that is not in the brains — a person's public profile, a company, a page someone links. Never say you cannot reach the web.");
+  if (web.fetch) out.push("When your web search cannot open a page (some sites refuse it — LinkedIn among them), open it with `tonoman web fetch --url <address>`: it reads the page from here, the way a browser does. If that is refused too, say so and ask the person for what you need.");
+  else if (web.search) out.push("Some sites (LinkedIn among them) refuse your web search; then say so and ask the person for what you need.");
+  if (!web.search && !web.fetch) out.push("You have no web access. If asked to look something up online, say so.");
+  return out;
+}
 
 /** The Website Talent's short note (the details are in `tonoman site --help`). */
 const SITE_NOTE = [

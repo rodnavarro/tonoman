@@ -416,6 +416,37 @@ describe("publishing", () => {
   });
 });
 
+describe("web fetch", () => {
+  it("TOOL-WEB-FETCH without the grant `tonoman web fetch` does nothing; with it, the page comes back", async () => {
+    const opened: string[] = [];
+    const b = createBroker({
+      store: createStore({ root: path.join(tmp, "c2"), token: async () => "", fetchEveryMs: 0, log: () => {} }),
+      scratch: path.join(tmp, "s2"),
+      log: () => {},
+      registry: { reach: async (): Promise<Reach> => ({ tenant: "test-a", speaker: { accountId: "a", name: "A", member: true, role: "member" }, brains: [] }), recordRepo: async () => {} },
+      fetchPage: async (url) => (opened.push(url), { url, status: 200, title: "Priya Raman - Acme", description: "Head of data", text: "x".repeat(6000) }),
+    });
+    await b.start();
+    try {
+      const go = async (webFetch: boolean, body: Record<string, unknown>) => {
+        const { token, cli } = b.startTurn({ agentGuid: "g", slackUserId: "U1", who: "A", webFetch });
+        const r = await fetch(`${b.url}/web/fetch`, { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify(body) });
+        return { status: r.status, text: await r.text(), env: cli.env };
+      };
+      const off = await go(false, { url: "https://example.com/" });
+      expect(off.status).toBe(403);
+      expect(off.env.TONOMAN_WEB_FETCH).toBeUndefined();
+      expect(opened).toEqual([]);
+      const on = await go(true, { url: "https://example.com/" });
+      expect(on.env.TONOMAN_WEB_FETCH).toBe("1");
+      expect(on.text).toContain("title: Priya Raman - Acme");
+      expect(on.text).toContain("1000 more characters: --from 5000");
+    } finally {
+      await b.close();
+    }
+  });
+});
+
 describe("the pure parts", () => {
   it("SITE-EDIT-IN-PLACE occurrences are counted in words only, never in ids or kinds", () => {
     const page = { title: "text", summary: null, meta: { description: "A text" }, layout: [{ id: "text", blockType: "text", body: "text and text" }] };

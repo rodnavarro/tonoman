@@ -60,6 +60,7 @@ export const cliSource = String.raw`"use strict";
 const URL_ = process.env.TONOMAN_BRAIN_URL, TOKEN = process.env.TONOMAN_BRAIN_TOKEN;
 const RECEIPTS = process.env.TONOMAN_RECEIPTS === "1";
 const SITE = process.env.TONOMAN_SITE === "1";
+const WEB_FETCH = process.env.TONOMAN_WEB_FETCH === "1";
 const MAX = 6000; // CLI-OUTPUT-BOUNDED
 
 const GROUPS = {
@@ -82,6 +83,13 @@ const GROUPS = {
       totals: { route: "receipts/totals", args: ["[--year]"], about: "The year's count and totals by category, from the ledger." },
     },
   },
+  web: {
+    about: "open a public web page from here, as a browser would (web-fetch tool)",
+    needs: "web",
+    commands: {
+      fetch: { route: "web/fetch", args: ["--url", "[--from N]"], about: "Open one public https page and print its title, description and text (5000 characters at a time; --from continues). Use it for a page your web search could not open. Private and internal addresses are refused." },
+    },
+  },
   site: {
     about: "read and change the tenant's website: drafts, a preview link, publish on an owner's word (Website skill)",
     needs: "site",
@@ -99,7 +107,7 @@ const GROUPS = {
 
 const out = (s) => process.stdout.write(s.length > MAX ? s.slice(0, MAX) + "\n… " + (s.length - MAX) + " more characters not shown; narrow the request (a folder, a smaller page).\n" : s.endsWith("\n") ? s : s + "\n");
 const fail = (s, code = 1) => { process.stderr.write(s + "\n"); process.exit(code); };
-const available = (g) => !GROUPS[g].needs || (GROUPS[g].needs === "receipts" && RECEIPTS) || (GROUPS[g].needs === "site" && SITE);
+const available = (g) => !GROUPS[g].needs || (GROUPS[g].needs === "receipts" && RECEIPTS) || (GROUPS[g].needs === "site" && SITE) || (GROUPS[g].needs === "web" && WEB_FETCH);
 
 function help(group) {
   if (!group) {
@@ -138,7 +146,7 @@ async function stdin() {
   const [group, cmd, ...rest] = process.argv.slice(2);
   if (!group || group === "--help" || group === "help") return out(help());
   if (!GROUPS[group]) fail("No command group '" + group + "'. See tonoman --help.", 2);
-  if (!available(group)) fail(group === "receipts" ? "Receipts is not on for this agent, so tonoman receipts does nothing here." : group === "site" ? "Website is not on for this agent, or its site is not connected, so tonoman site does nothing here." : "Not available here.", 3);
+  if (!available(group)) fail(group === "receipts" ? "Receipts is not on for this agent, so tonoman receipts does nothing here." : group === "site" ? "Website is not on for this agent, or its site is not connected, so tonoman site does nothing here." : group === "web" ? "Web fetch is not granted to this agent, so tonoman web does nothing here." : "Not available here.", 3);
   if (!cmd || cmd === "--help" || cmd === "help") return out(help(group));
   const spec = GROUPS[group].commands[cmd];
   if (!spec) fail("No command '" + group + " " + cmd + "'. See tonoman " + group + " --help.", 2);

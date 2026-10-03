@@ -826,6 +826,8 @@ function runClosure(runner: TurnRunner, cfg: AgentConfig, users?: TurnUsers): Wi
           // the harness tests passed and the path turns take dropped them (CLI-CLOSED-WHATEVER-FAILS).
           cli: r.lean ? undefined : r.cli,
           shell: cfg.shell === "full" ? "full" : "tonoman",
+          // Carried like `cli`: dropped here, no real turn would ever have it switched off (TOOL-WEB-SEARCH).
+          webSearch: r.webSearch,
           cwd: r.cwd,
         },
         signal,
@@ -1519,7 +1521,7 @@ export async function run(
     start: (agent, user, who, key, opts) => {
       const g = wired.get(agent)?.cfg.guid;
       // Each use is saved with the session the moment it happens (BRAIN-USED-DECIDES).
-      return b && g ? b.broker.startTurn({ agentGuid: g, slackUserId: user, who, receipts: opts?.receipts, site: opts?.site }, { onUse: (id) => remember(agent, key, [id]) }) : undefined;
+      return b && g ? b.broker.startTurn({ agentGuid: g, slackUserId: user, who, receipts: opts?.receipts, site: opts?.site, webFetch: opts?.webFetch }, { onUse: (id) => remember(agent, key, [id]) }) : undefined;
     },
     bind: (token, cwd) => b?.broker.bindFolder(token, cwd),
     attach: (token, files) => b?.broker.attach(token, files),

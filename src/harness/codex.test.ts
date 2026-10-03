@@ -139,6 +139,14 @@ describe("tonoman, the only command (Tonoman Cloud docs/definition/objects/cli.m
     expect(cfg(r.codexTail({ prompt: "hi", cwd: "/tmp/t", lean: true } as never))).not.toContain('web_search="live"');
   });
 
+  it("TOOL-WEB-SEARCH a Codex agent not granted web search has it switched off", async () => {
+    const { Runner } = await import("./codex");
+    const args = new Runner({ local: true, closedShell: true } as never).codexTail({ prompt: "hi", cwd: "/tmp/t", webSearch: false } as never);
+    const cfg = args.filter((_, i) => args[i - 1] === "-c");
+    expect(cfg).toContain('web_search="disabled"');
+    expect(cfg).not.toContain('web_search="live"');
+  });
+
   it("CLI-CODEX-ONLY-ITS-TOOL a Codex turn has no child agents, no plugins and no hooks", async () => {
     const { Runner } = await import("./codex");
     const args = new Runner({ local: true, closedShell: true } as never).codexTail({ prompt: "hi", cwd: "/tmp/t" } as never);
