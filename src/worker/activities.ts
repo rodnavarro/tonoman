@@ -1578,10 +1578,11 @@ function guidanceFor(provider: "claude" | "codex", receipts?: { entities?: strin
   const receiptsOn = !!receipts;
   const how =
     provider === "codex"
-      ? "You have one tool, `tonoman`: pass the command's arguments as a list, e.g. [\"brain\",\"list\"]. Start with [\"--help\"] to see its groups, and [\"brain\",\"--help\"] for a group's commands."
+      ? "Besides web search, you have one tool, `tonoman`: pass the command's arguments as a list, e.g. [\"brain\",\"list\"]. Start with [\"--help\"] to see its groups, and [\"brain\",\"--help\"] for a group's commands."
       : CLI_NOTE;
   return [
     how,
+    WEB_NOTE,
     "Brains hold this person's knowledge — their own brain and any shared with them. Nothing else of theirs is on this machine.",
     "- Start with `tonoman brain list`: each brain, its index.md, and the map Tonoman keeps (topics and their hub pages). Follow those, then search.",
     "- For what a folder holds, or the newest pages on something, use `tonoman brain pages` with that folder — one call, never guess paths.",
@@ -1593,6 +1594,11 @@ function guidanceFor(provider: "claude" | "codex", receipts?: { entities?: strin
     ...(siteOn ? ["", SITE_NOTE] : []),
   ].join("\n");
 }
+
+/** The web (CLI-WEB-ON-BOTH-PROVIDERS): said every turn, because an agent whose history says it could
+ *  not reach the web goes on believing it unless told otherwise. */
+const WEB_NOTE =
+  "You can search the web and open public pages (your web search tool). Use it when asked about something that is not in the brains — a person's public profile, a company, a page someone links. Some sites (LinkedIn among them) refuse to be read; then say so and ask the person for what you need. Never say you cannot reach the web.";
 
 /** The Website Talent's short note (the details are in `tonoman site --help`). */
 const SITE_NOTE = [

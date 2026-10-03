@@ -129,6 +129,16 @@ describe("tonoman, the only command (Tonoman Cloud docs/definition/objects/cli.m
     expect(unset.join(" ")).toContain("features.shell_tool=false");
   });
 
+  it("CLI-WEB-ON-BOTH-PROVIDERS a Codex conversation turn has live web search; a lean turn has none", async () => {
+    const { Runner } = await import("./codex");
+    const r = new Runner({ local: true, closedShell: true } as never);
+    const cfg = (args: string[]) => args.filter((_, i) => args[i - 1] === "-c");
+    expect(cfg(r.codexTail({ prompt: "hi", cwd: "/tmp/t" } as never))).toContain('web_search="live"');
+    // A resumed conversation keeps it.
+    expect(cfg(r.codexTail({ prompt: "hi", cwd: "/tmp/t" } as never, false, "019a0000-0000-0000-0000-000000000000"))).toContain('web_search="live"');
+    expect(cfg(r.codexTail({ prompt: "hi", cwd: "/tmp/t", lean: true } as never))).not.toContain('web_search="live"');
+  });
+
   it("CLI-CODEX-ONLY-ITS-TOOL a Codex turn has no child agents, no plugins and no hooks", async () => {
     const { Runner } = await import("./codex");
     const args = new Runner({ local: true, closedShell: true } as never).codexTail({ prompt: "hi", cwd: "/tmp/t" } as never);
