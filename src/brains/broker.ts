@@ -21,9 +21,9 @@ import { seed, seedFiles, safePagePath } from "./store";
 import { brainFailureText, isSetupFault, SETUP_FAULT_TEXT } from "./credential";
 import { cliSource, toolShimSource } from "./cli";
 import { checkReceipt, documentTrouble, planReceipt, reportOf, totals, type FiledOutcome, type Plan } from "../receipts/receipts";
-import { runSite } from "../site/commands";
+import { imageTrouble, runSite } from "../site/commands";
 import { fetchPage } from "../web/fetch";
-import { payloadSite, type PayloadSite } from "../site/payload";
+import { payloadSite, SiteRefused, type PayloadSite } from "../site/payload";
 
 export interface Reachable {
   id: string;
@@ -222,7 +222,12 @@ export function createBroker(o: BrokerOptions) {
    *  over before the agent runs (`attach`), so nothing the agent does in its folder — a file it made,
    *  a copy it changed, a link to somewhere else — can be filed, and the broker never opens a path the
    *  turn controls (RECEIPT-FILES-WHAT-WAS-SENT). */
-  async function turnFile(t: Turn, named: unknown): Promise<{ bytes: Buffer; name: string } | { status: number; text: string }> {
+  async function turnFile(
+    t: Turn,
+    named: unknown,
+    // What may be done with it: filed as a receipt (the default), or put on the site as an image.
+    use: { verb: string; done: string; trouble: (name: string, bytes: Buffer) => string | null } = { verb: "filed", done: "Not filed.", trouble: documentTrouble },
+  ): Promise<{ bytes: Buffer; name: string } | { status: number; text: string }> {
     if (typeof named !== "string" || !named.trim()) return { status: 400, text: "Name the attached file (it is in this turn's folder)." };
     const name = named.trim();
     // By its name: `photo.jpg`, `./photo.jpg`, or the path the agent was shown for it in its own
@@ -231,9 +236,9 @@ export function createBroker(o: BrokerOptions) {
     const plain = path.basename(name);
     const shown = !/[\\/]/.test(name) || (!!t.cwd && path.resolve(t.cwd, name) === path.join(path.resolve(t.cwd), plain));
     const bytes = shown ? t.attachments?.get(plain) : undefined;
-    if (!bytes) return { status: 403, text: `"${name}" is not a file the person sent in this conversation. Only a file they sent can be filed.` };
-    const trouble = documentTrouble(plain, bytes);
-    if (trouble) return { status: 422, text: `Not filed. ${trouble}` };
+    if (!bytes) return { status: 403, text: `"${name}" is not a file the person sent in this conversation. Only a file they sent can be ${use.verb}.` };
+    const trouble = use.trouble(plain, bytes);
+    if (trouble) return { status: 422, text: `${use.done} ${trouble}` };
     return { bytes, name: plain };
   }
 
@@ -321,6 +326,26 @@ export function createBroker(o: BrokerOptions) {
     "site.save": siteCommand("save"),
     "site.preview": siteCommand("preview"),
     "site.publish": siteCommand("publish"),
+    // A photo the person sent, into the site's own images (SITE-IMAGE-FROM-THE-CONVERSATION). It
+    // needs the turn's attachments, so it is served here rather than in runSite. No page changes.
+    async "site.upload"(t, reach, body) {
+      const s = await siteOf(t);
+      if ("status" in s) return s;
+      if (!reach.speaker.member) return { status: 403, text: "This person is not a member of the tenant, so nothing of the site can be changed for them." };
+      const file = await turnFile(t, body.file, { verb: "uploaded", done: "Not uploaded.", trouble: imageTrouble });
+      if ("status" in file) return file;
+      const alt = typeof body.alt === "string" ? body.alt.trim() : "";
+      try {
+        const img = await s.site.upload(file.name, file.bytes, alt);
+        const size = img.width && img.height ? ` (${img.width}×${img.height})` : "";
+        return {
+          status: 200,
+          text: `Uploaded to the site's images: ${img.url}${size}. No page shows it yet: put that address in a section's image field (a team member's photo, for one) with \`tonoman site save\`, which saves a draft as always.`,
+        };
+      } catch (e) {
+        return { status: e instanceof SiteRefused ? e.status : 502, text: `Not uploaded. The site said: ${(e as Error).message}.` };
+      }
+    },
     async list(t, reach) {
       if (!reach.speaker.member) return { status: 200, text: "This person is not a member of the tenant, so they reach no brains." };
       if (reach.brains.length === 0) return { status: 200, text: "This person reaches no brains." };

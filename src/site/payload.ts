@@ -205,6 +205,12 @@ export function payloadSite(conn: SiteConnection, fetchImpl: typeof fetch = fetc
       return live;
     },
 
+    /** Put an image into the site's own images (SITE-IMAGES-IN-THE-SITE). The site makes it web-sized
+     *  and answers with where it now lives; no page changes. */
+    async upload(filename: string, bytes: Buffer, alt: string): Promise<{ name: string; url: string; width?: number; height?: number }> {
+      return call("POST", "/media/upload", { filename, alt, data: bytes.toString("base64") });
+    },
+
     /** The draft, on the real site, for whoever holds the link (SITE-PREVIEW-LINK). */
     previewLink: (path: string): string => `${site}${path === "/" ? "/" : path}?preview=${encodeURIComponent(conn.previewSecret)}`,
     liveLink: (path: string): string => `${site}${path === "/" ? "/" : path}`,

@@ -1620,6 +1620,7 @@ const SITE_NOTE = [
   "- A page may already have changes waiting from an earlier request. `read` shows the draft and says what it changes against the live page: tell the person, and when they ask about what the site shows now, answer from `read --live`.",
   "- A word, a line, a name: `tonoman site edit`. A section or a whole page: `tonoman site save`. Make the change in every language the page has unless told otherwise; a new page gets every language the site has (`--same-as` ties them together).",
   "- A new page needs a title (the page's own name — the site adds its name after it), a description of about 150 characters and a summary of what the page answers, in each language, and exactly one main heading (its first section's).",
+  "- Images: a photo the person sends goes on the site with `tonoman site upload --file <its name>`; use the address it prints (/media/…) in the section's image field. Use only images the person sent or the site already has; never link an image from another website.",
   "- Everything you save is a DRAFT. Answer with what you changed and the preview link, and say it is a draft awaiting approval. Never say it is live.",
   "- Publish only when the person says to: `tonoman site publish`. It works only for an owner or admin; pass on exactly what it answers, and say “live” only if it said so.",
   "- Behaviour — checkout, sign-in, a new kind of section — is the site's code, not content: say so, and offer what the sections can do instead.",

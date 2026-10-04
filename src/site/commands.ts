@@ -25,6 +25,22 @@ const no = (status: number, text: string): Out => ({ status, text });
 const str = (v: unknown): string => (typeof v === "string" ? v.trim() : "");
 const MAY_PUBLISH = new Set(["owner", "admin"]);
 
+/** PURE: why this file cannot go on the site as an image, or null when it can
+ *  (SITE-IMAGE-FROM-THE-CONVERSATION). Checked on its first bytes, not only its name. */
+export function imageTrouble(name: string, bytes: Buffer): string | null {
+  const e = (/\.([a-z0-9]+)$/i.exec(name)?.[1] ?? "").toLowerCase();
+  if (/^(heic|heif)$/.test(e)) return "A HEIC photo cannot go on the site as it is. Ask the person to send it as a JPEG (on an iPhone: share it, or set Camera > Formats to Most Compatible).";
+  if (!["jpg", "jpeg", "png", "webp"].includes(e)) return `A .${e || "?"} file is not an image the site takes (JPEG, PNG or WebP).`;
+  if (bytes.length === 0) return "That file is empty.";
+  if (bytes.length > 15 * 1024 * 1024) return "That image is over 15 MB.";
+  const starts = (...b: number[]) => b.every((v, i) => bytes[i] === v);
+  const is =
+    e === "png" ? starts(0x89, 0x50, 0x4e, 0x47)
+    : e === "webp" ? bytes.subarray(0, 4).toString("latin1") === "RIFF" && bytes.subarray(8, 12).toString("latin1") === "WEBP"
+    : starts(0xff, 0xd8, 0xff);
+  return is ? null : `That file is called .${e} but is not one, or it is damaged. Ask the person to send it again.`;
+}
+
 /** PURE: an address as the site writes it. */
 export function normPath(v: unknown): string {
   let p = str(v).toLowerCase();

@@ -34,7 +34,9 @@ function fakeSite() {
   const docs: Doc[] = [];
   let nextId = 1;
   const calls: string[] = [];
-  const json = (status: number, body: unknown) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+  /** What reached the site's image upload, as it arrived. */
+  const uploads: { filename: string; alt: string; bytes: Buffer }[] = [];
+  const json =(status: number, body: unknown) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
   const refuse = (message: string) => json(400, { errors: [{ message }] });
   const view = (d: Doc, lang: string, draft: boolean) => {
     const c = (draft ? d.latest : d.main)[lang] ?? {};
@@ -64,6 +66,11 @@ function fakeSite() {
     const lang = url.searchParams.get("locale") ?? "en";
     const draft = url.searchParams.get("draft") === "true";
     const body = init?.body ? (JSON.parse(String(init.body)) as Content & { _status?: string }) : {};
+    if (url.pathname === "/cms-api/media/upload" && method === "POST") {
+      const sent = body as { filename?: string; alt?: string; data?: string };
+      uploads.push({ filename: sent.filename ?? "", alt: sent.alt ?? "", bytes: Buffer.from(sent.data ?? "", "base64") });
+      return json(200, { name: "photo-1a2b3c4d.webp", url: "/media/photo-1a2b3c4d.webp", width: 800, height: 800 });
+    }
     const rest = url.pathname.replace(/^\/cms-api\/pages/, "");
     if (rest === "/sections" && method === "GET") return json(200, SHAPE);
     if (rest === "" && method === "GET") {
@@ -112,7 +119,7 @@ function fakeSite() {
     docs.push(d);
     return d;
   };
-  return { fetchImpl, docs, live, calls };
+  return { fetchImpl, docs, live, calls, uploads };
 }
 
 let tmp: string;
@@ -365,6 +372,58 @@ describe("changing", () => {
     const r = await run(turn(MEMBER), "save", { path: "/bare", lang: "en", json: JSON.stringify({ title: "Bare", layout: [{ blockType: "text", body: "b" }] }) });
     expect(r.status).toBe(200);
     expect(r.text).toContain("It has no description yet; the site will not publish a page without one");
+  });
+});
+
+describe("images", () => {
+  const JPEG = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.from("a photo")]);
+  const PDF = Buffer.from("%PDF-1.7 a document");
+  const HEIC = Buffer.concat([Buffer.from([0, 0, 0, 24]), Buffer.from("ftypheic"), Buffer.alloc(12)]);
+  /** A turn where the person sent these files (the worker hands them over before the agent runs). */
+  const sending = (user: string, files: { name: string; bytes: Buffer }[]) => {
+    const t = turn(user);
+    broker.attach(t, files);
+    return t;
+  };
+
+  it("SITE-IMAGE-FROM-THE-CONVERSATION a photo the person sent goes to the site as it arrived, and the answer is its address there", async () => {
+    const r = await run(sending(MEMBER, [{ name: "priya.jpg", bytes: JPEG }]), "upload", { file: "priya.jpg", alt: "Priya Raman" });
+    expect(r.status).toBe(200);
+    expect(r.text).toContain("/media/photo-1a2b3c4d.webp");
+    expect(site.uploads).toEqual([{ filename: "priya.jpg", alt: "Priya Raman", bytes: JPEG }]);
+  });
+
+  it("SITE-IMAGE-FROM-THE-CONVERSATION only a file the person sent: another name, or a path elsewhere, is refused and nothing is sent", async () => {
+    const t = sending(MEMBER, [{ name: "priya.jpg", bytes: JPEG }]);
+    for (const file of ["other.jpg", "/etc/priya.jpg", "../priya.jpg", ""]) {
+      const r = await run(t, "upload", { file });
+      expect(r.status, file).toBeGreaterThanOrEqual(400);
+    }
+    expect(site.uploads).toEqual([]);
+  });
+
+  it("SITE-IMAGE-FROM-THE-CONVERSATION a file that is not a JPEG, PNG or WebP is refused before anything is sent", async () => {
+    const t = sending(MEMBER, [{ name: "cv.pdf", bytes: PDF }, { name: "IMG_1.heic", bytes: HEIC }, { name: "fake.jpg", bytes: Buffer.from("not a photo") }]);
+    expect((await run(t, "upload", { file: "cv.pdf" })).status).toBe(422);
+    const heic = await run(t, "upload", { file: "IMG_1.heic" });
+    expect(heic.status).toBe(422);
+    expect(heic.text).toContain("JPEG");
+    expect((await run(t, "upload", { file: "fake.jpg" })).status).toBe(422);
+    expect(site.uploads).toEqual([]);
+  });
+
+  it("SITE-UPLOAD-IS-NOT-PUBLISHING an upload touches no page, and says the image shows only where a saved page uses it", async () => {
+    site.live(TEAM);
+    const r = await run(sending(MEMBER, [{ name: "priya.jpg", bytes: JPEG }]), "upload", { file: "priya.jpg" });
+    expect(r.status).toBe(200);
+    expect(r.text).toMatch(/no page shows it yet/i);
+    expect(site.calls.filter((c) => c.includes("/pages"))).toEqual([]);
+  });
+
+  it("SITE-KEY-IS-THE-AGENTS someone who is not a member uploads nothing", async () => {
+    const r = await run(sending(STRANGER, [{ name: "priya.jpg", bytes: JPEG }]), "upload", { file: "priya.jpg" });
+    expect(r.status).toBe(403);
+    expect(site.uploads).toEqual([]);
   });
 });
 
