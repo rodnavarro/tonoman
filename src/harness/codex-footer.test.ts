@@ -93,6 +93,41 @@ describe("a Codex turn's footer", () => {
     expect(done.usage!.iterationsUsed).toBe(1);
   });
 
+  it("CONVO-FOOTER-THIS-TURN in a conversation that carries on, the footer counts this turn's calls and tokens, not the conversation's", async () => {
+    // As Codex keeps a resumed conversation: one record for every turn, each begun by `task_started`,
+    // each call's usage carrying the running total; and `turn.completed` reports that running total.
+    const call = (input: number, cached: number, output: number, total: { i: number; c: number; o: number }) => {
+      total.i += input;
+      total.c += cached;
+      total.o += output;
+      return JSON.stringify({ type: "event_msg", payload: { type: "token_count", info: { last_token_usage: { input_tokens: input, cached_input_tokens: cached, output_tokens: output }, total_token_usage: { input_tokens: total.i, cached_input_tokens: total.c, output_tokens: total.o } }, rate_limits: { primary: { used_percent: 4, window_minutes: 300, resets_at: RESET_5H } } } });
+    };
+    const started = JSON.stringify({ type: "event_msg", payload: { type: "task_started" } });
+    const t = { i: 0, c: 0, o: 0 };
+    const lines = [started, call(40_000, 30_000, 500, t), call(50_000, 45_000, 600, t), started, call(60_000, 55_000, 700, t), call(61_000, 60_000, 300, t)];
+    fake = path.join(tmp, "fake-codex.js");
+    writeFileSync(
+      fake,
+      `const fs=require("fs"),path=require("path");
+const dir=path.join(process.env.CODEX_HOME,"sessions","2026","09","19"); fs.mkdirSync(dir,{recursive:true});
+fs.writeFileSync(path.join(dir,"rollout-2026-09-19T18-13-54-${THREAD}.jsonl"), ${JSON.stringify(lines.join("\n") + "\n")});
+const out=(o)=>process.stdout.write(JSON.stringify(o)+"\\n");
+process.stdin.resume(); process.stdin.on("end",()=>{
+  out({type:"thread.started",thread_id:"${THREAD}"});
+  out({type:"item.completed",item:{type:"agent_message",text:"Done."}});
+  out({type:"turn.completed",usage:{input_tokens:${t.i},cached_input_tokens:${t.c},output_tokens:${t.o}}});
+});`,
+    );
+    const u = (await runTurn(newRunner())).usage!;
+    expect(u.iterationsUsed).toBe(2);
+    // This turn: 121,000 in, 115,000 of it cached, 1,000 out — not the 211,000 of the whole conversation.
+    expect(u.cacheReadTokens).toBe(115_000);
+    expect(u.inputTokens).toBe(6_000);
+    expect(u.outputTokens).toBe(1_000);
+    expect(u.contextTokens).toBe(61_000);
+    expect(renderStatus("small", u, undefined, [], 0)).toMatch(/ · 122\.0k tok · .* · ⟳ 2$/);
+  });
+
   it("INFER-MODEL-IS-DEFAULT a Codex turn runs on the model the turn asks for, not the one the runner was built with", async () => {
     writeFake([14_300]);
     const done = await runTurn(newRunner("sol"), "terra");

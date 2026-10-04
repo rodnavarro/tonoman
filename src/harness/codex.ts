@@ -450,6 +450,9 @@ export class Runner implements TurnRunner {
     const u: TurnUsage | undefined = usage
       ? {
           ...usage,
+          // On a resumed conversation `turn.completed` reports the CONVERSATION's running total; the
+          // record says what this turn alone used (CONVO-FOOTER-THIS-TURN).
+          ...(report?.turn ? { inputTokens: Math.max(0, report.turn.input - report.turn.cached), cacheReadTokens: report.turn.cached, outputTokens: report.turn.output } : {}),
           iterationsUsed: Math.max(1, report?.modelCalls ?? 0),
           ...(report?.lastInput ? { contextTokens: report.lastInput } : {}),
           ...(report?.windows.length ? { accountWindows: report.windows } : {}),
@@ -653,31 +656,64 @@ export function rolloutOf(codexHomeDir: string, threadId: string): string | unde
   return find(`${codexHomeDir}/sessions`, 0);
 }
 
-/** PURE: what one turn's own record says: how many model calls, the last call's context, its allowance. */
-export function parseTurnRollout(text: string): { modelCalls: number; lastInput: number; windows: UsageWindow[] } {
+/** Tokens as Codex counts them: input (the cached part included), the cached part, output. */
+export interface CodexTokens {
+  input: number;
+  cached: number;
+  output: number;
+}
+
+export interface TurnRecord {
+  modelCalls: number;
+  lastInput: number;
+  windows: UsageWindow[];
+  /** What this turn alone used, when the record carries running totals. */
+  turn?: CodexTokens;
+}
+
+/** PURE: what the LATEST turn in a conversation's record says (CONVO-FOOTER-THIS-TURN): how many model
+ *  calls it made, what its last call held, the tokens it alone used, and the allowance. A resumed
+ *  conversation keeps every turn in one record, each begun by `task_started`, and each call carries
+ *  the conversation's running total — so the turn's tokens are that total now, less what it was when
+ *  the turn began. */
+export function parseTurnRollout(text: string): TurnRecord {
+  type Usage = { input_tokens?: number; cached_input_tokens?: number; output_tokens?: number; reasoning_output_tokens?: number };
+  const tokens = (u: Usage | undefined): CodexTokens | undefined =>
+    u ? { input: u.input_tokens ?? 0, cached: u.cached_input_tokens ?? 0, output: (u.output_tokens ?? 0) + (u.reasoning_output_tokens ?? 0) } : undefined;
   let modelCalls = 0;
   let lastInput = 0;
   let windows: UsageWindow[] = [];
+  let total: CodexTokens | undefined;
+  let atStart: CodexTokens = { input: 0, cached: 0, output: 0 };
   for (const line of text.split("\n")) {
-    if (!line.includes('"token_count"')) continue;
-    let o: { payload?: { type?: string; info?: { last_token_usage?: { input_tokens?: number } } | null; rate_limits?: unknown } };
+    if (!line.includes('"token_count"') && !line.includes('"task_started"')) continue;
+    let o: { payload?: { type?: string; info?: { last_token_usage?: Usage; total_token_usage?: Usage } | null; rate_limits?: unknown } };
     try {
       o = JSON.parse(line);
     } catch {
+      continue;
+    }
+    if (o.payload?.type === "task_started") {
+      // A new turn begins: everything before it was earlier turns'.
+      modelCalls = 0;
+      lastInput = 0;
+      atStart = total ?? atStart;
       continue;
     }
     if (o.payload?.type !== "token_count") continue;
     if (o.payload.info) {
       modelCalls++;
       lastInput = o.payload.info.last_token_usage?.input_tokens ?? lastInput;
+      total = tokens(o.payload.info.total_token_usage) ?? total;
     }
     const w = parseCodexRateLimits(o.payload.rate_limits as never);
     if (w.length) windows = w;
   }
-  return { modelCalls, lastInput, windows };
+  const turn = total && { input: Math.max(0, total.input - atStart.input), cached: Math.max(0, total.cached - atStart.cached), output: Math.max(0, total.output - atStart.output) };
+  return { modelCalls, lastInput, windows, ...(turn ? { turn } : {}) };
 }
 
-export function readTurnRollout(codexHomeDir: string, threadId: string): { modelCalls: number; lastInput: number; windows: UsageWindow[] } | undefined {
+export function readTurnRollout(codexHomeDir: string, threadId: string): TurnRecord | undefined {
   try {
     const f = rolloutOf(codexHomeDir, threadId);
     return f ? parseTurnRollout(fs.readFileSync(f, "utf8")) : undefined;
@@ -688,7 +724,7 @@ export function readTurnRollout(codexHomeDir: string, threadId: string): { model
 
 /** The same, for a turn that ran as its own user: found and read AS that user, so a link put where
  *  the record was shows the worker nothing of its own (TURNUSER-ROOT-STAYS-OUT). */
-export async function readTurnRolloutAs(user: TurnUser, codexHomeDir: string, threadId: string): Promise<{ modelCalls: number; lastInput: number; windows: UsageWindow[] } | undefined> {
+export async function readTurnRolloutAs(user: TurnUser, codexHomeDir: string, threadId: string): Promise<TurnRecord | undefined> {
   const safe = threadId.replace(/[^A-Za-z0-9-]/g, "");
   if (!safe) return undefined;
   const f = await findAsUser(user, `${codexHomeDir}/sessions`, `rollout-*${safe}.jsonl`);
