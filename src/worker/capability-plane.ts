@@ -104,7 +104,7 @@ async function runTalentProcess(
 ): Promise<TalentOutcome> {
   const talent = run.talent ?? "meeting-recap";
   const entry = TALENT_ENTRY[talent];
-  if (!entry) return { status: "failed", reason: `no CLI registered for talent ${talent}` };
+  if (!entry) return { status: "failed", reason: `no program registered for skill ${talent}` };
   // A Talent that has nothing to do with recordings runs on an agent with no recording flow
   // (TALENT-NEEDS-NO-RECORDINGS); what it is handed of the tenant's context is what there is.
   const voice = deps.voice?.(run.agent);
@@ -192,10 +192,10 @@ async function runTalentProcess(
     });
     opts?.signal?.removeEventListener("abort", onAbort);
 
-    if (spawnError) return { status: "failed", reason: `could not start talent ${talent}: ${spawnError}` };
+    if (spawnError) return { status: "failed", reason: `could not start skill ${talent}: ${spawnError}` };
     const trimmed = out.trim();
     if (!trimmed) {
-      return { status: "failed", reason: `talent exited ${code} with no outcome — ${err.slice(-400)}` };
+      return { status: "failed", reason: `skill exited ${code} with no outcome — ${err.slice(-400)}` };
     }
     const outcome = JSON.parse(trimmed) as TalentOutcome;
     // Which brains this run filed into — the runtime's record, never the Talent's say-so — so the

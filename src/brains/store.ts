@@ -643,7 +643,7 @@ export function createStore(o: StoreOptions) {
         await fs.writeFile(logFile, prior + (prior.endsWith("\n") ? "" : "\n") + logLine(now(), files[0]!.path, req.note, req.who));
         await git(["add", "--", logRel], wt);
       }
-      const title = (req.subject ?? req.note).replace(/\s+/g, " ").trim().slice(0, req.subject ? 200 : 72) || "Filed by a Talent";
+      const title = (req.subject ?? req.note).replace(/\s+/g, " ").trim().slice(0, req.subject ? 200 : 72) || "Filed by a skill";
       const msg = `${title}\n\nFor: ${req.who}\nTonoman-Op: ${opId}\n`;
       const c = await git(["commit", "-q", "-F", "-"], wt, msg);
       if (c.code !== 0) return { ok: false, reason: "push-failed", detail: c.out.slice(0, 300) };

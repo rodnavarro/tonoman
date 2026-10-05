@@ -145,7 +145,7 @@ export function checkReceipt(a: ReceiptArgs, entities: string[]): Checked {
   if (!entity && !extra) return { ok: false, ask: "Every receipt belongs to one legal entity. Ask the person which one." };
   const known = entities.map(slug).filter(Boolean);
   if (entity || !extra) {
-    if (!known.length) return { ok: false, ask: "This tenant's legal entities are not set in the Receipts settings, so nothing can be filed yet. Tell the person to set them in the Hub (the agent's Receipts Talent)." };
+    if (!known.length) return { ok: false, ask: "This tenant's legal entities are not set in the Receipts settings, so nothing can be filed yet. Tell the person to set them in the Hub (the agent's Receipts skill)." };
     if (!known.includes(entity)) return { ok: false, ask: `"${a.entity}" is not one of this tenant's entities (${known.join(", ")}). Ask the person which one.` };
   }
   const e = ext(a.fileName);

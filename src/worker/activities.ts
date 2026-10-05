@@ -830,7 +830,7 @@ export function makeActivities(deps: TurnDeps) {
           },
         );
         if (outcome.status === "failed") {
-          const reason = outcome.reason ?? "talent failed";
+          const reason = outcome.reason ?? "the skill failed";
           // A LOGIN problem is said out loud now, in the recap's channel, rather than after the launch
           // budget runs out. Temporal retries a failed run inside the same launch, so a signed-out agent
           // retried all night and never reached the final-launch warning: prod Sapien's recap failed
