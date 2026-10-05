@@ -17,7 +17,7 @@ function capBase(): { url: string; token: string } {
   const url = process.env.TONOMAN_CAPABILITY_URL;
   if (!url) {
     throw new Error(
-      'TONOMAN_CAPABILITY_URL is not set — a Talent runs inside the Tonoman runtime or its dev harness',
+      'TONOMAN_CAPABILITY_URL is not set — a skill runs inside the Tonoman runtime or its dev harness',
     );
   }
   return { url, token: process.env.TONOMAN_CAPABILITY_TOKEN ?? '' };

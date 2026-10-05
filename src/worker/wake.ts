@@ -195,7 +195,7 @@ export function serveWake(o: WakeServerOptions, signal: AbortSignal): boolean {
       // is owed "started" or "already running" now, and starting a workflow is a fast call — it is
       // the RUN that is slow, and that is Temporal's to carry, not this connection's.
       if (route === "/api/talent-run") {
-        if (!o.deps.runTalent) return send(404, { error: "this worker cannot run a Talent on demand" });
+        if (!o.deps.runTalent) return send(404, { error: "this worker cannot run a skill on demand" });
         const t = parseTalentRun(parsed);
         if (!t.ok) return send(400, { error: t.error });
         // The Hub names an agent by its registry guid; this worker keys its own map by whatever the

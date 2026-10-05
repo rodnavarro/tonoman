@@ -384,6 +384,8 @@ export interface TurnRunReq {
   mcpServers?: McpServerSpec[];
   /** `tonoman`, the turn's one command (cli.md in Tonoman Cloud). */
   cli?: { binDir: string; env: Record<string, string> };
+  /** Web search for this turn (TOOL-WEB-SEARCH); false only for an agent not granted it. */
+  webSearch?: boolean;
   /** The turn's own working folder. */
   cwd?: string;
 }
@@ -413,7 +415,7 @@ export interface TurnBrains {
     user: string,
     who: string,
     key: string,
-    opts?: { receipts?: { brainId: string; entities?: string[]; version?: number } },
+    opts?: { receipts?: { brainId: string; entities?: string[]; version?: number }; site?: { url: string; api?: string; secretRef: string; version?: number }; webFetch?: boolean },
   ): { token: string; mcp: McpServerSpec; cli: { binDir: string; env: Record<string, string> } } | undefined;
   /** The turn's own folder, once it exists: the only place a file it files may come from. */
   bind?(token: string, cwd: string): void;
@@ -828,7 +830,7 @@ export function makeActivities(deps: TurnDeps) {
           },
         );
         if (outcome.status === "failed") {
-          const reason = outcome.reason ?? "talent failed";
+          const reason = outcome.reason ?? "the skill failed";
           // A LOGIN problem is said out loud now, in the recap's channel, rather than after the launch
           // budget runs out. Temporal retries a failed run inside the same launch, so a signed-out agent
           // retried all night and never reached the final-launch warning: prod Sapien's recap failed
@@ -1051,6 +1053,12 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
     let brainTurn: { token: string; mcp: McpServerSpec; cli: { binDir: string; env: Record<string, string> } } | undefined;
     // The Receipts Talent, when it is on for this agent with a brain set (TALENT-IN-CONVERSATION).
     const receipts = receiptsOf(found.cfg.talents);
+    // The Website Talent, when it is on for this agent and its site is connected (SITE-IS-A-TALENT).
+    const site = siteOf(found.cfg.talents, found.cfg.credentials);
+    // The web tools (TOOL-WEB-SEARCH, TOOL-WEB-FETCH). An agent with no registry keeps web search.
+    const granted = found.cfg.granted_tools;
+    const webSearch = granted === undefined || granted.includes("web-search");
+    const webFetch = !!granted?.includes("web-fetch");
     let staleHistory = false;
     // This turn is about a finance document: whatever it says goes to the sender privately.
     let finance = false;
@@ -1085,7 +1093,7 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
         }
       }
       if (receipts && prior.includes(receipts.brainId)) finance = true;
-      brainTurn = brains.start(input.agent, input.user, input.user, key, { receipts });
+      brainTurn = brains.start(input.agent, input.user, input.user, key, { receipts, site, webFetch });
       // Outside the speaker's own DM, a turn that can reach brains — or remembers one — is held. An
       // announcement is held even in their DM: it is posted only after the reach is checked again.
       held = (audience.kind !== "self" && (!!brainTurn || prior.length > 0 || finance)) || !!input.drewOn?.length;
@@ -1262,11 +1270,11 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
     if (brainTurn && brains && known?.label) {
       // Re-open with the person's name for log.md; the first token is closed unused.
       brains.end(brainTurn.token);
-      brainTurn = brains.start(input.agent, input.user, known.label, key, { receipts });
+      brainTurn = brains.start(input.agent, input.user, known.label, key, { receipts, site, webFetch });
     }
     const parts = [
       found.context ?? "",
-      brainTurn ? guidanceFor(provider, receipts) : "",
+      brainTurn ? guidanceFor(provider, receipts, !!site, { search: webSearch, fetch: webFetch }) : "",
       input.afterInterruption
         ? "(your previous answer was interrupted by a new message; continue from what the user now says)"
         : "",
@@ -1375,6 +1383,7 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
           // `tonoman` (cli.md): on Claude a command its shell may run and nothing else; on Codex,
           // whose shell is switched off for it, the same command as its one tool.
           cli: brainTurn?.cli,
+          webSearch,
           mcpServers: brainTurn && provider === "codex" ? [brainTurn.mcp] : undefined,
           cwd: turnDir,
         },
@@ -1557,15 +1566,30 @@ export function receiptsOf(talents: { name: string; version?: number; config?: R
   return { brainId, ...(entities.length ? { entities } : {}), version: t.version };
 }
 
+/** PURE: the Website Talent as this agent has it — where its site is and the reference to its key —
+ *  or nothing when the Talent is off, has no address, or the site is not connected. */
+export function siteOf(
+  talents: { name: string; version?: number; config?: Record<string, unknown> }[] | undefined,
+  credentials: { kind: string; secret_ref?: string }[] | undefined,
+): { url: string; api?: string; secretRef: string; version?: number } | undefined {
+  const t = (talents ?? []).find((x) => x.name === "website");
+  const url = typeof t?.config?.site === "string" ? t.config.site.trim().replace(/\/+$/, "") : "";
+  const secretRef = (credentials ?? []).find((c) => c.kind === "website" && c.secret_ref)?.secret_ref ?? "";
+  if (!t || !/^https?:\/\//.test(url) || !secretRef) return undefined;
+  const api = typeof t.config?.api === "string" ? t.config.api.trim().replace(/\/+$/, "") : "";
+  return { url, ...(api ? { api } : {}), secretRef, version: t.version };
+}
+
 /** What the turn is told about `tonoman` (CLI-SMALL-CONTEXT), and how to use brains well. */
-function guidanceFor(provider: "claude" | "codex", receipts?: { entities?: string[] }): string {
+function guidanceFor(provider: "claude" | "codex", receipts?: { entities?: string[] }, siteOn = false, web: { search: boolean; fetch: boolean } = { search: true, fetch: false }): string {
   const receiptsOn = !!receipts;
   const how =
     provider === "codex"
-      ? "You have one tool, `tonoman`: pass the command's arguments as a list, e.g. [\"brain\",\"list\"]. Start with [\"--help\"] to see its groups, and [\"brain\",\"--help\"] for a group's commands."
+      ? (web.search ? "Besides web search, you" : "You") + " have one tool, `tonoman`: pass the command's arguments as a list, e.g. [\"brain\",\"list\"]. Start with [\"--help\"] to see its groups, and [\"brain\",\"--help\"] for a group's commands."
       : CLI_NOTE;
   return [
     how,
+    ...webNotes(web),
     "Brains hold this person's knowledge — their own brain and any shared with them. Nothing else of theirs is on this machine.",
     "- Start with `tonoman brain list`: each brain, its index.md, and the map Tonoman keeps (topics and their hub pages). Follow those, then search.",
     "- For what a folder holds, or the newest pages on something, use `tonoman brain pages` with that folder — one call, never guess paths.",
@@ -1574,8 +1598,33 @@ function guidanceFor(provider: "claude" | "codex", receipts?: { entities?: strin
     "  Prefer an existing page (read it first and pass its revision); add a new page to the index or its topic's hub. Say which brain and page, and only once the write says it is saved.",
     "- If a brain is read only, say so. If something was cut or could not be reached, say what you could not look at.",
     ...(receiptsOn ? ["", RECEIPTS_NOTE, receipts?.entities?.length ? `This tenant's legal entities, one of which every receipt names: ${receipts.entities.join(", ")}. If it is not clear which, ask — naming these.` : ""] : []),
+    ...(siteOn ? ["", SITE_NOTE] : []),
   ].join("\n");
 }
+
+/** The web (CLI-WEB-ON-BOTH-PROVIDERS): said every turn, because an agent whose history says it could
+ *  not reach the web goes on believing it unless told otherwise. */
+function webNotes(web: { search: boolean; fetch: boolean }): string[] {
+  const out: string[] = [];
+  if (web.search) out.push("You can search the web and open public pages (your web search tool). Use it when asked about something that is not in the brains — a person's public profile, a company, a page someone links. Never say you cannot reach the web.");
+  if (web.fetch) out.push("When your web search cannot open a page (some sites refuse it — LinkedIn among them), open it with `tonoman web fetch --url <address>`: it reads the page from here, the way a browser does. If that is refused too, say so and ask the person for what you need.");
+  else if (web.search) out.push("Some sites (LinkedIn among them) refuse your web search; then say so and ask the person for what you need.");
+  if (!web.search && !web.fetch) out.push("You have no web access. If asked to look something up online, say so.");
+  return out;
+}
+
+/** The Website Talent's short note (the details are in `tonoman site --help`). */
+const SITE_NOTE = [
+  "Website is on: you can change the tenant's website with `tonoman site`. Its pages are data — words and sections — each with a draft and a published version.",
+  "- Look first: `tonoman site pages`, then `tonoman site read` the page (a section at a time). For anything new, `tonoman site sections` says what a page can be made of.",
+  "- A page may already have changes waiting from an earlier request. `read` shows the draft and says what it changes against the live page: tell the person, and when they ask about what the site shows now, answer from `read --live`.",
+  "- A word, a line, a name: `tonoman site edit`. A section or a whole page: `tonoman site save`. Make the change in every language the page has unless told otherwise; a new page gets every language the site has (`--same-as` ties them together).",
+  "- A new page needs a title (the page's own name — the site adds its name after it), a description of about 150 characters and a summary of what the page answers, in each language, and exactly one main heading (its first section's).",
+  "- Images: a photo the person sends goes on the site with `tonoman site upload --file <its name>`; use the address it prints (/media/…) in the section's image field. Use only images the person sent or the site already has; never link an image from another website.",
+  "- Everything you save is a DRAFT. Answer with what you changed and the preview link, and say it is a draft awaiting approval. Never say it is live.",
+  "- Publish only when the person says to: `tonoman site publish`. It works only for an owner or admin; pass on exactly what it answers, and say “live” only if it said so.",
+  "- Behaviour — checkout, sign-in, a new kind of section — is the site's code, not content: say so, and offer what the sections can do instead.",
+].join("\n");
 
 /** The Receipts Talent's short note (the details are in `tonoman receipts --help`). */
 const RECEIPTS_NOTE = [

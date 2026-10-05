@@ -248,7 +248,7 @@ export class Runner implements TurnRunner {
       // before it runs — compound commands and substitutions included (CLI-ONLY-THIS-COMMAND). That
       // needs permissions ON: headless, anything not allowed is refused, never asked. A turn that
       // lost `tonoman` has no shell at all (below); only an agent set to a full shell runs unasked.
-      ...(tonomanOnly(req) ? ["--permission-mode", "default", "--allowedTools", "Bash(tonoman:*),WebSearch"] : ["--dangerously-skip-permissions"]),
+      ...(tonomanOnly(req) ? ["--permission-mode", "default", "--allowedTools", req.webSearch === false ? "Bash(tonoman:*)" : "Bash(tonoman:*),WebSearch"] : ["--dangerously-skip-permissions"]),
       // NO MCP SERVER THIS AGENT WAS NOT EXPLICITLY GIVEN.
       //
       // `--setting-sources user` reads the account's own configuration, and on a claude.ai
@@ -287,6 +287,8 @@ export class Runner implements TurnRunner {
       const deny = this.o.closedShell
         ? [...(shellOpen ? [] : ["Bash"]), ...listed.filter((t) => t !== "Bash"), ...FILE_DENY_RULES]
         : [...listed.filter((t) => !(shellOpen && t === "Bash")), ...FILE_DENY_RULES];
+      // Web search only for an agent granted it (TOOL-WEB-SEARCH).
+      if (req.webSearch === false && !deny.includes("WebSearch")) deny.push("WebSearch");
       args.push("--disallowedTools", deny.join(","));
     }
     // The turn's MCP servers (the brain tool), from a file in its own folder. `--strict-mcp-config`

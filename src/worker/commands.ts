@@ -127,7 +127,9 @@ export function parse(text: string): Command | undefined {
   if (!PREFIX.test(t) || !/^![a-z]/i.test(t)) return undefined;
   const m = /^!(\S+)\s*([\s\S]*)$/.exec(t);
   if (!m) return undefined;
-  return { name: m[1]!.toLowerCase(), arg: (m[2] ?? "").trim() };
+  const name = m[1]!.toLowerCase();
+  // Talents are called skills now; `!skill` runs the same command, and `!talent` keeps working.
+  return { name: name === "skill" ? "talent" : name, arg: (m[2] ?? "").trim() };
 }
 
 /** PURE: a slash command's line with the app's name taken off — `!sapien-dev-connect plaud` →
@@ -262,8 +264,8 @@ const HELP = [
   "• `!disconnect plaud` / `!disconnect lorealistar` — forget it again",
   "• `!disconnect claude` / `!disconnect codex` — sign out of the subscription I answer on",
   "• `!connections` — what this agent is connected to",
-  "• `!talent <name> <id> [again]` — run a Talent on one item now, instead of waiting for its schedule (`again` re-runs an already-filed item)",
-  "• `!talent agenda-brief now` — review today's calendar now: what's left, what overlaps, where the free time is",
+  "• `!skill <name> <id> [again]` — run a skill on one item now, instead of waiting for its schedule (`again` re-runs an already-filed item)",
+  "• `!skill agenda-brief now` — review today's calendar now: what's left, what overlaps, where the free time is",
   "• `!new` — forget this thread and start over",
   "• `!help` — this",
 ].join("\n");
@@ -550,7 +552,7 @@ export async function run(
     // item now. The same Talent a schedule polls, invoked by hand — a Talent is triggered by
     // schedule, on demand, or both.
     case "talent": {
-      if (!deps.runTalent) return "This deployment can't run a Talent on demand.";
+      if (!deps.runTalent) return "This deployment can't run a skill on demand.";
       const parts = (cmd.arg ?? "").trim().split(/\s+/).filter(Boolean);
       // A trailing `again` (or `force`) re-runs an item already filed — bypassing the idempotency
       // guard that otherwise makes "run this again" a no-op. It is the last word, so it never
@@ -560,7 +562,7 @@ export async function run(
       const [name, ...rest] = tokens;
       const item = rest.join(" ");
       if (!name || !item)
-        return "Usage: `!talent <name> <recording-id> [again]` — runs a Talent on one item now; `again` re-runs an already-filed item.";
+        return "Usage: `!skill <name> <recording-id> [again]` — runs a skill on one item now; `again` re-runs an already-filed item.";
       const r = await deps.runTalent(agent, name, item, user, force);
       return r.message;
     }
