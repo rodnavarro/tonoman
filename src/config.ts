@@ -226,7 +226,9 @@ export interface AgentConfig {
     instance?: string;
     /** What each of its tools uses (TALENT-BINDING-PER-TOOL), resolved by the registry: the
      *  credentials, never their values. Absent from an older registry. */
-    bindings?: Record<string, { mode: string; credentials: { id: string; kind: string; alias: string; secret_ref?: string; status?: string }[] }>;
+    bindings?: Record<string, { mode: string; credentials: { id: string; kind: string; alias: string; label?: string; scope?: string; secret_ref?: string; status?: string }[] }>;
+    /** When this copy was added: its scheduled work starts here (TALENT-COPY-STARTS-NOW). */
+    since?: string;
   }[];
   /** Outside credentials this agent may use, from the registry (§8). Identified by `(kind, alias)`:
    *  the KIND is what the platform knows how to talk to, the ALIAS is which one of them this is.

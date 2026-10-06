@@ -10,7 +10,7 @@ import * as calendar from "./calendar";
 import type { CalEvent } from "./calendar";
 import * as plaudapi from "./plaudapi";
 import { recordingKey } from "./recordingkey";
-import { accountFor, type TurnDeps } from "./activities";
+import { accountFor, type TurnDeps, type VoiceConfig } from "./activities";
 import type { TalentOutcome } from "../talent-sdk";
 import { pagePathTrouble, publishPageToBrain, publishRecapToBrain } from "../brains/talentpublish";
 
@@ -209,6 +209,55 @@ async function runTalentProcess(
   }
 }
 
+/** File a meeting's recap in the tenant's second brain — into a brain when brains decide where this
+ *  skill files (BRAIN-TALENT-TARGET), else the voice flow's git checkout. The content is the caller's;
+ *  the repo, push credential, journal and timezone are the runtime's. Shared by the Talent plane and
+ *  the `tonoman meeting-recap file` tool, so a recap filed by a turn lands exactly where one filed by
+ *  the Talent did. */
+export async function publishRecap(
+  deps: TurnDeps,
+  voice: VoiceConfig,
+  agent: string,
+  user: string | undefined,
+  talent: string,
+  p: { rec: recap.Recording; recap: recap.Recap; transcript: string; candidates: CalEvent[]; by: string[] },
+): Promise<{ ok: true; published: boolean; path: string; route?: string; brain?: string; brainId?: string } | { ok: false; status: number; error: string }> {
+  const target = deps.talentBrain ? await deps.talentBrain.target(agent, user, talent) : undefined;
+  if (target && "error" in target) return { ok: false, status: 403, error: `Nothing was filed: ${target.error}.` };
+  if (target) {
+    const filed = await publishRecapToBrain(deps.talentBrain!.store, target, {
+      rec: p.rec,
+      recap: p.recap,
+      transcript: p.transcript,
+      journal: voice.journal,
+      candidates: p.candidates,
+      by: p.by,
+      timezone: voice.timezone,
+      owner: user,
+    });
+    if (!filed.result.ok) return { ok: false, status: 502, error: `Nothing was filed in ${target.name}: ${filed.result.detail}.` };
+    return { ok: true, published: filed.result.sha !== null, path: filed.page, route: filed.route, brain: target.name, brainId: target.id };
+  }
+  const published = await recap.publish(
+    voice.brainDir,
+    p.rec,
+    p.recap,
+    p.transcript,
+    voice.pushUrl,
+    voice.journal,
+    p.candidates,
+    p.by,
+    voice.timezone,
+    // WHOSE recap — the per-person account it came from; undefined on the shared path, so unchanged.
+    user,
+  );
+  const route = recap.resolveRoute(voice.journal, p.recap?.route);
+  // The same resolution `publish` used, re-run after the write — the page now carries this
+  // recording's id, so it resolves to exactly where it landed, suffix and all.
+  const where = await recap.pathsForUnique(voice.brainDir, voice.journal, p.rec, route, recap.recapSlugHint(p.recap ?? {}), p.recap?.meeting);
+  return { ok: true, published, path: where.page, route };
+}
+
 export async function startCapabilityPlane(deps: TurnDeps): Promise<CapabilityPlane> {
   const tokens = new Map<string, RunToken>();
   const filedIn = new Map<string, string[]>();
@@ -326,53 +375,16 @@ export async function startCapabilityPlane(deps: TurnDeps): Promise<CapabilityPl
         // content (rec, recap, transcript, candidates, by); the repo, push credential, journal and
         // timezone are the runtime's, resolved here. Returns where it landed so the Talent can report.
         if (req.method === "POST" && pathname === "/cap/publish") {
-          const rec = body.rec as recap.Recording;
-          const r = body.recap as recap.Recap;
-          // Into a brain, when brains decide where this run files (BRAIN-TALENT-TARGET).
-          const target = deps.talentBrain ? await deps.talentBrain.target(run.agent, run.user, run.talent ?? "meeting-recap") : undefined;
-          if (target && "error" in target) return reply(403, { error: `Nothing was filed: ${target.error}.` });
-          if (target) {
-            const filed = await publishRecapToBrain(deps.talentBrain!.store, target, {
-              rec,
-              recap: r,
-              transcript: String(body.transcript ?? ""),
-              journal: voice.journal,
-              candidates: (body.candidates as CalEvent[]) ?? [],
-              by: (body.by as string[]) ?? [],
-              timezone: voice.timezone,
-              owner: run.user,
-            });
-            if (!filed.result.ok) return reply(502, { error: `Nothing was filed in ${target.name}: ${filed.result.detail}.` });
-            filedIn.set(token, [...new Set([...(filedIn.get(token) ?? []), target.id])]);
-            return reply(200, { published: filed.result.sha !== null, path: filed.page, route: filed.route, brain: target.name });
-          }
-          const published = await recap.publish(
-            voice.brainDir,
-            rec,
-            r,
-            String(body.transcript ?? ""),
-            voice.pushUrl,
-            voice.journal,
-            (body.candidates as CalEvent[]) ?? [],
-            (body.by as string[]) ?? [],
-            voice.timezone,
-            // WHOSE recap — the per-person account this run was polled from. The brain is still keyed
-            // by agent today, but the page now carries the owner so a later per-user split is a
-            // re-file, not a reconstruction. Undefined on the shared path (Sapien), so unchanged.
-            run.user,
-          );
-          const route = recap.resolveRoute(voice.journal, r?.route);
-          // The same resolution `publish` used, re-run after the write — the page now carries this
-          // recording's id, so it resolves to exactly where it landed, suffix and all.
-          const where = await recap.pathsForUnique(
-            voice.brainDir,
-            voice.journal,
-            rec,
-            route,
-            recap.recapSlugHint(r ?? {}),
-            r?.meeting,
-          );
-          return reply(200, { published, path: where.page, route });
+          const out = await publishRecap(deps, voice, run.agent, run.user, run.talent ?? "meeting-recap", {
+            rec: body.rec as recap.Recording,
+            recap: body.recap as recap.Recap,
+            transcript: String(body.transcript ?? ""),
+            candidates: (body.candidates as CalEvent[]) ?? [],
+            by: (body.by as string[]) ?? [],
+          });
+          if (!out.ok) return reply(out.status, { error: out.error });
+          if (out.brainId) filedIn.set(token, [...new Set([...(filedIn.get(token) ?? []), out.brainId])]);
+          return reply(200, { published: out.published, path: out.path, route: out.route, ...(out.brain ? { brain: out.brain } : {}) });
         }
 
         // calendar candidates around a recording. TRANSITIONAL: calendar is a `requires` credential,

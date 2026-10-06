@@ -62,7 +62,11 @@ const RECEIPTS = process.env.TONOMAN_RECEIPTS === "1";
 let CLOUD_TOOLS = [];
 try { CLOUD_TOOLS = JSON.parse(process.env.TONOMAN_CLOUD_TOOLS || "[]"); } catch { CLOUD_TOOLS = []; }
 const WEB_FETCH = process.env.TONOMAN_WEB_FETCH === "1";
+// The worker's own tools a skill on this agent brings (plaud, calendar, meeting-recap): their groups
+// are here only when one is (CLI-GRANTED-GROUPS).
+const LOCAL = (process.env.TONOMAN_LOCAL_TOOLS || "").split(",").filter(Boolean);
 const MAX = 6000; // CLI-OUTPUT-BOUNDED
+let LIMIT = MAX;
 
 const GROUPS = {
   brain: {
@@ -91,9 +95,34 @@ const GROUPS = {
       fetch: { route: "web/fetch", args: ["--url", "[--from N]"], about: "Open one public https page and print its title, description and text (5000 characters at a time; --from continues). Use it for a page your web search could not open. Private and internal addresses are refused." },
     },
   },
+  plaud: {
+    about: "the Plaud recordings you may read, by the login's label (plaud tool)",
+    needs: "plaud",
+    commands: {
+      logins: { route: "tool/plaud/logins", args: [], about: "The Plaud logins you can use here, by label. Your own is 'mine'." },
+      list: { route: "tool/plaud/list", args: ["[--login <label>]"], about: "The newest recordings on a login: id, title, when, minutes. Without --login, your own (or the one shared login)." },
+      transcript: { route: "tool/plaud/transcript", args: ["--id", "[--login <label>]"], about: "Transcribe one recording and print the whole transcript, with its title, start and length. Kept after the first time.", max: 400000 },
+    },
+  },
+  calendar: {
+    about: "the calendars you may read, by label (calendar tool)",
+    needs: "calendar",
+    commands: {
+      list: { route: "tool/calendar/list", args: [], about: "The calendars you can read here, by label." },
+      find: { route: "tool/calendar/find", args: ["--from <ISO time>", "--to <ISO time>", "[--calendars <label,label>]"], about: "Entries around a stretch of time (padded either side): title, start, end, attendees, which calendar. Without --calendars, every one you can read." },
+      day: { route: "tool/calendar/day", args: ["[--calendars <label,label>]"], about: "Today in the tenant's time zone, worked out exactly: what is left, every overlap, back-to-back stretches and the best free block." },
+    },
+  },
+  "meeting-recap": {
+    about: "file a meeting's recap (meeting-recap skill)",
+    needs: "meeting-recap",
+    commands: {
+      file: { route: "tool/meeting-recap/file", args: ["--id", "[--login <label>]", "[--copy <keyword>]", "--recap (the recap JSON, or on stdin)"], about: "File one recording's recap in the second brain, with its transcript. The recap is JSON: summary, highlights, decisions, followups, participants, and route, meeting and alignment when asked for. It is checked before it is filed; a refusal says what to fix.", stdin: "recap" },
+    },
+  },
 };
 
-const out = (s) => process.stdout.write(s.length > MAX ? s.slice(0, MAX) + "\n… " + (s.length - MAX) + " more characters not shown; narrow the request (a folder, a smaller page).\n" : s.endsWith("\n") ? s : s + "\n");
+const out = (s) => process.stdout.write(s.length > LIMIT ? s.slice(0, LIMIT) + "\n… " + (s.length - LIMIT) + " more characters not shown; narrow the request (a folder, a smaller page).\n" : s.endsWith("\n") ? s : s + "\n");
 const fail = (s, code = 1) => { process.stderr.write(s + "\n"); process.exit(code); };
 // The tools a Tonoman Cloud serves this agent (D-CLOUD-TOOLS): each a group whose commands go to the
 // broker under /cloud/<group>/<command>, which carries them to the Cloud.
@@ -103,7 +132,7 @@ for (const t of CLOUD_TOOLS) {
   for (const [c, x] of Object.entries(t.commands || {})) commands[c] = { route: "cloud/" + t.name + "/" + c, args: x.args || [], about: x.about || "", stdin: x.stdin };
   GROUPS[t.name] = { about: t.about || "", cloud: true, commands };
 }
-const available = (g) => !GROUPS[g].needs || (GROUPS[g].needs === "receipts" && RECEIPTS) || (GROUPS[g].needs === "web" && WEB_FETCH);
+const available = (g) => !GROUPS[g].needs || (GROUPS[g].needs === "receipts" && RECEIPTS) || (GROUPS[g].needs === "web" && WEB_FETCH) || LOCAL.includes(GROUPS[g].needs);
 
 function help(group) {
   if (!group) {
@@ -148,6 +177,8 @@ async function stdin() {
   if (!spec) fail("No command '" + group + " " + cmd + "'. See tonoman " + group + " --help.", 2);
   if (!URL_ || !TOKEN) fail("tonoman is not connected in this turn.", 4);
   const body = parse(rest);
+  // A command whose whole answer is the point (a transcript) says how much it may print.
+  if (spec.max) LIMIT = spec.max;
   if (group === "brain" && cmd === "write" && typeof body.content !== "string") body.content = await stdin();
   // A Cloud tool's command names the argument it reads from standard input when not given.
   if (spec.stdin && typeof body[spec.stdin] !== "string" && body.remove === undefined) body[spec.stdin] = await stdin();

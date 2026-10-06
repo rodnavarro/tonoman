@@ -24,6 +24,7 @@ import {
   ParentClosePolicy,
   proxyActivities,
   setHandler,
+  sleep,
   startChild,
   workflowInfo,
   patched,
@@ -193,6 +194,8 @@ const {
   openTalentRun,
   closeTalentRun,
   talentRunStatus,
+  recapTurn,
+  skillsDue,
 } = proxyActivities<Activities>({
   // Listing is a cheap HTTP call; processing downloads audio and runs two models. openTalentRun /
   // closeTalentRun are quick DB writes that ride the same block — the timeout is a ceiling, not a cost.
@@ -218,6 +221,9 @@ const {
 export interface PollInput {
   /** Roster name of the agent whose second brain receives the recaps. */
   agent: string;
+  /** Which meeting-recap copy this poll is for, when it is not the first: its own logins, its own
+   *  runs (TALENT-SEVERAL-INSTANCES-SCHEDULED). Absent = the first, exactly as before copies. */
+  copy?: string;
   /** Slack user id to notify. */
   notify: string;
   /** Kept for compatibility with schedules created before the interval moved to the schedule
@@ -266,7 +272,7 @@ export async function plaudPollWorkflow(input: PollInput): Promise<void> {
 
   let found: { id: string; title: string; stamp: string; minutes: number; user?: string; notify?: string }[] = [];
   try {
-    found = await findNewRecordings({ agent: input.agent });
+    found = await findNewRecordings(input.copy ? { agent: input.agent, copy: input.copy } : { agent: input.agent });
   } catch (e) {
     // A dead Plaud token is the expected failure — it expires every 24h. Say so, once, and let the
     // schedule try again on its own cadence rather than swallowing it.
@@ -308,7 +314,9 @@ export async function plaudPollWorkflow(input: PollInput): Promise<void> {
     // item is never launched again; one past its launch budget is left for a person; the rest go to
     // the child, which announces ONLY on the first launch — so a recording is announced once, not
     // once per relaunch (fourteen times, the day the GPU route was down).
-    const prior = await talentRunStatus({ agent: input.agent, talent: plan.talent.name, itemKey: key });
+    const prior = await talentRunStatus(
+      input.copy ? { agent: input.agent, talent: plan.talent.name, instance: input.copy, itemKey: key } : { agent: input.agent, talent: plan.talent.name, itemKey: key },
+    );
     const gate = talentGate(prior);
     if (gate === "skip-done") continue;
     if (gate === "skip-given-up") {
@@ -330,7 +338,7 @@ export async function plaudPollWorkflow(input: PollInput): Promise<void> {
         // member too — else two members' recordings sharing an id would dedup against each other.
         // The shared account (no user) keeps the original shape, so an in-flight run across a deploy
         // is still recognised.
-        workflowId: rec.user ? `talent:${input.agent}:${rec.user}:${key}` : `talent:${input.agent}:${key}`,
+        workflowId: `talent:${input.agent}${input.copy ? `~${input.copy}` : ""}${rec.user ? `:${rec.user}` : ""}:${key}`,
         args: [
           {
             agent: input.agent,
@@ -344,6 +352,7 @@ export async function plaudPollWorkflow(input: PollInput): Promise<void> {
             minutes: rec.minutes,
             notify,
             user: rec.user,
+            ...(input.copy ? { instance: input.copy } : {}),
           },
         ],
         parentClosePolicy: ParentClosePolicy.ABANDON,
@@ -459,6 +468,36 @@ export async function runTalentWorkflow(input: RunTalentInput): Promise<void> {
     }).catch(() => {});
   }
 
+  // meeting-recap is a PROMPT (D-JOBS-ARE-PROMPTS): the agent is asked to recap the recording on the
+  // person's behalf and does it with the tools the skill brings; the file tool closes this run as done.
+  // The post hook is this wait — it reads the record, nudges once, and fails with a reason rather
+  // than leaving a recording silently unfiled (RECAP-JOB-POST-HOOK).
+  // `patched`: a run already under way when this shipped replays the way it began.
+  if (input.talent === "meeting-recap" && input.notify && patched("recap-is-a-prompt")) {
+    const job = { agent: input.agent, notify: input.notify, instance: input.instance, recordingId: input.recordingId ?? input.itemKey, user: input.user, title: input.title, minutes: input.minutes };
+    const filed = async (checks: number) => {
+      for (let i = 0; i < checks; i++) {
+        await sleep("30 seconds");
+        const st = await talentRunStatus({ agent: input.agent, talent: input.talent, instance: input.instance, itemKey: input.itemKey });
+        if (st?.status === "done") return true;
+      }
+      return false;
+    };
+    try {
+      await recapTurn(job);
+      if (await filed(30)) return;
+      await recapTurn({ ...job, nudge: true });
+      if (await filed(20)) return;
+      throw new Error("the agent was asked twice and did not file the recap");
+    } catch (e) {
+      await closeTalentRun({ agent: input.agent, talent: input.talent, instance: input.instance, itemKey: input.itemKey, status: "failed", error: failureReason(e).slice(0, 500) }).catch(() => {});
+      if (input.force || isFinalLaunch(prior)) {
+        await sayVerbatim({ agent: input.agent, user: input.notify, text: `⚠️ I couldn't finish a recording — ${failureReason(e).slice(0, 200)}` }).catch(() => {});
+      }
+      throw e;
+    }
+  }
+
   try {
     // CUT OVER to the self-contained Talent CLI (spawned via the capability plane). `processRecording`
     // remains for a one-line revert: swap `runTalent` back to it and restart the worker. The announce
@@ -565,6 +604,54 @@ export async function dropsPollWorkflow(input: DropsPollInput): Promise<void> {
 
 /** PURE: the slot a brief belongs to — its scheduled minute, in UTC. One brief per slot: a re-fire of
  *  the same minute (a schedule catching up after a restart) is the same run, not a second message. */
+export interface SkillsTickInput {
+  agent: string;
+}
+
+/**
+ * The agent's one clock (D-ONE-CLOCK-PER-AGENT). One Temporal schedule per agent fires at the recap
+ * poll's interval and at each agenda time; each firing asks which skill copies are due and runs them —
+ * every meeting-recap copy polls its own logins, an agenda-brief copy whose time this is sends its
+ * brief. A second copy of a skill is therefore scheduled like the first, with no schedule of its own.
+ */
+export async function skillsTickWorkflow(input: SkillsTickInput): Promise<void> {
+  const at = workflowInfo().startTime.getTime();
+  const due = await skillsDue({ agent: input.agent, at });
+  for (const copy of due.recaps) {
+    try {
+      await plaudPollWorkflow({ agent: input.agent, notify: due.notify, ...(copy !== "meeting-recap" ? { copy } : {}) });
+    } catch (e) {
+      // One copy's dead login must not stop another's recordings, or the agenda.
+      console.log(`skills: ${input.agent} — ${copy} could not look for recordings: ${failureReason(e).slice(0, 200)}`);
+    }
+  }
+  const slot = agendaSlot(at);
+  for (const copy of due.agendas) {
+    const item = `agenda-${slot}`;
+    try {
+      await startChild(runTalentWorkflow, {
+        // The first copy keeps the id it always had, so a brief already started is recognised.
+        workflowId: `talent:${input.agent}:${copy}:${slot}`,
+        args: [
+          {
+            agent: input.agent,
+            talent: "agenda-brief",
+            ...(copy !== "agenda-brief" ? { instance: copy } : {}),
+            version: due.agendaVersion,
+            itemKey: item,
+            recordingId: item,
+            notify: due.notify,
+            user: due.notify || undefined,
+          },
+        ],
+        parentClosePolicy: ParentClosePolicy.ABANDON,
+      });
+    } catch (e) {
+      if (!(e instanceof WorkflowExecutionAlreadyStartedError)) throw e;
+    }
+  }
+}
+
 export function agendaSlot(startMs: number): string {
   return new Date(Math.floor(startMs / 60_000) * 60_000).toISOString().slice(0, 16);
 }

@@ -81,7 +81,9 @@ export interface RegistryAgent {
    *  worker finds the one that drives the voice flow by NAME (a Talent is code, not wire steps). */
   talents?: {
     instance?: string;
-    bindings?: Record<string, { mode: string; credentials: { id: string; kind: string; alias: string; accounts?: { accountId?: string | null; secretRef?: string | null; status?: string | null }[] }[] }>;
+    bindings?: Record<string, { mode: string; credentials: { id: string; kind: string; alias: string; label?: string | null; scope?: string; accounts?: { accountId?: string | null; secretRef?: string | null; status?: string | null }[] }[] }>;
+    /** When this copy was added (TALENT-COPY-STARTS-NOW in Tonoman Cloud). */
+    since?: string | null;
     id: string;
     name: string;
     description?: string | null;
@@ -308,6 +310,7 @@ export class RegistryControlPlane implements ControlPlane {
           schedule_enabled: s.scheduleEnabled,
           // Which instance, and what its tools use (TALENT-INSTANCE-NAMED, TALENT-BINDING-PER-TOOL).
           instance: s.instance ?? s.name,
+          since: s.since ?? undefined,
           bindings: Object.fromEntries(
             Object.entries(s.bindings ?? {}).map(([tool, b]) => [
               tool,
@@ -315,7 +318,7 @@ export class RegistryControlPlane implements ControlPlane {
                 mode: b.mode,
                 credentials: (b.credentials ?? []).map((c) => {
                   const shared = (c.accounts ?? []).find((x) => (x.accountId ?? null) === null) ?? c.accounts?.[0];
-                  return { id: c.id, kind: c.kind, alias: c.alias, secret_ref: shared?.secretRef ?? undefined, status: shared?.status ?? undefined };
+                  return { id: c.id, kind: c.kind, alias: c.alias, label: c.label ?? undefined, scope: c.scope, secret_ref: shared?.secretRef ?? undefined, status: shared?.status ?? undefined };
                 }),
               },
             ]),

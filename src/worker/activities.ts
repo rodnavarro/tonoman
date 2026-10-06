@@ -113,6 +113,15 @@ export interface TurnDeps {
   };
   /** Run text as a turn addressed to a person. `drewOn`: brains the text draws on (a Talent's filing). */
   ask?(agent: string, user: string, text: string, drewOn?: string[]): Promise<void>;
+  /** The prompt a recording's run sends the agent (D-JOBS-ARE-PROMPTS): for this copy, this recording,
+   *  on this person's behalf — or the nudge when its turn ended without filing it. */
+  /** The Plaud accounts a skill copy other than the first reads, each floored at when the copy was
+   *  added (TALENT-COPY-STARTS-NOW). Undefined = the voice flow's own, as the first copy reads. */
+  copyAccounts?(agent: string, copy: string): Promise<VoiceAccount[] | undefined>;
+  /** What the agent's one schedule should run now (D-ONE-CLOCK-PER-AGENT): every meeting-recap copy
+   *  whose schedule is on, and each agenda-brief copy whose time this is. */
+  skillsDue?(agent: string, at: number): { notify: string; recaps: string[]; agendas: string[]; agendaVersion: number };
+  recapJob?(agent: string, j: { notify?: string; instance?: string; recordingId: string; user?: string; title?: string; minutes?: number; nudge?: boolean }): Promise<string>;
   /** The display-only status footer for a finished turn: the model, the turn's tokens, context
    *  occupancy, and how much of the Claude plan's 5h/7d windows is left. Null for none. */
   footer?(agent: string, conversation: string, usage: TurnUsage | undefined, speaker?: string): Promise<string | null>;
@@ -622,12 +631,26 @@ export function makeActivities(deps: TurnDeps) {
     },
 
     /** Which finished recordings have not been published yet. Cheap and safe to retry. */
-    async findNewRecordings(input: { agent: string }): Promise<
+    async findNewRecordings(input: { agent: string; copy?: string }): Promise<
       { id: string; title: string; stamp: string; minutes: number; user?: string; notify?: string }[]
     > {
       const v = deps.voice?.(input.agent);
       if (!v) return [];
       const out: { id: string; title: string; stamp: string; minutes: number; user?: string; notify?: string }[] = [];
+      // A copy other than the first reads its own logins from when it was added; what is new to it is
+      // what IT has not run (its run records), not what another copy filed — two copies on one login
+      // are two runs, as their owner set them up (TALENT-SEVERAL-INSTANCES-SCHEDULED).
+      if (input.copy) {
+        const accounts = (await deps.copyAccounts?.(input.agent, input.copy)) ?? [];
+        for (const acct of accounts) {
+          const all = await recap.listRecordings(acct.creds, 20);
+          for (const r of all) {
+            if (r.startTime < (acct.floorMs ?? v.floorMs)) continue;
+            out.push({ id: r.id, title: r.title, stamp: r.stamp, minutes: Math.max(1, Math.round(r.duration / 60000)), user: acct.user, notify: acct.notifyUser });
+          }
+        }
+        return out;
+      }
       // One account for every tenant that has not gone per-person, so this loop runs once and makes
       // the same two calls the flow always made. With per-member accounts it runs per account, and
       // each recording is tagged with the member it belongs to so the poll can attribute and route it.
@@ -971,6 +994,20 @@ export function makeActivities(deps: TurnDeps) {
     /** These drops' announcements have been started: they are not news again (DROPS-TOLD-ONCE). */
     async dropsTold(input: { agent: string; user: string; ids: string[] }): Promise<void> {
       await deps.lorealistar?.told(input.agent, input.user, input.ids);
+    },
+
+    /** Ask the agent to recap a recording, on the person's behalf, as a turn in their conversation —
+     *  the job IS a prompt (D-JOBS-ARE-PROMPTS). The agent files it with its tools; the run's post hook
+     *  reads the run record to see that it did. */
+    async recapTurn(input: { agent: string; notify: string; instance?: string; recordingId: string; user?: string; title?: string; minutes?: number; nudge?: boolean }): Promise<void> {
+      if (!deps.recapJob || !deps.ask) throw new Error("this worker cannot run a recap as a prompt");
+      const text = await deps.recapJob(input.agent, input);
+      await deps.ask(input.agent, input.notify, text);
+    },
+
+    /** What the agent's one schedule runs on this tick (D-ONE-CLOCK-PER-AGENT). */
+    async skillsDue(input: { agent: string; at: number }): Promise<{ notify: string; recaps: string[]; agendas: string[]; agendaVersion: number }> {
+      return deps.skillsDue?.(input.agent, input.at) ?? { notify: "", recaps: [], agendas: [], agendaVersion: 1 };
     },
 
     /** Say something to one person, in a DM and nowhere else. */

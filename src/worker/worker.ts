@@ -78,11 +78,15 @@ import { promises as fsp } from "node:fs";
 import { defaultHarnesses } from "../gateway";
 import { parseMountRef, parseRef, registrySecretPath } from "../core/secretref";
 import { harnessForProvider, providerAccountLabel, providerLabel, type HarnessKind, type InferenceProvider } from "../harness";
-import { accountsFromUsers, makeActivities, type TurnRunReq, type VoiceConfig, type TurnBrains } from "./activities";
-import { startCapabilityPlane, type CapabilityPlane } from "./capability-plane";
-import { agendaTickWorkflow, conversationWorkflow, dropsPollWorkflow, messageSignal, plaudPollWorkflow, runTalentWorkflow, type AgendaTickInput, type DropsPollInput, type Inbound, type PollInput } from "./workflows";
+import { accountsFromUsers, accountsOf, makeActivities, type TurnRunReq, type VoiceAccount, type VoiceConfig, type TurnBrains } from "./activities";
+import { publishRecap, startCapabilityPlane, type CapabilityPlane } from "./capability-plane";
+import { calendarChoices, localTools, localToolsOf, skillsNote } from "./localtools";
+import { recapJobPrompt, recapNudge } from "../talents/voice/plaud-and-calendar-meetings/prompt";
+import { agendaFacts, describeFacts, localParts, localTimeOn } from "../talents/calendar/agenda-brief/facts";
+import { checkPhase } from "../talents/calendar/agenda-brief/run";
+import { agendaTickWorkflow, conversationWorkflow, dropsPollWorkflow, messageSignal, plaudPollWorkflow, runTalentWorkflow, skillsTickWorkflow, type AgendaTickInput, type DropsPollInput, type Inbound, type PollInput, type SkillsTickInput } from "./workflows";
 import { agendaBrief, parseAgendaTimes } from "./talents/agenda-brief";
-import { WorkflowExecutionAlreadyStartedError } from "@temporalio/common";
+import { ApplicationFailure, WorkflowExecutionAlreadyStartedError } from "@temporalio/common";
 import { planReload } from "./reload";
 
 export interface WorkerOptions {
@@ -446,6 +450,9 @@ function disallowedTools(): string[] {
  *  bound to when its credential is chosen. Rewritten on every sync pass, so a source added or
  *  repointed in the Hub is followed without a restart. */
 let legacySources: LegacySource[] = [];
+/** The worker's own tools a skill brings (`tonoman plaud`, `calendar`, `meeting-recap`), answered once
+ *  the agents are wired; until then a call is told to try again (D-JOBS-ARE-PROMPTS). */
+let localToolCall: ReturnType<typeof localTools> | undefined;
 
 async function startBrains(): Promise<{ registry: ReturnType<typeof registryClient>; broker: Broker; store: BrainStore } | undefined> {
   const base = process.env.TONOMANCLOUD_API_URL;
@@ -514,7 +521,9 @@ async function startBrains(): Promise<{ registry: ReturnType<typeof registryClie
       return { status: 502, text: `Tonoman Cloud could not be reached just now (${(e as Error).message}). Nothing was done.` };
     }
   };
-  const broker = createBroker({ store, registry, provisioner, scratch: path.join(root, "_scratch"), toolsDir: turnUsersOn() ? TOOLS_DIR : undefined, recordRun, cloudTool });
+  const localTool = (guid: string, speaker: string, group: string, command: string, body: Record<string, unknown>) =>
+    localToolCall ? localToolCall(guid, speaker, group, command, body) : Promise.resolve({ status: 503, text: "This agent's tools are still starting. Try again in a moment." });
+  const broker = createBroker({ store, registry, provisioner, scratch: path.join(root, "_scratch"), toolsDir: turnUsersOn() ? TOOLS_DIR : undefined, recordRun, cloudTool, localTool });
   await broker.start();
   // The refresh runs on the LOCAL model only (BRAIN-LOCAL-MODEL): gemma4:e4b by default, at the URL
   // given. With no URL, brains are still mapped, just not connected by topic.
@@ -1187,6 +1196,10 @@ export async function run(
         a.cfg.displayName ?? "",
         brainsOn,
       );
+      // Its skills, and what each copy's tools use, by label — so a person can say "my work calendar"
+      // and a job can name "Team Plaud", and the agent calls the tool the same way either way.
+      const skills = skillsNote(a.cfg, (n) => getTalent(n)?.description);
+      if (skills) a.context = `${a.context}\n\n${skills}`;
     }
   };
 
@@ -1544,7 +1557,14 @@ export async function run(
     start: (agent, user, who, key, opts) => {
       const g = wired.get(agent)?.cfg.guid;
       // Each use is saved with the session the moment it happens (BRAIN-USED-DECIDES).
-      return b && g ? b.broker.startTurn({ agentGuid: g, slackUserId: user, who, receipts: opts?.receipts, cloudTools: opts?.cloudTools, webFetch: opts?.webFetch }, { onUse: (id) => remember(agent, key, [id]) }) : undefined;
+      // The worker's own tools this agent's skills bring, as `tonoman` groups (CLI-GRANTED-GROUPS).
+      const localGroups = localToolsOf(wired.get(agent)!.cfg);
+      return b && g
+        ? b.broker.startTurn(
+            { agentGuid: g, slackUserId: user, who, receipts: opts?.receipts, cloudTools: opts?.cloudTools, webFetch: opts?.webFetch, localTools: localGroups },
+            { onUse: (id) => remember(agent, key, [id]) },
+          )
+        : undefined;
     },
     bind: (token, cwd) => b?.broker.bindFolder(token, cwd),
     attach: (token, files) => b?.broker.attach(token, files),
@@ -1697,6 +1717,86 @@ export async function run(
         console.error(`worker: ${name} failed to post in ${channel} — ${(e as Error).message}`);
         return false;
       }
+    },
+    // A meeting-recap copy other than the first: its own Plaud logins, from when it was added
+    // (TALENT-SEVERAL-INSTANCES-SCHEDULED, TALENT-COPY-STARTS-NOW).
+    copyAccounts: async (name: string, copy: string) => {
+      const a = wired.get(name);
+      const v = voiceCreds.get(name);
+      if (!a || !v) return undefined;
+      const g = (a.cfg.talents ?? []).find((t) => (t.instance ?? t.name) === copy);
+      if (!g) return [];
+      const since = g.since ? Date.parse(g.since) : NaN;
+      const floor = Math.max(v.floorMs, Number.isFinite(since) ? since : Date.now());
+      const out: VoiceAccount[] = [];
+      for (const c of g.bindings?.plaud?.credentials ?? []) {
+        if (c.scope === "per_person" || !c.secret_ref) continue;
+        const tokenJson = await resolveRef(c.secret_ref, a.cfg.guid);
+        if (tokenJson) out.push({ creds: { tokenJson }, floorMs: floor });
+      }
+      const own = !g.bindings?.plaud || g.bindings.plaud.mode === "each_person" || g.bindings.plaud.credentials.some((c) => c.scope === "per_person");
+      if (own) for (const acct of accountsOf(v)) out.push({ ...acct, floorMs: Math.max(acct.floorMs ?? v.floorMs, floor) });
+      return out;
+    },
+    // What the agent's one schedule runs on this firing (D-ONE-CLOCK-PER-AGENT).
+    skillsDue: (name: string, at: number) => {
+      const a = wired.get(name);
+      const v = voiceCreds.get(name);
+      const notify = v?.notifyUser ?? "";
+      const reach = !!v && (!!notify || !!v.notifyChannel);
+      const grants = (a?.cfg.talents ?? []).filter((t) => t.schedule_enabled !== false);
+      const tz = a?.cfg.timezone || "UTC";
+      return {
+        notify,
+        recaps: reach ? grants.filter((t) => t.name === meetingRecap.name).map((t) => t.instance ?? t.name) : [],
+        agendas: reach
+          ? grants
+              .filter((t) => t.name === agendaBrief.name)
+              .filter((t) => parseAgendaTimes(t.config?.times).some((x) => Math.abs(at - localTimeOn(at, tz, x.hour, x.minute)) < 90_000))
+              .map((t) => t.instance ?? t.name)
+          : [],
+        agendaVersion: agendaBrief.version,
+      };
+    },
+    // The prompt a recording's run sends the agent (D-JOBS-ARE-PROMPTS): this copy's Plaud login and
+    // calendars by label, the journal, mission and vocabulary the recap rules use.
+    recapJob: async (name: string, j: { notify?: string; instance?: string; recordingId: string; user?: string; title?: string; minutes?: number; nudge?: boolean }) => {
+      const a = wired.get(name);
+      // A job runs on someone's behalf, and only for someone with access (AGENTACCOUNT-ACCESS-IS-GRANTED).
+      if (j.notify && a && !knowsSpeaker(a.cfg.principals, j.notify)) {
+        throw ApplicationFailure.nonRetryable(`${j.notify} has no access to this agent, so nothing is run on their behalf`);
+      }
+      const v = voiceCreds.get(name);
+      const copy = j.instance ?? meetingRecap.name;
+      const grants = a?.cfg.talents ?? [];
+      const grant = grants.find((t) => (t.instance ?? t.name) === copy) ?? grants.find((t) => t.name === meetingRecap.name);
+      const sharedBound = grant?.bindings?.plaud?.credentials.find((c) => c.scope !== "per_person" && c.secret_ref);
+      const login = sharedBound ? sharedBound.label || sharedBound.alias : j.user ? "mine" : "";
+      if (j.nudge) return recapNudge({ copy, id: j.recordingId, title: j.title ?? j.recordingId, login });
+      // What the recording is, from Plaud itself — an on-demand run knows only its id.
+      let rec: recapFloor.Recording | undefined;
+      try {
+        const creds = sharedBound?.secret_ref
+          ? { tokenJson: await resolveRef(sharedBound.secret_ref, a?.cfg.guid) }
+          : j.user
+            ? v?.accounts?.find((x) => x.user === j.user)?.creds
+            : v?.creds;
+        if (creds) rec = (await recapFloor.listRecordings(creds, 50)).find((r) => r.id === j.recordingId);
+      } catch (e) {
+        console.log(`worker: ${name} recap prompt — could not read the recording's details: ${(e as Error).message}`);
+      }
+      return recapJobPrompt({
+        copy,
+        id: j.recordingId,
+        title: rec?.title ?? j.title ?? j.recordingId,
+        startedAt: rec?.startTime ?? Date.now(),
+        minutes: rec ? Math.max(1, Math.round(rec.duration / 60_000)) : (j.minutes ?? 0),
+        login,
+        calendars: a && grant?.bindings?.calendar ? calendarChoices(a.cfg, copy).map((c) => c.label) : [],
+        journal: v?.journal,
+        mission: v?.mission,
+        vocab: v?.vocab,
+      });
     },
     ask: async (name: string, user: string, text: string, drewOn?: string[]) => {
       const conv = await voiceConversation(name, user);
@@ -1887,6 +1987,72 @@ export async function run(
   // inference and publishing. Started once, closed over `deps` (so it resolves each run's VoiceConfig
   // live, across reloads), and attached to `deps` so the `runTalent` activity can spawn through it.
   // Best-effort: a failure here must not stop the worker from answering messages.
+  // The tools a skill brings to a turn, answered here with what the worker holds: the voice flow's
+  // transcription chain and brain, each person's Plaud, the calendars a copy reads (D-JOBS-ARE-PROMPTS).
+  localToolCall = localTools({
+    agentByGuid: (guid) => {
+      for (const [name, a] of wired) if (a.cfg.guid === guid) return { name, cfg: a.cfg };
+      return undefined;
+    },
+    voice: (name) => voiceCreds.get(name),
+    plaudCreds: async (name, login) => {
+      const v = voiceCreds.get(name);
+      if (login.user) return v?.accounts?.find((x) => x.user === login.user)?.creds;
+      if (login.secretRef) {
+        const tokenJson = await resolveRef(login.secretRef, wired.get(name)?.cfg.guid);
+        return tokenJson ? { tokenJson } : undefined;
+      }
+      return v?.creds;
+    },
+    listRecordings: (creds, limit) => recapFloor.listRecordings(creds, limit),
+    transcribe: (name, creds, rec, user) => {
+      const v = voiceCreds.get(name);
+      if (!v) throw new Error("this agent has no transcription set up");
+      const cacheDir = user && v.chunkCacheDir ? path.join(v.chunkCacheDir, encodeURIComponent(user)) : v.chunkCacheDir;
+      return recapFloor.transcribe(creds, rec, v.transcribe, v.vocab, undefined, cacheDir);
+    },
+    feeds: async (_name, cfg, choices) => {
+      const out: calendar.CalendarFeed[] = [];
+      for (const c of choices) {
+        if (c.kind === "google") out.push({ kind: "google", alias: c.alias, url: "" });
+        else {
+          const url = c.secretRef ? await registrySecret(cfg.guid, c.secretRef) : "";
+          if (url) out.push({ kind: c.kind, alias: c.alias, url });
+        }
+      }
+      return out;
+    },
+    gather: (name, feeds, from, to) =>
+      calendar.gather(feeds, from, to, {
+        exclude: voiceCreds.get(name)?.calendarExclude,
+        google: (f, a, b) => deps.googleCalendar(name, f, a, b),
+        log: (m: string) => console.log(m),
+      }),
+    describeDay: (events, now, tz) => {
+      const facts = agendaFacts(
+        events.map((e) => ({ summary: e.summary, start: e.start, end: e.end, attendees: e.attendees, source: e.source ?? { kind: "", alias: "" } })),
+        now,
+        tz,
+      );
+      return describeFacts(facts, tz, checkPhase(localParts(now, tz).hour) !== "morning");
+    },
+    publish: async (name, user, p) => {
+      const v = voiceCreds.get(name);
+      if (!v) throw new Error("this agent has no second brain to file into");
+      const out = await publishRecap(deps as unknown as Parameters<typeof publishRecap>[0], v, name, user, "meeting-recap", {
+        rec: p.rec,
+        recap: p.recap as unknown as recapFloor.Recap,
+        transcript: p.transcript,
+        candidates: p.candidates,
+        by: p.by,
+      });
+      if (!out.ok) throw new Error(out.error);
+      return out;
+    },
+    closeRun: (name, instance, id, summary) =>
+      deps.talentRun.close(name, meetingRecap.name, recordingKey(id), "done", undefined, { summary }, instance === meetingRecap.name ? undefined : instance),
+  });
+
   let talentPlane: CapabilityPlane | undefined;
   try {
     talentPlane = await startCapabilityPlane(deps as unknown as Parameters<typeof startCapabilityPlane>[0]);
@@ -2964,16 +3130,11 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
 
   /** Stop one agent's poll. Best effort and idempotent: a flow that was never scheduled has
    *  nothing to pause, which is the normal case for a flow that was never on. */
+  /** A flow switched off or disconnected: the agent's one schedule stops polling for it, and goes on
+   *  with whatever else is due (D-ONE-CLOCK-PER-AGENT). */
   async function pauseVoiceSchedule(name: string, why: string): Promise<void> {
-    try {
-      const h = client.schedule.getHandle(voiceScheduleId(name));
-      if (!(await h.describe()).state.paused) {
-        await h.pause(why);
-        console.log(`worker: ${name} voice schedule paused — ${why}`);
-      }
-    } catch {
-      /* no schedule under that id */
-    }
+    console.log(`worker: ${name} recordings are not looked for — ${why}`);
+    await ensureSkillsSchedule(name).catch((e) => console.error(`worker: ${name} skills schedule failed — ${(e as Error).message}`));
   }
 
   for (const name of disabledFlows) await pauseVoiceSchedule(name, DISABLED_NOTE);
@@ -3003,156 +3164,84 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
     }
   }
 
-  /** Create, update or resume one agent's poll schedule. Separated from the loop for the same
-   *  reason as wireVoice: a flow that becomes ready AFTER boot has to get a schedule then, not at
-   *  the next restart. Safe to call repeatedly — "already exists" is the normal answer. */
-  async function ensureVoiceSchedule(name: string, v: VoiceConfig): Promise<void> {
-    const recipient = v.notifyUser ?? "";
-    if (!recipient && !v.notifyChannel) {
-      // Nowhere to send a recap is not a state to run in: the pipeline would transcribe, summarise,
-      // commit and then have nobody to tell.
-      console.log(`worker: ${name} voice flow not scheduled — nobody to tell (set notify_channel or notify_user)`);
-      return;
-    }
-    const scheduleId = voiceScheduleId(name);
-    // Cadence is configuration: a positive interval polls every N seconds; zero (or less) means OFF
-    // — the Talent runs ON DEMAND only (invoked like a tool), with no schedule at all. Removing any
-    // existing schedule makes "set the cadence to 0" actually stop the polling rather than leave a
-    // stale one running.
-    const secs = v.pollSeconds ?? 300;
-    if (secs <= 0) {
-      try {
-        await client.schedule.getHandle(scheduleId).delete();
-        console.log(`worker: ${name} voice poll disabled (cadence 0) — on-demand only`);
-      } catch {
-        /* no schedule to remove, which is the normal case when it was never scheduled */
-      }
-      return;
-    }
-    const every: Duration = `${secs} seconds`;
-    const action = {
-      type: "startWorkflow" as const,
-      workflowType: plaudPollWorkflow,
-      taskQueue: o.taskQueue,
-      args: [{ agent: name, notify: recipient ?? "" }] as [PollInput],
-    };
+  /** Notes of pauses this worker wrote on the old per-skill schedules — ours to lift on the new one. */
+  const OUR_PAUSES = new Set([DISABLED_NOTE, DISCONNECTED_NOTE, SCHEDULE_OFF_NOTE]);
 
-    // One-time migration off the old NAME-keyed id. An earlier build scheduled `voice:<tenant>-<name>`;
-    // left in place it keeps polling alongside the new guid-keyed schedule — the double-process this
-    // change exists to prevent. Delete it when the id has actually moved (guid rosters only).
-    if (scheduleId !== `voice:${name}`) {
-      try {
-        await client.schedule.getHandle(`voice:${name}`).delete();
-        console.log(`worker: ${name} removed the legacy name-keyed voice schedule (now ${scheduleId})`);
-      } catch {
-        /* no legacy schedule under the old id, which is the normal case after the first migration */
-      }
-    }
-
-    // The loop's execution, if this pod is the one replacing it. Left running it would poll in
-    // parallel with the schedule and announce everything twice — the double-answer bug in a
-    // different costume.
-    try {
-      const old = client.workflow.getHandle(scheduleId);
-      const d = await old.describe();
-      if (d.status.name === "RUNNING") {
-        await old.terminate("superseded by the voice schedule");
-        console.log(`worker: ${name} terminated the old polling workflow — a schedule drives it now`);
-      }
-    } catch {
-      /* nothing running under that id, which is the normal case */
-    }
-
-    try {
-      await client.schedule.create({
-        scheduleId,
-        spec: { intervals: [{ every }] },
-        // SKIP, not BUFFER: a tick that lands while the previous one is still transcribing has
-        // nothing new to say, and queueing it would only guarantee a pile-up behind a slow meeting.
-        policies: { overlap: ScheduleOverlapPolicy.SKIP },
-        action,
-      });
-      console.log(`worker: ${name} voice schedule created — every ${every}`);
-    } catch (e) {
-      if (!/already exists/i.test((e as Error).message ?? "")) throw e;
-      // Update rather than leave it: the interval and the recipient come from the registry, and a
-      // schedule that silently keeps yesterday's configuration is the staleness this design was
-      // meant to remove.
-      const h = client.schedule.getHandle(scheduleId);
-      await h.update((prev) => ({
-        ...prev,
-        spec: { intervals: [{ every }] },
-        action,
-      }));
-      // And UNPAUSE it — but ONLY the pause this worker wrote. Turning the flow off pauses the
-      // schedule, so skipping this entirely would make the switch work in one direction only: a row
-      // set back to enabled=true would look on in the registry and in the boot log while the
-      // schedule sat paused and nothing ever ran.
-      //
-      // Unpausing UNCONDITIONALLY is the other half of the same mistake, and it is the one that
-      // actually cost something: every restart resumed a schedule a person had paused on purpose,
-      // so a backlog held back for inspection drained itself the next time the pod came up.
-      const state = (await h.describe()).state;
-      if (state.paused) {
-        if (scheduleOn(name, meetingRecap.name) && (state.note === DISABLED_NOTE || state.note === DISCONNECTED_NOTE)) {
-          // Both are OUR pauses, and we only reach here with live creds in hand — the account is
-          // connected and the flow is enabled — so the reason for either pause no longer holds.
-          await h.unpause(state.note === DISCONNECTED_NOTE ? "a member reconnected their Plaud account" : "flow_property enabled=true");
-          console.log(`worker: ${name} voice schedule resumed`);
-        } else if (state.note !== SCHEDULE_OFF_NOTE) {
-          // The switch's own pause is settled by applyScheduleSwitch below, not reported as a person's.
-          console.log(
-            `worker: ${name} voice schedule LEFT PAUSED — ${state.note || "paused outside the registry"}`,
-          );
-        }
-      }
-      console.log(`worker: ${name} voice schedule updated — every ${every}`);
-    }
-    await applyScheduleSwitch(name, scheduleId, scheduleOn(name, meetingRecap.name), "voice");
-  }
-
-  /** The agenda brief's schedule: time-of-day, in the tenant's timezone, one Temporal schedule per
-   *  agent (`agenda:<guid>`). It exists only while the agent holds the `agenda-brief` grant AND has a
-   *  working flow to read calendars and announce through; otherwise any schedule is removed, so
-   *  revoking the grant actually stops the briefs. Safe to call repeatedly. */
-  async function ensureAgendaSchedule(name: string): Promise<void> {
+  /**
+   * The agent's ONE schedule (D-ONE-CLOCK-PER-AGENT): `skills:<guid>`, firing at the recap poll's
+   * interval while any meeting-recap copy runs on its schedule, and at each agenda copy's times. Each
+   * firing is a `skillsTickWorkflow` that asks which copies are due — so a second copy of a skill is
+   * scheduled like the first, and an agent has one schedule however many skills and copies it holds.
+   * Replaces the per-skill `voice:` and `agenda:` schedules, which are removed here. Safe to call
+   * repeatedly; the registry's switches decide what each firing runs, not pauses.
+   */
+  async function ensureSkillsSchedule(name: string): Promise<void> {
     const a = wired.get(name);
-    const scheduleId = `agenda:${a?.cfg.guid ?? name}`;
-    const grant = a?.cfg.talents?.find((t) => t.name === agendaBrief.name);
     const v = voiceCreds.get(name);
-    const times = grant ? parseAgendaTimes(grant.config?.times) : [];
+    const guid = a?.cfg.guid ?? name;
+    const scheduleId = `skills:${guid}`;
+    for (const old of [voiceScheduleId(name), `voice:${name}`, `agenda:${guid}`]) {
+      try {
+        await client.schedule.getHandle(old).delete();
+        console.log(`worker: ${name} removed the ${old.split(":")[0]} schedule — the agent's one schedule runs it now`);
+      } catch {
+        /* not there, the normal case after the first move */
+      }
+    }
+    // A loop workflow from before schedules, if this pod is the one replacing it.
+    try {
+      const loop = client.workflow.getHandle(voiceScheduleId(name));
+      if ((await loop.describe()).status.name === "RUNNING") await loop.terminate("superseded by the agent's schedule");
+    } catch {
+      /* nothing running under that id */
+    }
     const recipient = v?.notifyUser ?? "";
-    if (!a || !grant || !v || !times.length || (!recipient && !v.notifyChannel)) {
+    const reach = !!v && (!!recipient || !!v.notifyChannel);
+    const grants = (a?.cfg.talents ?? []).filter((t) => t.schedule_enabled !== false);
+    const secs = v?.pollSeconds ?? 300;
+    const recaps = reach && secs > 0 ? grants.filter((t) => t.name === meetingRecap.name) : [];
+    const times = new Map<string, { hour: number; minute: number }>();
+    if (reach) for (const g of grants.filter((t) => t.name === agendaBrief.name)) for (const t of parseAgendaTimes(g.config?.times)) times.set(`${t.hour}:${t.minute}`, t);
+    if (!a || (!recaps.length && !times.size)) {
       try {
         await client.schedule.getHandle(scheduleId).delete();
-        console.log(`worker: ${name} agenda schedule removed`);
+        console.log(`worker: ${name} has nothing on a schedule — its schedule is removed`);
       } catch {
-        /* never scheduled — the normal case for an agent without the grant */
+        /* never scheduled */
       }
-      if (grant && !v) console.log(`worker: ${name} agenda brief not scheduled — no flow to read calendars through`);
       return;
     }
     const timezone = a.cfg.timezone || "UTC";
-    const spec = { calendars: times.map((t) => ({ hour: t.hour, minute: t.minute })), timezone };
-    const action = {
-      type: "startWorkflow" as const,
-      workflowType: agendaTickWorkflow,
-      taskQueue: o.taskQueue,
-      args: [{ agent: name, notify: recipient, version: agendaBrief.version }] as [AgendaTickInput],
+    const spec = {
+      ...(recaps.length ? { intervals: [{ every: `${secs} seconds` as Duration }] } : {}),
+      ...(times.size ? { calendars: [...times.values()].map((t) => ({ hour: t.hour, minute: t.minute })) } : {}),
+      timezone,
     };
-    // A brief is about the moment it was due. After downtime, a 07:00 brief delivered at 15:00 is noise:
-    // catch up for half an hour, then skip. SKIP overlap, as for the poll.
+    const action = { type: "startWorkflow" as const, workflowType: skillsTickWorkflow, taskQueue: o.taskQueue, args: [{ agent: name }] as [SkillsTickInput] };
+    // SKIP: a firing that lands while the last is still looking has nothing new to add. A brief is
+    // about the moment it was due, so after downtime only half an hour is caught up.
     const policies = { overlap: ScheduleOverlapPolicy.SKIP, catchupWindow: "30 minutes" as Duration };
-    const when = times.map((t) => `${String(t.hour).padStart(2, "0")}:${String(t.minute).padStart(2, "0")}`).join(", ");
+    const what = [recaps.length ? `recordings every ${secs}s (${recaps.map((t) => t.instance ?? t.name).join(", ")})` : "", times.size ? `briefs at ${[...times.values()].map((t) => `${String(t.hour).padStart(2, "0")}:${String(t.minute).padStart(2, "0")}`).join(", ")} ${timezone}` : ""].filter(Boolean).join("; ");
     try {
       await client.schedule.create({ scheduleId, spec, policies, action });
-      console.log(`worker: ${name} agenda schedule created — ${when} ${timezone}`);
+      console.log(`worker: ${name} schedule created — ${what}`);
     } catch (e) {
       if (!/already exists/i.test((e as Error).message ?? "")) throw e;
-      await client.schedule.getHandle(scheduleId).update((prev) => ({ ...prev, spec, action, policies: { ...prev.policies, ...policies } }));
-      console.log(`worker: ${name} agenda schedule updated — ${when} ${timezone}`);
+      const h = client.schedule.getHandle(scheduleId);
+      await h.update((prev) => ({ ...prev, spec, action, policies: { ...prev.policies, ...policies } }));
+      const state = (await h.describe()).state;
+      if (state.paused && OUR_PAUSES.has(state.note ?? "")) await h.unpause("the agent's skills decide what runs");
+      else if (state.paused) console.log(`worker: ${name} schedule LEFT PAUSED — ${state.note || "paused outside the registry"}`);
+      console.log(`worker: ${name} schedule updated — ${what}`);
     }
-    await applyScheduleSwitch(name, scheduleId, grant.schedule_enabled !== false, "agenda");
+  }
+
+  /** Kept as names for every place that already asks for them: both are the agent's one schedule now. */
+  async function ensureVoiceSchedule(name: string, _v: VoiceConfig): Promise<void> {
+    await ensureSkillsSchedule(name);
+  }
+  async function ensureAgendaSchedule(name: string): Promise<void> {
+    await ensureSkillsSchedule(name);
   }
 
   /** The drop watcher's timer (drop-watch.md): while the agent holds the grant and somebody has

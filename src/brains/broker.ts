@@ -75,6 +75,9 @@ export interface TurnSpec {
   cloudTools?: CloudTool[];
   /** `web-fetch` is granted to the agent (TOOL-WEB-FETCH): the turn has `tonoman web fetch`. */
   webFetch?: boolean;
+  /** The worker's own tools a skill on this agent brings — `plaud`, `calendar`, `meeting-recap` — each
+   *  a `tonoman` group the worker answers, as the person speaking (D-JOBS-ARE-PROMPTS). Absent = none. */
+  localTools?: string[];
 }
 
 /** A tool a Tonoman Cloud serves an agent, as its roster describes it: the `tonoman` group it adds to
@@ -157,6 +160,9 @@ export interface BrokerOptions {
   ) => Promise<{ status: number; text: string }>;
   /** How `tonoman web fetch` opens a page; the guarded fetcher unless a test gives its own. */
   fetchPage?: typeof fetchPage;
+  /** Answer a call to one of the worker's own tools (`tonoman plaud …`, `tonoman calendar …`): the
+   *  agent, the person speaking, the group and command, the arguments. Absent = none served. */
+  localTool?: (agentGuid: string, speaker: string, group: string, command: string, body: Record<string, unknown>) => Promise<{ status: number; text: string }>;
 }
 
 const INDEX_HEAD_BYTES = 4000;
@@ -623,9 +629,15 @@ export function createBroker(o: BrokerOptions) {
     const name = url.startsWith("/receipts/") ? `receipts.${url.slice("/receipts/".length)}` : url.startsWith("/web/") ? `web.${url.slice("/web/".length)}` : url.replace(/^\/brain\//, "");
     // A tool the Cloud serves: /cloud/<tool>/<command>, carried there as is.
     const cloud = /^\/cloud\/([a-z0-9-]+)\/([a-z0-9-]+)$/.exec(url);
+    // One of the worker's own tools a skill brings: /tool/<group>/<command>, only when the turn has it.
+    const local = /^\/tool\/([a-z0-9-]+)\/([a-z0-9-]+)$/.exec(url);
     const h: Handler | undefined = cloud
       ? (turn, _reach, body) => cloudCall(turn, cloud[1]!, cloud[2]!, body)
-      : Object.prototype.hasOwnProperty.call(handlers, name) ? handlers[name] : undefined;
+      : local
+        ? t.localTools?.includes(local[1]!) && o.localTool
+          ? (turn, _reach, body) => o.localTool!(turn.agentGuid, turn.slackUserId, local[1]!, local[2]!, body)
+          : undefined
+        : Object.prototype.hasOwnProperty.call(handlers, name) ? handlers[name] : undefined;
     if (req.method !== "POST" || !h) return send(404, "no such tool");
     const chunks: Buffer[] = [];
     req.on("data", (c) => chunks.push(c as Buffer));
@@ -689,7 +701,7 @@ export function createBroker(o: BrokerOptions) {
     startTurn(spec: TurnSpec, hooks: TurnHooks = {}): { token: string; mcp: McpServerSpec; cli: TurnCli } {
       const token = randomBytes(24).toString("hex");
       turns.set(token, { ...spec, used: new Set(), fetched: new Set(), bytes: 0, expiresAt: Date.now() + 2 * 60 * 60 * 1000, onUse: hooks.onUse });
-      const env = { TONOMAN_BRAIN_URL: baseUrl, TONOMAN_BRAIN_TOKEN: token, ...(spec.receipts ? { TONOMAN_RECEIPTS: "1" } : {}), ...(spec.cloudTools?.length ? { TONOMAN_CLOUD_TOOLS: JSON.stringify(spec.cloudTools.map(({ name, about, commands }) => ({ name, about, commands }))) } : {}), ...(spec.webFetch ? { TONOMAN_WEB_FETCH: "1" } : {}) };
+      const env = { TONOMAN_BRAIN_URL: baseUrl, TONOMAN_BRAIN_TOKEN: token, ...(spec.receipts ? { TONOMAN_RECEIPTS: "1" } : {}), ...(spec.cloudTools?.length ? { TONOMAN_CLOUD_TOOLS: JSON.stringify(spec.cloudTools.map(({ name, about, commands }) => ({ name, about, commands }))) } : {}), ...(spec.webFetch ? { TONOMAN_WEB_FETCH: "1" } : {}), ...(spec.localTools?.length ? { TONOMAN_LOCAL_TOOLS: spec.localTools.join(",") } : {}) };
       return {
         token,
         mcp: { name: "tonoman", command: o.node ?? process.execPath, args: [shimPath], env: { ...env, TONOMAN_CLI_PATH: cliPath } },
