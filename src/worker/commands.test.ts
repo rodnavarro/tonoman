@@ -50,6 +50,8 @@ describe("parse", () => {
   it("reads a command that arrives wrapped in Slack formatting", () => {
     expect(parse("`!connect claude`")).toEqual({ name: "connect", arg: "claude" });
     expect(parse("```!connections```")).toEqual({ name: "connections", arg: "" });
+    // CRED-ABSORBS-CONNECTION: the new word runs the same command.
+    expect(parse("!credentials")).toEqual({ name: "connections", arg: "" });
     expect(parse("*!status*")).toEqual({ name: "status", arg: "" });
     expect(parse("`*!connect google*`")).toEqual({ name: "connect", arg: "google" });
   });

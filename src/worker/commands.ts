@@ -129,7 +129,9 @@ export function parse(text: string): Command | undefined {
   if (!m) return undefined;
   const name = m[1]!.toLowerCase();
   // Talents are called skills now; `!skill` runs the same command, and `!talent` keeps working.
-  return { name: name === "skill" ? "talent" : name, arg: (m[2] ?? "").trim() };
+  // Connections are called credentials now (CRED-ABSORBS-CONNECTION); `!connections` keeps working.
+  const ALIASES: Record<string, string> = { skill: "talent", credentials: "connections" };
+  return { name: ALIASES[name] ?? name, arg: (m[2] ?? "").trim() };
 }
 
 /** PURE: a slash command's line with the app's name taken off — `!sapien-dev-connect plaud` →
@@ -263,7 +265,7 @@ const HELP = [
   "• `!connect lorealistar` — connect your own LOREALISTAR login, so I can watch for new drops for you",
   "• `!disconnect plaud` / `!disconnect lorealistar` — forget it again",
   "• `!disconnect claude` / `!disconnect codex` — sign out of the subscription I answer on",
-  "• `!connections` — what this agent is connected to",
+  "• `!credentials` — the logins this agent uses (`!connections` also works)",
   "• `!skill <name> <id> [again]` — run a skill on one item now, instead of waiting for its schedule (`again` re-runs an already-filed item)",
   "• `!skill agenda-brief now` — review today's calendar now: what's left, what overlaps, where the free time is",
   "• `!new` — forget this thread and start over",
