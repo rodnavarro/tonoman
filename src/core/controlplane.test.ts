@@ -185,7 +185,10 @@ describe("the roster mapping is a WHITELIST, and that cuts both ways", () => {
     const cfg = await plane([{ ...base, skills }]).roster();
     const [first, second] = cfg.agents[0]!.skills!;
     expect(first!.instance).toBe("meeting-recap");
-    expect(first!.bindings?.calendar).toEqual({ mode: "credentials", credentials: [{ id: "c1", kind: "ics", alias: "team", secret_ref: "ics.url:team", status: "connected" }] });
+    expect(first!.bindings?.calendar).toEqual({
+      mode: "credentials",
+      credentials: [{ id: "c1", kind: "ics", alias: "team", secret_ref: "ics.url:team", status: "connected", accounts: [{ secret_ref: "ics.url:team", status: "connected" }] }],
+    });
     expect(second).toMatchObject({ name: "meeting-recap", instance: "team-recap", config: { output_channel: "C2" } });
   });
 

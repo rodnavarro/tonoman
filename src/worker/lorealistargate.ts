@@ -9,6 +9,7 @@
 // from anything the request carries, so nobody connects a login on someone else's behalf.
 
 import type { SlackConnector, SlackInteraction } from "../connector/slack";
+import { slotKey } from "./tokenstore";
 
 export const LOREALISTAR_CONNECT_ACTION = "tonoman_connect_lorealistar";
 
@@ -20,17 +21,39 @@ export interface LorealistarGateDeps {
   tell(agent: string, user: string, conversation: string, text: string): Promise<void>;
 }
 
-export function connectBlocks(conversation: string): { text: string; blocks: unknown[] } {
+/** The button's value: the conversation, and — for a copy of the tool (`lorealistar-2`, D-TOOL-COPIES
+ *  in Tonoman Cloud) — which copy the login is for. A bare string is the first copy's, as before. */
+function buttonValue(conversation: string, copy?: string): string {
+  return copy ? JSON.stringify({ c: conversation, copy }) : conversation;
+}
+function readButton(value: string): { conversation: string; copy?: string } {
+  if (value.startsWith("{")) {
+    try {
+      const o = JSON.parse(value) as { c?: string; copy?: string };
+      return { conversation: String(o.c ?? ""), copy: o.copy || undefined };
+    } catch {
+      /* the bare reading */
+    }
+  }
+  return { conversation: value };
+}
+
+export function connectBlocks(conversation: string, copy?: string): { text: string; blocks: unknown[] } {
   return {
     text: "Connect LOREALISTAR",
     blocks: [
       {
         type: "section",
-        text: { type: "mrkdwn", text: "*Connect your LOREALISTAR login*, and I will watch for new drops for you and tell you the moment one appears." },
+        text: {
+          type: "mrkdwn",
+          text: copy
+            ? `*Connect your LOREALISTAR login for ${copy}* — the same one as before, or another — and I will watch it for new drops for you.`
+            : "*Connect your LOREALISTAR login*, and I will watch for new drops for you and tell you the moment one appears.",
+        },
       },
       {
         type: "actions",
-        elements: [{ type: "button", action_id: LOREALISTAR_CONNECT_ACTION, style: "primary", text: { type: "plain_text", text: "Connect LOREALISTAR" }, value: conversation }],
+        elements: [{ type: "button", action_id: LOREALISTAR_CONNECT_ACTION, style: "primary", text: { type: "plain_text", text: "Connect LOREALISTAR" }, value: buttonValue(conversation, copy) }],
       },
       {
         type: "context",
@@ -40,11 +63,11 @@ export function connectBlocks(conversation: string): { text: string; blocks: unk
   };
 }
 
-export function loginModal(agent: string, conversation: string): Record<string, unknown> {
+export function loginModal(agent: string, conversation: string, copy?: string): Record<string, unknown> {
   return {
     type: "modal",
     callback_id: LOREALISTAR_CONNECT_ACTION,
-    private_metadata: JSON.stringify({ agent, conversation }),
+    private_metadata: JSON.stringify({ agent, conversation, ...(copy ? { copy } : {}) }),
     title: { type: "plain_text", text: "Connect LOREALISTAR" },
     submit: { type: "plain_text", text: "Connect" },
     close: { type: "plain_text", text: "Cancel" },
@@ -67,10 +90,10 @@ export function loginModal(agent: string, conversation: string): Record<string, 
 }
 
 /** Offer it in the channel. Returns false when there is nothing to post to. */
-export async function ask(deps: LorealistarGateDeps, agent: string, conversation: string): Promise<boolean> {
+export async function ask(deps: LorealistarGateDeps, agent: string, conversation: string, copy?: string): Promise<boolean> {
   const conn = deps.conn(agent);
   if (!conn) return false;
-  const { text, blocks } = connectBlocks(conversation);
+  const { text, blocks } = connectBlocks(conversation, copy);
   await conn.postBlocks(conversation, text, blocks);
   return true;
 }
@@ -98,23 +121,27 @@ export async function handleInteraction(deps: LorealistarGateDeps, agent: string
 
   if (it.kind === "block_actions" && it.actionId === LOREALISTAR_CONNECT_ACTION) {
     if (!it.triggerId) return "no trigger_id";
-    await conn.call("views.open", { trigger_id: it.triggerId, view: loginModal(agent, it.value ?? "") });
+    const b = readButton(it.value ?? "");
+    await conn.call("views.open", { trigger_id: it.triggerId, view: loginModal(agent, b.conversation, b.copy) });
     return "opened lorealistar dialog";
   }
 
   if (it.kind === "view_submission" && it.callbackId === LOREALISTAR_CONNECT_ACTION) {
-    const conversation = String(safeParse(it.privateMetadata).conversation ?? "");
-    // Whoever filled it in — as Slack says, not as the request says.
-    const user = it.userId;
+    const meta = safeParse(it.privateMetadata);
+    const conversation = String(meta.conversation ?? "");
+    // Whoever filled it in — as Slack says, not as the request says — under the copy it is for.
+    const person = it.userId;
+    const copy = typeof meta.copy === "string" && /^[a-z][a-z0-9-]{1,39}$/.test(meta.copy) ? meta.copy : undefined;
+    const user = slotKey(copy, person);
     const email = valueOf(it.values, "email");
     const password = valueOf(it.values, "password", false);
     if (!email || !password) {
-      await deps.tell(agent, user, conversation, "⚠️ I need both the email and the password you use on LOREALISTAR. Nothing was saved.").catch(() => {});
+      await deps.tell(agent, person, conversation, "⚠️ I need both the email and the password you use on LOREALISTAR. Nothing was saved.").catch(() => {});
       return "lorealistar: a field was empty";
     }
     const r = await deps.save(agent, user, email, password).catch((e) => ({ ok: false, message: `I couldn't save that — ${(e as Error).message.slice(0, 160)}` }));
-    await deps.tell(agent, user, conversation, r.ok ? `✅ ${r.message}` : `⚠️ ${r.message}`).catch(() => {});
-    return r.ok ? `connected lorealistar for ${user}` : `lorealistar for ${user} was not connected`;
+    await deps.tell(agent, person, conversation, r.ok ? `✅ ${copy ? `${copy}: ` : ""}${r.message}` : `⚠️ ${r.message}`).catch(() => {});
+    return r.ok ? `connected lorealistar${copy ? ` (${copy})` : ""} for ${person}` : `lorealistar for ${person} was not connected`;
   }
 
   return "not mine";

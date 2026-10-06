@@ -226,7 +226,7 @@ export interface AgentConfig {
     instance?: string;
     /** What each of its tools uses (SKILL-BINDING-PER-TOOL), resolved by the registry: the
      *  credentials, never their values. Absent from an older registry. */
-    bindings?: Record<string, { mode: string; credentials: { id: string; kind: string; alias: string; label?: string; scope?: string; secret_ref?: string; status?: string }[] }>;
+    bindings?: Record<string, { mode: string; copy?: string; credentials: { id: string; kind: string; alias: string; label?: string; scope?: string; secret_ref?: string; status?: string; accounts?: { secret_ref?: string; status?: string }[] }[] }>;
     /** When this copy was added: its scheduled work starts here (SKILL-COPY-STARTS-NOW). */
     since?: string;
   }[];

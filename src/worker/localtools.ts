@@ -36,8 +36,10 @@ export function skillsNote(cfg: Pick<AgentConfig, "skills">, describe: (skill: s
     for (const [tool, b] of Object.entries(t.bindings ?? {})) {
       const shared = b.credentials.filter((c) => c.scope !== "per_person").map((c) => `"${c.label || c.alias}"`);
       const own = b.mode === "each_person" || b.credentials.some((c) => c.scope === "per_person");
-      const what = [...(own ? ["each person's own (\"mine\")"] : []), ...shared];
-      if (what.length) uses.push(`${tool}: ${what.join(", ")}`);
+      // A numbered copy of the tool (D-TOOL-COPIES) is named by its keyword: `--login plaud-2`.
+      const copy = b.copy && b.copy !== tool ? b.copy : undefined;
+      const what = [...(own ? [copy ? `each person's own login for ${copy} (--login "${copy}")` : "each person's own (\"mine\")"] : []), ...shared];
+      if (what.length) uses.push(`${copy ?? tool}: ${what.join(", ")}`);
     }
     const about = describe(t.name);
     lines.push(`- \`${word}\`${word !== t.name ? ` (a copy of ${t.name})` : ""}${about ? ` — ${about}` : ""}${uses.length ? ` Uses ${uses.join("; ")}.` : ""}`);
@@ -82,6 +84,8 @@ export interface PlaudLogin {
   user?: string;
   /** A shared login other than the voice flow's own: its sealed reference. */
   secretRef?: string;
+  /** The person's own login for a copy of the tool, read by its reference. */
+  own?: boolean;
 }
 
 /** PURE: the Plaud logins `speaker` may use on this agent. Their own when they connected one; and every
@@ -96,6 +100,16 @@ export function plaudLogins(cfg: Pick<AgentConfig, "skills">, v: Pick<VoiceConfi
       if (c.scope === "per_person" || !c.secret_ref) continue;
       const label = c.label || c.alias;
       shared.set(label.toLowerCase(), { label, secretRef: c.secret_ref });
+    }
+  }
+  // The speaker's own login for a numbered copy of the tool (`plaud-2`, D-TOOL-COPIES), by its keyword.
+  for (const t of cfg.skills ?? []) {
+    const b = t.bindings?.plaud;
+    if (!b?.copy || b.copy === "plaud" || b.mode !== "each_person") continue;
+    for (const c of b.credentials) {
+      for (const acc of c.accounts ?? []) {
+        if (acc.secret_ref === `plaud.tokens:${b.copy}:${speaker}` && acc.status !== "revoked") shared.set(b.copy.toLowerCase(), { label: b.copy, secretRef: acc.secret_ref, own: true });
+      }
     }
   }
   if (!shared.size && v && !(v.accounts?.length) && v.creds) shared.set("shared", { label: "shared" });
@@ -287,7 +301,7 @@ export function localTools(deps: LocalToolDeps) {
     if (group === "plaud" || (group === "meeting-recap" && command === "file")) {
       const logins = plaudLogins(cfg, v, speaker);
       if (group === "plaud" && command === "logins") {
-        return { status: 200, text: logins.length ? logins.map((l) => `${l.label}${l.user ? " (your own)" : " (shared)"}`).join("\n") : "No Plaud login you may use here. Connect yours with !connect plaud in a DM." };
+        return { status: 200, text: logins.length ? logins.map((l) => `${l.label}${l.user || l.own ? " (your own)" : " (shared)"}`).join("\n") : "No Plaud login you may use here. Connect yours with !connect plaud in a DM." };
       }
       const login = pickLogin(logins, typeof body.login === "string" ? body.login : undefined);
       if ("error" in login) return { status: 400, text: login.error };

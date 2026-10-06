@@ -81,7 +81,7 @@ export interface RegistryAgent {
    *  worker finds the one that drives the voice flow by NAME (a Skill is code, not wire steps). */
   skills?: {
     instance?: string;
-    bindings?: Record<string, { mode: string; credentials: { id: string; kind: string; alias: string; label?: string | null; scope?: string; accounts?: { accountId?: string | null; secretRef?: string | null; status?: string | null }[] }[] }>;
+    bindings?: Record<string, { mode: string; copy?: string; credentials: { id: string; kind: string; alias: string; label?: string | null; scope?: string; accounts?: { accountId?: string | null; secretRef?: string | null; status?: string | null }[] }[] }>;
     /** When this copy was added (SKILL-COPY-STARTS-NOW in Tonoman Cloud). */
     since?: string | null;
     id: string;
@@ -319,9 +319,21 @@ export class RegistryControlPlane implements ControlPlane {
               tool,
               {
                 mode: b.mode,
+                // Which copy of the tool this is (D-TOOL-COPIES in Tonoman Cloud): `plaud-2` reads its own logins.
+                copy: b.copy,
                 credentials: (b.credentials ?? []).map((c) => {
                   const shared = (c.accounts ?? []).find((x) => (x.accountId ?? null) === null) ?? c.accounts?.[0];
-                  return { id: c.id, kind: c.kind, alias: c.alias, label: c.label ?? undefined, scope: c.scope, secret_ref: shared?.secretRef ?? undefined, status: shared?.status ?? undefined };
+                  return {
+                    id: c.id,
+                    kind: c.kind,
+                    alias: c.alias,
+                    label: c.label ?? undefined,
+                    scope: c.scope,
+                    secret_ref: shared?.secretRef ?? undefined,
+                    status: shared?.status ?? undefined,
+                    // Each person's own login under it, by reference — never the value.
+                    accounts: (c.accounts ?? []).filter((x) => x.secretRef).map((x) => ({ secret_ref: x.secretRef ?? undefined, status: x.status ?? undefined })),
+                  };
                 }),
               },
             ]),

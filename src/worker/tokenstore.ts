@@ -59,6 +59,23 @@ export function plaudRefFor(base: string, user?: string): string {
   return user ? `${base}:${user}` : base;
 }
 
+/** The key a person's login for a COPY of a tool is kept under (D-TOOL-COPIES in Tonoman Cloud):
+ *  `<copy>:<user>` — so `plaud-2`'s login is `plaud.tokens:plaud-2:U…` and never the one the person
+ *  connected for `plaud`. The first copy keeps the bare user, so nothing already kept moves. */
+export function slotKey(copy: string | undefined, user: string): string {
+  return copy ? `${copy}:${user}` : user;
+}
+
+/** The person a key is for: the Slack id after any copy name. */
+export function personOf(key: string): string {
+  return key.includes(":") ? key.slice(key.lastIndexOf(":") + 1) : key;
+}
+
+/** The copy a key is for, or undefined for the first copy. */
+export function copyOf(key: string): string | undefined {
+  return key.includes(":") ? key.slice(0, key.lastIndexOf(":")) : undefined;
+}
+
 /** A Slack user or bot id: `U…`/`W…` (users) or `B…` (bots), all-caps alphanumeric. The scope
  *  suffix on a per-person ref is ALWAYS one of these, which is what lets `userFromPlaudRef`
  *  distinguish a member's account from a per-AGENT secret like `plaud.tokens:sapien10` — the agent
@@ -114,6 +131,8 @@ export function fileStore(root?: string): TokenStore {
       for (const e of entries) {
         if (!e.isDirectory()) continue;
         const user = decodeURIComponent(e.name);
+        // A copy's login (`plaud-2:U…`) is read through that copy, not polled as the first's.
+        if (!SLACK_ID.test(user)) continue;
         const tokenFile = path.join(dir, e.name, ".plaud", "tokens.json");
         const st = await fsp.stat(tokenFile).catch(() => undefined);
         if (!st) continue;

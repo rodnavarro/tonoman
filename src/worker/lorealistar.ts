@@ -144,11 +144,15 @@ export function dropWatcher(o: { store: DropStore; site: Pick<LookDeps, "signIn"
       });
     },
 
-    /** What the site said about one drop, for this person. */
+    /** What the site said about one drop, for this person — under their login for any copy of the
+     *  tool (`lorealistar-2:U…`), the run being theirs either way. */
     async drop(agent: string, user: string, id: string): Promise<{ drop: Campaign; seen: string } | undefined> {
-      const state = await o.store.loadState(agent, user).catch(() => undefined);
-      const p = state?.pending?.[id];
-      return p ? { drop: p.drop, seen: p.seen } : undefined;
+      const keys = [user, ...(await o.store.users(agent).catch(() => [] as string[])).filter((k) => k !== user && k.endsWith(`:${user}`))];
+      for (const k of keys) {
+        const p = (await o.store.loadState(agent, k).catch(() => undefined))?.pending?.[id];
+        if (p) return { drop: p.drop, seen: p.seen };
+      }
+      return undefined;
     },
 
     users: (agent: string): Promise<string[]> => o.store.users(agent),
@@ -199,8 +203,10 @@ export function cloudDropStore(o: { baseUrl: string; token: string; guidOf: (age
     const r = await f(url(agent, ref), { method: "PUT", headers: { ...auth, "content-type": "application/json" }, body: JSON.stringify({ value: JSON.stringify(value) }) });
     if (!r.ok) throw new Error(`secrets: ${r.status} storing ${ref.split(":")[0]}`);
   };
+  // A person's Slack id, or `<copy>:<id>` for their login to a copy of the tool (D-TOOL-COPIES).
   const safe = (user: string): string => {
-    if (!SLACK_ID.test(user)) throw new Error("that is not a person's Slack id");
+    const m = /^(?:([a-z][a-z0-9-]{1,39}):)?([^:]+)$/.exec(user);
+    if (!m || !SLACK_ID.test(m[2]!)) throw new Error("that is not a person's Slack id");
     return user;
   };
   return {
@@ -217,7 +223,11 @@ export function cloudDropStore(o: { baseUrl: string; token: string; guidOf: (age
       const r = await f(`${o.baseUrl.replace(/\/+$/, "")}/v1/system/agents/${guid}/secrets`, { headers: auth }).catch(() => undefined);
       if (!r || !r.ok) return [];
       const body = (await r.json().catch(() => undefined)) as { secrets?: { ref: string }[] } | undefined;
-      return (body?.secrets ?? []).map((s) => s.ref).filter((ref) => ref.startsWith(`${LOGIN_REF}:`)).map((ref) => ref.slice(LOGIN_REF.length + 1)).filter((u) => SLACK_ID.test(u));
+      return (body?.secrets ?? [])
+        .map((s) => s.ref)
+        .filter((ref) => ref.startsWith(`${LOGIN_REF}:`))
+        .map((ref) => ref.slice(LOGIN_REF.length + 1))
+        .filter((u) => SLACK_ID.test(u.slice(u.lastIndexOf(":") + 1)));
     },
   };
 }

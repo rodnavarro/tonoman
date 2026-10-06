@@ -1650,6 +1650,14 @@ export async function run(
         }
       : undefined,
     lorealistar: drops,
+    // A login key (`U…`, or `lorealistar-2:U…` for a copy of the tool) → the person, the drop-watch copy
+    // that uses it, and that copy's channel (D-TOOL-COPIES). Null: no drop-watch copy uses that tool copy.
+    dropCopy: (name: string, key: string) => {
+      const tc = tokenstore.copyOf(key) ?? "lorealistar";
+      const grant = (wired.get(name)?.cfg.skills ?? []).find((t) => t.name === dropWatch.name && (t.bindings?.lorealistar?.copy ?? "lorealistar") === tc);
+      if (!grant) return null;
+      return { person: tokenstore.personOf(key), instance: (grant.instance ?? grant.name) !== grant.name ? grant.instance : undefined, channel: dropChannel(grant.config?.output_channel) };
+    },
     dm: async (name: string, user: string, text: string) => {
       const conv = await dmFor(name, user);
       if (conv) await wired.get(name)?.conn.reply(conv).send(text);
@@ -1737,6 +1745,22 @@ export async function run(
         if (c.scope === "per_person" || !c.secret_ref) continue;
         const tokenJson = await resolveRef(c.secret_ref, a.cfg.guid);
         if (tokenJson) out.push({ creds: { tokenJson }, floorMs: floor });
+      }
+      // A numbered copy of the tool (`plaud-2`, D-TOOL-COPIES) reads each person's login connected for
+      // IT — `!connect plaud-2` — never the one they connected for `plaud`.
+      const toolCopy = g.bindings?.plaud?.copy;
+      if (toolCopy && toolCopy !== "plaud") {
+        if (g.bindings!.plaud!.mode === "each_person") {
+          for (const c of g.bindings!.plaud!.credentials) {
+            for (const acc of c.accounts ?? []) {
+              const user = tokenstore.userFromPlaudRef(acc.secret_ref?.replace(`plaud.tokens:${toolCopy}:`, "plaud.tokens:"));
+              if (!user || !acc.secret_ref || acc.status === "revoked") continue;
+              const tokenJson = await resolveRef(acc.secret_ref, a.cfg.guid);
+              if (tokenJson) out.push({ creds: { tokenJson }, user, floorMs: floor });
+            }
+          }
+        }
+        return out;
       }
       const own = !g.bindings?.plaud || g.bindings.plaud.mode === "each_person" || g.bindings.plaud.credentials.some((c) => c.scope === "per_person");
       if (own) for (const acct of accountsOf(v)) out.push({ ...acct, floorMs: Math.max(acct.floorMs ?? v.floorMs, floor) });
@@ -2297,10 +2321,18 @@ export async function run(
       void forgetSession(name, conversation).catch(() => {});
       void forgetSession(name, `${conversation}@codex`).catch(() => {});
     },
+    // `plaud-2` on this agent is a copy of plaud (D-TOOL-COPIES in Tonoman Cloud): a word one of its skill
+    // copies' tools is known by, other than the tool's own name.
+    toolCopyKind: (name, word) => {
+      for (const t of wired.get(name)?.cfg.skills ?? []) {
+        for (const [tool, b] of Object.entries(t.bindings ?? {})) if (b.copy && b.copy === word && b.copy !== tool) return tool;
+      }
+      return undefined;
+    },
     plaudConnected: (name, user) => {
       // Per-person: is the SPEAKER's own account connected. Shared: the tenant's one account, and the
       // user is ignored — same question either way for a shared agent.
-      const u = flowcfg.plaudPerPerson(wired.get(name)?.cfg.flows?.voice) ? user : undefined;
+      const u = user?.includes(":") || flowcfg.plaudPerPerson(wired.get(name)?.cfg.flows?.voice) ? user : undefined;
       return plaudcli.connected(name, u);
     },
     // `!connect claude`, typed on purpose. The SAME offer the auth gate makes on its own when a
@@ -2331,8 +2363,8 @@ export async function run(
       return "";
     },
     // A published calendar address. The blocks ARE the message; see connectClaude.
-    connectLorealistar: async (name, conversation) => {
-      const asked = await lorealistargate.ask(lorealistarDeps, name, conversation).catch((e) => {
+    connectLorealistar: async (name, conversation, copy) => {
+      const asked = await lorealistargate.ask(lorealistarDeps, name, conversation, copy).catch((e) => {
         console.error(`worker: ${name} connect lorealistar failed: ${(e as Error).message}`);
         return false;
       });
@@ -2369,7 +2401,7 @@ export async function run(
     disconnectPlaud: async (name, user) => {
       // Per-person: forget only the SPEAKER's own account, so one teammate signing out never touches
       // another's. Shared: the tenant's one account.
-      const u = flowcfg.plaudPerPerson(wired.get(name)?.cfg.flows?.voice) ? user : undefined;
+      const u = user?.includes(":") || flowcfg.plaudPerPerson(wired.get(name)?.cfg.flows?.voice) ? user : undefined;
       await plaudauth.disconnect(name, u);
       // And STOP POLLING. This used to end "the running flow finishes its current cycle first",
       // which was a polite way of saying the credential stayed resolved in memory until the next
@@ -2386,11 +2418,11 @@ export async function run(
     finishPlaud: async (name, pasted, user) => {
       // Per-person: store the SPEAKER's tokens under their own scope; the secrets-list route is what
       // makes the account visible to the poll, so no connection row is needed here.
-      const u = flowcfg.plaudPerPerson(wired.get(name)?.cfg.flows?.voice) ? user : undefined;
+      const u = user?.includes(":") || flowcfg.plaudPerPerson(wired.get(name)?.cfg.flows?.voice) ? user : undefined;
       const r = await plaudauth.complete(name, pasted, u);
       if (!r.ok) return `That didn't work - ${r.problem}.`;
       // The `!code plaud <address>` completion path — register the connecting person into the tenant.
-      await autoRegisterMember(name, user);
+      await autoRegisterMember(name, user ? tokenstore.personOf(user) : user);
       // THE SECOND COMPLETION PATH. The dialog is not the only way in — `!connect plaud <code>`
       // lands here — and a fix applied to one of two doors is not a fix. Starting the poll has to
       // happen wherever a credential arrives, not wherever it was convenient to add it.
@@ -2408,7 +2440,7 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
     },
     connectPlaud: async (name, conversation, user) => {
       // Per-person: begin a login for the SPEAKER, whose tokens land in their own scope.
-      const u = flowcfg.plaudPerPerson(wired.get(name)?.cfg.flows?.voice) ? user : undefined;
+      const u = user?.includes(":") || flowcfg.plaudPerPerson(wired.get(name)?.cfg.flows?.voice) ? user : undefined;
       // Buttons and a private dialog, the same shape as connecting Claude. Two mechanisms for
       // one idea is something a person has to learn twice, and the typed version put an
       // authorization code into channel history.
@@ -2657,7 +2689,7 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
     // the "✅ connected" reply, so the agent knows the speaker's name by the time the first recap posts.
     complete: async (name, pasted, user) => {
       const r = await plaudauth.complete(name, pasted, user);
-      if (r.ok) await autoRegisterMember(name, user);
+      if (r.ok) await autoRegisterMember(name, user ? tokenstore.personOf(user) : user);
       return r;
     },
     notifyChannel: (name) => voiceCreds.get(name)?.notifyChannel,

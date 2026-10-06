@@ -34,6 +34,18 @@ import { authFailureState, notLoggedInNotice, isNotLoggedInError } from "../turn
 
 /** How the worker finds an agent's connector and runner. Injected at worker construction so this
  *  module holds no globals and can be unit-tested without Temporal. */
+/** One login's look at LOREALISTAR: the key it is kept under, the person it is theirs, and — for a copy
+ *  of the drop watch — which copy and where it announces (D-TOOL-COPIES in Tonoman Cloud). */
+export interface DropLook {
+  user: string;
+  person?: string;
+  instance?: string;
+  channel?: string;
+  news: { id: string; name: string }[];
+  notice?: string;
+  alive?: string;
+}
+
 export interface TurnDeps {
   agent(name: string): { cfg: AgentConfig; conn: Connector; context?: string; run: (req: TurnRunReq, signal?: AbortSignal) => AsyncIterable<TurnEvent> } | undefined;
   /** What this agent needs to run the voice flow, or undefined if it is not configured for one. */
@@ -166,6 +178,9 @@ export interface TurnDeps {
     /** These drops' announcements have been started. */
     told(agent: string, user: string, ids: string[]): Promise<void>;
   };
+  /** Which drop-watch copy a login key is for (D-TOOL-COPIES): the person, the copy, its channel; null
+   *  when no copy uses that copy of the tool. Absent: every login is the first copy's, as before. */
+  dropCopy?(agent: string, key: string): { person: string; instance?: string; channel?: string } | null;
   /** Say something to ONE person, in a DM — never in a channel, whatever channel the agent has. */
   dm?(agent: string, user: string, text: string): Promise<void>;
   /** The tenant's timezone, for what is "today". */
@@ -977,16 +992,20 @@ export function makeActivities(deps: TurnDeps) {
 
     /** One look at LOREALISTAR for everyone who has connected a login for this agent
      *  (drop-watch.md). One person's trouble never stops another's look. */
-    async dropLooks(input: { agent: string }): Promise<{ user: string; news: { id: string; name: string }[]; notice?: string; alive?: string }[]> {
+    async dropLooks(input: { agent: string }): Promise<DropLook[]> {
       const l = deps.lorealistar;
       if (!l) return [];
-      const out: { user: string; news: { id: string; name: string }[]; notice?: string; alive?: string }[] = [];
+      const out: DropLook[] = [];
       for (const user of await l.users(input.agent)) {
+        // A login for a copy of the tool (`lorealistar-2:U…`) is looked at for the drop-watch copy that
+        // uses it, and told where that copy says (D-TOOL-COPIES); one no copy uses is not looked at.
+        const where = deps.dropCopy ? deps.dropCopy(input.agent, user) : { person: user };
+        if (!where) continue;
         const r = await l.lookFor(input.agent, user, deps.timezoneOf?.(input.agent)).catch((e) => {
           console.error(`worker: ${input.agent} could not look at LOREALISTAR for ${user} — ${String((e as Error)?.message ?? e).slice(0, 160)}`);
           return undefined;
         });
-        if (r && (r.news.length || r.notice || r.alive)) out.push({ user, ...r });
+        if (r && (r.news.length || r.notice || r.alive)) out.push({ user, ...(deps.dropCopy ? { person: where.person, instance: where.instance, channel: where.channel } : {}), ...r });
       }
       return out;
     },

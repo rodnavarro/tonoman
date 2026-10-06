@@ -582,13 +582,15 @@ export function dropRunId(agent: string, user: string, dropId: string): string {
  */
 export async function dropsPollWorkflow(input: DropsPollInput): Promise<void> {
   for (const look of await dropLooks({ agent: input.agent })) {
-    for (const text of [look.notice, look.alive]) if (text) await tellPrivately({ agent: input.agent, user: look.user, text });
+    // The person the login is theirs; a copy's login key (`lorealistar-2:U…`) is not a Slack id.
+    const person = look.person ?? look.user;
+    for (const text of [look.notice, look.alive]) if (text) await tellPrivately({ agent: input.agent, user: person, text });
     const started: string[] = [];
     for (const d of look.news) {
       try {
         await startChild(runSkillWorkflow, {
           workflowId: dropRunId(input.agent, look.user, d.id),
-          args: [{ agent: input.agent, skill: "drop-watch", version: input.version, itemKey: `drop-${d.id}`, recordingId: `drop-${d.id}`, notify: look.user, user: look.user, channel: input.channel }],
+          args: [{ agent: input.agent, skill: "drop-watch", ...(look.instance ? { instance: look.instance } : {}), version: input.version, itemKey: `drop-${d.id}`, recordingId: `drop-${d.id}`, notify: person, user: person, channel: look.channel ?? input.channel }],
           parentClosePolicy: ParentClosePolicy.ABANDON,
         });
         started.push(d.id);

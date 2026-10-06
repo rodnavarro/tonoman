@@ -21,6 +21,7 @@
 // Slack connection, a harness, or Temporal.
 
 import { parseStatusMode, renderStatus, renderWindows, STATUS_MODES, type StatusMode, type UsageWindow } from "../statusline";
+import { slotKey } from "./tokenstore";
 import type { TurnUsage } from "../core/contracts";
 
 export interface Command {
@@ -240,8 +241,12 @@ export interface CommandDeps {
   connectClaude?(agent: string, conversation: string, user?: string): Promise<string>;
   /** Offer the calendar dialog. Same contract: "" when the blocks are the message. */
   connectIcs?(agent: string, conversation: string): Promise<string>;
-  /** Offer the private dialog for a person's own LOREALISTAR login (drop-watch.md). */
-  connectLorealistar?(agent: string, conversation: string): Promise<string>;
+  /** Offer the private dialog for a person's own LOREALISTAR login (drop-watch.md) — for a copy of
+   *  the tool when `copy` names one (`lorealistar-2`, D-TOOL-COPIES in Tonoman Cloud). */
+  connectLorealistar?(agent: string, conversation: string, copy?: string): Promise<string>;
+  /** The kind a word names when it is one of this agent's copies of a tool that takes a person's
+   *  login — `plaud-2` → plaud — so `!connect plaud-2` connects that copy (D-TOOL-COPIES). */
+  toolCopyKind?(agent: string, word: string): string | undefined;
   /** Forget the SPEAKER's LOREALISTAR login, and stop watching for them. */
   disconnectLorealistar?(agent: string, user?: string): Promise<string>;
   /** Finish a connection with the callback URL the person pasted back. `user` completes the
@@ -404,6 +409,13 @@ export async function run(
     case "logout": {
       const { which } = splitConnector(cmd.arg);
       if (!which) return "Which one? `!disconnect plaud` or `!disconnect claude`.";
+      // A copy of a tool forgets the person's login for that copy only (D-TOOL-COPIES).
+      const copyKind = deps.toolCopyKind?.(agent, which);
+      if (copyKind && user) {
+        const key = slotKey(which, user);
+        if (copyKind === "plaud" && deps.disconnectPlaud) return deps.disconnectPlaud(agent, key);
+        if (copyKind === "lorealistar" && deps.disconnectLorealistar) return deps.disconnectLorealistar(agent, key);
+      }
       if ((INFERENCE_KINDS as readonly string[]).includes(which)) {
         if (!deps.disconnectClaude) return "I have no way to sign out of an inference provider on this deployment.";
         return deps.disconnectClaude(agent, user);
@@ -420,6 +432,22 @@ export async function run(
     case "connect": {
       const { which, rest } = splitConnector(cmd.arg);
       if (!which) return `Which one? ${CONNECT_KINDS.map((c) => `\`!connect ${c}\``).join(", ")}.`;
+      // A copy of a tool (`plaud-2`, D-TOOL-COPIES in Tonoman Cloud): the person's own login for that
+      // copy, kept apart from the one they connected for the first — the same account, or another.
+      const copyKind = deps.toolCopyKind?.(agent, which);
+      if (copyKind === "plaud" || copyKind === "lorealistar") {
+        if (!user) return "I don't know who is asking, so I can't keep a login for you.";
+        if (copyKind === "lorealistar") {
+          if (!deps.connectLorealistar) return "I can't watch LOREALISTAR on this deployment.";
+          return deps.connectLorealistar(agent, conversation, which);
+        }
+        if (!deps.connectPlaud) return "I have no way to connect an account on this deployment.";
+        const key = slotKey(which, user);
+        if (rest.toLowerCase() !== "again" && (await deps.plaudConnected?.(agent, key).catch(() => false))) {
+          return `✅ Your Plaud login for ${which} is already connected. Type \`!connect ${which} again\` to sign in with a different one.`;
+        }
+        return deps.connectPlaud(agent, conversation, key);
+      }
       if (!(CONNECT_KINDS as readonly string[]).includes(which)) return unknownConnector(which, CONNECT_KINDS);
 
       // The subscription this agent ANSWERS on, as opposed to an outside account it reads. Listed
