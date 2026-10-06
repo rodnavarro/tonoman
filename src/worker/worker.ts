@@ -2116,16 +2116,19 @@ export async function run(
     if (!guid || !baseUrl) return;
     let profileName: string | undefined;
     let email: string | undefined;
+    let image: string | undefined;
     try {
       const conn = a?.conn as SlackConnector | undefined;
       // users.info reads `user` from the QUERY STRING, not a JSON body — posting it in the body
       // (which conn.call does by default) silently returns user_not_found. So put it in the URL.
       const info = await conn?.call<{
-        user?: { real_name?: string; profile?: { real_name?: string; display_name?: string; email?: string } };
+        user?: { real_name?: string; profile?: { real_name?: string; display_name?: string; email?: string; image_192?: string; image_72?: string } };
       }>(`users.info?user=${encodeURIComponent(user)}`);
       const p = info?.user;
       profileName = p?.profile?.real_name || p?.real_name || p?.profile?.display_name || undefined;
       email = p?.profile?.email || undefined;
+      // Their Slack picture, for the Hub's People picker (PEOPLE-PICKER-PHOTO in Tonoman Cloud).
+      image = p?.profile?.image_192 || p?.profile?.image_72 || undefined;
     } catch (e) {
       console.error(`worker: ${name} users.info failed for ${user}: ${(e as Error).message}`);
     }
@@ -2136,7 +2139,7 @@ export async function run(
           authorization: `Bearer ${process.env.TONOMANCLOUD_API_TOKEN ?? ""}`,
           "content-type": "application/json",
         },
-        body: JSON.stringify({ slackUserId: user, name: profileName, email, ...(auth ?? {}) }),
+        body: JSON.stringify({ slackUserId: user, name: profileName, email, image, ...(auth ?? {}) }),
       });
     } catch (e) {
       console.error(`worker: ${name} register-member failed for ${user}: ${(e as Error).message}`);
