@@ -1627,7 +1627,36 @@ export async function run(
       : memoryDropStore(),
   });
 
+  // Transcription the platform does is metered (USAGE-TRANSCRIPTION-METERED in Tonoman Cloud): the Cloud
+  // is asked first — an add-on not taken, or a day's 24 hours used, is said, never a silent skip — and
+  // told the seconds of audio after, by the recording's key. A worker with no Cloud meters nothing.
+  const transcriptionMeterFor = (name: string, user?: string): recapFloor.TranscriptionMeter | undefined => {
+    const guid = wired.get(name)?.cfg.guid;
+    const base = process.env.TONOMANCLOUD_API_URL?.replace(/\/+$/, "");
+    if (!guid || !base) return undefined;
+    const headers = { authorization: `Bearer ${process.env.TONOMANCLOUD_API_TOKEN ?? ""}`, "content-type": "application/json" };
+    return {
+      before: async () => {
+        const r = await fetch(`${base}/v1/system/agents/${guid}/allowance/transcription.seconds`, { headers, signal: AbortSignal.timeout(8000) }).catch(() => undefined);
+        // A Cloud that cannot answer does not stop the work: the use is still reported after.
+        if (!r?.ok) return;
+        const a = (await r.json().catch(() => ({}))) as { allowed?: boolean; reason?: string };
+        if (a.allowed === false) throw new Error(`not transcribed: ${a.reason ?? "the platform's transcription is not on for this organization"}`);
+      },
+      after: async (audioSeconds, key) => {
+        const r = await fetch(`${base}/v1/system/agents/${guid}/usage`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ meter: "transcription.seconds", quantity: Math.round(audioSeconds), key: `recording:${key}`, ...(user ? { slackUserId: tokenstore.personOf(user) } : {}) }),
+          signal: AbortSignal.timeout(8000),
+        });
+        if (!r.ok) throw new Error(`usage → ${r.status}`);
+      },
+    };
+  };
+
   const deps = {
+    transcriptionMeter: transcriptionMeterFor,
     agent: (name: string) => wired.get(name),
     voice: (name: string) => voiceCreds.get(name),
     recordUsage: (name: string, conversation: string, u: TurnUsage) => lastUsage.set(name, conversation, u),
@@ -2027,7 +2056,7 @@ export async function run(
       const v = voiceCreds.get(name);
       if (!v) throw new Error("this agent has no transcription set up");
       const cacheDir = user && v.chunkCacheDir ? path.join(v.chunkCacheDir, encodeURIComponent(user)) : v.chunkCacheDir;
-      return recapFloor.transcribe(creds, rec, v.transcribe, v.vocab, undefined, cacheDir);
+      return recapFloor.transcribe(creds, rec, v.transcribe, v.vocab, undefined, cacheDir, transcriptionMeterFor(name, user));
     },
     feeds: async (_name, cfg, choices) => {
       const out: calendar.CalendarFeed[] = [];

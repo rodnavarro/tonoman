@@ -285,9 +285,19 @@ async function isPublished(brainDir: string, rec: Recording, journal?: Journal):
   return false;
 }
 
+/** Metering around a transcription the platform does (USAGE-TRANSCRIPTION-METERED in Tonoman Cloud):
+ *  `before` may refuse — it throws, with the reason a person reads — and `after` is told the seconds of
+ *  audio, under the recording's key, so a retry is counted once. */
+export interface TranscriptionMeter {
+  before(): Promise<void>;
+  after(audioSeconds: number, key: string): Promise<void>;
+}
+
 export interface TranscribeResult {
   text: string;
   seconds: number;
+  /** Seconds of AUDIO transcribed — what is metered — as against `seconds`, the time it took. */
+  audioSeconds?: number;
   /** Which providers actually served, in the order they first did. Recorded because the recap page
    *  states who transcribed it, and a hardcoded "Groq" became a lie the moment a second provider
    *  existed. Empty when every chunk came from the cache — see `transcribedBy`. */
@@ -445,6 +455,7 @@ export async function transcribe(
   /** Where finished chunks are kept, so a retry resumes instead of starting over. Optional: the
    *  single-machine path passes none and behaves exactly as before. */
   cacheDir?: string,
+  meter?: TranscriptionMeter,
 ): Promise<TranscribeResult> {
   // The audio, and ONLY the audio. Plaud will also hand over its own transcript and summary, and
   // taking them would put the quality of every recap in somebody else's model, tuned for somebody
@@ -454,7 +465,7 @@ export async function transcribe(
     : (await plaudGet<{ temp_url: string }>(creds, `/file/temp-url/${rec.id}`)).temp_url;
   // Everything past resolving that URL is source-agnostic — it is the `transcribe` CAPABILITY. The
   // cache is keyed by the recording's KEY so a retry after a rename still finds its chunks.
-  return transcribeAudio(tempUrl, rec.title, recordingKey(rec.id), providers, vocab, onProgress, cacheDir);
+  return transcribeAudio(tempUrl, rec.title, recordingKey(rec.id), providers, vocab, onProgress, cacheDir, meter);
 }
 
 /** The provider-routing core of transcription, with NOTHING tied to a source: fetch a ready audio
@@ -472,8 +483,11 @@ export async function transcribeAudio(
   vocab: string,
   onProgress?: (done: number, total: number) => void,
   cacheDir?: string,
+  meter?: TranscriptionMeter,
 ): Promise<TranscribeResult> {
   const t0 = Date.now();
+  // Asked first: a tenant the platform does not transcribe for is told so before its audio is fetched.
+  await meter?.before();
 
   // A scratch directory per recording, removed whether or not this succeeds. The audio is the
   // customer's meeting; it has no business outliving the transcription.
@@ -542,7 +556,9 @@ export async function transcribeAudio(
       onProgress?.(i + 1, parts.length);
     }
     if (reused) console.log(`recap: ${label} — reused ${reused}/${parts.length} chunk(s) from a previous attempt`);
-    return { text: joinChunks(texts), seconds: (Date.now() - t0) / 1000, by };
+    // Counted once it is done, by the recording's key; a meter that cannot be reached never costs the transcript.
+    await meter?.after(totalSecs, cacheId).catch((e) => console.error(`recap: ${label} — usage not reported: ${(e as Error).message}`));
+    return { text: joinChunks(texts), seconds: (Date.now() - t0) / 1000, by, audioSeconds: totalSecs };
   } finally {
     await fs.rm(work, { recursive: true, force: true }).catch(() => {});
   }

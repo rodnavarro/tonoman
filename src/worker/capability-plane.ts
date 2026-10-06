@@ -349,6 +349,7 @@ export async function startCapabilityPlane(deps: TurnDeps): Promise<CapabilityPl
             typeof body.vocab === "string" ? body.vocab : voice.vocab,
             undefined,
             cacheDir,
+            deps.transcriptionMeter?.(run.agent, run.user),
           );
           return reply(200, out);
         }

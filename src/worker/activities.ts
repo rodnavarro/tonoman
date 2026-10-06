@@ -178,6 +178,8 @@ export interface TurnDeps {
     /** These drops' announcements have been started. */
     told(agent: string, user: string, ids: string[]): Promise<void>;
   };
+  /** Metering for a transcription the platform does, for this agent's tenant (USAGE-TRANSCRIPTION-METERED). */
+  transcriptionMeter?(agent: string, user?: string): recap.TranscriptionMeter | undefined;
   /** Which drop-watch copy a login key is for (D-TOOL-COPIES): the person, the copy, its channel; null
    *  when no copy uses that copy of the tool. Absent: every login is the first copy's, as before. */
   dropCopy?(agent: string, key: string): { person: string; instance?: string; channel?: string } | null;
@@ -744,6 +746,7 @@ export function makeActivities(deps: TurnDeps) {
               ctx.heartbeat(note);
             },
             chunkCacheDir,
+            deps.transcriptionMeter?.(input.agent, input.user),
           ),
       );
       console.log(
