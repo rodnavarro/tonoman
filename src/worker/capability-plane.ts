@@ -45,7 +45,7 @@ export interface CapabilityPlane {
   /** Spawn a Talent CLI for one run against this plane and return its outcome. Used by the runTalent
    *  activity and the dev-run endpoint. */
   spawn(
-    run: { agent: string; item: string; user?: string; talent?: string },
+    run: { agent: string; item: string; user?: string; talent?: string; instance?: string },
     opts?: { signal?: AbortSignal; onProgress?: (note: string) => void },
   ): Promise<TalentOutcome>;
   close(): Promise<void>;
@@ -97,7 +97,7 @@ async function runTalentProcess(
   baseUrl: string,
   mint: (r: RunToken) => string,
   revoke: (t: string) => void,
-  run: { agent: string; item: string; user?: string; talent?: string },
+  run: { agent: string; item: string; user?: string; talent?: string; instance?: string },
   opts?: { signal?: AbortSignal; onProgress?: (note: string) => void },
   /** The brains each run filed into, by token — set by /cap/publish, read once the run ends. */
   filedIn: Map<string, string[]> = new Map(),
@@ -117,7 +117,8 @@ async function runTalentProcess(
       user: run.user,
       // The grant's saved config (an agenda brief's times, a recap's output channel). It was always
       // `{}`, so a Talent could declare config fields and never receive a value.
-      config: deps.talentConfig?.(run.agent, talent) ?? {},
+      // This instance's settings (TALENT-SEVERAL-INSTANCES); the first instance's when none is named.
+      config: deps.talentConfig?.(run.agent, run.instance ?? talent) ?? {},
       // The tenant context the recap prompt needs — provided by the runtime, never held by the Talent.
       context: {
         mission: voice?.mission ?? "",

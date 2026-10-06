@@ -259,13 +259,19 @@ describe("talent_run records carry the trigger, who asked, and the result", () =
     const s = spyDeps();
     const result = { summary: "Filed the Globex call", links: [{ label: "Recap", url: "https://x.test/r" }] };
     await s.acts.closeTalentRun({ agent: "a", talent: "t", itemKey: "k", status: "done", result });
-    expect(s.closes[0]).toEqual(["a", "t", "k", "done", undefined, result]);
+    expect(s.closes[0]).toEqual(["a", "t", "k", "done", undefined, result, undefined]);
   });
 
   it("a failed run still closes with its reason and no result", async () => {
     const s = spyDeps();
     await s.acts.closeTalentRun({ agent: "a", talent: "t", itemKey: "k", status: "failed", error: "nope" });
-    expect(s.closes[0]).toEqual(["a", "t", "k", "failed", "nope", undefined]);
+    expect(s.closes[0]).toEqual(["a", "t", "k", "failed", "nope", undefined, undefined]);
+  });
+
+  it("TALENT-SEVERAL-INSTANCES a run of a second instance is recorded as that instance, not the first", async () => {
+    const s = spyDeps();
+    await s.acts.closeTalentRun({ agent: "a", talent: "meeting-recap", instance: "team-recap", itemKey: "k", status: "done" });
+    expect(s.closes[0]).toEqual(["a", "meeting-recap", "k", "done", undefined, undefined, "team-recap"]);
   });
 
   /** `runTalent` heartbeats, so it needs an activity context. Stubbed rather than mocked at module

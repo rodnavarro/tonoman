@@ -174,6 +174,26 @@ describe("the roster mapping is a WHITELIST, and that cuts both ways", () => {
       ["agenda-brief", true],
     ]);
   });
+
+  it("TALENT-BINDING-PER-TOOL carries each instance's name and what its tools use, the shared account flattened", async () => {
+    await withTokens();
+    const team = { id: "c1", kind: "ics", alias: "team", accounts: [{ accountId: null, secretRef: "ics.url:team", status: "connected" }] };
+    const talents = [
+      { id: "t1", name: "meeting-recap", version: 3, config: {}, scheduleEnabled: true, instance: "meeting-recap", bindings: { calendar: { mode: "credentials", credentials: [team] } } },
+      { id: "t1", name: "meeting-recap", version: 3, config: { output_channel: "C2" }, scheduleEnabled: true, instance: "team-recap", bindings: {} },
+    ];
+    const cfg = await plane([{ ...base, talents }]).roster();
+    const [first, second] = cfg.agents[0]!.talents!;
+    expect(first!.instance).toBe("meeting-recap");
+    expect(first!.bindings?.calendar).toEqual({ mode: "credentials", credentials: [{ id: "c1", kind: "ics", alias: "team", secret_ref: "ics.url:team", status: "connected" }] });
+    expect(second).toMatchObject({ name: "meeting-recap", instance: "team-recap", config: { output_channel: "C2" } });
+  });
+
+  it("TALENT-INSTANCE-NAMED a grant from an older registry, with no instance, is its skill's first instance", async () => {
+    await withTokens();
+    const cfg = await plane([{ ...base, talents: [{ id: "t1", name: "receipts", version: 1, config: {} }] }]).roster();
+    expect(cfg.agents[0]!.talents![0]!.instance).toBe("receipts");
+  });
 });
 
 describe("RegistryControlPlane — a connection flattens to its shared account, and carries every account", () => {

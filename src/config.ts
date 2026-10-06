@@ -221,6 +221,12 @@ export interface AgentConfig {
     /** False when the Talent's schedule is switched off for this agent: its timer is paused, and
      *  `!talent` still runs it. Absent means on, as it was before the switch existed. */
     schedule_enabled?: boolean;
+    /** Which instance of the skill this is (TALENT-INSTANCE-NAMED in Tonoman Cloud): its name is the
+     *  word that runs it. Absent, or the skill's own name, for the first. */
+    instance?: string;
+    /** What each of its tools uses (TALENT-BINDING-PER-TOOL), resolved by the registry: the
+     *  credentials, never their values. Absent from an older registry. */
+    bindings?: Record<string, { mode: string; credentials: { id: string; kind: string; alias: string; secret_ref?: string; status?: string }[] }>;
   }[];
   /** Outside credentials this agent may use, from the registry (§8). Identified by `(kind, alias)`:
    *  the KIND is what the platform knows how to talk to, the ALIAS is which one of them this is.

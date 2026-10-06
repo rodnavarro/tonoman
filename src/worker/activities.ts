@@ -56,6 +56,7 @@ export interface TurnDeps {
   /** Read one connected Google calendar for a window, through the registry's token refresh. */
   googleCalendar?(agent: string, feed: calendar.CalendarFeed, from: number, to: number): Promise<calendar.CalEvent[]>;
   /** A granted Talent's saved config for this agent (`agent_talent.config`), or `{}`. */
+  /** The settings of one instance of a skill on an agent: by the instance's name, else the skill's. */
   talentConfig?(agent: string, talent: string): Record<string, unknown>;
   /** Say something verbatim to a person, opening a DM if needed. */
   say?(agent: string, user: string, text: string): Promise<void>;
@@ -87,7 +88,7 @@ export interface TurnDeps {
       talent: string,
       itemKey: string,
       version: number,
-      o?: { trigger?: "schedule" | "command" | "hub"; requestedBy?: string; forUser?: string },
+      o?: { trigger?: "schedule" | "command" | "hub"; requestedBy?: string; forUser?: string; instance?: string },
     ): Promise<void>;
     close(
       agent: string,
@@ -97,6 +98,7 @@ export interface TurnDeps {
       error?: string,
       /** What the run produced: the announcement text, and where the output can be read. */
       result?: { summary: string; links?: { label: string; url: string }[] },
+      instance?: string,
     ): Promise<void>;
     /** The durable status of one item, for the recording-level idempotency guard: a prior `done`
      *  lets a re-run skip the transcription + inference it would otherwise re-pay. Best-effort like
@@ -106,6 +108,7 @@ export interface TurnDeps {
       agent: string,
       talent: string,
       itemKey: string,
+      instance?: string,
     ): Promise<{ status: "running" | "done" | "failed"; attempts: number } | undefined>;
   };
   /** Run text as a turn addressed to a person. `drewOn`: brains the text draws on (a Talent's filing). */
@@ -808,6 +811,7 @@ export function makeActivities(deps: TurnDeps) {
       notify?: string;
       user?: string;
       talent?: string;
+      instance?: string;
       channel?: string;
     }): Promise<{ status: string; summary?: string; links?: { label: string; url: string }[] }> {
       const plane = deps.talentPlane;
@@ -821,7 +825,7 @@ export function makeActivities(deps: TurnDeps) {
       const beat = setInterval(() => ctx.heartbeat(lastNote), 20_000);
       try {
         const outcome = await plane.spawn(
-          { agent: input.agent, item: input.item, user: input.user, talent: input.talent },
+          { agent: input.agent, item: input.item, user: input.user, talent: input.talent, instance: input.instance },
           {
             signal: ctx.cancellationSignal,
             onProgress: (note) => {
@@ -898,6 +902,7 @@ export function makeActivities(deps: TurnDeps) {
     async openTalentRun(input: {
       agent: string;
       talent: string;
+      instance?: string;
       itemKey: string;
       version: number;
       trigger?: "schedule" | "command" | "hub";
@@ -908,6 +913,7 @@ export function makeActivities(deps: TurnDeps) {
         trigger: input.trigger,
         requestedBy: input.requestedBy,
         forUser: input.forUser,
+        instance: input.instance,
       });
     },
 
@@ -916,6 +922,7 @@ export function makeActivities(deps: TurnDeps) {
     async closeTalentRun(input: {
       agent: string;
       talent: string;
+      instance?: string;
       itemKey: string;
       status: "done" | "failed";
       error?: string;
@@ -928,6 +935,7 @@ export function makeActivities(deps: TurnDeps) {
         input.status,
         input.error,
         input.result,
+        input.instance,
       );
     },
 
@@ -938,9 +946,10 @@ export function makeActivities(deps: TurnDeps) {
     async talentRunStatus(input: {
       agent: string;
       talent: string;
+      instance?: string;
       itemKey: string;
     }): Promise<{ status: "running" | "done" | "failed"; attempts: number } | undefined> {
-      return (await deps.talentRun?.status?.(input.agent, input.talent, input.itemKey)) ?? undefined;
+      return (await deps.talentRun?.status?.(input.agent, input.talent, input.itemKey, input.instance)) ?? undefined;
     },
 
     /** One look at LOREALISTAR for everyone who has connected a login for this agent

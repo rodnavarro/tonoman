@@ -367,6 +367,8 @@ export interface RunTalentInput {
   agent: string;
   /** Which Talent, by name — the installed voice Talent (the Plaud Talent, `meeting-recap`). */
   talent: string;
+  /** Which instance of it (TALENT-SEVERAL-INSTANCES): its settings and its run record. Absent = the first. */
+  instance?: string;
   /** The one item this run is for — a recording's KEY (`recordingKey`). Every run is exactly ONE
    *  item; the fan-out lives in the poll, not in the Talent. */
   itemKey: string;
@@ -416,7 +418,7 @@ export async function runTalentWorkflow(input: RunTalentInput): Promise<void> {
   // run still IN FLIGHT; this catches one that already FINISHED (a re-tick after retention, or an
   // on-demand re-ask). `force` is the deliberate "recap it again". The read fails OPEN (returns
   // undefined on any error), so this can only skip a genuinely-done item, never block a new one.
-  const prior = await talentRunStatus({ agent: input.agent, talent: input.talent, itemKey: input.itemKey });
+  const prior = await talentRunStatus({ agent: input.agent, talent: input.talent, instance: input.instance, itemKey: input.itemKey });
   const gate = talentGate(prior, input.force);
   if (gate === "skip-done") {
     console.log(`recap: ${input.agent} — “${input.itemKey}” already filed (talent_run done); skipping re-run`);
@@ -433,6 +435,7 @@ export async function runTalentWorkflow(input: RunTalentInput): Promise<void> {
   await openTalentRun({
     agent: input.agent,
     talent: input.talent,
+    instance: input.instance,
     itemKey: input.itemKey,
     version: input.version,
     trigger: input.trigger ?? "schedule",
@@ -466,6 +469,7 @@ export async function runTalentWorkflow(input: RunTalentInput): Promise<void> {
       item: input.recordingId ?? input.itemKey,
       user: input.user,
       talent: input.talent,
+      instance: input.instance,
       channel: input.channel,
     });
     void processRecording; // kept importable for the revert; see above
@@ -475,6 +479,7 @@ export async function runTalentWorkflow(input: RunTalentInput): Promise<void> {
     await closeTalentRun({
       agent: input.agent,
       talent: input.talent,
+      instance: input.instance,
       itemKey: input.itemKey,
       status: "done",
       result: outcome?.summary ? { summary: outcome.summary, links: outcome.links } : undefined,
@@ -485,6 +490,7 @@ export async function runTalentWorkflow(input: RunTalentInput): Promise<void> {
     await closeTalentRun({
       agent: input.agent,
       talent: input.talent,
+      instance: input.instance,
       itemKey: input.itemKey,
       status: "failed",
       error: failureReason(e).slice(0, 500),

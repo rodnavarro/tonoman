@@ -1344,7 +1344,11 @@ export async function run(
     // unreadable must not silently become "no calendar": it is logged by alias, never by URL,
     // because a published feed's link IS its credential.
     const calendars: calendar.CalendarFeed[] = [];
-    for (const c of a.cfg.credentials ?? []) {
+    // What the recap's own calendar tool is bound to (TALENT-BINDING-PER-TOOL); an older registry
+    // sends no bindings, and then every calendar the agent was granted, as before.
+    const recapGrant = (a.cfg.talents ?? []).find((t) => t.name === meetingRecap.name);
+    const boundCalendars = recapGrant?.bindings?.calendar?.credentials;
+    for (const c of boundCalendars ?? a.cfg.credentials ?? []) {
       if (c.kind !== "ics" && c.kind !== "google") continue; // outlook: connect-only for now
       if (c.status && c.status !== "connected") {
         console.log(`worker: ${name} calendar ${c.kind}/${c.alias} is ${c.status}, skipping`);
@@ -1745,8 +1749,11 @@ export async function run(
         console.error(`worker: ${name} auth-state report failed — ${(e as Error).message}`),
       ),
     providerLabel: (name: string): string => providerLabel(providerOf(wired.get(name)?.cfg)),
-    talentConfig: (name: string, talent: string): Record<string, unknown> =>
-      wired.get(name)?.cfg.talents?.find((t) => t.name === talent)?.config ?? {},
+    talentConfig: (name: string, talent: string): Record<string, unknown> => {
+      // By the instance's name first (TALENT-INSTANCE-NAMED), else the skill's first instance.
+      const all = wired.get(name)?.cfg.talents ?? [];
+      return (all.find((t) => (t.instance ?? t.name) === talent) ?? all.find((t) => t.name === talent))?.config ?? {};
+    },
     infer: async (name: string, p: { system: string; user: string }, owner?: string): Promise<string> => {
       const a = wired.get(name);
       if (!a) throw new Error(`infer: ${name} is not a wired agent`);
@@ -1778,7 +1785,7 @@ export async function run(
         talentName: string,
         itemKey: string,
         version: number,
-        o?: { trigger?: "schedule" | "command" | "hub"; requestedBy?: string; forUser?: string },
+        o?: { trigger?: "schedule" | "command" | "hub"; requestedBy?: string; forUser?: string; instance?: string },
       ) => {
         const baseUrl = process.env.TONOMANCLOUD_API_URL;
         const guid = wired.get(name)?.cfg.guid;
@@ -1795,6 +1802,7 @@ export async function run(
             // hand are very different situations that used to leave identical rows.
             body: JSON.stringify({
               talent: talentName,
+              ...(o?.instance && o.instance !== talentName ? { instance: o.instance } : {}),
               itemKey,
               version,
               trigger: o?.trigger ?? "schedule",
@@ -1816,6 +1824,7 @@ export async function run(
         status: "done" | "failed",
         error?: string,
         result?: { summary: string; links?: { label: string; url: string }[] },
+        instance?: string,
       ) => {
         const baseUrl = process.env.TONOMANCLOUD_API_URL;
         const guid = wired.get(name)?.cfg.guid;
@@ -1832,6 +1841,7 @@ export async function run(
             // the wire and a field length is a contract, not a hope.
             body: JSON.stringify({
               talent: talentName,
+              ...(instance && instance !== talentName ? { instance } : {}),
               itemKey,
               status,
               error,
@@ -1845,12 +1855,12 @@ export async function run(
           console.error(`worker: ${name} talent_run close ${talentName}/${itemKey} failed: ${String(e)}`);
         }
       },
-      status: async (name: string, talentName: string, itemKey: string) => {
+      status: async (name: string, talentName: string, itemKey: string, instance?: string) => {
         const baseUrl = process.env.TONOMANCLOUD_API_URL;
         const guid = wired.get(name)?.cfg.guid;
         if (!baseUrl || !guid) return undefined; // a file roster has no registry to ask
         try {
-          const qs = `talent=${encodeURIComponent(talentName)}&itemKey=${encodeURIComponent(itemKey)}`;
+          const qs = `talent=${encodeURIComponent(talentName)}&itemKey=${encodeURIComponent(itemKey)}${instance && instance !== talentName ? `&instance=${encodeURIComponent(instance)}` : ""}`;
           const r = await fetch(`${baseUrl}/v1/system/agents/${guid}/talent-runs?${qs}`, {
             headers: { authorization: `Bearer ${process.env.TONOMANCLOUD_API_TOKEN ?? ""}` },
           });
@@ -2029,15 +2039,22 @@ export async function run(
     // On-demand: start the SAME per-item workflow the poll starts, so an on-demand run and a
     // scheduled one dedup against each other (the deterministic id). AlreadyStarted is the normal
     // answer for an item in flight or already done — reported, not an error.
-    runTalent: async (name, talent, item, user, force, how) => {
+    runTalent: async (name, word, item, user, force, how) => {
+      // The word is an instance's name (TALENT-INSTANCE-NAMED) or a skill's, which is its first
+      // instance: `!skill acme-recap <id>` runs meeting-recap with acme-recap's settings and record.
+      const grants = wired.get(name)?.cfg.talents ?? [];
+      const g = grants.find((t) => (t.instance ?? t.name) === word) ?? grants.find((t) => t.name === word);
+      const talent = g?.name ?? word;
+      const instance = g?.instance && g.instance !== talent ? g.instance : undefined;
       const tdef = getTalent(talent);
-      if (!tdef) return { started: false, message: `I don't run a skill called "${talent}".` };
+      if (!tdef) return { started: false, message: `I don't run a skill called "${word}".` };
       // Keyed on the recording's KEY, exactly as the poll keys it, so an on-demand run of an item
       // the poll knows under a renamed id is the same item — same workflow id, same run record.
       // A brief is about NOW, not an item: every ask is its own run, never deduped against the last.
       if (talent === agendaBrief.name) item = `now-${Date.now()}`;
       const key = recordingKey(item);
-      const wfId = user ? `talent:${name}:${user}:${key}` : `talent:${name}:${key}`;
+      const who = instance ? `${name}~${instance}` : name;
+      const wfId = user ? `talent:${who}:${user}:${key}` : `talent:${who}:${key}`;
       try {
         await client.workflow.start(runTalentWorkflow, {
           workflowId: wfId,
@@ -2046,6 +2063,7 @@ export async function run(
             {
               agent: name,
               talent,
+              ...(instance ? { instance } : {}),
               itemKey: key,
               recordingId: item,
               version: tdef.version,
@@ -2068,8 +2086,8 @@ export async function run(
           started: true,
           workflowId: wfId,
           message: force
-            ? `Re-running *${talent}* on \`${item}\` now — a fresh recap, even though it was already filed.`
-            : `Running *${talent}* on \`${item}\` now — I'll post the recap when it's done.`,
+            ? `Re-running *${word}* on \`${item}\` now — a fresh recap, even though it was already filed.`
+            : `Running *${word}* on \`${item}\` now — I'll post the recap when it's done.`,
         };
       } catch (e) {
         if (e instanceof WorkflowExecutionAlreadyStartedError) {

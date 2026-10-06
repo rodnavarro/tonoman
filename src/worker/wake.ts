@@ -130,7 +130,9 @@ export function parseTalentRun(body: unknown): { ok: true; req: TalentRunRequest
     ok: true,
     req: {
       agent: str("agent"),
-      talent: str("talent"),
+      // The instance's name when the Hub names one (TALENT-SEVERAL-INSTANCES): it is the word runTalent
+      // resolves, so a second recap runs as itself and not as the first.
+      talent: str("instance") || str("talent"),
       item: str("item"),
       user: str("user"),
       force: b.force === true,
