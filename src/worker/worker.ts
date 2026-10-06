@@ -1923,6 +1923,45 @@ export async function run(
     }
   };
 
+  // Someone the roster does not list wrote to an agent. They may still be known: a member of the
+  // tenant whose Slack id the registry has not seen yet, or one it learned since the last roster
+  // read. So before the platform's notice, ask the registry once with what Slack says of them —
+  // it attaches the Slack id to the account with that email and answers whether this agent knows
+  // that account (AGENTACCOUNT-MEMBERS-ARE-KNOWN in Tonoman Cloud). Known: added to the agent's
+  // people in memory, so the next message needs no call. Not known, or no registry: false.
+  const knowSpeaker = async (name: string, user: string): Promise<boolean> => {
+    const a = wired.get(name);
+    const guid = a?.cfg.guid;
+    const baseUrl = process.env.TONOMANCLOUD_API_URL;
+    if (!a || !guid || !baseUrl) return false;
+    let profileName: string | undefined;
+    let email: string | undefined;
+    try {
+      const info = await (a.conn as SlackConnector).call<{
+        user?: { real_name?: string; is_bot?: boolean; profile?: { real_name?: string; display_name?: string; email?: string } };
+      }>(`users.info?user=${encodeURIComponent(user)}`);
+      if (info?.user?.is_bot) return false;
+      profileName = info?.user?.profile?.real_name || info?.user?.real_name || info?.user?.profile?.display_name || undefined;
+      email = info?.user?.profile?.email || undefined;
+    } catch (e) {
+      console.error(`worker: ${name} users.info failed for ${user}: ${(e as Error).message}`);
+    }
+    try {
+      const r = await fetch(`${baseUrl}/v1/system/agents/${guid}/know-speaker`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${process.env.TONOMANCLOUD_API_TOKEN ?? ""}`, "content-type": "application/json" },
+        body: JSON.stringify({ slackUserId: user, name: profileName, email }),
+      });
+      const j = (await r.json()) as { known?: boolean; label?: string; accountId?: string };
+      if (!r.ok || !j.known || !j.label) return false;
+      a.cfg.principals = [...(a.cfg.principals ?? []), { kind: "slack_user_id", value: user, label: j.label }];
+      return true;
+    } catch (e) {
+      console.error(`worker: ${name} know-speaker failed for ${user}: ${(e as Error).message}`);
+      return false;
+    }
+  };
+
   // In-channel commands. They read and write the same maps the status footer uses, so what
   // `!status` reports is exactly what the footer would have shown.
   const commandDeps: cmds.CommandDeps = {
@@ -2504,6 +2543,8 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
   // logic must be identical whether it is boot or reload that starts it.
   const pumps: Promise<void>[] = [];
   const unknownNotice = noticeLimiter();
+  // Asking the registry about a stranger is once per person and agent in ten minutes, like the notice.
+  const strangerLookup = noticeLimiter();
   const startPump = (name: string, a: Wired): Promise<void> => {
     const ac = new AbortController();
     signal.addEventListener("abort", () => ac.abort(), { once: true });
@@ -2533,9 +2574,12 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
         // Someone the agent does not know starts no turn (AGENTACCOUNT-UNKNOWN-NO-TURN): whether
         // they are known is a registry fact, so it is checked here and costs nothing. Commands above
         // still answer — connecting an account is how a person becomes known.
-        if (!knowsSpeaker(a.cfg.principals, env.user)) {
+        if (
+          !knowsSpeaker(a.cfg.principals, env.user) &&
+          !(strangerLookup.shouldSay(name, "", env.user) && (await knowSpeaker(name, env.user)))
+        ) {
           if (unknownNotice.shouldSay(name, env.conversation, env.user)) {
-            const text = unknownSpeakerNotice(a.cfg.displayName ?? a.cfg.name ?? name);
+            const text = unknownSpeakerNotice(a.cfg.displayName ?? a.cfg.name ?? name, env.user);
             const conn = a.conn as SlackConnector;
             const privately = await conn.postEphemeral(env.conversation, env.user, text).catch(() => false);
             if (!privately) await a.conn.reply(env.conversation).send(text).catch(() => {});

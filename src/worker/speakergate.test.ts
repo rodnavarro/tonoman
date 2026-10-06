@@ -23,7 +23,9 @@ describe("who the agent answers", () => {
   });
 
   it("AGENTACCOUNT-UNKNOWN-NO-TURN the notice is fixed words that say who can add them", () => {
-    expect(unknownSpeakerNotice("Atlas")).toBe("I don't know who you are yet, so I can't help here. Ask an owner or admin of your team to add you to Atlas in Tonoman Cloud.");
+    expect(unknownSpeakerNotice("Atlas")).toBe("I don't know who you are yet, so I can't help here. Ask an owner or admin of your team to allow you on Atlas in Tonoman Cloud.");
+    // ACCOUNT-NO-EMAIL-NO-GUESS: the person is shown their own Slack id, which is what an admin allows.
+    expect(unknownSpeakerNotice("Atlas", "U0AAAAAAA9")).toBe("I don't know who you are yet, so I can't help here. Ask an owner or admin of your team to allow you on Atlas in Tonoman Cloud — your Slack id is U0AAAAAAA9.");
   });
 
   it("AGENTACCOUNT-UNKNOWN-NO-TURN three messages in a row get one notice; it is said again after ten minutes", () => {
