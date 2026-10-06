@@ -80,7 +80,7 @@ import { parseMountRef, parseRef, registrySecretPath } from "../core/secretref";
 import { harnessForProvider, providerAccountLabel, providerLabel, type HarnessKind, type InferenceProvider } from "../harness";
 import { accountsFromUsers, accountsOf, makeActivities, type TurnRunReq, type VoiceAccount, type VoiceConfig, type TurnBrains } from "./activities";
 import { publishRecap, startCapabilityPlane, type CapabilityPlane } from "./capability-plane";
-import { calendarChoices, localTools, localToolsOf, skillsNote } from "./localtools";
+import { calendarChoices, copyFloor, dueCopies, localTools, localToolsOf, skillsNote } from "./localtools";
 import { recapJobPrompt, recapNudge } from "../talents/voice/plaud-and-calendar-meetings/prompt";
 import { agendaFacts, describeFacts, localParts, localTimeOn } from "../talents/calendar/agenda-brief/facts";
 import { checkPhase } from "../talents/calendar/agenda-brief/run";
@@ -953,6 +953,16 @@ function wireOne(a: AgentConfig, harnesses: ReturnType<typeof defaultHarnesses>)
   return { cfg: a, conn, runner, run: runClosure(runner, a, usersOfThisWorker()) };
 }
 
+/** PURE: does TONOMAN_AGENTS name this agent — by guid, label or display name, or by a prefix ending in
+ *  `*` (`northwind-*`: every agent of that tenant, including one made after the worker started). */
+export function servesAgent(only: Set<string>, names: string[]): boolean {
+  const mine = names.filter(Boolean).map((n) => n.toLowerCase());
+  for (const want of only) {
+    if (want.endsWith("*") ? mine.some((n) => n.startsWith(want.slice(0, -1))) : mine.includes(want)) return true;
+  }
+  return false;
+}
+
 function wire(cfg: Config, only: Set<string> = new Set()): Map<string, Wired> {
   const harnesses = defaultHarnesses();
   const out = new Map<string, Wired>();
@@ -960,12 +970,7 @@ function wire(cfg: Config, only: Set<string> = new Set()): Map<string, Wired> {
     // `a.name` is now the stable guid (registry roster). What a person reads in a log or types into
     // TONOMAN_AGENTS is the tenant-prefixed display name (`label`) while the machine keys off `a.name`.
     const label = agentLabel(a);
-    if (
-      only.size > 0 &&
-      !only.has(a.name.toLowerCase()) &&
-      !only.has(label.toLowerCase()) &&
-      !only.has((a.displayName ?? "").toLowerCase())
-    ) {
+    if (only.size > 0 && !servesAgent(only, [a.name, label, a.displayName ?? ""])) {
       // Said out loud rather than skipped quietly: "why is my agent not answering" is otherwise
       // answered only by remembering an environment variable somebody set days ago.
       console.log(`worker: not serving ${label} — TONOMAN_AGENTS does not list it`);
@@ -1726,8 +1731,7 @@ export async function run(
       if (!a || !v) return undefined;
       const g = (a.cfg.talents ?? []).find((t) => (t.instance ?? t.name) === copy);
       if (!g) return [];
-      const since = g.since ? Date.parse(g.since) : NaN;
-      const floor = Math.max(v.floorMs, Number.isFinite(since) ? since : Date.now());
+      const floor = copyFloor(v.floorMs, g.since, Date.now());
       const out: VoiceAccount[] = [];
       for (const c of g.bindings?.plaud?.credentials ?? []) {
         if (c.scope === "per_person" || !c.secret_ref) continue;
@@ -1744,19 +1748,7 @@ export async function run(
       const v = voiceCreds.get(name);
       const notify = v?.notifyUser ?? "";
       const reach = !!v && (!!notify || !!v.notifyChannel);
-      const grants = (a?.cfg.talents ?? []).filter((t) => t.schedule_enabled !== false);
-      const tz = a?.cfg.timezone || "UTC";
-      return {
-        notify,
-        recaps: reach ? grants.filter((t) => t.name === meetingRecap.name).map((t) => t.instance ?? t.name) : [],
-        agendas: reach
-          ? grants
-              .filter((t) => t.name === agendaBrief.name)
-              .filter((t) => parseAgendaTimes(t.config?.times).some((x) => Math.abs(at - localTimeOn(at, tz, x.hour, x.minute)) < 90_000))
-              .map((t) => t.instance ?? t.name)
-          : [],
-        agendaVersion: agendaBrief.version,
-      };
+      return { notify, ...dueCopies(a?.cfg ?? {}, reach, at, parseAgendaTimes, localTimeOn), agendaVersion: agendaBrief.version };
     },
     // The prompt a recording's run sends the agent (D-JOBS-ARE-PROMPTS): this copy's Plaud login and
     // calendars by label, the journal, mission and vocabulary the recap rules use.
@@ -2022,12 +2014,19 @@ export async function run(
       }
       return out;
     },
-    gather: (name, feeds, from, to) =>
-      calendar.gather(feeds, from, to, {
+    gather: async (name, feeds, from, to) => {
+      const unreadable: string[] = [];
+      const events = await calendar.gather(feeds, from, to, {
         exclude: voiceCreds.get(name)?.calendarExclude,
         google: (f, a, b) => deps.googleCalendar(name, f, a, b),
-        log: (m: string) => console.log(m),
-      }),
+        log: (m: string) => {
+          console.log(m);
+          const bad = /^calendar: (\S+?) could not be read/.exec(m);
+          if (bad) unreadable.push(bad[1]!);
+        },
+      });
+      return { events, unreadable };
+    },
     describeDay: (events, now, tz) => {
       const facts = agendaFacts(
         events.map((e) => ({ summary: e.summary, start: e.start, end: e.end, attendees: e.attendees, source: e.source ?? { kind: "", alias: "" } })),
@@ -2892,12 +2891,7 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
       // the same TONOMAN_AGENTS allowlist wire() applies at boot before diffing.
       const servable = nextAgents.filter((a) => {
         if (only.size === 0) return true;
-        const label = agentLabel(a);
-        return (
-          only.has(a.name.toLowerCase()) ||
-          only.has(label.toLowerCase()) ||
-          only.has((a.displayName ?? "").toLowerCase())
-        );
+        return servesAgent(only, [a.name, agentLabel(a), a.displayName ?? ""]);
       });
       const current = [...wired.values()].map((w) => w.cfg);
       const plan = planReload(current, servable);

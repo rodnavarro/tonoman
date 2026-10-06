@@ -46,6 +46,35 @@ export function skillsNote(cfg: Pick<AgentConfig, "talents">, describe: (skill: 
   return ["## Your skills", "Each runs with `!skill <keyword>`. Its tools name a login or calendar by label; \"mine\" is the person's own.", ...lines].join("\n");
 }
 
+/** PURE: which skill copies the agent's one schedule runs at `at` (D-ONE-CLOCK-PER-AGENT): every
+ *  meeting-recap copy with its schedule on, and each agenda-brief copy one of whose times this is
+ *  (within a minute and a half). Nothing runs where nobody can be told. */
+export function dueCopies(
+  cfg: Pick<AgentConfig, "talents" | "timezone">,
+  reach: boolean,
+  at: number,
+  times: (raw: unknown) => { hour: number; minute: number }[],
+  localTimeOn: (ms: number, tz: string, hour: number, minute: number) => number,
+): { recaps: string[]; agendas: string[] } {
+  if (!reach) return { recaps: [], agendas: [] };
+  const on = (cfg.talents ?? []).filter((t) => t.schedule_enabled !== false);
+  const tz = cfg.timezone || "UTC";
+  return {
+    recaps: on.filter((t) => t.name === "meeting-recap").map((t) => t.instance ?? t.name),
+    agendas: on
+      .filter((t) => t.name === "agenda-brief")
+      .filter((t) => times(t.config?.times).some((x) => Math.abs(at - localTimeOn(at, tz, x.hour, x.minute)) < 90_000))
+      .map((t) => t.instance ?? t.name),
+  };
+}
+
+/** PURE: where a copy's scheduled work starts — the later of the flow's floor and when it was added
+ *  (TALENT-COPY-STARTS-NOW); a copy with no readable start starts now. */
+export function copyFloor(flowFloorMs: number, since: string | undefined, now: number): number {
+  const t = since ? Date.parse(since) : NaN;
+  return Math.max(flowFloorMs, Number.isFinite(t) ? t : now);
+}
+
 /** One Plaud login a person may read here. */
 export interface PlaudLogin {
   label: string;
@@ -219,7 +248,9 @@ export interface LocalToolDeps {
   transcribe(name: string, creds: recap.PlaudCreds, rec: recap.Recording, user: string | undefined): Promise<recap.TranscribeResult>;
   /** Calendar feeds for these choices, URLs resolved. */
   feeds(name: string, cfg: AgentConfig, choices: CalendarChoice[]): Promise<calendar.CalendarFeed[]>;
-  gather(name: string, feeds: calendar.CalendarFeed[], from: number, to: number): Promise<CalEvent[]>;
+  /** Every entry in the window, and the calendars that could not be read: said, never taken for an
+   *  empty day (CONN-READ-FAILURE-NOT-ABSENCE). */
+  gather(name: string, feeds: calendar.CalendarFeed[], from: number, to: number): Promise<{ events: CalEvent[]; unreadable: string[] }>;
   /** The day's facts, worded (the agenda brief's own arithmetic). */
   describeDay(events: CalEvent[], now: number, timeZone: string): string;
   /** File a recap; where it landed. */
@@ -295,7 +326,7 @@ export function localTools(deps: LocalToolDeps) {
       const choices = calendarChoices(cfg, (cfg.talents ?? []).some((t) => (t.instance ?? t.name) === copy) ? copy : undefined);
       const feeds = await deps.feeds(name, cfg, choices);
       const pad = (v?.calendarPadMinutes ?? 30) * 60000;
-      const candidates = feeds.length ? await deps.gather(name, feeds, got.rec.startTime - pad, got.rec.startTime + got.rec.duration + pad) : [];
+      const candidates = feeds.length ? (await deps.gather(name, feeds, got.rec.startTime - pad, got.rec.startTime + got.rec.duration + pad)).events : [];
       const checked = checkRecap(body.recap, {
         candidates,
         routes: v?.journal?.routes.map((r) => r.id),
@@ -319,25 +350,30 @@ export function localTools(deps: LocalToolDeps) {
       if (!picked.length) return { status: 200, text: "No calendar is connected here, so there is nothing to read." };
       const feeds = await deps.feeds(name, cfg, picked);
       const labelOf = (s?: { kind: string; alias: string }) => picked.find((c) => c.kind === s?.kind && c.alias === s?.alias)?.label ?? s?.alias ?? "";
+      // A calendar that could not be read is not an empty one: the answer says so, by label.
+      const unread = (u: string[]) =>
+        u.length
+          ? `\n\nCould not read: ${u.map((x) => picked.find((c) => `${c.kind}/${c.alias}` === x)?.label ?? x).join(", ")}, so this may be missing entries. Say so; do not call the day clear.`
+          : "";
       if (command === "day") {
         const tz = cfg.timezone || "UTC";
         const t = now();
         const day = 24 * 60 * 60 * 1000;
-        const events = await deps.gather(name, feeds, t - day, t + day);
-        return { status: 200, text: deps.describeDay(events, t, tz) };
+        const { events, unreadable } = await deps.gather(name, feeds, t - day, t + day);
+        return { status: 200, text: deps.describeDay(events, t, tz) + unread(unreadable) };
       }
       if (command === "find") {
         const from = Date.parse(String(body.from ?? ""));
         const to = Date.parse(String(body.to ?? ""));
         if (!Number.isFinite(from) || !Number.isFinite(to) || to < from) return { status: 400, text: "--from and --to are ISO times, the first before the second." };
         const pad = (v?.calendarPadMinutes ?? 30) * 60000;
-        const events = await deps.gather(name, feeds, from - pad, to + pad);
-        if (!events.length) return { status: 200, text: "Nothing on those calendars then." };
+        const { events, unreadable } = await deps.gather(name, feeds, from - pad, to + pad);
+        if (!events.length) return { status: 200, text: `Nothing on those calendars then.${unread(unreadable)}` };
         return {
           status: 200,
           text: events
             .map((e) => `"${e.summary}"  ${iso(e.start)} → ${iso(e.end)}  ${labelOf(e.source)}${e.attendees.length ? `  with ${e.attendees.slice(0, 8).join(", ")}` : ""}`)
-            .join("\n"),
+            .join("\n") + unread(unreadable),
         };
       }
     }

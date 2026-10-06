@@ -98,7 +98,7 @@ describe("the tools, answered", () => {
         return { text: "Ana: let's launch on May 4.", seconds: 1800, by: ["groq"] };
       },
       feeds: async () => [{ kind: "ics", alias: "work", url: "https://example.test/work.ics" }],
-      gather: async () => [{ summary: "Launch sync", start: rec.startTime, end: rec.startTime + rec.duration, attendees: ["Ana", "Ben"], source: { kind: "ics", alias: "work" } }],
+      gather: async () => ({ events: [{ summary: "Launch sync", start: rec.startTime, end: rec.startTime + rec.duration, attendees: ["Ana", "Ben"], source: { kind: "ics", alias: "work" } }], unreadable: [] }),
       describeDay: () => "a clear day",
       publish: async (_n: string, _u: string | undefined, p: unknown) => {
         calls.published.push(p);
@@ -141,6 +141,20 @@ describe("the tools, answered", () => {
   });
 });
 
+describe("a calendar that cannot be read", () => {
+  it("CONN-READ-FAILURE-NOT-ABSENCE the tool says which calendar it could not read, so a day is never called clear on a failure", async () => {
+    const deps = {
+      agentByGuid: () => ({ name: "Rex", cfg: cfg([recap("meeting-recap", undefined, { mode: "credentials", credentials: [WORK] })]) }),
+      voice: () => undefined,
+      feeds: async () => [{ kind: "ics", alias: "work", url: "x" }],
+      gather: async () => ({ events: [], unreadable: ["ics/work"] }),
+      describeDay: () => "The calendar is clear.",
+    };
+    const r = await localTools(deps as never)("g-1", "UANA", "calendar", "day", {});
+    expect(r.text).toContain("Could not read: Work calendar");
+  });
+});
+
 describe("the recap job is a prompt", () => {
   it("D-JOBS-ARE-PROMPTS the prompt names the copy, the recording, and its login and calendars by label", () => {
     const p = recapJobPrompt({ copy: "team-recap", id: "R-1", title: "Launch sync", startedAt: Date.parse("2026-10-06T10:00:00Z"), minutes: 30, login: "Team Plaud", calendars: ["Home calendar"], journal: { routes: [{ id: "clients", when: "a client meeting" }], fallback: "unclassified" } });
@@ -155,5 +169,41 @@ describe("the recap job is a prompt", () => {
     expect(p).toContain("`tonoman plaud transcript --id R-1`");
     expect(p).not.toContain("--copy");
     expect(recapNudge({ copy: "meeting-recap", id: "R-1", title: "x", login: "mine" })).toContain("tonoman meeting-recap file --id R-1`");
+  });
+});
+
+describe("which agents a worker serves", () => {
+  it("AGENT-WORKER-SERVES-WHICH a name, a label, or a prefix ending in * — so an agent made later is served too", async () => {
+    const { servesAgent } = await import("./worker");
+    const only = new Set(["globex-sapien", "northwind-*"]);
+    expect(servesAgent(only, ["g-1", "northwind-nova", "Nova"])).toBe(true);
+    expect(servesAgent(only, ["g-2", "globex-sapien", "Sapien"])).toBe(true);
+    expect(servesAgent(only, ["g-3", "initech-nelly", "Nelly"])).toBe(false);
+  });
+});
+
+describe("the agent's one schedule", () => {
+  it("TALENT-SEVERAL-INSTANCES-SCHEDULED every meeting-recap copy with its schedule on is run at each firing; one switched off is not", async () => {
+    const { dueCopies } = await import("./localtools");
+    const { parseAgendaTimes } = await import("./talents/agenda-brief");
+    const { localTimeOn } = await import("../talents/calendar/agenda-brief/facts");
+    const c = { timezone: "UTC", talents: [
+      { name: "meeting-recap", version: 3, instance: "meeting-recap" },
+      { name: "meeting-recap", version: 3, instance: "team-recap" },
+      { name: "meeting-recap", version: 3, instance: "paused-recap", schedule_enabled: false },
+      { name: "agenda-brief", version: 1, instance: "agenda-brief", config: { times: "07:00" } },
+      { name: "agenda-brief", version: 1, instance: "evening-brief", config: { times: "18:30" } },
+    ] } as never;
+    const at = Date.parse("2026-10-06T07:00:20Z");
+    expect(dueCopies(c, true, at, parseAgendaTimes, localTimeOn)).toEqual({ recaps: ["meeting-recap", "team-recap"], agendas: ["agenda-brief"] });
+    expect(dueCopies(c, true, Date.parse("2026-10-06T18:30:00Z"), parseAgendaTimes, localTimeOn).agendas).toEqual(["evening-brief"]);
+    expect(dueCopies(c, false, at, parseAgendaTimes, localTimeOn)).toEqual({ recaps: [], agendas: [] });
+  });
+
+  it("TALENT-COPY-STARTS-NOW a copy looks only at what was recorded after it was added", async () => {
+    const { copyFloor } = await import("./localtools");
+    expect(copyFloor(Date.parse("2026-09-01T00:00:00Z"), "2026-10-06T07:00:00Z", 0)).toBe(Date.parse("2026-10-06T07:00:00Z"));
+    expect(copyFloor(Date.parse("2026-10-07T00:00:00Z"), "2026-10-06T07:00:00Z", 0)).toBe(Date.parse("2026-10-07T00:00:00Z"));
+    expect(copyFloor(0, undefined, 1234)).toBe(1234);
   });
 });
