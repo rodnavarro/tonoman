@@ -43,7 +43,7 @@ describe("capability plane /cap/infer — whose subscription pays", () => {
   });
 });
 
-describe("capability plane /cap/publish — where a Talent files", () => {
+describe("capability plane /cap/publish — where a Skill files", () => {
   let plane: CapabilityPlane | undefined;
   afterEach(async () => {
     await plane?.close();
@@ -56,7 +56,7 @@ describe("capability plane /cap/publish — where a Talent files", () => {
     const deps = {
       agent: () => undefined,
       voice: () => ({ timezone: "UTC" }) as VoiceConfig,
-      talentBrain: {
+      skillBrain: {
         target: async () => target,
         store: {
           read: async () => null,
@@ -77,25 +77,25 @@ describe("capability plane /cap/publish — where a Talent files", () => {
     return { written, publish };
   };
 
-  it("BRAIN-TALENT-TARGET a run that cannot file says which brain and why, and nothing is written", async () => {
+  it("BRAIN-SKILL-TARGET a run that cannot file says which brain and why, and nothing is written", async () => {
     const { written, publish } = await start({ error: "this run cannot write to Engineering" });
-    const r = await publish(plane!.mint({ agent: "sapien", item: "rec-1", user: "UANA", talent: "meeting-recap" }));
+    const r = await publish(plane!.mint({ agent: "sapien", item: "rec-1", user: "UANA", skill: "meeting-recap" }));
     expect(r.status).toBe(403);
     expect((await r.json()).error).toBe("Nothing was filed: this run cannot write to Engineering.");
     expect(written).toEqual([]);
   });
 
-  it("BRAIN-TALENT-TARGET a run that can files the page and its transcript into that brain, and says which", async () => {
+  it("BRAIN-SKILL-TARGET a run that can files the page and its transcript into that brain, and says which", async () => {
     const target = { id: "b-ana", name: "Ana's brain", who: "UANA", brain: { id: "b-ana", tenant: "t", repoUrl: "/r" }, authorize: async () => true };
     const { written, publish } = await start(target);
-    const r = await publish(plane!.mint({ agent: "sapien", item: "rec-1", user: "UANA", talent: "meeting-recap" }));
+    const r = await publish(plane!.mint({ agent: "sapien", item: "rec-1", user: "UANA", skill: "meeting-recap" }));
     expect(r.status).toBe(200);
     expect(await r.json()).toMatchObject({ published: true, brain: "Ana's brain" });
     expect(written[0].files.map((f) => f.path.endsWith("Transcript.md"))).toEqual([false, true]);
   });
 });
 
-describe("capability plane — what needs no recording flow (talent.md, drop-watch.md in Tonoman Cloud)", () => {
+describe("capability plane — what needs no recording flow (skill.md, drop-watch.md in Tonoman Cloud)", () => {
   let plane: CapabilityPlane | undefined;
   afterEach(async () => {
     await plane?.close();
@@ -109,7 +109,7 @@ describe("capability plane — what needs no recording flow (talent.md, drop-wat
       agent: () => undefined,
       // An agent with no recording flow at all: Mia.
       voice: () => undefined,
-      talentBrain: {
+      skillBrain: {
         target: async () => target,
         store: {
           read: async () => null,
@@ -133,15 +133,15 @@ describe("capability plane — what needs no recording flow (talent.md, drop-wat
     return { written, asked, call };
   };
   const brain = { id: "b-stef", name: "Stef's brain", who: "USTEF", brain: { id: "b-stef", tenant: "t", repoUrl: "/r" }, authorize: async () => true };
-  const mint = (user?: string) => plane!.mint({ agent: "mia", item: "drop-abc", user, talent: "drop-watch" });
+  const mint = (user?: string) => plane!.mint({ agent: "mia", item: "drop-abc", user, skill: "drop-watch" });
 
-  it("TALENT-NEEDS-NO-RECORDINGS a Talent that has nothing to do with recordings is served on an agent with no recording flow; one that does is still refused there", async () => {
+  it("SKILL-NEEDS-NO-RECORDINGS a Skill that has nothing to do with recordings is served on an agent with no recording flow; one that does is still refused there", async () => {
     const { call } = await start(brain);
     expect((await call("/cap/page", mint("USTEF"), { path: "Drops/x.md", content: "# x" })).status).toBe(200);
     expect((await call("/cap/transcribe", mint("USTEF"), { audioUrl: "https://x" })).status).toBe(404);
   });
 
-  it("TALENT-FILES-A-PAGE the page goes where the Talent said, in the brain the run is pointed at, and the answer says which", async () => {
+  it("SKILL-FILES-A-PAGE the page goes where the Skill said, in the brain the run is pointed at, and the answer says which", async () => {
     const { written, call } = await start(brain);
     const r = await call("/cap/page", mint("USTEF"), { path: "Drops/2026-09-20-serum-abc.md", content: "# Serum\n40 of 250 left\n", note: "LOREALISTAR drop: Serum" });
     expect(r.status).toBe(200);
@@ -151,7 +151,7 @@ describe("capability plane — what needs no recording flow (talent.md, drop-wat
     expect(written[0]!.note).toBe("LOREALISTAR drop: Serum");
   });
 
-  it("TALENT-FILES-A-PAGE a path that would leave the brain, or is not a page, is refused and nothing is written", async () => {
+  it("SKILL-FILES-A-PAGE a path that would leave the brain, or is not a page, is refused and nothing is written", async () => {
     const { written, call } = await start(brain);
     for (const path of ["../outside.md", "/etc/passwd.md", "Drops/../../x.md", "C:/x.md", ".git/config.md", "Drops/x.txt", "Drops//x.md", ""]) {
       expect((await call("/cap/page", mint("USTEF"), { path, content: "x" })).status, path).toBe(400);
@@ -160,7 +160,7 @@ describe("capability plane — what needs no recording flow (talent.md, drop-wat
     expect(written).toEqual([]);
   });
 
-  it("TALENT-FILES-A-PAGE a run with no brain to file into, or one it may not write, is told so — and nothing is written", async () => {
+  it("SKILL-FILES-A-PAGE a run with no brain to file into, or one it may not write, is told so — and nothing is written", async () => {
     const none = await start(undefined);
     const r = await none.call("/cap/page", mint("USTEF"), { path: "Drops/x.md", content: "x" });
     expect(r.status).toBe(409);
@@ -172,7 +172,7 @@ describe("capability plane — what needs no recording flow (talent.md, drop-wat
     expect(refused.written).toEqual([]);
   });
 
-  it("DROPS-LOGIN-SEALED the Talent is told what the site said about a drop — for the person its run is for, whoever it names — and nothing of their login", async () => {
+  it("DROPS-LOGIN-SEALED the Skill is told what the site said about a drop — for the person its run is for, whoever it names — and nothing of their login", async () => {
     const drop = { id: "abc", type: "DROP", name: "Serum", status: "Active", initial_qty: 250, claimed_qty: 210 };
     const { asked, call } = await start(brain, { "USTEF/abc": drop });
     // It cannot ask on anyone else's behalf: the person is the run's own, not a field of the request.

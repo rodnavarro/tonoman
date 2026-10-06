@@ -1,7 +1,7 @@
 // Starting a program as a turn's own Linux user (docs/definition/objects/turn-user.md in Tonoman Cloud).
 //
 // The worker is root; nothing it starts on an agent's behalf is (TURNUSER-NOTHING-AS-ROOT). Every
-// program — a turn, a Talent, a sign-in, a status check — goes through here: the user is made if it
+// program — a turn, a Skill, a sign-in, a status check — goes through here: the user is made if it
 // is not there, the drop is proven once before anything real runs under it, and the program is
 // started with `setpriv`, which sets the user and its one group, clears every other group, and sets
 // no-new-privileges so nothing it runs can climb back (TURNUSER-ONE-LAUNCHER).
@@ -60,7 +60,7 @@ export function homeOf(uid: number, root: string = HOMES_ROOT): string {
 
 /** PURE: what a user keeps for one agent — a provider's login, its history. The agent's name arrives
  *  over the wire, so it cannot name a path. */
-export function homeIn(user: TurnUser, agent: string, what: "claude" | "codex" | "turns" | "talents"): string {
+export function homeIn(user: TurnUser, agent: string, what: "claude" | "codex" | "turns" | "skills"): string {
   const safe = (agent ?? "").split(/[\\/]/).pop()!.replace(/[^A-Za-z0-9_-]/g, "");
   return `${user.home}/agents/${safe || "_invalid"}/${what}`;
 }

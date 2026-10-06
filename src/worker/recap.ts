@@ -460,10 +460,10 @@ export async function transcribe(
 /** The provider-routing core of transcription, with NOTHING tied to a source: fetch a ready audio
  *  URL, segment it, and route each chunk through the provider chain with resume-from-cache and
  *  dead-provider skipping. `transcribe` above is the thin Plaud adapter that resolves a temp URL
- *  first; the Talent runtime's `transcribe` capability calls THIS directly with a URL the Talent
+ *  first; the Skill runtime's `transcribe` capability calls THIS directly with a URL the Skill
  *  resolved from its own credential. `cacheId` keys the chunk cache (a recording id); `label` is for
  *  logs only. These `console.log`s are fine here — this runs worker-side (the capability plane),
- *  never inside a Talent CLI whose stdout carries the outcome. */
+ *  never inside a Skill CLI whose stdout carries the outcome. */
 export async function transcribeAudio(
   audioUrl: string,
   label: string,
@@ -841,7 +841,7 @@ export function parseRecapJson(raw: string): Recap {
 /** The model-routing core of a recap inference: one JSON-mode chat completion through the provider
  *  chain, returning the raw string. This is the `infer` CAPABILITY — which model, its budget and its
  *  billing are the tenant's provider chain; the PROMPT and the parsing of the result are the caller's
- *  (the Talent's) domain. Worker-side, so `console.log` is fine. */
+ *  (the Skill's) domain. Worker-side, so `console.log` is fine. */
 export async function inferJson(providers: Provider[], system: string, user: string): Promise<string> {
   const served = await chatWith(
     providers,
@@ -949,8 +949,8 @@ export async function summarize(
   // The MODEL comes from the provider row, so which model summarises is a tenant's configuration
   // rather than this file's opinion — and pointing it at a gateway with room is what removes the
   // 413 that made a 62-minute meeting unsummarisable at any price. `inferJson` is the model-routing
-  // core — the `infer` capability the Talent runtime calls; the PROMPT above and the parse below are
-  // the recap's own, which is why they stay here (and move into the Talent with the port).
+  // core — the `infer` capability the Skill runtime calls; the PROMPT above and the parse below are
+  // the recap's own, which is why they stay here (and move into the Skill with the port).
   const raw = await inferJson(providers, system, `Meeting: ${title}\n\nTranscript:\n${budgetTranscript(transcript, budgetFor(providers))}`);
   const out = parseRecapJson(raw);
   // A verdict outside the closed set is DROPPED, not coerced. See `resolveAlignment`.

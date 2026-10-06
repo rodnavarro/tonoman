@@ -1,13 +1,13 @@
 import { describe, expect, it } from "vitest";
 import { calendarChoices, checkRecap, localTools, localToolsOf, pickCalendars, pickLogin, plaudLogins, skillsNote } from "./localtools";
-import { recapJobPrompt, recapNudge } from "../talents/voice/plaud-and-calendar-meetings/prompt";
+import { recapJobPrompt, recapNudge } from "../skills/voice/plaud-and-calendar-meetings/prompt";
 import type { AgentConfig } from "../config";
 
 // The tools a skill brings to a turn, called by label as people say them (D-JOBS-ARE-PROMPTS and
 // TOOL-CALLED-BY-LABEL in Tonoman Cloud). Neutral cast: Ana, Ben; Team Plaud; Work and Home calendars.
 
 const recap = (instance: string, plaud: unknown, calendar: unknown) => ({ name: "meeting-recap", version: 3, instance, bindings: { plaud, calendar } as never });
-const cfg = (talents: unknown[], credentials: unknown[] = []) => ({ guid: "g-1", timezone: "UTC", talents, credentials }) as unknown as AgentConfig;
+const cfg = (skills: unknown[], credentials: unknown[] = []) => ({ guid: "g-1", timezone: "UTC", skills, credentials }) as unknown as AgentConfig;
 const WORK = { id: "c1", kind: "ics", alias: "work", label: "Work calendar", scope: "shared", secret_ref: "ics.secret:work", status: "connected" };
 const HOME = { id: "c2", kind: "google", alias: "home", label: "Home calendar", scope: "shared", status: "connected" };
 const TEAM = { id: "p1", kind: "plaud", alias: "team", label: "Team Plaud", scope: "shared", secret_ref: "plaud.secret:team" };
@@ -15,9 +15,9 @@ const OWN = { id: "p0", kind: "plaud", alias: "default", label: "Plaud", scope: 
 
 describe("which tools a turn has", () => {
   it("CLI-GRANTED-GROUPS a skill brings its tools to the turn, and only its own", () => {
-    expect(localToolsOf({ talents: [{ name: "agenda-brief", version: 1 }] })).toEqual(["calendar"]);
-    expect(localToolsOf({ talents: [{ name: "meeting-recap", version: 3 }] }).sort()).toEqual(["calendar", "meeting-recap", "plaud"]);
-    expect(localToolsOf({ talents: [{ name: "web-search", version: 1 }] })).toEqual([]);
+    expect(localToolsOf({ skills: [{ name: "agenda-brief", version: 1 }] })).toEqual(["calendar"]);
+    expect(localToolsOf({ skills: [{ name: "meeting-recap", version: 3 }] }).sort()).toEqual(["calendar", "meeting-recap", "plaud"]);
+    expect(localToolsOf({ skills: [{ name: "web-search", version: 1 }] })).toEqual([]);
   });
 
   it("TOOL-CALLED-BY-LABEL the agent is told each copy's keyword and what its tools use, by label", () => {
@@ -52,7 +52,7 @@ describe("Plaud logins, by label", () => {
 });
 
 describe("calendars, by label", () => {
-  it("TALENT-BINDING-PER-TOOL a copy reads only the calendars it is set to; the agent, any its copies use", () => {
+  it("SKILL-BINDING-PER-TOOL a copy reads only the calendars it is set to; the agent, any its copies use", () => {
     const c = cfg([recap("meeting-recap", undefined, { mode: "credentials", credentials: [WORK] }), recap("team-recap", undefined, { mode: "credentials", credentials: [HOME] })]);
     expect(calendarChoices(c, "team-recap").map((x) => x.label)).toEqual(["Home calendar"]);
     expect(calendarChoices(c).map((x) => x.label).sort()).toEqual(["Home calendar", "Work calendar"]);
@@ -179,15 +179,16 @@ describe("which agents a worker serves", () => {
     expect(servesAgent(only, ["g-1", "northwind-nova", "Nova"])).toBe(true);
     expect(servesAgent(only, ["g-2", "globex-sapien", "Sapien"])).toBe(true);
     expect(servesAgent(only, ["g-3", "initech-nelly", "Nelly"])).toBe(false);
-  });
+    // Loading the whole worker takes a while when the full suite runs alongside.
+  }, 30_000);
 });
 
 describe("the agent's one schedule", () => {
-  it("TALENT-SEVERAL-INSTANCES-SCHEDULED every meeting-recap copy with its schedule on is run at each firing; one switched off is not", async () => {
+  it("SKILL-SEVERAL-INSTANCES-SCHEDULED every meeting-recap copy with its schedule on is run at each firing; one switched off is not", async () => {
     const { dueCopies } = await import("./localtools");
-    const { parseAgendaTimes } = await import("./talents/agenda-brief");
-    const { localTimeOn } = await import("../talents/calendar/agenda-brief/facts");
-    const c = { timezone: "UTC", talents: [
+    const { parseAgendaTimes } = await import("./skills/agenda-brief");
+    const { localTimeOn } = await import("../skills/calendar/agenda-brief/facts");
+    const c = { timezone: "UTC", skills: [
       { name: "meeting-recap", version: 3, instance: "meeting-recap" },
       { name: "meeting-recap", version: 3, instance: "team-recap" },
       { name: "meeting-recap", version: 3, instance: "paused-recap", schedule_enabled: false },
@@ -200,7 +201,7 @@ describe("the agent's one schedule", () => {
     expect(dueCopies(c, false, at, parseAgendaTimes, localTimeOn)).toEqual({ recaps: [], agendas: [] });
   });
 
-  it("TALENT-COPY-STARTS-NOW a copy looks only at what was recorded after it was added", async () => {
+  it("SKILL-COPY-STARTS-NOW a copy looks only at what was recorded after it was added", async () => {
     const { copyFloor } = await import("./localtools");
     expect(copyFloor(Date.parse("2026-09-01T00:00:00Z"), "2026-10-06T07:00:00Z", 0)).toBe(Date.parse("2026-10-06T07:00:00Z"));
     expect(copyFloor(Date.parse("2026-10-07T00:00:00Z"), "2026-10-06T07:00:00Z", 0)).toBe(Date.parse("2026-10-07T00:00:00Z"));

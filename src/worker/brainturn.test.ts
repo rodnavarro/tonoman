@@ -41,9 +41,9 @@ interface Scenario {
   dmWorks?: boolean;
   /** The model works this long, saying nothing, before it answers. */
   silentMs?: number;
-  /** The agent's provider (default claude) and its Talents that are on. */
+  /** The agent's provider (default claude) and its Skills that are on. */
   provider?: "claude" | "codex";
-  talents?: { name: string; version: number; config?: Record<string, unknown> }[];
+  skills?: { name: string; version: number; config?: Record<string, unknown> }[];
   /** Exactly what the model emits, instead of the one-tool-then-answer default. */
   script?: () => AsyncIterable<TurnEvent>;
 }
@@ -128,7 +128,7 @@ function build(sc: Scenario, provenanceStore = new Map<string, string[]>(), kept
   };
   const acts = makeActivities({
     agent: () => ({
-      cfg: { name: "echo", guid: "g-echo", inference_provider: sc.provider ?? "claude", talents: sc.talents ?? [], principals: [{ kind: "slack_user_id", value: "UANA", label: "Ana" }] } as never,
+      cfg: { name: "echo", guid: "g-echo", inference_provider: sc.provider ?? "claude", skills: sc.skills ?? [], principals: [{ kind: "slack_user_id", value: "UANA", label: "Ana" }] } as never,
       conn: { reply: () => reply } as never,
       run,
     }),
@@ -303,7 +303,7 @@ describe("found in review", () => {
   });
 });
 
-describe("what a Talent announces", () => {
+describe("what a Skill announces", () => {
   const announce = (conversation: string, drewOn: string[]) => ({ ...turn(conversation, "UANA", "Announce the recap"), fromSystem: true, drewOn });
 
   it("BRAIN-PRIVATE-CONFIRMATIONS a recap filed into a brain the channel cannot read is announced to its person by DM", async () => {
@@ -534,8 +534,8 @@ describe("tonoman in the turn (cli.md in Tonoman Cloud)", () => {
     expect(req.prompt).toMatch(/one tool, `tonoman`/);
   });
 
-  it("TALENT-IN-CONVERSATION with Receipts on, the turn's tonoman files into the brain set on the Talent, from the turn's own folder", async () => {
-    const { acts } = build({ audience: { kind: "self" }, uses: [], answer: "ok", talents: [{ name: "receipts", version: 1, config: { brain: "b-fin", entities: "acme-llc, northwind-ventures-llc" } }] });
+  it("SKILL-IN-CONVERSATION with Receipts on, the turn's tonoman files into the brain set on the Skill, from the turn's own folder", async () => {
+    const { acts } = build({ audience: { kind: "self" }, uses: [], answer: "ok", skills: [{ name: "receipts", version: 1, config: { brain: "b-fin", entities: "acme-llc, northwind-ventures-llc" } }] });
     await acts.runTurn(turn("D1"));
     expect(started.at(-1)!.receipts).toMatchObject({ brainId: "b-fin", entities: ["acme-llc", "northwind-ventures-llc"] });
     expect(bound.at(-1)).toMatchObject({ token: started.at(-1)!.token, cwd: requests[0]!.cwd });
@@ -543,30 +543,30 @@ describe("tonoman in the turn (cli.md in Tonoman Cloud)", () => {
   });
 
   it("RECEIPT-ENTITY-ALWAYS the agent is told the tenant's own legal entities, so it asks which of THOSE — not ones it made up", async () => {
-    const { acts } = build({ audience: { kind: "self" }, uses: [], answer: "ok", talents: [{ name: "receipts", version: 1, config: { brain: "b-fin", entities: "acme-llc, northwind-ventures-llc" } }] });
+    const { acts } = build({ audience: { kind: "self" }, uses: [], answer: "ok", skills: [{ name: "receipts", version: 1, config: { brain: "b-fin", entities: "acme-llc, northwind-ventures-llc" } }] });
     await acts.runTurn(turn("D1"));
     expect(requests[0]!.prompt).toMatch(/acme-llc, northwind-ventures-llc/);
   });
 
   it("RECEIPT-NOTE-LATER the agent is told that a filed receipt is corrected by editing the brain — search for its row, edit its note — not by a command of Receipts' own", async () => {
-    const { acts } = build({ audience: { kind: "self" }, uses: [], answer: "ok", talents: [{ name: "receipts", version: 1, config: { brain: "b-fin" } }] });
+    const { acts } = build({ audience: { kind: "self" }, uses: [], answer: "ok", skills: [{ name: "receipts", version: 1, config: { brain: "b-fin" } }] });
     await acts.runTurn(turn("D1"));
     expect(requests[0]!.prompt).toMatch(/tonoman brain search/);
     expect(requests[0]!.prompt).toMatch(/tonoman brain edit/);
   });
 
   it("RECEIPT-ONE-OR-MANY the agent is told not to file a document with several payments, or a statement, until the person says which rows it stands for", async () => {
-    const { acts } = build({ audience: { kind: "self" }, uses: [], answer: "ok", talents: [{ name: "receipts", version: 1, config: { brain: "b-fin" } }] });
+    const { acts } = build({ audience: { kind: "self" }, uses: [], answer: "ok", skills: [{ name: "receipts", version: 1, config: { brain: "b-fin" } }] });
     await acts.runTurn(turn("D1"));
     expect(requests[0]!.prompt).toMatch(/several payments/);
     expect(requests[0]!.prompt).toMatch(/statement/);
     expect(requests[0]!.prompt).toMatch(/counted twice/);
   });
 
-  it("TALENT-IN-CONVERSATION with Receipts off, or with no brain set, there is no receipts group and no note about it", async () => {
-    for (const talents of [[], [{ name: "receipts", version: 1, config: {} }]]) {
+  it("SKILL-IN-CONVERSATION with Receipts off, or with no brain set, there is no receipts group and no note about it", async () => {
+    for (const skills of [[], [{ name: "receipts", version: 1, config: {} }]]) {
       requests = [];
-      const { acts } = build({ audience: { kind: "self" }, uses: [], answer: "ok", talents });
+      const { acts } = build({ audience: { kind: "self" }, uses: [], answer: "ok", skills });
       await acts.runTurn(turn("D1"));
       expect(started.at(-1)!.receipts).toBeUndefined();
       expect(requests[0]!.prompt).not.toMatch(/tonoman receipts/);
@@ -587,7 +587,7 @@ describe("a finance document is private from the moment it arrives (receipt.md i
   };
 
   it("RECEIPT-PRIVATE-THROUGHOUT a question about a receipt, asked before any brain was touched, goes to the sender privately — even where everyone can read the finances brain", async () => {
-    const { acts } = build({ ...everyoneReadsFinances, uses: [], answer: "Is this $48.96 for Acme LLC or Northwind Ventures LLC?", talents: receiptsOn });
+    const { acts } = build({ ...everyoneReadsFinances, uses: [], answer: "Is this $48.96 for Acme LLC or Northwind Ventures LLC?", skills: receiptsOn });
     await acts.runTurn({ ...turn("G1", "UANA", "file this"), mediaPaths: [await photo()] } as never);
     expect(dms.map((d) => d.text).join("\n")).toMatch(/48\.96/);
     expect(inThread().join("\n")).not.toMatch(/48\.96/);
@@ -595,32 +595,32 @@ describe("a finance document is private from the moment it arrives (receipt.md i
   });
 
   it("RECEIPT-PRIVATE-THROUGHOUT nothing of it is shown while the agent works: no streamed words, no tool details", async () => {
-    const { acts } = build({ ...everyoneReadsFinances, uses: [], answer: "Filed Corner Bistro for 48.96", talents: receiptsOn });
+    const { acts } = build({ ...everyoneReadsFinances, uses: [], answer: "Filed Corner Bistro for 48.96", skills: receiptsOn });
     await acts.runTurn({ ...turn("G1", "UANA", "file this"), mediaPaths: [await photo()] } as never);
     expect(posted.filter((p) => p.op !== "send" && p.op !== "finalize").map((p) => p.text ?? "").join("\n")).not.toMatch(/Antojo|jev\.md/);
   });
 
   it("RECEIPT-PRIVATE-THROUGHOUT the answer to the agent's question, sent later in the same thread with no file, is private too", async () => {
     const store = new Map<string, string[]>();
-    const first = build({ ...everyoneReadsFinances, uses: [], answer: "Which entity?", talents: receiptsOn }, store);
+    const first = build({ ...everyoneReadsFinances, uses: [], answer: "Which entity?", skills: receiptsOn }, store);
     await first.acts.runTurn({ ...turn("G1", "UANA", "file this"), mediaPaths: [await photo()] } as never);
     dms = [];
     posted = [];
-    const second = build({ ...everyoneReadsFinances, uses: [], answer: "Filed under acme-llc for 48.96", talents: receiptsOn }, store);
+    const second = build({ ...everyoneReadsFinances, uses: [], answer: "Filed under acme-llc for 48.96", skills: receiptsOn }, store);
     await second.acts.runTurn(turn("G1", "UANA", "acme"));
     expect(dms.map((d) => d.text).join("\n")).toMatch(/acme-llc/);
     expect(inThread().join("\n")).not.toMatch(/acme-llc/);
   });
 
   it("RECEIPT-PRIVATE-THROUGHOUT with Receipts on, a question with no document and no finance history is answered in the thread as ever", async () => {
-    const { acts } = build({ ...everyoneReadsFinances, uses: [], answer: "Tuesday works", talents: receiptsOn });
+    const { acts } = build({ ...everyoneReadsFinances, uses: [], answer: "Tuesday works", skills: receiptsOn });
     await acts.runTurn(turn("G1", "UANA", "when can we meet?"));
     expect(inThread().at(-1)).toMatch(/Tuesday works/);
     expect(dms).toEqual([]);
   });
 
   it("RECEIPT-PRIVATE-THROUGHOUT in the sender's own DM it is answered right there", async () => {
-    const { acts } = build({ audience: { kind: "self" }, uses: [], answer: "Filed for 48.96", talents: receiptsOn, reachAtStart: { "b-fin": "Finances" } });
+    const { acts } = build({ audience: { kind: "self" }, uses: [], answer: "Filed for 48.96", skills: receiptsOn, reachAtStart: { "b-fin": "Finances" } });
     await acts.runTurn({ ...turn("D1", "UANA", "file this"), mediaPaths: [await photo()] } as never);
     expect(inThread().at(-1)).toMatch(/48\.96/);
     expect(dms).toEqual([]);
@@ -639,7 +639,7 @@ describe("the files a person sent, as the turn gets them (conversation.md, recei
   };
 
   it("RECEIPT-FILES-WHAT-WAS-SENT before the agent runs, the worker hands the broker each file exactly as it arrived, under the name the agent will see", async () => {
-    const { acts } = build({ audience: { kind: "self" }, uses: [], answer: "ok", talents: [{ name: "receipts", version: 1, config: { brain: "b-fin" } }] });
+    const { acts } = build({ audience: { kind: "self" }, uses: [], answer: "ok", skills: [{ name: "receipts", version: 1, config: { brain: "b-fin" } }] });
     await acts.runTurn({ ...turn("D1", "UANA", "file this"), mediaPaths: [await sent("a", "receipt.jpg", "front")] } as never);
     expect(attached).toHaveLength(1);
     expect(attached[0]!.token).toBe(started.at(-1)!.token);
@@ -647,7 +647,7 @@ describe("the files a person sent, as the turn gets them (conversation.md, recei
   });
 
   it("CONVO-ATTACHED-FILES two files with the same name are both kept, each under a name of its own", async () => {
-    const { acts } = build({ audience: { kind: "self" }, uses: [], answer: "ok", talents: [{ name: "receipts", version: 1, config: { brain: "b-fin" } }] });
+    const { acts } = build({ audience: { kind: "self" }, uses: [], answer: "ok", skills: [{ name: "receipts", version: 1, config: { brain: "b-fin" } }] });
     await acts.runTurn({ ...turn("D1", "UANA", "front and back"), mediaPaths: [await sent("a", "receipt.jpg", "front"), await sent("b", "receipt.jpg", "back")] } as never);
     const names = attached[0]!.files.map((f) => f.name);
     expect(new Set(names).size).toBe(2);
@@ -669,12 +669,12 @@ describe("a receipt is rarely one message (conversation.md, receipt.md in Tonoma
     const photo = path.join(tmp, "IMG_0042.jpg");
     await fs.writeFile(photo, "the receipt, as it arrived");
 
-    const first = build({ audience: { kind: "self" }, uses: [], answer: "What was this lunch for?", talents: receiptsOn, reachAtStart: { "b-fin": "Finances" } }, new Map(), kept);
+    const first = build({ audience: { kind: "self" }, uses: [], answer: "What was this lunch for?", skills: receiptsOn, reachAtStart: { "b-fin": "Finances" } }, new Map(), kept);
     await first.acts.runTurn({ ...turn("D1", "UANA", ""), mediaPaths: [photo] } as never);
     attached = [];
     requests = [];
 
-    const second = build({ audience: { kind: "self" }, uses: [], answer: "Filed.", talents: receiptsOn, reachAtStart: { "b-fin": "Finances" } }, new Map(), kept);
+    const second = build({ audience: { kind: "self" }, uses: [], answer: "Filed.", skills: receiptsOn, reachAtStart: { "b-fin": "Finances" } }, new Map(), kept);
     await second.acts.runTurn(turn("D1", "UANA", "A client lunch about the AI engagement."));
     expect(attached[0]!.files.map((f) => [f.name, f.bytes.toString()])).toEqual([["IMG_0042.jpg", "the receipt, as it arrived"]]);
     // The agent is told it is still there, by the name it can file it under — and is not shown it again as new.
@@ -691,11 +691,11 @@ describe("a receipt is rarely one message (conversation.md, receipt.md in Tonoma
     const photo = path.join(tmp, "IMG_0042.jpg");
     await fs.writeFile(photo, "ana's receipt");
     const members = { kind: "members", members: ["UANA", "UBEN"], name: "team" } as Audience;
-    const first = build({ audience: members, uses: [], answer: "ok", talents: receiptsOn }, new Map(), kept);
+    const first = build({ audience: members, uses: [], answer: "ok", skills: receiptsOn }, new Map(), kept);
     await first.acts.runTurn({ ...turn("G1", "UANA", "here"), mediaPaths: [photo] } as never);
     attached = [];
     requests = [];
-    const second = build({ audience: members, uses: [], answer: "ok", talents: receiptsOn }, new Map(), kept);
+    const second = build({ audience: members, uses: [], answer: "ok", skills: receiptsOn }, new Map(), kept);
     await second.acts.runTurn(turn("G1", "UBEN", "file that one for me"));
     expect(attached).toEqual([]);
     expect(requests[0]!.prompt).not.toMatch(/IMG_0042/);

@@ -65,7 +65,7 @@ export async function recoverWrites(d: RecoverDeps): Promise<{ landed: number; r
       await d.store.settle(it.id, "abandoned", "the refresh runs again after the restart");
       continue;
     }
-    // A Talent's filing is re-checked against what the RUN may reach; a person's note against theirs.
+    // A Skill's filing is re-checked against what the RUN may reach; a person's note against theirs.
     const reachNow = async () =>
       e.notify?.unattended && d.registry.reachUnattended
         ? d.registry.reachUnattended(who!.agent, who!.user)

@@ -20,17 +20,17 @@ const GROUPS_OF: Record<string, string[]> = {
 };
 
 /** PURE: the worker-served `tonoman` groups this agent's skills bring (CLI-GRANTED-GROUPS). */
-export function localToolsOf(cfg: Pick<AgentConfig, "talents">): string[] {
+export function localToolsOf(cfg: Pick<AgentConfig, "skills">): string[] {
   const out = new Set<string>();
-  for (const t of cfg.talents ?? []) for (const g of GROUPS_OF[t.name] ?? []) out.add(g);
+  for (const t of cfg.skills ?? []) for (const g of GROUPS_OF[t.name] ?? []) out.add(g);
   return [...out];
 }
 
 /** PURE: what the agent is told about its skills each turn — each copy by keyword, what it does, and
  *  which logins and calendars its tools use, by label (D-JOBS-ARE-PROMPTS). Empty for no skills. */
-export function skillsNote(cfg: Pick<AgentConfig, "talents">, describe: (skill: string) => string | undefined): string {
+export function skillsNote(cfg: Pick<AgentConfig, "skills">, describe: (skill: string) => string | undefined): string {
   const lines: string[] = [];
-  for (const t of cfg.talents ?? []) {
+  for (const t of cfg.skills ?? []) {
     const word = t.instance ?? t.name;
     const uses: string[] = [];
     for (const [tool, b] of Object.entries(t.bindings ?? {})) {
@@ -50,14 +50,14 @@ export function skillsNote(cfg: Pick<AgentConfig, "talents">, describe: (skill: 
  *  meeting-recap copy with its schedule on, and each agenda-brief copy one of whose times this is
  *  (within a minute and a half). Nothing runs where nobody can be told. */
 export function dueCopies(
-  cfg: Pick<AgentConfig, "talents" | "timezone">,
+  cfg: Pick<AgentConfig, "skills" | "timezone">,
   reach: boolean,
   at: number,
   times: (raw: unknown) => { hour: number; minute: number }[],
   localTimeOn: (ms: number, tz: string, hour: number, minute: number) => number,
 ): { recaps: string[]; agendas: string[] } {
   if (!reach) return { recaps: [], agendas: [] };
-  const on = (cfg.talents ?? []).filter((t) => t.schedule_enabled !== false);
+  const on = (cfg.skills ?? []).filter((t) => t.schedule_enabled !== false);
   const tz = cfg.timezone || "UTC";
   return {
     recaps: on.filter((t) => t.name === "meeting-recap").map((t) => t.instance ?? t.name),
@@ -69,7 +69,7 @@ export function dueCopies(
 }
 
 /** PURE: where a copy's scheduled work starts — the later of the flow's floor and when it was added
- *  (TALENT-COPY-STARTS-NOW); a copy with no readable start starts now. */
+ *  (SKILL-COPY-STARTS-NOW); a copy with no readable start starts now. */
 export function copyFloor(flowFloorMs: number, since: string | undefined, now: number): number {
   const t = since ? Date.parse(since) : NaN;
   return Math.max(flowFloorMs, Number.isFinite(t) ? t : now);
@@ -87,11 +87,11 @@ export interface PlaudLogin {
 /** PURE: the Plaud logins `speaker` may use on this agent. Their own when they connected one; and every
  *  shared login a skill copy here is set to use — or, with no copy set to one, the voice flow's own
  *  shared login, as before bindings. Never somebody else's own. */
-export function plaudLogins(cfg: Pick<AgentConfig, "talents">, v: Pick<VoiceConfig, "accounts" | "creds"> | undefined, speaker: string): PlaudLogin[] {
+export function plaudLogins(cfg: Pick<AgentConfig, "skills">, v: Pick<VoiceConfig, "accounts" | "creds"> | undefined, speaker: string): PlaudLogin[] {
   const out: PlaudLogin[] = [];
   if (v?.accounts?.some((a) => a.user === speaker)) out.push({ label: "mine", user: speaker });
   const shared = new Map<string, PlaudLogin>();
-  for (const t of cfg.talents ?? []) {
+  for (const t of cfg.skills ?? []) {
     for (const c of t.bindings?.plaud?.credentials ?? []) {
       if (c.scope === "per_person" || !c.secret_ref) continue;
       const label = c.label || c.alias;
@@ -130,7 +130,7 @@ export interface CalendarChoice {
 /** PURE: the calendars readable on this agent, by label — what any skill copy here is set to read, or,
  *  with no copy set to any, every connected calendar the agent holds, as before bindings. `copy` keeps
  *  it to one copy's (its run reads only its own). */
-export function calendarChoices(cfg: Pick<AgentConfig, "talents" | "credentials">, copy?: string): CalendarChoice[] {
+export function calendarChoices(cfg: Pick<AgentConfig, "skills" | "credentials">, copy?: string): CalendarChoice[] {
   const seen = new Map<string, CalendarChoice>();
   const add = (c: { kind: string; alias: string; label?: string; secret_ref?: string; status?: string }) => {
     if (c.kind !== "ics" && c.kind !== "google") return;
@@ -138,7 +138,7 @@ export function calendarChoices(cfg: Pick<AgentConfig, "talents" | "credentials"
     const label = c.label || `${c.kind} ${c.alias}`;
     seen.set(`${c.kind}:${c.alias}`, { label, kind: c.kind, alias: c.alias, secretRef: c.secret_ref });
   };
-  const copies = (cfg.talents ?? []).filter((t) => !copy || (t.instance ?? t.name) === copy);
+  const copies = (cfg.skills ?? []).filter((t) => !copy || (t.instance ?? t.name) === copy);
   const bound = copies.flatMap((t) => t.bindings?.calendar?.credentials ?? []);
   const anyBinding = copies.some((t) => t.bindings?.calendar);
   for (const c of anyBinding ? bound : (cfg.credentials ?? [])) add(c);
@@ -323,7 +323,7 @@ export function localTools(deps: LocalToolDeps) {
       // meeting-recap file
       if (!got.text.trim()) return { status: 409, text: "That recording has no speech in it; it is not filed." };
       const copy = typeof body.copy === "string" && body.copy ? body.copy : "meeting-recap";
-      const choices = calendarChoices(cfg, (cfg.talents ?? []).some((t) => (t.instance ?? t.name) === copy) ? copy : undefined);
+      const choices = calendarChoices(cfg, (cfg.skills ?? []).some((t) => (t.instance ?? t.name) === copy) ? copy : undefined);
       const feeds = await deps.feeds(name, cfg, choices);
       const pad = (v?.calendarPadMinutes ?? 30) * 60000;
       const candidates = feeds.length ? (await deps.gather(name, feeds, got.rec.startTime - pad, got.rec.startTime + got.rec.duration + pad)).events : [];

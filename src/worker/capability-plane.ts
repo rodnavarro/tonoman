@@ -11,18 +11,18 @@ import type { CalEvent } from "./calendar";
 import * as plaudapi from "./plaudapi";
 import { recordingKey } from "./recordingkey";
 import { accountFor, type TurnDeps, type VoiceConfig } from "./activities";
-import type { TalentOutcome } from "../talent-sdk";
-import { pagePathTrouble, publishPageToBrain, publishRecapToBrain } from "../brains/talentpublish";
+import type { SkillOutcome } from "../skill-sdk";
+import { pagePathTrouble, publishPageToBrain, publishRecapToBrain } from "../brains/skillpublish";
 
-// The capability plane — the runtime side of the Talent SDK's mediated capabilities (A15).
+// The capability plane — the runtime side of the Skill SDK's mediated capabilities (A15).
 //
-// A Talent is a spawned CLI that cannot reach into the worker. The three things it is NOT allowed to
+// A Skill is a spawned CLI that cannot reach into the worker. The three things it is NOT allowed to
 // do itself — route transcription across the tenant's providers, spend the tenant's inference
 // budget, write the tenant's git-backed second brain — it asks this server to do, over localhost.
 // That is what keeps provider routing, metering and the brain the runtime's, never baked into a
-// Talent, while the Talent stays portable.
+// Skill, while the Skill stays portable.
 //
-// One server per worker, started at boot, closed over `deps`. `runTalent` mints a short-lived token
+// One server per worker, started at boot, closed over `deps`. `runSkill` mints a short-lived token
 // per spawn that names the run (agent, item, user); every handler resolves the run's VoiceConfig
 // from that token and delegates to the same cores Sapien's live pipeline uses. localhost + a random
 // bearer is the whole auth story: the only caller is a subprocess on this host.
@@ -31,23 +31,23 @@ interface RunToken {
   agent: string;
   item: string;
   user?: string;
-  talent?: string;
+  skill?: string;
   expiresAt: number;
 }
 
 export interface CapabilityPlane {
-  /** Base URL handed to a spawned Talent as TONOMAN_CAPABILITY_URL. */
+  /** Base URL handed to a spawned Skill as TONOMAN_CAPABILITY_URL. */
   url: string;
-  /** Issue a token scoped to one run; pass it to the Talent as TONOMAN_CAPABILITY_TOKEN. */
-  mint(run: { agent: string; item: string; user?: string; talent?: string }): string;
+  /** Issue a token scoped to one run; pass it to the Skill as TONOMAN_CAPABILITY_TOKEN. */
+  mint(run: { agent: string; item: string; user?: string; skill?: string }): string;
   /** Drop a token once its child has exited. */
   revoke(token: string): void;
-  /** Spawn a Talent CLI for one run against this plane and return its outcome. Used by the runTalent
+  /** Spawn a Skill CLI for one run against this plane and return its outcome. Used by the runSkill
    *  activity and the dev-run endpoint. */
   spawn(
-    run: { agent: string; item: string; user?: string; talent?: string; instance?: string },
+    run: { agent: string; item: string; user?: string; skill?: string; instance?: string },
     opts?: { signal?: AbortSignal; onProgress?: (note: string) => void },
-  ): Promise<TalentOutcome>;
+  ): Promise<SkillOutcome>;
   close(): Promise<void>;
 }
 
@@ -68,78 +68,78 @@ function readJson(req: http.IncomingMessage): Promise<Record<string, unknown>> {
   });
 }
 
-/** PURE: the command, words and environment that start a Talent's program. As the run's own user
- *  the worker's environment is scrubbed of its secrets first — a Talent asks the runtime for what it
- *  needs (TALENT-ASKS-THE-RUNTIME), so all it is told is where to ask and the run's token. */
-export function talentCommand(runAs: TurnUser | undefined, bin: string, args: string[], workerEnv: NodeJS.ProcessEnv, baseUrl: string, token: string): { cmd: string; args: string[]; env: NodeJS.ProcessEnv } {
+/** PURE: the command, words and environment that start a Skill's program. As the run's own user
+ *  the worker's environment is scrubbed of its secrets first — a Skill asks the runtime for what it
+ *  needs (SKILL-ASKS-THE-RUNTIME), so all it is told is where to ask and the run's token. */
+export function skillCommand(runAs: TurnUser | undefined, bin: string, args: string[], workerEnv: NodeJS.ProcessEnv, baseUrl: string, token: string): { cmd: string; args: string[]; env: NodeJS.ProcessEnv } {
   return commandFor(runAs, bin, args, workerEnv, { TONOMAN_CAPABILITY_URL: baseUrl, TONOMAN_CAPABILITY_TOKEN: token });
 }
 
-/** name → the Talent CLI's entrypoint, relative to the repo root (the worker's cwd). One entry while
- *  there is one built-in Talent; this becomes the loader's registry when a second arrives. */
-const TALENT_ENTRY: Record<string, string> = {
-  "meeting-recap": "src/talents/voice/plaud-and-calendar-meetings/index.ts",
-  "agenda-brief": "src/talents/calendar/agenda-brief/index.ts",
-  "drop-watch": "src/talents/lorealistar/drop-watch/index.ts",
+/** name → the Skill CLI's entrypoint, relative to the repo root (the worker's cwd). One entry while
+ *  there is one built-in Skill; this becomes the loader's registry when a second arrives. */
+const SKILL_ENTRY: Record<string, string> = {
+  "meeting-recap": "src/skills/voice/plaud-and-calendar-meetings/index.ts",
+  "agenda-brief": "src/skills/calendar/agenda-brief/index.ts",
+  "drop-watch": "src/skills/lorealistar/drop-watch/index.ts",
 };
 
-/** Spawn a Talent CLI as a subprocess and collect its outcome. This is the core both the `runTalent`
+/** Spawn a Skill CLI as a subprocess and collect its outcome. This is the core both the `runSkill`
  *  Temporal activity and the dev-run endpoint share: mint a scoped token, assemble the input (the
- *  item + this agent's config + the runtime context the Talent needs but must not hold — mission,
+ *  item + this agent's config + the runtime context the Skill needs but must not hold — mission,
  *  journal, vocab), run `tsx <entry>` with the capability coordinates in its env, pipe the input on
  *  stdin, read the single outcome JSON on stdout and progress lines on stderr, then revoke the token.
  *  A cancellation (Temporal activity timeout/cancel) kills the child. */
-/** Talents that have nothing to do with recordings, and so need no recording flow to run. */
+/** Skills that have nothing to do with recordings, and so need no recording flow to run. */
 const NEEDS_NO_RECORDINGS = new Set(["drop-watch"]);
 
-async function runTalentProcess(
+async function runSkillProcess(
   deps: TurnDeps,
   baseUrl: string,
   mint: (r: RunToken) => string,
   revoke: (t: string) => void,
-  run: { agent: string; item: string; user?: string; talent?: string; instance?: string },
+  run: { agent: string; item: string; user?: string; skill?: string; instance?: string },
   opts?: { signal?: AbortSignal; onProgress?: (note: string) => void },
   /** The brains each run filed into, by token — set by /cap/publish, read once the run ends. */
   filedIn: Map<string, string[]> = new Map(),
-): Promise<TalentOutcome> {
-  const talent = run.talent ?? "meeting-recap";
-  const entry = TALENT_ENTRY[talent];
-  if (!entry) return { status: "failed", reason: `no program registered for skill ${talent}` };
-  // A Talent that has nothing to do with recordings runs on an agent with no recording flow
-  // (TALENT-NEEDS-NO-RECORDINGS); what it is handed of the tenant's context is what there is.
+): Promise<SkillOutcome> {
+  const skill = run.skill ?? "meeting-recap";
+  const entry = SKILL_ENTRY[skill];
+  if (!entry) return { status: "failed", reason: `no program registered for skill ${skill}` };
+  // A Skill that has nothing to do with recordings runs on an agent with no recording flow
+  // (SKILL-NEEDS-NO-RECORDINGS); what it is handed of the tenant's context is what there is.
   const voice = deps.voice?.(run.agent);
-  if (!voice && !NEEDS_NO_RECORDINGS.has(talent)) return { status: "failed", reason: `no voice configuration for ${run.agent}` };
+  if (!voice && !NEEDS_NO_RECORDINGS.has(skill)) return { status: "failed", reason: `no voice configuration for ${run.agent}` };
 
-  const token = mint({ agent: run.agent, item: run.item, user: run.user, talent, expiresAt: Date.now() + 6 * 60 * 60 * 1000 });
+  const token = mint({ agent: run.agent, item: run.item, user: run.user, skill, expiresAt: Date.now() + 6 * 60 * 60 * 1000 });
   try {
     const input = {
       item: run.item,
       user: run.user,
       // The grant's saved config (an agenda brief's times, a recap's output channel). It was always
-      // `{}`, so a Talent could declare config fields and never receive a value.
-      // This instance's settings (TALENT-SEVERAL-INSTANCES); the first instance's when none is named.
-      config: deps.talentConfig?.(run.agent, run.instance ?? talent) ?? {},
-      // The tenant context the recap prompt needs — provided by the runtime, never held by the Talent.
+      // `{}`, so a Skill could declare config fields and never receive a value.
+      // This instance's settings (SKILL-SEVERAL-INSTANCES); the first instance's when none is named.
+      config: deps.skillConfig?.(run.agent, run.instance ?? skill) ?? {},
+      // The tenant context the recap prompt needs — provided by the runtime, never held by the Skill.
       context: {
         mission: voice?.mission ?? "",
         journal: voice?.journal,
         vocab: voice?.vocab,
         timezone: voice?.timezone,
         calendarRoutes: voice?.calendarRoutes ?? {},
-        // Who the run is on behalf of, for a Talent that addresses someone (the agenda brief).
+        // Who the run is on behalf of, for a Skill that addresses someone (the agenda brief).
         notifyUser: voice?.notifyUser,
       },
     };
     // The production image ships compiled `dist` and omits `tsx` and `src` (`npm ci --omit=dev`), so
-    // `tsx src/…/index.ts` cannot run there. Prefer the compiled Talent (`node dist/…/index.js`), and
+    // `tsx src/…/index.ts` cannot run there. Prefer the compiled Skill (`node dist/…/index.js`), and
     // fall back to tsx on the TS source for local dev, which runs from a bind-mounted tree with no
     // build. `existsSync` is resolved against the worker's cwd, the same base the spawn uses.
     const distEntry = entry.replace(/^src[/\\]/, "dist/").replace(/\.ts$/, ".js");
     const compiled = existsSync(distEntry);
-    // As the run's own Linux user when turns run as theirs: a Talent is started on an agent's behalf
+    // As the run's own Linux user when turns run as theirs: a Skill is started on an agent's behalf
     // too. When that user cannot be had the run fails, rather than go out as the worker.
     const runAs = deps.turnUser ? await deps.turnUser(run.agent, run.user) : undefined;
-    const start = talentCommand(runAs, compiled ? "node" : "tsx", [compiled ? distEntry : entry], process.env, baseUrl, token);
+    const start = skillCommand(runAs, compiled ? "node" : "tsx", [compiled ? distEntry : entry], process.env, baseUrl, token);
     const grouped = !!ownGroup(runAs).detached;
     // Reserved before it starts and released exactly once, on a start that failed as on an exit.
     const hold = await runBegan(runAs);
@@ -151,7 +151,7 @@ async function runTalentProcess(
       release();
       throw e;
     }
-    // A Talent's browser, or anything else it started, ends with the run.
+    // A Skill's browser, or anything else it started, ends with the run.
     child.once("exit", release);
     child.once("error", release);
     hold.started(child.pid);
@@ -183,7 +183,7 @@ async function runTalentProcess(
       carry = lines.pop() ?? "";
       for (const line of lines) {
         if (line.startsWith("@progress ")) opts?.onProgress?.(line.slice("@progress ".length).trim());
-        else if (line.trim()) console.log(`talent:${run.agent}:${talent} ${line}`);
+        else if (line.trim()) console.log(`skill:${run.agent}:${skill} ${line}`);
       }
     });
 
@@ -193,13 +193,13 @@ async function runTalentProcess(
     });
     opts?.signal?.removeEventListener("abort", onAbort);
 
-    if (spawnError) return { status: "failed", reason: `could not start skill ${talent}: ${spawnError}` };
+    if (spawnError) return { status: "failed", reason: `could not start skill ${skill}: ${spawnError}` };
     const trimmed = out.trim();
     if (!trimmed) {
       return { status: "failed", reason: `skill exited ${code} with no outcome — ${err.slice(-400)}` };
     }
-    const outcome = JSON.parse(trimmed) as TalentOutcome;
-    // Which brains this run filed into — the runtime's record, never the Talent's say-so — so the
+    const outcome = JSON.parse(trimmed) as SkillOutcome;
+    // Which brains this run filed into — the runtime's record, never the Skill's say-so — so the
     // announcement is delivered only where they may be read (BRAIN-PRIVATE-CONFIRMATIONS).
     const filed = filedIn.get(token);
     return filed?.length ? { ...outcome, brains: filed } : outcome;
@@ -210,22 +210,22 @@ async function runTalentProcess(
 }
 
 /** File a meeting's recap in the tenant's second brain — into a brain when brains decide where this
- *  skill files (BRAIN-TALENT-TARGET), else the voice flow's git checkout. The content is the caller's;
- *  the repo, push credential, journal and timezone are the runtime's. Shared by the Talent plane and
+ *  skill files (BRAIN-SKILL-TARGET), else the voice flow's git checkout. The content is the caller's;
+ *  the repo, push credential, journal and timezone are the runtime's. Shared by the Skill plane and
  *  the `tonoman meeting-recap file` tool, so a recap filed by a turn lands exactly where one filed by
- *  the Talent did. */
+ *  the Skill did. */
 export async function publishRecap(
   deps: TurnDeps,
   voice: VoiceConfig,
   agent: string,
   user: string | undefined,
-  talent: string,
+  skill: string,
   p: { rec: recap.Recording; recap: recap.Recap; transcript: string; candidates: CalEvent[]; by: string[] },
 ): Promise<{ ok: true; published: boolean; path: string; route?: string; brain?: string; brainId?: string } | { ok: false; status: number; error: string }> {
-  const target = deps.talentBrain ? await deps.talentBrain.target(agent, user, talent) : undefined;
+  const target = deps.skillBrain ? await deps.skillBrain.target(agent, user, skill) : undefined;
   if (target && "error" in target) return { ok: false, status: 403, error: `Nothing was filed: ${target.error}.` };
   if (target) {
-    const filed = await publishRecapToBrain(deps.talentBrain!.store, target, {
+    const filed = await publishRecapToBrain(deps.skillBrain!.store, target, {
       rec: p.rec,
       recap: p.recap,
       transcript: p.transcript,
@@ -268,8 +268,8 @@ export async function startCapabilityPlane(deps: TurnDeps): Promise<CapabilityPl
     return token;
   };
   const revoke = (token: string): void => void tokens.delete(token);
-  const spawnTalent: CapabilityPlane["spawn"] = (run, opts) =>
-    runTalentProcess(deps, baseUrl, mint, revoke, run, opts, filedIn);
+  const spawnSkill: CapabilityPlane["spawn"] = (run, opts) =>
+    runSkillProcess(deps, baseUrl, mint, revoke, run, opts, filedIn);
 
   const server = http.createServer((req, res) => {
     void (async () => {
@@ -280,16 +280,16 @@ export async function startCapabilityPlane(deps: TurnDeps): Promise<CapabilityPl
 
       const pathname = new URL(req.url ?? "/", "http://plane").pathname;
 
-      // Dev harness: run a Talent end-to-end against this plane without the Temporal poll. Gated by
-      // TONOMAN_TALENT_DEV so it never exists in a real deployment. This is the "develop locally"
+      // Dev harness: run a Skill end-to-end against this plane without the Temporal poll. Gated by
+      // TONOMAN_SKILL_DEV so it never exists in a real deployment. This is the "develop locally"
       // path and the step-6 proof hook — it mints its own token, so it is the one route without one.
-      if (process.env.TONOMAN_TALENT_DEV && req.method === "POST" && pathname === "/dev/run") {
+      if (process.env.TONOMAN_SKILL_DEV && req.method === "POST" && pathname === "/dev/run") {
         const b = await readJson(req);
-        const outcome = await spawnTalent({
+        const outcome = await spawnSkill({
           agent: String(b.agent ?? ""),
           item: String(b.item ?? ""),
           user: b.user ? String(b.user) : undefined,
-          talent: b.talent ? String(b.talent) : undefined,
+          skill: b.skill ? String(b.skill) : undefined,
         });
         return reply(200, outcome);
       }
@@ -301,18 +301,18 @@ export async function startCapabilityPlane(deps: TurnDeps): Promise<CapabilityPl
 
       const body = req.method === "POST" ? await readJson(req) : {};
 
-      // What needs no recording flow comes first (TALENT-NEEDS-NO-RECORDINGS).
+      // What needs no recording flow comes first (SKILL-NEEDS-NO-RECORDINGS).
       try {
-        // One page the Talent wrote, into the brain the run is pointed at (TALENT-FILES-A-PAGE).
+        // One page the Skill wrote, into the brain the run is pointed at (SKILL-FILES-A-PAGE).
         if (req.method === "POST" && pathname === "/cap/page") {
           const trouble = pagePathTrouble(String(body.path ?? ""));
           if (trouble) return reply(400, { error: trouble });
           const content = String(body.content ?? "");
           if (!content || content.length > 200_000) return reply(400, { error: "a page has something in it, and not more than a page's worth" });
-          const target = deps.talentBrain ? await deps.talentBrain.target(run.agent, run.user, run.talent ?? "") : undefined;
+          const target = deps.skillBrain ? await deps.skillBrain.target(run.agent, run.user, run.skill ?? "") : undefined;
           if (!target) return reply(409, { error: "Nothing was filed: this run has no brain to file into." });
           if ("error" in target) return reply(403, { error: `Nothing was filed: ${target.error}.` });
-          const filed = await publishPageToBrain(deps.talentBrain!.store, target, { path: String(body.path), content, note: body.note ? String(body.note) : undefined });
+          const filed = await publishPageToBrain(deps.skillBrain!.store, target, { path: String(body.path), content, note: body.note ? String(body.note) : undefined });
           if (!filed.ok) return reply(502, { error: `Nothing was filed in ${target.name}: ${filed.detail}.` });
           filedIn.set(token, [...new Set([...(filedIn.get(token) ?? []), target.id])]);
           return reply(200, { filed: true, path: String(body.path), brain: target.name });
@@ -332,7 +332,7 @@ export async function startCapabilityPlane(deps: TurnDeps): Promise<CapabilityPl
       if (!voice) return reply(404, { error: `no voice configuration for ${run.agent}` });
 
       try {
-        // transcribe: the Talent resolved the audio URL with its own credential; the plane fetches,
+        // transcribe: the Skill resolved the audio URL with its own credential; the plane fetches,
         // segments and routes it through the TENANT's transcription chain (groq / local-gpu). Per-
         // user chunk cache, exactly like the live pipeline, so a retry resumes.
         if (req.method === "POST" && pathname === "/cap/transcribe") {
@@ -355,8 +355,8 @@ export async function startCapabilityPlane(deps: TurnDeps): Promise<CapabilityPl
 
         // infer: the reasoning runs on the AGENT'S OWN inference provider (the Claude Code harness /
         // its subscription), NOT a side model — a recap is the agent thinking about the meeting. The
-        // prompt is the Talent's; the plane budgets the user message to a generous window (Claude is
-        // large) and routes it through deps.infer. The Talent parses the returned text.
+        // prompt is the Skill's; the plane budgets the user message to a generous window (Claude is
+        // large) and routes it through deps.infer. The Skill parses the returned text.
         if (req.method === "POST" && pathname === "/cap/infer") {
           if (!deps.infer) return reply(503, { error: "this runtime has no inference provider" });
           const text = await deps.infer(
@@ -365,17 +365,17 @@ export async function startCapabilityPlane(deps: TurnDeps): Promise<CapabilityPl
               system: String(body.system ?? ""),
               user: recap.budgetTranscript(String(body.user ?? ""), 500_000),
             },
-            // Whose item this is. The token names it, so a Talent cannot choose whose subscription pays.
+            // Whose item this is. The token names it, so a Skill cannot choose whose subscription pays.
             run.user,
           );
           return reply(200, { text });
         }
 
-        // publish: file the artifact in the tenant's git-backed second brain. The Talent supplies the
+        // publish: file the artifact in the tenant's git-backed second brain. The Skill supplies the
         // content (rec, recap, transcript, candidates, by); the repo, push credential, journal and
-        // timezone are the runtime's, resolved here. Returns where it landed so the Talent can report.
+        // timezone are the runtime's, resolved here. Returns where it landed so the Skill can report.
         if (req.method === "POST" && pathname === "/cap/publish") {
-          const out = await publishRecap(deps, voice, run.agent, run.user, run.talent ?? "meeting-recap", {
+          const out = await publishRecap(deps, voice, run.agent, run.user, run.skill ?? "meeting-recap", {
             rec: body.rec as recap.Recording,
             recap: body.recap as recap.Recap,
             transcript: String(body.transcript ?? ""),
@@ -388,8 +388,8 @@ export async function startCapabilityPlane(deps: TurnDeps): Promise<CapabilityPl
         }
 
         // calendar candidates around a recording. TRANSITIONAL: calendar is a `requires` credential,
-        // so the clean shape is the Talent fetching the feed itself via credential('calendar'). Until
-        // the ICS parsing is ported into the Talent, the plane resolves candidates from the tenant's
+        // so the clean shape is the Skill fetching the feed itself via credential('calendar'). Until
+        // the ICS parsing is ported into the Skill, the plane resolves candidates from the tenant's
         // configured feeds and applies the same padded window the live pipeline does.
         if (req.method === "POST" && pathname === "/cap/calendar-candidates") {
           if (!voice.calendars?.length) return reply(200, []);
@@ -403,7 +403,7 @@ export async function startCapabilityPlane(deps: TurnDeps): Promise<CapabilityPl
         }
 
         // calendar events: every entry in [from, to) across the agent's calendars, no padding — for a
-        // Talent that reasons about a day (the agenda brief) rather than one recording.
+        // Skill that reasons about a day (the agenda brief) rather than one recording.
         if (req.method === "POST" && pathname === "/cap/calendar-events") {
           if (!voice.calendars?.length) return reply(200, []);
           const events = await calendar.gather(voice.calendars, Number(body.from ?? 0), Number(body.to ?? 0), {
@@ -417,9 +417,9 @@ export async function startCapabilityPlane(deps: TurnDeps): Promise<CapabilityPl
           );
         }
 
-        // credential: a fresh, usable credential for a kind the Talent declared in `requires`. For
+        // credential: a fresh, usable credential for a kind the Skill declared in `requires`. For
         // Plaud the plane resolves (and refreshes) the OAuth bearer from the tokenstore and hands the
-        // Talent a ready {token, base} — so the Talent only needs the Plaud API, never the tokenstore,
+        // Skill a ready {token, base} — so the Skill only needs the Plaud API, never the tokenstore,
         // and can re-fetch across a long run. (The legacy captured-bearer path returns tokenJson.)
         if (req.method === "GET" && pathname.startsWith("/cap/credential/")) {
           const kind = decodeURIComponent(pathname.slice("/cap/credential/".length));
@@ -455,7 +455,7 @@ export async function startCapabilityPlane(deps: TurnDeps): Promise<CapabilityPl
       return mint({ ...run, expiresAt: Date.now() + 6 * 60 * 60 * 1000 });
     },
     revoke,
-    spawn: spawnTalent,
+    spawn: spawnSkill,
     close() {
       return new Promise((resolve) => server.close(() => resolve()));
     },

@@ -3,7 +3,7 @@ import { Context } from "@temporalio/activity";
 import { makeActivities, accountsOf, accountFor, accountsFromUsers, loginAlertText, speakerContext, type TurnDeps, type VoiceConfig } from "./activities";
 import * as recap from "./recap";
 import { isAuthError } from "../authflow";
-import { meetingRecap } from "./talents/meeting-recap";
+import { meetingRecap } from "./skills/meeting-recap";
 
 describe("speakerContext — who is speaking, where the model believes it", () => {
   it("names a recognised person in the system prompt and labels their message", () => {
@@ -53,9 +53,9 @@ describe("loginAlertText — a recap that fails for want of a Claude login says 
     expect(t).not.toContain("<@");
   });
 });
-/** voicePlan is the one decision the poll reads each tick: which Talent to run (name + version). It
- *  falls back to the built-in Plaud Talent when the roster carried no grant — the voice flow IS
- *  meeting-recap. There is no runner switch any more; a Talent is code and the poll always runs it. */
+/** voicePlan is the one decision the poll reads each tick: which Skill to run (name + version). It
+ *  falls back to the built-in Plaud Skill when the roster carried no grant — the voice flow IS
+ *  meeting-recap. There is no runner switch any more; a Skill is code and the poll always runs it. */
 
 function depsWithVoice(v: Partial<VoiceConfig> | undefined): TurnDeps {
   // Only `voice` is exercised by voicePlan; the rest of TurnDeps is never touched, so a narrow stub
@@ -63,32 +63,32 @@ function depsWithVoice(v: Partial<VoiceConfig> | undefined): TurnDeps {
   return { agent: () => undefined, voice: () => (v ? (v as VoiceConfig) : undefined) };
 }
 
-describe("voicePlan — which Talent the poll runs", () => {
-  it("falls back to the built-in Plaud Talent when the agent has no voice config at all", async () => {
+describe("voicePlan — which Skill the poll runs", () => {
+  it("falls back to the built-in Plaud Skill when the agent has no voice config at all", async () => {
     const acts = makeActivities(depsWithVoice(undefined));
-    // Read off the manifest, not written out: the number is the Talent's business and changes when
+    // Read off the manifest, not written out: the number is the Skill's business and changes when
     // its declared requirements do, and pinning the literal here made a version bump look like a
-    // broken fallback. What this test is about is WHICH Talent, and that it is pinned at all.
+    // broken fallback. What this test is about is WHICH Skill, and that it is pinned at all.
     expect(await acts.voicePlan({ agent: "nelly" })).toEqual({
-      talent: { name: "meeting-recap", version: meetingRecap.version },
+      skill: { name: "meeting-recap", version: meetingRecap.version },
     });
   });
 
-  it("returns the installed Talent, pinned to its version, from the grant", async () => {
-    const acts = makeActivities(depsWithVoice({ talent: { name: "meeting-recap", version: 3 } }));
-    expect(await acts.voicePlan({ agent: "nelly" })).toEqual({ talent: { name: "meeting-recap", version: 3 } });
+  it("returns the installed Skill, pinned to its version, from the grant", async () => {
+    const acts = makeActivities(depsWithVoice({ skill: { name: "meeting-recap", version: 3 } }));
+    expect(await acts.voicePlan({ agent: "nelly" })).toEqual({ skill: { name: "meeting-recap", version: 3 } });
   });
 
-  it("returns the installed Talent on a per-person agent too — processRecording threads the member", async () => {
-    // Unlike the deleted interpreter, the Talent's run (processRecording) attributes per-member, so a
-    // per-person agent runs the Talent path like any other. No hardcoded fallback any more.
+  it("returns the installed Skill on a per-person agent too — processRecording threads the member", async () => {
+    // Unlike the deleted interpreter, the Skill's run (processRecording) attributes per-member, so a
+    // per-person agent runs the Skill path like any other. No hardcoded fallback any more.
     const acts = makeActivities(
       depsWithVoice({
-        talent: { name: "meeting-recap", version: 3 },
+        skill: { name: "meeting-recap", version: 3 },
         accounts: [{ user: "U0A", creds: { tokenJson: "", cliAgent: "initech", cliUser: "U0A" } }],
       }),
     );
-    expect(await acts.voicePlan({ agent: "initech" })).toEqual({ talent: { name: "meeting-recap", version: 3 } });
+    expect(await acts.voicePlan({ agent: "initech" })).toEqual({ skill: { name: "meeting-recap", version: 3 } });
   });
 });
 
@@ -204,12 +204,12 @@ describe("findNewRecordings — the shared account makes the same calls as befor
 });
 
 // W4 — a run record that says WHY it ran and WHAT it produced.
-describe("talent_run records carry the trigger, who asked, and the result", () => {
+describe("skill_run records carry the trigger, who asked, and the result", () => {
   function spyDeps() {
     const opens: unknown[][] = [];
     const closes: unknown[][] = [];
     const deps = {
-      talentRun: {
+      skillRun: {
         open: async (...a: unknown[]) => void opens.push(a),
         close: async (...a: unknown[]) => void closes.push(a),
       },
@@ -217,11 +217,11 @@ describe("talent_run records carry the trigger, who asked, and the result", () =
     return { opens, closes, acts: makeActivities(deps) };
   }
 
-  it("openTalentRun passes the trigger and requestedBy straight through", async () => {
+  it("openSkillRun passes the trigger and requestedBy straight through", async () => {
     const s = spyDeps();
-    await s.acts.openTalentRun({
+    await s.acts.openSkillRun({
       agent: "a",
-      talent: "meeting-recap",
+      skill: "meeting-recap",
       itemKey: "k",
       version: 2,
       trigger: "hub",
@@ -241,9 +241,9 @@ describe("talent_run records carry the trigger, who asked, and the result", () =
     // The Hub renders "for <name>", and the moment somebody presses run-now on a teammate's
     // recording the two diverge. Folding them into one field would have made that unreadable.
     const s = spyDeps();
-    await s.acts.openTalentRun({
+    await s.acts.openSkillRun({
       agent: "a",
-      talent: "meeting-recap",
+      skill: "meeting-recap",
       itemKey: "k",
       version: 3,
       trigger: "hub",
@@ -255,26 +255,26 @@ describe("talent_run records carry the trigger, who asked, and the result", () =
     expect(o.forUser).toBe("U-teammate");
   });
 
-  it("closeTalentRun carries what the run produced, not just that it finished", async () => {
+  it("closeSkillRun carries what the run produced, not just that it finished", async () => {
     const s = spyDeps();
     const result = { summary: "Filed the Globex call", links: [{ label: "Recap", url: "https://x.test/r" }] };
-    await s.acts.closeTalentRun({ agent: "a", talent: "t", itemKey: "k", status: "done", result });
+    await s.acts.closeSkillRun({ agent: "a", skill: "t", itemKey: "k", status: "done", result });
     expect(s.closes[0]).toEqual(["a", "t", "k", "done", undefined, result, undefined]);
   });
 
   it("a failed run still closes with its reason and no result", async () => {
     const s = spyDeps();
-    await s.acts.closeTalentRun({ agent: "a", talent: "t", itemKey: "k", status: "failed", error: "nope" });
+    await s.acts.closeSkillRun({ agent: "a", skill: "t", itemKey: "k", status: "failed", error: "nope" });
     expect(s.closes[0]).toEqual(["a", "t", "k", "failed", "nope", undefined, undefined]);
   });
 
-  it("TALENT-SEVERAL-INSTANCES a run of a second instance is recorded as that instance, not the first", async () => {
+  it("SKILL-SEVERAL-INSTANCES a run of a second instance is recorded as that instance, not the first", async () => {
     const s = spyDeps();
-    await s.acts.closeTalentRun({ agent: "a", talent: "meeting-recap", instance: "team-recap", itemKey: "k", status: "done" });
+    await s.acts.closeSkillRun({ agent: "a", skill: "meeting-recap", instance: "team-recap", itemKey: "k", status: "done" });
     expect(s.closes[0]).toEqual(["a", "meeting-recap", "k", "done", undefined, undefined, "team-recap"]);
   });
 
-  /** `runTalent` heartbeats, so it needs an activity context. Stubbed rather than mocked at module
+  /** `runSkill` heartbeats, so it needs an activity context. Stubbed rather than mocked at module
    *  level, so the rest of this file keeps the real one. */
   function withActivityContext(): void {
     vi.spyOn(Context, "current").mockReturnValue({
@@ -283,45 +283,45 @@ describe("talent_run records carry the trigger, who asked, and the result", () =
     } as unknown as ReturnType<typeof Context.current>);
   }
 
-  it("runTalent hands the announcement back, trimmed to 2000 chars", async () => {
+  it("runSkill hands the announcement back, trimmed to 2000 chars", async () => {
     withActivityContext();
     // Trimmed HERE rather than at the registry: a field length is a contract, and a 40kB transcript
     // arriving at a 2000-char column is a 413 nobody would connect to a recap.
     const long = "x".repeat(5000);
     const deps = {
-      talentPlane: { spawn: async () => ({ status: "done", steer: long, summary: "short" }) },
+      skillPlane: { spawn: async () => ({ status: "done", steer: long, summary: "short" }) },
       ask: async () => {},
     } as unknown as TurnDeps;
     const acts = makeActivities(deps);
-    const r = await acts.runTalent({ agent: "a", item: "i", notify: "U1" });
+    const r = await acts.runSkill({ agent: "a", item: "i", notify: "U1" });
     expect(r.status).toBe("done");
     expect(r.summary).toHaveLength(2000);
   });
 
-  it("TALENT-FIGURES-SAID-AS-GIVEN what a Talent marks to be said as written is posted exactly so, to the person the run is for — and is not handed to the agent to reword", async () => {
+  it("SKILL-FIGURES-SAID-AS-GIVEN what a Skill marks to be said as written is posted exactly so, to the person the run is for — and is not handed to the agent to reword", async () => {
     withActivityContext();
     const said: { agent: string; to: string; text: string }[] = [];
     const asked: string[] = [];
     const line = "New LOREALISTAR drop: *Absolut Repair* — 40 of 250 left, until 2026-09-30. https://us.lorealistar.com/activities/drop/abc";
     const deps = {
-      talentPlane: { spawn: async () => ({ status: "done", say: line, summary: "New drop: Absolut Repair" }) },
+      skillPlane: { spawn: async () => ({ status: "done", say: line, summary: "New drop: Absolut Repair" }) },
       say: async (agent: string, to: string, text: string) => void said.push({ agent, to, text }),
       ask: async (_a: string, _to: string, steer: string) => void asked.push(steer),
     } as unknown as TurnDeps;
-    const r = await makeActivities(deps).runTalent({ agent: "mia", item: "drop-abc", notify: "T1/dm-stef", user: "USTEF", talent: "drop-watch" });
+    const r = await makeActivities(deps).runSkill({ agent: "mia", item: "drop-abc", notify: "T1/dm-stef", user: "USTEF", skill: "drop-watch" });
     expect(said).toEqual([{ agent: "mia", to: "T1/dm-stef", text: line }]);
     expect(asked).toEqual([]);
     expect(r.summary).toBe(line);
   });
 
-  it("TALENT-FIGURES-SAID-AS-GIVEN with nobody to say it to, nothing is said — it is never posted somewhere else instead", async () => {
+  it("SKILL-FIGURES-SAID-AS-GIVEN with nobody to say it to, nothing is said — it is never posted somewhere else instead", async () => {
     withActivityContext();
     const said: string[] = [];
     const deps = {
-      talentPlane: { spawn: async () => ({ status: "done", say: "40 of 250 left" }) },
+      skillPlane: { spawn: async () => ({ status: "done", say: "40 of 250 left" }) },
       say: async (_a: string, _to: string, text: string) => void said.push(text),
     } as unknown as TurnDeps;
-    await makeActivities(deps).runTalent({ agent: "mia", item: "drop-abc", user: "USTEF", talent: "drop-watch" });
+    await makeActivities(deps).runSkill({ agent: "mia", item: "drop-abc", user: "USTEF", skill: "drop-watch" });
     expect(said).toEqual([]);
   });
 
@@ -332,7 +332,7 @@ describe("talent_run records carry the trigger, who asked, and the result", () =
     const asked: string[] = [];
     const line = "New LOREALISTAR drop: *Absolut Repair* — 40 of 250 left, until 2026-09-30. https://us.lorealistar.com/activities/drop/abc";
     const deps = {
-      talentPlane: { spawn: async () => ({ status: "done", say: line, summary: "New drop: Absolut Repair" }) },
+      skillPlane: { spawn: async () => ({ status: "done", say: line, summary: "New drop: Absolut Repair" }) },
       // `say` speaks to a PERSON (it opens a DM with whoever it is given). Handing it the channel is
       // what production did, and the drop went nowhere: a channel is reached by `sayIn` and only that.
       say: async (_a: string, to: string, text: string) => void inDm.push(`say→${to}: ${text}`),
@@ -340,7 +340,7 @@ describe("talent_run records carry the trigger, who asked, and the result", () =
       dm: async (_a: string, _user: string, text: string) => void inDm.push(text),
       ask: async (_a: string, _to: string, steer: string) => void asked.push(steer),
     } as unknown as TurnDeps;
-    await makeActivities(deps).runTalent({ agent: "mia", item: "drop-abc", notify: "USTEF", user: "USTEF", talent: "drop-watch", channel: "C0DROPS" });
+    await makeActivities(deps).runSkill({ agent: "mia", item: "drop-abc", notify: "USTEF", user: "USTEF", skill: "drop-watch", channel: "C0DROPS" });
     expect(inChannel).toEqual([{ to: "C0DROPS", text: line }]); // as given, not reworded
     expect(inDm).toEqual([]);
     expect(asked).toEqual([]);
@@ -351,11 +351,11 @@ describe("talent_run records carry the trigger, who asked, and the result", () =
     const inDm: { user: string; text: string }[] = [];
     const line = "New LOREALISTAR drop: *Absolut Repair* — 40 of 250 left.";
     const deps = {
-      talentPlane: { spawn: async () => ({ status: "done", say: line }) },
+      skillPlane: { spawn: async () => ({ status: "done", say: line }) },
       sayIn: async () => false, // not invited, or no such channel
       dm: async (_a: string, user: string, text: string) => void inDm.push({ user, text }),
     } as unknown as TurnDeps;
-    await makeActivities(deps).runTalent({ agent: "mia", item: "drop-abc", notify: "USTEF", user: "USTEF", talent: "drop-watch", channel: "#drops" });
+    await makeActivities(deps).runSkill({ agent: "mia", item: "drop-abc", notify: "USTEF", user: "USTEF", skill: "drop-watch", channel: "#drops" });
     expect(inDm.length).toBe(1);
     expect(inDm[0]!.user).toBe("USTEF");
     expect(inDm[0]!.text.startsWith(line)).toBe(true); // the figures still as given, first
@@ -367,10 +367,10 @@ describe("talent_run records carry the trigger, who asked, and the result", () =
     withActivityContext();
     const said: { to: string; text: string }[] = [];
     const deps = {
-      talentPlane: { spawn: async () => ({ status: "failed", reason: "401 unauthorized: please run /login" }) },
+      skillPlane: { spawn: async () => ({ status: "failed", reason: "401 unauthorized: please run /login" }) },
       say: async (_a: string, to: string, text: string) => void said.push({ to, text }),
     } as unknown as TurnDeps;
-    await expect(makeActivities(deps).runTalent({ agent: "mia-login-test", item: "drop-abc", notify: "USTEF", user: "USTEF", talent: "drop-watch", channel: "C0DROPS" })).rejects.toThrow();
+    await expect(makeActivities(deps).runSkill({ agent: "mia-login-test", item: "drop-abc", notify: "USTEF", user: "USTEF", skill: "drop-watch", channel: "C0DROPS" })).rejects.toThrow();
     expect(said.map((s) => s.to)).not.toContain("C0DROPS");
   });
 
@@ -379,11 +379,11 @@ describe("talent_run records carry the trigger, who asked, and the result", () =
     const inChannel: string[] = [];
     const inDm: { user: string; text: string }[] = [];
     const deps = {
-      talentPlane: { spawn: async () => ({ status: "done", say: "40 of 250 left" }) },
+      skillPlane: { spawn: async () => ({ status: "done", say: "40 of 250 left" }) },
       say: async (_a: string, _u: string, text: string) => void inChannel.push(text),
       dm: async (_a: string, user: string, text: string) => void inDm.push({ user, text }),
     } as unknown as TurnDeps;
-    await makeActivities(deps).runTalent({ agent: "mia", item: "drop-abc", notify: "USTEF", user: "USTEF", talent: "drop-watch" });
+    await makeActivities(deps).runSkill({ agent: "mia", item: "drop-abc", notify: "USTEF", user: "USTEF", skill: "drop-watch" });
     expect(inDm).toEqual([{ user: "USTEF", text: "40 of 250 left" }]);
     expect(inChannel).toEqual([]);
   });
@@ -426,24 +426,24 @@ describe("talent_run records carry the trigger, who asked, and the result", () =
   it("BRAIN-NO-DISCLOSURE a run that filed into a brain leaves no word of what it filed in the run record", async () => {
     withActivityContext();
     const deps = {
-      talentPlane: {
+      skillPlane: {
         spawn: async () => ({ status: "done", steer: "Recap: Jev is TypeSafe's secret model", summary: "Jev secret", links: [{ label: "AI/jev-recap.md", url: "x" }], brains: ["b-eng"] }),
       },
       ask: async () => {},
     } as unknown as TurnDeps;
-    const r = await makeActivities(deps).runTalent({ agent: "a", item: "i", notify: "U1" });
+    const r = await makeActivities(deps).runSkill({ agent: "a", item: "i", notify: "U1" });
     expect(r.status).toBe("done");
     expect(JSON.stringify(r)).not.toMatch(/Jev|jev-recap/);
     expect(r.links).toBeUndefined();
   });
 
-  it("falls back to the Talent's own summary when there was nothing to announce", async () => {
+  it("falls back to the Skill's own summary when there was nothing to announce", async () => {
     withActivityContext();
     const deps = {
-      talentPlane: { spawn: async () => ({ status: "skipped", summary: "already filed" }) },
+      skillPlane: { spawn: async () => ({ status: "skipped", summary: "already filed" }) },
       ask: async () => {},
     } as unknown as TurnDeps;
-    const r = await makeActivities(deps).runTalent({ agent: "a", item: "i" });
+    const r = await makeActivities(deps).runSkill({ agent: "a", item: "i" });
     expect(r).toMatchObject({ status: "skipped", summary: "already filed" });
   });
 });

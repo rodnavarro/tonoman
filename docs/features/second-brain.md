@@ -5,10 +5,10 @@ of the person's work product, distinct from the conversation transcript ([`git-m
 which is per-conversation dialogue). The load-bearing decision recorded here: **the second brain
 belongs to a Tonoman *account* (a person), not to an agent.** It is a **service of Tonoman** — a
 runtime substrate every agent reaches through the SDK by naming *whose* brain — not a per-agent
-config and not a standalone Talent.
+config and not a standalone Skill.
 
 This is the feature-level view of the store that architecture.md **§A3** touches from the memory side.
-It is written and read through the capability plane the Talents use ([`tonoman-talents.md`](tonoman-talents.md)).
+It is written and read through the capability plane the Skills use ([`tonoman-skills.md`](tonoman-skills.md)).
 
 ---
 
@@ -19,20 +19,20 @@ your own connected accounts, over your own data. Priya talks to Nelly-as-Priya; 
 Nelly-as-you. A single brain keyed by the *agent* would pool everyone's meetings into one store, so
 anyone talking to Nelly could read Priya's — the exact failure the per-user model exists to prevent.
 
-Keying the brain by **account** closes that loop. The Plaud Talent, polling Priya's per-person Plaud,
+Keying the brain by **account** closes that loop. The Plaud Skill, polling Priya's per-person Plaud,
 files her recap in **Priya's** brain. When you open the same agent, you read **yours**. The Users tab
 is per-user for the same reason: it shows what *that person* connected and can use, never a shared pool.
 
-## The contract: a Talent names the user, the runtime resolves the brain
+## The contract: a Skill names the user, the runtime resolves the brain
 
-A Talent never holds a brain path. It calls the capability with a **`user`**, and the runtime resolves
+A Skill never holds a brain path. It calls the capability with a **`user`**, and the runtime resolves
 that user's configured second-brain storage — the same per-turn resolution `configHomeFor(agent, user)`
 already does for the inference login (§A2), one layer over.
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant T as Talent (Plaud)
+    participant T as Skill (Plaud)
     participant Plane as Capability plane
     participant SB as Second-brain service
     participant Repo as Account git repo
@@ -52,7 +52,7 @@ sequenceDiagram
 ```
 
 The shape is the important part: **the `user` is the key, and the substrate owns the mapping** from a
-user to their repo. A Talent stays ignorant of storage; the runtime stays the only thing that knows
+user to their repo. A Skill stays ignorant of storage; the runtime stays the only thing that knows
 where a person's brain lives.
 
 ## Cloud now, local later (intent only)
@@ -76,4 +76,4 @@ the substrate resolves the right person's repo. The per-user *knobs* it depends 
 scoping is the remaining piece.
 
 _Built on A2 (the per-turn `configHomeFor(agent, user)` resolution this mirrors) and A3 (the git
-plumbing). Consumed by the Talents through the capability plane. See [[per-user-connections-and-inference]]._
+plumbing). Consumed by the Skills through the capability plane. See [[per-user-connections-and-inference]]._

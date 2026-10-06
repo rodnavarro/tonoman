@@ -66,7 +66,7 @@ export interface TurnSpec {
   who: string;
   /** The turn's own folder: the only place a file it files may come from (CONVO-FILES-IN-THE-TURN). */
   cwd?: string;
-  /** The Receipts Talent, when it is on for the agent: the brain it files into (TALENT-BRAIN-SETTING)
+  /** The Receipts Skill, when it is on for the agent: the brain it files into (SKILL-BRAIN-SETTING)
    *  and the tenant's legal entities. Absent = `tonoman receipts` says it is off (CLI-GRANTED-GROUPS). */
   receipts?: { brainId: string; entities?: string[]; version?: number };
   /** Tools a Tonoman Cloud serves this agent (D-CLOUD-TOOLS in Tonoman Cloud): each a `tonoman`
@@ -91,11 +91,11 @@ export interface CloudTool {
   commands: Record<string, { args: string[]; about: string; stdin?: string; file?: string }>;
 }
 
-/** A run of a Talent begun by a conversation (RUN-FROM-CONVERSATION), content-free. */
+/** A run of a Skill begun by a conversation (RUN-FROM-CONVERSATION), content-free. */
 export interface ConversationRun {
   agentGuid: string;
   slackUserId: string;
-  talent: string;
+  skill: string;
   version: number;
   itemKey: string;
   status: "done" | "failed";
@@ -147,7 +147,7 @@ export interface BrokerOptions {
   log?: (s: string) => void;
   /** The node binary that runs the shim and the CLI; the worker's own by default. */
   node?: string;
-  /** Record a Talent's run begun by a conversation (best-effort). */
+  /** Record a Skill's run begun by a conversation (best-effort). */
   recordRun?: (run: ConversationRun) => Promise<void>;
   /** Carry a call to a tool the Cloud serves (D-CLOUD-TOOLS): the agent, the tool and command, the
    *  person speaking by the id the surface gave, the arguments, and a file they sent when the command
@@ -219,12 +219,12 @@ export function createBroker(o: BrokerOptions) {
     ...(b.asIs ? { asIs: true } : {}),
   });
 
-  /** The Receipts Talent's brain, as this speaker reaches it — or why not. */
+  /** The Receipts Skill's brain, as this speaker reaches it — or why not. */
   function receiptsBrain(t: Turn, reach: Reach, need: "read" | "write"): { b: Reachable } | { status: number; text: string } {
     if (!t.receipts) return { status: 403, text: "Receipts is not on for this agent, so `tonoman receipts` does nothing here." };
     if (!reach.speaker.member) return { status: 403, text: "This person is not a member of the tenant, so they cannot file or read receipts." };
     const b = reach.brains.find((x) => x.id === t.receipts!.brainId);
-    // Turning the Talent on widens nobody's reach (RECEIPT-WHO-MAY-FILE).
+    // Turning the Skill on widens nobody's reach (RECEIPT-WHO-MAY-FILE).
     if (!b || (need === "write" && b.mode !== "write")) {
       return { status: 403, text: `This person cannot ${need === "write" ? "file into" : "read"} the brain Receipts files into. Nothing was ${need === "write" ? "written" : "read"}.` };
     }
@@ -262,7 +262,7 @@ export function createBroker(o: BrokerOptions) {
   }
 
   async function runOf(t: Turn, itemKey: string, ok: boolean, summary: string): Promise<void> {
-    await o.recordRun?.({ agentGuid: t.agentGuid, slackUserId: t.slackUserId, talent: "receipts", version: t.receipts?.version ?? 1, itemKey, status: ok ? "done" : "failed", summary }).catch(() => {});
+    await o.recordRun?.({ agentGuid: t.agentGuid, slackUserId: t.slackUserId, skill: "receipts", version: t.receipts?.version ?? 1, itemKey, status: ok ? "done" : "failed", summary }).catch(() => {});
   }
 
   /** Make a brain's repo on its first use (BRAIN-REPO-ON-FIRST-USE). Only the owner's own turn does. */
@@ -508,7 +508,7 @@ export function createBroker(o: BrokerOptions) {
     // Change a page or a file in place (BRAIN-EDIT-IN-PLACE): the words to find, and the words to put
     // there or to add after them. Worked out on the file as it is on its remote inside every push
     // attempt, so a change someone pushed meanwhile is kept; everything but the words found stays
-    // byte for byte. General on purpose (D-BRAINS-ARE-EDITABLE): no Talent has a command of its own
+    // byte for byte. General on purpose (D-BRAINS-ARE-EDITABLE): no Skill has a command of its own
     // for correcting what it filed.
     async edit(t, reach, body) {
       const b = pickBrain(reach.brains, body.brain);
@@ -694,7 +694,7 @@ export function createBroker(o: BrokerOptions) {
     get url() {
       return baseUrl;
     },
-    /** Make a brain's repo if it has none yet (a Talent's first filing into it). */
+    /** Make a brain's repo if it has none yet (a Skill's first filing into it). */
     ensureRepo: (tenant: string, b: Reachable): Promise<Reachable> => (b.state === "active" ? Promise.resolve(b) : provision(tenant, b)),
     /** Open a turn's access. Returns the MCP server (Codex) and the `tonoman` command (Claude) — both
      *  on the same token, which works only while the turn runs (CLI-DIES-WITH-TURN). */

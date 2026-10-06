@@ -1,4 +1,4 @@
-// Where a Talent's channel setting leads (docs/definition/objects/drop-watch.md in Tonoman Cloud).
+// Where a Skill's channel setting leads (docs/definition/objects/drop-watch.md in Tonoman Cloud).
 import { describe, it, expect } from "vitest";
 import { channelIdOf, channelRef, channelResolver, type SlackCall } from "./channelsay";
 
@@ -12,7 +12,7 @@ const slack = (pages: { id: string; name: string }[][]) => {
   return { call, calls };
 };
 
-describe("the channel a Talent's settings name", () => {
+describe("the channel a Skill's settings name", () => {
   it("DROPS-IN-A-CHANNEL a channel may be given by its id or by its name, with or without the #", () => {
     expect(channelRef("C0C2DPQB7PY")).toEqual({ id: "C0C2DPQB7PY" });
     expect(channelRef(" #Drops ")).toEqual({ name: "drops" });

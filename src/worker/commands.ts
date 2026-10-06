@@ -45,7 +45,7 @@ export const KNOWN = [
   "code",
   "callback",
   "new",
-  "talent",
+  "skill",
 ] as const;
 
 /** What starts a command. One character, on purpose.
@@ -128,9 +128,9 @@ export function parse(text: string): Command | undefined {
   const m = /^!(\S+)\s*([\s\S]*)$/.exec(t);
   if (!m) return undefined;
   const name = m[1]!.toLowerCase();
-  // Talents are called skills now; `!skill` runs the same command, and `!talent` keeps working.
+  // Skills are called skills now; `!skill` runs the same command, and `!skill` keeps working.
   // Connections are called credentials now (CRED-ABSORBS-CONNECTION); `!connections` keeps working.
-  const ALIASES: Record<string, string> = { skill: "talent", credentials: "connections" };
+  const ALIASES: Record<string, string> = { skill: "skill", credentials: "connections" };
   return { name: ALIASES[name] ?? name, arg: (m[2] ?? "").trim() };
 }
 
@@ -176,16 +176,16 @@ export interface ConnectionLine {
 export interface CommandDeps {
   /** What this agent is connected to. Absent on a deployment with no registry behind it. */
   connections?(agent: string): Promise<ConnectionLine[]>;
-  /** Run a Talent on ONE item now, out of band from its schedule — the on-demand, tool-like trigger.
+  /** Run a Skill on ONE item now, out of band from its schedule — the on-demand, tool-like trigger.
    *  Shares the poll's per-item workflow id, so an on-demand run and a scheduled one never
-   *  double-process the same item. Absent on a deployment with no Talent runtime behind it. */
-  runTalent?(
+   *  double-process the same item. Absent on a deployment with no Skill runtime behind it. */
+  runSkill?(
     agent: string,
-    talent: string,
+    skill: string,
     item: string,
     user?: string,
     force?: boolean,
-    /** WHAT started this run, and who asked. `!talent` is a `command`; the Hub's run-now button is
+    /** WHAT started this run, and who asked. `!skill` is a `command`; the Hub's run-now button is
      *  `hub` and supplies its own `requestedBy`. Recorded on the run, never interpreted here. */
     o?: { trigger?: "schedule" | "command" | "hub"; requestedBy?: string },
   ): Promise<{ started: boolean; message: string; workflowId?: string }>;
@@ -550,11 +550,11 @@ export async function run(
       return [`*Connected* — ${list.length} thing${list.length === 1 ? "" : "s"}:`, ...lines].join("\n");
     }
 
-    // On-demand, like a tool: `!talent meeting-recap <recording-id>` runs the Talent on that one
-    // item now. The same Talent a schedule polls, invoked by hand — a Talent is triggered by
+    // On-demand, like a tool: `!skill meeting-recap <recording-id>` runs the Skill on that one
+    // item now. The same Skill a schedule polls, invoked by hand — a Skill is triggered by
     // schedule, on demand, or both.
-    case "talent": {
-      if (!deps.runTalent) return "This deployment can't run a skill on demand.";
+    case "skill": {
+      if (!deps.runSkill) return "This deployment can't run a skill on demand.";
       const parts = (cmd.arg ?? "").trim().split(/\s+/).filter(Boolean);
       // A trailing `again` (or `force`) re-runs an item already filed — bypassing the idempotency
       // guard that otherwise makes "run this again" a no-op. It is the last word, so it never
@@ -565,7 +565,7 @@ export async function run(
       const item = rest.join(" ");
       if (!name || !item)
         return "Usage: `!skill <name> <recording-id> [again]` — runs a skill on one item now; `again` re-runs an already-filed item.";
-      const r = await deps.runTalent(agent, name, item, user, force);
+      const r = await deps.runSkill(agent, name, item, user, force);
       return r.message;
     }
 

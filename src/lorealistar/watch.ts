@@ -14,10 +14,10 @@ import { renew as cognitoRenew, signIn as cognitoSignIn, type Pool, type Renewal
 export const POOL: Pool = { userPoolId: "us-east-1_wDTwPouSP", clientId: "5uau3lmnl89k9paakt8bjurb2a" };
 export const SITE = "https://us.lorealistar.com";
 
-// What a drop IS and how it is put into words lives with the Talent that says it (a Talent imports
+// What a drop IS and how it is put into words lives with the Skill that says it (a Skill imports
 // nothing that belongs to the runtime); the runtime uses the same.
-import { type Campaign } from "../talents/lorealistar/drop-watch/drop";
-export { type Campaign, dropFacts, dropLine, dropPage } from "../talents/lorealistar/drop-watch/drop";
+import { type Campaign } from "../skills/lorealistar/drop-watch/drop";
+export { type Campaign, dropFacts, dropLine, dropPage } from "../skills/lorealistar/drop-watch/drop";
 
 /** What is kept between looks, per person. Small, and holds no password. */
 export interface WatchState {

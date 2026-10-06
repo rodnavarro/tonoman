@@ -162,37 +162,37 @@ describe("the roster mapping is a WHITELIST, and that cuts both ways", () => {
     expect(cfg.agents[0]!.flows).toEqual(flows);
   });
 
-  it("carries each Talent grant's schedule switch, which is what pauses its timer", async () => {
+  it("carries each Skill grant's schedule switch, which is what pauses its timer", async () => {
     await withTokens();
-    const talents = [
+    const skills = [
       { id: "t1", name: "meeting-recap", version: 2, config: {}, scheduleEnabled: false },
       { id: "t2", name: "agenda-brief", version: 1, config: { times: "07:00" }, scheduleEnabled: true },
     ];
-    const cfg = await plane([{ ...base, talents }]).roster();
-    expect(cfg.agents[0]!.talents?.map((t) => [t.name, t.schedule_enabled])).toEqual([
+    const cfg = await plane([{ ...base, skills }]).roster();
+    expect(cfg.agents[0]!.skills?.map((t) => [t.name, t.schedule_enabled])).toEqual([
       ["meeting-recap", false],
       ["agenda-brief", true],
     ]);
   });
 
-  it("TALENT-BINDING-PER-TOOL carries each instance's name and what its tools use, the shared account flattened", async () => {
+  it("SKILL-BINDING-PER-TOOL carries each instance's name and what its tools use, the shared account flattened", async () => {
     await withTokens();
     const team = { id: "c1", kind: "ics", alias: "team", accounts: [{ accountId: null, secretRef: "ics.url:team", status: "connected" }] };
-    const talents = [
+    const skills = [
       { id: "t1", name: "meeting-recap", version: 3, config: {}, scheduleEnabled: true, instance: "meeting-recap", bindings: { calendar: { mode: "credentials", credentials: [team] } } },
       { id: "t1", name: "meeting-recap", version: 3, config: { output_channel: "C2" }, scheduleEnabled: true, instance: "team-recap", bindings: {} },
     ];
-    const cfg = await plane([{ ...base, talents }]).roster();
-    const [first, second] = cfg.agents[0]!.talents!;
+    const cfg = await plane([{ ...base, skills }]).roster();
+    const [first, second] = cfg.agents[0]!.skills!;
     expect(first!.instance).toBe("meeting-recap");
     expect(first!.bindings?.calendar).toEqual({ mode: "credentials", credentials: [{ id: "c1", kind: "ics", alias: "team", secret_ref: "ics.url:team", status: "connected" }] });
     expect(second).toMatchObject({ name: "meeting-recap", instance: "team-recap", config: { output_channel: "C2" } });
   });
 
-  it("TALENT-INSTANCE-NAMED a grant from an older registry, with no instance, is its skill's first instance", async () => {
+  it("SKILL-INSTANCE-NAMED a grant from an older registry, with no instance, is its skill's first instance", async () => {
     await withTokens();
-    const cfg = await plane([{ ...base, talents: [{ id: "t1", name: "receipts", version: 1, config: {} }] }]).roster();
-    expect(cfg.agents[0]!.talents![0]!.instance).toBe("receipts");
+    const cfg = await plane([{ ...base, skills: [{ id: "t1", name: "receipts", version: 1, config: {} }] }]).roster();
+    expect(cfg.agents[0]!.skills![0]!.instance).toBe("receipts");
   });
 });
 

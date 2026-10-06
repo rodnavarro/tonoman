@@ -156,7 +156,7 @@ describe("every run of an agent goes out as its turn's user (Tonoman Cloud docs/
     expect(events).not.toContain("run");
   });
 
-  it("TURNUSER-NOTHING-AS-ROOT a Talent's inference, which nobody is speaking in, goes out as a user too", async () => {
+  it("TURNUSER-NOTHING-AS-ROOT a Skill's inference, which nobody is speaking in, goes out as a user too", async () => {
     events.length = 0;
     const got = await ranWith({ inference_provider: "claude" }, { lean: true }, users());
     expect(got!.runAs).toEqual({ uid: 20001, home: "/srv/tonoman/homes/20001" });

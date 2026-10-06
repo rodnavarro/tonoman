@@ -93,7 +93,7 @@ export interface TurnRequest {
    * therefore shared by every conversation the process serves — which made one person's `/model`
    * silently change everybody else's. A turn that names its model does not have that problem. */
   model?: string;
-  /** optional: a LEAN inference turn — no tools, no connectors, one turn. Used for Talent `infer`,
+  /** optional: a LEAN inference turn — no tools, no connectors, one turn. Used for Skill `infer`,
    * where the agent reasons on its subscription and NOTHING else: every built-in tool is disallowed
    * (their schemas leave the context too) and the agentic loop is capped at one turn, on top of the
    * `--strict-mcp-config` that already keeps connectors out. A recap is a completion, not a session. */

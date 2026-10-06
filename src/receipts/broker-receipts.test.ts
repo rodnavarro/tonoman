@@ -1,6 +1,6 @@
 // `tonoman receipts`, at the broker: who may file and read, only a file from the speaker's own turn
-// folder, a run recorded for each thing done, and nothing while the Talent is off. Rules: Tonoman
-// Cloud's docs/definition/objects/receipt.md, talent.md (TALENT-IN-CONVERSATION), run.md
+// folder, a run recorded for each thing done, and nothing while the Skill is off. Rules: Tonoman
+// Cloud's docs/definition/objects/receipt.md, skill.md (SKILL-IN-CONVERSATION), run.md
 // (RUN-FROM-CONVERSATION), cli.md (CLI-GRANTED-GROUPS).
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 
@@ -88,7 +88,7 @@ describe("filing from a conversation", () => {
     const { token } = startWith(ROD, "Rod");
     await call(token, "file", fields);
     expect(runs).toHaveLength(1);
-    expect(runs[0]).toMatchObject({ agentGuid: "sapien", slackUserId: ROD, talent: "receipts", status: "done", summary: "filed a receipt" });
+    expect(runs[0]).toMatchObject({ agentGuid: "sapien", slackUserId: ROD, skill: "receipts", status: "done", summary: "filed a receipt" });
     expect(JSON.stringify(runs[0])).not.toMatch(/Antojo|48\.96|breakfast/);
   });
 

@@ -14,7 +14,7 @@ not every design gate does. The rest stay in the architecture map.
 | **Claude Code harness & subscription auth** — the `claude -p` command + the OAuth credential store | [`auth-and-harness.md`](auth-and-harness.md) | §A2 |
 | **Git-backed memory** — the substrate-owned JSONL transcript + harness-session cache reuse | [`git-memory.md`](git-memory.md) | §A3 |
 | **Agent roster & reconcile-on-change** — the worker's whole view of an agent; reload diff | [`roster-and-reload.md`](roster-and-reload.md) | §A11 |
-| **Talents** — self-contained CLIs the runtime spawns | [`tonoman-talents.md`](tonoman-talents.md) | §A15 |
+| **Skills** — self-contained CLIs the runtime spawns | [`tonoman-skills.md`](tonoman-skills.md) | §A15 |
 | **Second brain** — the per-account, git-backed knowledge store agents file into | [`second-brain.md`](second-brain.md) | §A3 |
 | **Coding agent** _(proposed)_ — equipping an agent with Git + cluster access | [`coding-agent.md`](coding-agent.md) | — |
 

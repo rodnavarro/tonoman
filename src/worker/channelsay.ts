@@ -1,4 +1,4 @@
-// Saying something in a CHANNEL a Talent's settings name (DROPS-IN-A-CHANNEL in Tonoman Cloud).
+// Saying something in a CHANNEL a Skill's settings name (DROPS-IN-A-CHANNEL in Tonoman Cloud).
 //
 // A setting holds what a person typed: a channel's id (`C0ABC1234`), or its name with or without the
 // `#`. Slack posts to ids only, so a name is looked up — among the channels the agent can see — and

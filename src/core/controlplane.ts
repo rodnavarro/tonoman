@@ -76,13 +76,13 @@ export interface RegistryAgent {
   /** The tenant's display timezone, IANA. */
   timezone?: string;
   tools?: string[];
-  /** Talents GRANTED and enabled for this agent — the catalogue row (name, version, requires) plus
+  /** Skills GRANTED and enabled for this agent — the catalogue row (name, version, requires) plus
    *  the per-agent attachment's `config`. The registry has already filtered to enabled grants; the
-   *  worker finds the one that drives the voice flow by NAME (a Talent is code, not wire steps). */
-  talents?: {
+   *  worker finds the one that drives the voice flow by NAME (a Skill is code, not wire steps). */
+  skills?: {
     instance?: string;
     bindings?: Record<string, { mode: string; credentials: { id: string; kind: string; alias: string; label?: string | null; scope?: string; accounts?: { accountId?: string | null; secretRef?: string | null; status?: string | null }[] }[] }>;
-    /** When this copy was added (TALENT-COPY-STARTS-NOW in Tonoman Cloud). */
+    /** When this copy was added (SKILL-COPY-STARTS-NOW in Tonoman Cloud). */
     since?: string | null;
     id: string;
     name: string;
@@ -92,6 +92,8 @@ export interface RegistryAgent {
     config?: Record<string, unknown>;
     scheduleEnabled?: boolean;
   }[];
+  /** The old name of `skills`, sent alongside it for one release (D-TALENT-IS-SKILL). */
+  talents?: RegistryAgent["skills"];
   secondbrain?: {
     id: string;
     label: string;
@@ -299,16 +301,17 @@ export class RegistryControlPlane implements ControlPlane {
         // Mapped here too, and this is the field that taught the lesson: `mission` was added to the
         // registry, the roster and the voice flow, and dropped in this whitelist in between.
         timezone: a.timezone ?? "UTC",
-        // Same whitelist, same hazard: the voice flow finds its Talent by NAME among these grants,
-        // so a Talent that arrives on the roster but is dropped here would leave the voice flow with
-        // no grant and silently idle. A Talent is code, so only name/version/config travel.
-        talents: (a.talents ?? []).map((s) => ({
+        // Same whitelist, same hazard: the voice flow finds its Skill by NAME among these grants,
+        // so a Skill that arrives on the roster but is dropped here would leave the voice flow with
+        // no grant and silently idle. A Skill is code, so only name/version/config travel.
+        // `talents` is the same list from a Cloud not yet past the rename (D-TALENT-IS-SKILL).
+        skills: (a.skills ?? a.talents ?? []).map((s) => ({
           name: s.name,
           version: s.version,
           config: s.config,
           // The schedule switch. Mapped like the rest: a field dropped here is a switch that does nothing.
           schedule_enabled: s.scheduleEnabled,
-          // Which instance, and what its tools use (TALENT-INSTANCE-NAMED, TALENT-BINDING-PER-TOOL).
+          // Which instance, and what its tools use (SKILL-INSTANCE-NAMED, SKILL-BINDING-PER-TOOL).
           instance: s.instance ?? s.name,
           since: s.since ?? undefined,
           bindings: Object.fromEntries(

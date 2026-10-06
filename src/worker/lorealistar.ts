@@ -1,6 +1,6 @@
 // The runtime's half of the LOREALISTAR drop watcher (docs/definition/objects/drop-watch.md in
 // Tonoman Cloud). It holds each person's login and what it has told them, looks on their behalf, and
-// hands the Talent only what the site said about a drop — never the login (DROPS-LOGIN-SEALED).
+// hands the Skill only what the site said about a drop — never the login (DROPS-LOGIN-SEALED).
 //
 // Kept the way Plaud's tokens are: sealed in the Cloud, one secret per person, the person in the
 // ref's name (`lorealistar.login:<SlackUserId>`), so "who has connected" is read off the refs and no
@@ -15,7 +15,7 @@ export interface DropLogin {
 
 /** What is kept per person between looks. No password: that is the login's own secret. */
 export interface DropRecord extends WatchState {
-  /** Drops seen and not yet let go, by the site's id: what the Talent is told when it asks. */
+  /** Drops seen and not yet let go, by the site's id: what the Skill is told when it asks. */
   pending: Record<string, { drop: Campaign; seen: string }>;
   /** The tenant's day these counters are for, and the counters. */
   day?: string;

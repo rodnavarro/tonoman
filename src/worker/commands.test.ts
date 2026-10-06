@@ -500,40 +500,40 @@ describe("run — !model normalises the marketing name", () => {
   });
 });
 
-describe("!skill — talents are called skills now", () => {
-  it("TALENT-NAME-IS-IDENTITY `!skill` is the same command as `!talent`, which keeps working", () => {
-    expect(parse("!skill meeting-recap REC1")).toEqual({ name: "talent", arg: "meeting-recap REC1" });
-    expect(parse("!talent meeting-recap REC1")).toEqual({ name: "talent", arg: "meeting-recap REC1" });
-    expect(parse("!Skill agenda-brief now")).toEqual({ name: "talent", arg: "agenda-brief now" });
+describe("!skill — skills are called skills now", () => {
+  it("SKILL-NAME-IS-IDENTITY `!skill` is the same command as `!skill`, which keeps working", () => {
+    expect(parse("!skill meeting-recap REC1")).toEqual({ name: "skill", arg: "meeting-recap REC1" });
+    expect(parse("!skill meeting-recap REC1")).toEqual({ name: "skill", arg: "meeting-recap REC1" });
+    expect(parse("!Skill agenda-brief now")).toEqual({ name: "skill", arg: "agenda-brief now" });
   });
 });
 
-describe("!talent — on-demand run, with `again` to bypass the idempotency guard", () => {
-  it("runs a Talent on one item, force off by default", async () => {
-    const runTalent = vi.fn(async () => ({ started: true, message: "Running." }));
-    await run(deps({ runTalent }), "sapien", "c", { name: "talent", arg: "meeting-recap REC123" }, "U7");
-    expect(runTalent).toHaveBeenCalledWith("sapien", "meeting-recap", "REC123", "U7", false);
+describe("!skill — on-demand run, with `again` to bypass the idempotency guard", () => {
+  it("runs a Skill on one item, force off by default", async () => {
+    const runSkill = vi.fn(async () => ({ started: true, message: "Running." }));
+    await run(deps({ runSkill }), "sapien", "c", { name: "skill", arg: "meeting-recap REC123" }, "U7");
+    expect(runSkill).toHaveBeenCalledWith("sapien", "meeting-recap", "REC123", "U7", false);
   });
 
   it("reads a trailing `again` as force, without swallowing it into the recording id", async () => {
-    const runTalent = vi.fn(async () => ({ started: true, message: "Re-running." }));
-    await run(deps({ runTalent }), "sapien", "c", { name: "talent", arg: "meeting-recap REC123 again" }, "U7");
-    expect(runTalent).toHaveBeenCalledWith("sapien", "meeting-recap", "REC123", "U7", true);
+    const runSkill = vi.fn(async () => ({ started: true, message: "Re-running." }));
+    await run(deps({ runSkill }), "sapien", "c", { name: "skill", arg: "meeting-recap REC123 again" }, "U7");
+    expect(runSkill).toHaveBeenCalledWith("sapien", "meeting-recap", "REC123", "U7", true);
   });
 
   it("accepts `force` and `--force` as the same bypass", async () => {
-    const runTalent = vi.fn(async () => ({ started: true, message: "ok" }));
-    await run(deps({ runTalent }), "sapien", "c", { name: "talent", arg: "meeting-recap REC9 force" }, "U7");
-    expect(runTalent).toHaveBeenLastCalledWith("sapien", "meeting-recap", "REC9", "U7", true);
-    await run(deps({ runTalent }), "sapien", "c", { name: "talent", arg: "meeting-recap REC9 --force" }, "U7");
-    expect(runTalent).toHaveBeenLastCalledWith("sapien", "meeting-recap", "REC9", "U7", true);
+    const runSkill = vi.fn(async () => ({ started: true, message: "ok" }));
+    await run(deps({ runSkill }), "sapien", "c", { name: "skill", arg: "meeting-recap REC9 force" }, "U7");
+    expect(runSkill).toHaveBeenLastCalledWith("sapien", "meeting-recap", "REC9", "U7", true);
+    await run(deps({ runSkill }), "sapien", "c", { name: "skill", arg: "meeting-recap REC9 --force" }, "U7");
+    expect(runSkill).toHaveBeenLastCalledWith("sapien", "meeting-recap", "REC9", "U7", true);
   });
 
   it("still needs a name and an id", async () => {
-    const runTalent = vi.fn(async () => ({ started: true, message: "ok" }));
-    const out = await run(deps({ runTalent }), "sapien", "c", { name: "talent", arg: "meeting-recap" }, "U7");
+    const runSkill = vi.fn(async () => ({ started: true, message: "ok" }));
+    const out = await run(deps({ runSkill }), "sapien", "c", { name: "skill", arg: "meeting-recap" }, "U7");
     expect(out).toContain("Usage:");
-    expect(runTalent).not.toHaveBeenCalled();
+    expect(runSkill).not.toHaveBeenCalled();
   });
 });
 

@@ -17,7 +17,7 @@
 // registry, with no error anywhere to say so.
 //
 // It lives in core/ because BOTH halves resolve refs and neither should import the other: the
-// worker resolves a Talent's provider keys and a second brain's push token, and the control plane
+// worker resolves a Skill's provider keys and a second brain's push token, and the control plane
 // resolves each agent's Slack tokens while building the roster. One rule, read the same way twice.
 
 /** PURE: which scheme a credential ref names, and what is left after it. */

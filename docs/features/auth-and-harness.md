@@ -24,7 +24,7 @@ claude -p --output-format stream-json --include-partial-messages --verbose
 The prompt rides on **stdin**, not argv. `IS_SANDBOX=1` is set so `--dangerously-skip-permissions`
 is accepted as root. `--strict-mcp-config` keeps ambient connectors out by default. The runner
 **guards against `--bare` and unrequested `--resume`**. (The lean variant — every built-in tool
-disallowed, `--max-turns 1` — is how the Talent `infer` capability runs.)
+disallowed, `--max-turns 1` — is how the Skill `infer` capability runs.)
 
 ---
 

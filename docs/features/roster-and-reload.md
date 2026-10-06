@@ -3,7 +3,7 @@
 One gateway process runs a **roster** of agents. An agent is a **GUID-identified instance** (not a
 harness type): the GUID is its stable identity, keying its config volume, its git memory, and its
 registry row — so a rename in the Hub never re-keys anything. The **roster is the worker's entire view
-of an agent**: a Talent, a credential, or an identity edit that isn't on the roster is one the worker
+of an agent**: a Skill, a credential, or an identity edit that isn't on the roster is one the worker
 cannot see. An edit in the Hub reaches a running agent because the worker **re-fetches the roster and
 reconciles**, not because anything redeploys.
 
@@ -15,7 +15,7 @@ This is the feature-level view of architecture.md **§A11**.
 
 `controlPlaneFrom(env)` picks the source: `TONOMANCLOUD_API_URL` set ⇒ **`RegistryControlPlane`**
 (fetches `GET /v1/system/roster`), else a **`FileControlPlane`** (a local `settings.json`). The
-registry plane maps each `RegistryAgent` → `AgentConfig` through an **explicit whitelist** — `talents`,
+registry plane maps each `RegistryAgent` → `AgentConfig` through an **explicit whitelist** — `skills`,
 `secondbrain`, `credentials`, model, identity text, tokens — keyed by GUID. A field added at both the
 API and the worker but *missed* in this whitelist silently vanishes in between, which is the one hazard
 the mapping is written to guard.
@@ -93,8 +93,8 @@ side; the worker only exposes the endpoint.
 
 > **Not stale — deliberately kept:** §A11's `skills` / `config/skills/` vocabulary is **correct**. Those
 > are Claude Code **custom skills** (still called skills in code: `create agent --skill`), a different
-> concept from the Wave 2/3 **skill→talent** / **connection→credential** rename, which applied to the
-> *roster/voice* domain. The roster fields are already `talents` / `credentials`; A11 uses neither old
+> concept from the Wave 2/3 **skill→skill** / **connection→credential** rename, which applied to the
+> *roster/voice* domain. The roster fields are already `skills` / `credentials`; A11 uses neither old
 > name.
 
 _Built on A2 (the per-agent config home + auth) and A3 (the git memory the GUID keys). The GUID is the

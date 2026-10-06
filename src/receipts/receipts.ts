@@ -117,7 +117,7 @@ function realDate(date: string): boolean {
 }
 
 /** PURE: every field checked before anything is written. A refusal says what to ask the person.
- *  `entities` is the tenant's own list from the Talent's settings: with none set nothing is filed,
+ *  `entities` is the tenant's own list from the Skill's settings: with none set nothing is filed,
  *  because the list is what makes an entity real (RECEIPT-ENTITY-ALWAYS). */
 export function checkReceipt(a: ReceiptArgs, entities: string[]): Checked {
   const vendor = (a.vendor ?? "").trim();

@@ -40,9 +40,9 @@ import { isPoolCredential, startHeartbeat } from "./heartbeat";
 import { knowsSpeaker, noticeLimiter, unknownSpeakerNotice } from "./speakergate";
 import { cloudDropStore, dropWatcher, memoryDropStore } from "./lorealistar";
 import { siteOver } from "../lorealistar/watch";
-import { dropWatch, dropEveryMinutes, dropChannel } from "./talents/drop-watch";
-import { BUILTIN_TALENTS, getTalent } from "./talents/registry";
-import { meetingRecap } from "./talents/meeting-recap";
+import { dropWatch, dropEveryMinutes, dropChannel } from "./skills/drop-watch";
+import { BUILTIN_SKILLS, getSkill } from "./skills/registry";
+import { meetingRecap } from "./skills/meeting-recap";
 import {
   parseStatusMode,
   remoteAccountUsageCached,
@@ -81,11 +81,11 @@ import { harnessForProvider, providerAccountLabel, providerLabel, type HarnessKi
 import { accountsFromUsers, accountsOf, makeActivities, type TurnRunReq, type VoiceAccount, type VoiceConfig, type TurnBrains } from "./activities";
 import { publishRecap, startCapabilityPlane, type CapabilityPlane } from "./capability-plane";
 import { calendarChoices, copyFloor, dueCopies, localTools, localToolsOf, skillsNote } from "./localtools";
-import { recapJobPrompt, recapNudge } from "../talents/voice/plaud-and-calendar-meetings/prompt";
-import { agendaFacts, describeFacts, localParts, localTimeOn } from "../talents/calendar/agenda-brief/facts";
-import { checkPhase } from "../talents/calendar/agenda-brief/run";
-import { agendaTickWorkflow, conversationWorkflow, dropsPollWorkflow, messageSignal, plaudPollWorkflow, runTalentWorkflow, skillsTickWorkflow, type AgendaTickInput, type DropsPollInput, type Inbound, type PollInput, type SkillsTickInput } from "./workflows";
-import { agendaBrief, parseAgendaTimes } from "./talents/agenda-brief";
+import { recapJobPrompt, recapNudge } from "../skills/voice/plaud-and-calendar-meetings/prompt";
+import { agendaFacts, describeFacts, localParts, localTimeOn } from "../skills/calendar/agenda-brief/facts";
+import { checkPhase } from "../skills/calendar/agenda-brief/run";
+import { agendaTickWorkflow, conversationWorkflow, dropsPollWorkflow, messageSignal, plaudPollWorkflow, runSkillWorkflow, skillsTickWorkflow, type AgendaTickInput, type DropsPollInput, type Inbound, type PollInput, type SkillsTickInput } from "./workflows";
+import { agendaBrief, parseAgendaTimes } from "./skills/agenda-brief";
 import { ApplicationFailure, WorkflowExecutionAlreadyStartedError } from "@temporalio/common";
 import { planReload } from "./reload";
 
@@ -462,7 +462,7 @@ async function startBrains(): Promise<{ registry: ReturnType<typeof registryClie
   // One credential for the brains' git host, by reference (a mounted secret). Used per command.
   const gitSecret = process.env.TONOMAN_BRAIN_GIT_SECRET ?? "";
   const pat = async (): Promise<string> => (gitSecret ? resolveRef(gitSecret) : "");
-  // Every push by a person or a Talent queues a refresh of that brain (BRAIN-BACKGROUND-REFRESH).
+  // Every push by a person or a Skill queues a refresh of that brain (BRAIN-BACKGROUND-REFRESH).
   let pushed: (b: BrainRef) => void = () => {};
   const store = createStore({
     root,
@@ -483,21 +483,21 @@ async function startBrains(): Promise<{ registry: ReturnType<typeof registryClie
   const org = process.env.TONOMAN_BRAIN_ADO_ORG;
   const project = process.env.TONOMAN_BRAIN_ADO_PROJECT;
   const provisioner = org && project && makesBrains(process.env) ? adoProvisioner({ org, project, suffix: process.env.TONOMAN_BRAIN_REPO_SUFFIX ?? "", pat }) : undefined;
-  // A Talent working in a conversation records each thing it does as a run begun by the conversation,
+  // A Skill working in a conversation records each thing it does as a run begun by the conversation,
   // for the person speaking, with no content (RUN-FROM-CONVERSATION): opened and closed at once.
   const recordRun = async (r: ConversationRun): Promise<void> => {
     const base = process.env.TONOMANCLOUD_API_URL;
     if (!base) return;
     const call = (method: string, body: Record<string, unknown>) =>
-      fetch(`${base}/v1/system/agents/${encodeURIComponent(r.agentGuid)}/talent-runs`, {
+      fetch(`${base}/v1/system/agents/${encodeURIComponent(r.agentGuid)}/skill-runs`, {
         method,
         headers: { authorization: `Bearer ${process.env.TONOMANCLOUD_API_TOKEN ?? ""}`, "content-type": "application/json" },
         body: JSON.stringify(body),
       });
-    const opened = await call("POST", { talent: r.talent, itemKey: r.itemKey, version: r.version, trigger: "conversation", forUser: r.slackUserId });
-    if (!opened.ok) return console.error(`worker: ${r.talent} run from a conversation not recorded (${opened.status})`);
-    const closed = await call("PATCH", { talent: r.talent, itemKey: r.itemKey, status: r.status, result: { summary: r.summary } });
-    if (!closed.ok) console.error(`worker: ${r.talent} run from a conversation not closed (${closed.status})`);
+    const opened = await call("POST", { skill: r.skill, itemKey: r.itemKey, version: r.version, trigger: "conversation", forUser: r.slackUserId });
+    if (!opened.ok) return console.error(`worker: ${r.skill} run from a conversation not recorded (${opened.status})`);
+    const closed = await call("PATCH", { skill: r.skill, itemKey: r.itemKey, status: r.status, result: { summary: r.summary } });
+    if (!closed.ok) console.error(`worker: ${r.skill} run from a conversation not closed (${closed.status})`);
   };
   // A call to a tool the Cloud serves (D-CLOUD-TOOLS in Tonoman Cloud), carried there with the person
   // speaking; the Cloud's answer is the turn's.
@@ -867,7 +867,7 @@ function runClosure(runner: TurnRunner, cfg: AgentConfig, users?: TurnUsers): Wi
     if (cfg.container) throw new Error(`${cfg.name} runs in a container of its own; with turns running as their own users only an agent run by this worker can be started`);
     // The same for one reached over HTTP: whatever answers there starts the program as itself.
     if (cfg.url || (cfg.harness && cfg.harness !== "claude-code" && cfg.harness !== "codex")) throw new Error(`${cfg.name} is run somewhere else (${cfg.harness ?? "over HTTP"}); with turns running as their own users only an agent run by this worker can be started`);
-    // Every run of this agent — a person's turn, a Talent's inference, an announcement — goes out
+    // Every run of this agent — a person's turn, a Skill's inference, an announcement — goes out
     // as its turn's user, or not at all: never as the worker's own (TURNUSER-NOTHING-AS-ROOT).
     return (async function* () {
       // The Cloud decides whose user it is from who is speaking (TURNUSER-WHOSE); the worker only asks.
@@ -897,7 +897,7 @@ function runClosure(runner: TurnRunner, cfg: AgentConfig, users?: TurnUsers): Wi
 
 /** Channels each agent WATCHES for Wave 6's reply-in-thread mode, keyed by agent name. Module-level
  *  because the connector (built in `wireOne`) and the voice wiring (`wireVoice`, which knows the
- *  Talent config) live in different scopes but must share one source of truth. The connector reads
+ *  Skill config) live in different scopes but must share one source of truth. The connector reads
  *  it PER MESSAGE, and `wireVoice` rewrites it on every (re)wire, so turning the toggle on or off,
  *  or moving the output channel, takes effect on the next message without a restart. Empty for every
  *  agent until one enables the toggle — which is every agent today. */
@@ -937,7 +937,7 @@ function wireOne(a: AgentConfig, harnesses: ReturnType<typeof defaultHarnesses>)
     allowedUsers: a.slack?.allowed_users,
     mediaDir,
     mediaMount: mediaDir,
-    // Read live per message: `wireVoice` keeps this set in step with the agent's Talent config.
+    // Read live per message: `wireVoice` keeps this set in step with the agent's Skill config.
     watchedChannels: () => voiceWatch.get(a.name) ?? new Set<string>(),
     // Another agent served here watches the same channel: a plain message there is answered only
     // when it names one of them (CONVO-WHO-IS-ADDRESSED). Agents on another worker are not seen.
@@ -1075,27 +1075,27 @@ export function sessionStore(
   };
 }
 
-/** Report the built-in Talents to the Cloud catalogue — the one OSS→Cloud bridge for what a Talent
- *  IS. Git is the source of truth; this makes each `talent` row mirror the loaded manifest (version,
+/** Report the built-in Skills to the Cloud catalogue — the one OSS→Cloud bridge for what a Skill
+ *  IS. Git is the source of truth; this makes each `skill` row mirror the loaded manifest (version,
  *  requires, configSchema), replacing the seed's guess. Best-effort and idempotent: a file roster
  *  (no registry) is a no-op, and a registry that is briefly unreachable leaves the catalogue stale
- *  rather than stopping the worker — exactly like the talent_run rows. */
-export async function registerBuiltinTalents(): Promise<void> {
+ *  rather than stopping the worker — exactly like the skill_run rows. */
+export async function registerBuiltinSkills(): Promise<void> {
   const baseUrl = process.env.TONOMANCLOUD_API_URL;
   if (!baseUrl) return; // a self-hosted / file-roster worker has no catalogue to register into
   const token = process.env.TONOMANCLOUD_API_TOKEN ?? "";
-  // The catalogue is the platform's (TALENT-CATALOGUE-FROM-CODE): the platform's own fleet keeps it
+  // The catalogue is the platform's (SKILL-CATALOGUE-FROM-CODE): the platform's own fleet keeps it
   // current, and a pool — somebody's computer — registers nothing into it (POOL-SEES-ONLY-ITS-OWN).
   if (isPoolCredential(token)) {
-    console.log("worker: on a pool credential; the Talent catalogue is the platform's to register");
+    console.log("worker: on a pool credential; the Skill catalogue is the platform's to register");
     return;
   }
-  for (const t of BUILTIN_TALENTS) {
+  for (const t of BUILTIN_SKILLS) {
     try {
-      const r = await fetch(`${baseUrl}/v1/system/talents/${encodeURIComponent(t.name)}`, {
+      const r = await fetch(`${baseUrl}/v1/system/skills/${encodeURIComponent(t.name)}`, {
         method: "PUT",
         headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
-        // Bounded: registration is on the BOOT path (unlike the talent_run rows), so an API that is
+        // Bounded: registration is on the BOOT path (unlike the skill_run rows), so an API that is
         // up-but-hung, or a DNS blip, must not stall the worker for undici's ~5-minute default.
         signal: AbortSignal.timeout(5000),
         body: JSON.stringify({
@@ -1106,10 +1106,10 @@ export async function registerBuiltinTalents(): Promise<void> {
           schedule: t.schedule ?? null,
         }),
       });
-      if (!r.ok) console.error(`worker: register Talent ${t.name}@${t.version} → ${r.status}`);
-      else console.log(`worker: registered Talent ${t.name}@${t.version}`);
+      if (!r.ok) console.error(`worker: register Skill ${t.name}@${t.version} → ${r.status}`);
+      else console.log(`worker: registered Skill ${t.name}@${t.version}`);
     } catch (e) {
-      console.error(`worker: register Talent ${t.name} failed: ${String(e)}`);
+      console.error(`worker: register Skill ${t.name} failed: ${String(e)}`);
     }
   }
 }
@@ -1127,9 +1127,9 @@ export async function run(
   if (only.size > 0) {
     console.log(`worker: serving only ${[...only].join(", ")} (TONOMAN_AGENTS)`);
   }
-  // Register the built-in Talent catalogue before serving, so the Hub reads what this code actually
+  // Register the built-in Skill catalogue before serving, so the Hub reads what this code actually
   // loaded (version, requires, configSchema) rather than the seed's placeholder. Best-effort.
-  await registerBuiltinTalents();
+  await registerBuiltinSkills();
   const wired = wire(cfg, only);
   if (wired.size === 0) {
     // Loudly: a worker with no connectors looks perfectly healthy while answering nobody.
@@ -1203,7 +1203,7 @@ export async function run(
       );
       // Its skills, and what each copy's tools use, by label — so a person can say "my work calendar"
       // and a job can name "Team Plaud", and the agent calls the tool the same way either way.
-      const skills = skillsNote(a.cfg, (n) => getTalent(n)?.description);
+      const skills = skillsNote(a.cfg, (n) => getSkill(n)?.description);
       if (skills) a.context = `${a.context}\n\n${skills}`;
     }
   };
@@ -1362,9 +1362,9 @@ export async function run(
     // unreadable must not silently become "no calendar": it is logged by alias, never by URL,
     // because a published feed's link IS its credential.
     const calendars: calendar.CalendarFeed[] = [];
-    // What the recap's own calendar tool is bound to (TALENT-BINDING-PER-TOOL); an older registry
+    // What the recap's own calendar tool is bound to (SKILL-BINDING-PER-TOOL); an older registry
     // sends no bindings, and then every calendar the agent was granted, as before.
-    const recapGrant = (a.cfg.talents ?? []).find((t) => t.name === meetingRecap.name);
+    const recapGrant = (a.cfg.skills ?? []).find((t) => t.name === meetingRecap.name);
     const boundCalendars = recapGrant?.bindings?.calendar?.credentials;
     for (const c of boundCalendars ?? a.cfg.credentials ?? []) {
       if (c.kind !== "ics" && c.kind !== "google") continue; // outlook: connect-only for now
@@ -1389,31 +1389,31 @@ export async function run(
     const token = await resolveRef(src.secret_ref, a.cfg.guid);
     const pushUrl = token ? src.repo_url.replace("https://", `https://x-access-token:${token}@`) : src.repo_url;
     const dir = path.join(process.env.TONOMAN_STATE_ROOT ?? "/root/.tonoman", "secondbrain", name, src.id);
-    // The installed Talent that drives the voice flow, if any — the built-in Plaud reference Talent,
-    // found by NAME. A Talent is CODE behind a manifest: the worker resolves name→implementation
-    // from its own registry rather than reading steps off the wire. Any granted Talent the worker
+    // The installed Skill that drives the voice flow, if any — the built-in Plaud reference Skill,
+    // found by NAME. A Skill is CODE behind a manifest: the worker resolves name→implementation
+    // from its own registry rather than reading steps off the wire. Any granted Skill the worker
     // has no code for is logged and skipped (the day-2 marketplace case, surfaced honestly).
-    for (const t of a.cfg.talents ?? []) {
-      if (!getTalent(t.name)) {
-        console.warn(`worker: ${name} granted Talent '${t.name}' has no loaded implementation — skipping`);
+    for (const t of a.cfg.skills ?? []) {
+      if (!getSkill(t.name)) {
+        console.warn(`worker: ${name} granted Skill '${t.name}' has no loaded implementation — skipping`);
       }
     }
-    const voiceGrant = (a.cfg.talents ?? []).find((t) => t.name === meetingRecap.name);
+    const voiceGrant = (a.cfg.skills ?? []).find((t) => t.name === meetingRecap.name);
     // Pin the loaded CODE's version, not the roster's — a run is recorded against the code that ran.
     const voiceSkill = voiceGrant
-      ? { name: voiceGrant.name, version: getTalent(voiceGrant.name)?.version ?? voiceGrant.version }
+      ? { name: voiceGrant.name, version: getSkill(voiceGrant.name)?.version ?? voiceGrant.version }
       : undefined;
-    // Wave 4: the output channel is now a Talent CONFIG value (`output_channel`, a Slack channel id),
+    // Wave 4: the output channel is now a Skill CONFIG value (`output_channel`, a Slack channel id),
     // set per-agent in the Hub and carried on the roster grant. It takes precedence over the legacy
-    // `voice.notify_channel` flow property, which stays as the fallback so an agent whose Talent
+    // `voice.notify_channel` flow property, which stays as the fallback so an agent whose Skill
     // config is unset behaves exactly as before. A blank config value is not a value — it falls
     // through rather than silently sending recaps nowhere.
     const configChannel =
       typeof voiceGrant?.config?.output_channel === "string" ? voiceGrant.config.output_channel.trim() : "";
     if (configChannel)
-      console.log(`worker: ${name} voice output channel from Talent config: ${configChannel}`);
+      console.log(`worker: ${name} voice output channel from Skill config: ${configChannel}`);
 
-    // Wave 6: watch the output channel for reply-in-thread mode when the Talent config turns it on.
+    // Wave 6: watch the output channel for reply-in-thread mode when the Skill config turns it on.
     // Rewritten on every (re)wire so a toggle or a channel move is picked up without a restart; the
     // connector reads `voiceWatch` per message. The resolved channel is the same one recaps land in
     // (config first, legacy flow property as fallback) — you answer questions where you posted.
@@ -1470,8 +1470,8 @@ export async function run(
       // round trip that can be stale on its own.
       mission: a.cfg.mission ?? "",
       timezone: a.cfg.timezone ?? "UTC",
-      // The Talent this voice flow runs — its name and pinned version, recorded onto every run.
-      talent: voiceSkill ? { name: voiceSkill.name, version: voiceSkill.version } : undefined,
+      // The Skill this voice flow runs — its name and pinned version, recorded onto every run.
+      skill: voiceSkill ? { name: voiceSkill.name, version: voiceSkill.version } : undefined,
       floorMs,
       vocab: vocabularyFor(a.cfg),
     });
@@ -1639,13 +1639,13 @@ export async function run(
     claimSession,
     resetSession,
     brains: turnBrains(brainsSys),
-    // A Talent's program goes out as the run's own Linux user too (TURNUSER-NOTHING-AS-ROOT).
+    // A Skill's program goes out as the run's own Linux user too (TURNUSER-NOTHING-AS-ROOT).
     turnUser: usersOfThisWorker()
       ? async (agent: string, user: string | undefined) => {
           const users = usersOfThisWorker()!;
           const who = await users.for(wired.get(agent)?.cfg.guid ?? agent, user || undefined);
           const runAs = { uid: who.uid, home: who.home };
-          await users.handOver(runAs, { configHome: homeIn(runAs, agent, "talents") });
+          await users.handOver(runAs, { configHome: homeIn(runAs, agent, "skills") });
           return runAs;
         }
       : undefined,
@@ -1658,16 +1658,16 @@ export async function run(
     dropTurnDir,
     turnsRoot: turnUsersOn() ? TURNS_ROOT : undefined,
     sentFiles: sentFiles(path.join(process.env.TONOMAN_STATE_ROOT ?? "/root/.tonoman", "sent")),
-    // Where a Talent files (BRAIN-TALENT-TARGET): the brain its settings name, else the personal brain
+    // Where a Skill files (BRAIN-SKILL-TARGET): the brain its settings name, else the personal brain
     // of the person the run is for. An agent that already files into a second brain keeps doing so
     // (BRAIN-MIGRATION). The run must be able to write there, now and again right before the push.
-    talentBrain: brainsSys
+    skillBrain: brainsSys
       ? {
           store: brainsSys.store,
-          target: async (agentName: string, user: string | undefined, talent: string) => {
+          target: async (agentName: string, user: string | undefined, skill: string) => {
             const a = wired.get(agentName);
             if (!a?.cfg.guid) return undefined;
-            const named = (a.cfg.talents ?? []).find((t) => t.name === talent)?.config?.brain;
+            const named = (a.cfg.skills ?? []).find((t) => t.name === skill)?.config?.brain;
             if (!(typeof named === "string" && named.trim()) && (a.cfg.secondbrain ?? []).length) return undefined;
             const guid = a.cfg.guid;
             const r = await brainsSys.registry.reachUnattended(guid, user ?? null);
@@ -1704,7 +1704,7 @@ export async function run(
       const conv = await voiceConversation(name, user);
       if (conv) await wired.get(name)?.conn.reply(conv).send(text);
     },
-    // In a CHANNEL a Talent's settings name — its id, or its name looked up among what the agent can
+    // In a CHANNEL a Skill's settings name — its id, or its name looked up among what the agent can
     // see (DROPS-IN-A-CHANNEL). Never through `say`, which takes a person and opens a DM with them.
     sayIn: async (name: string, channel: string, text: string): Promise<boolean> => {
       const a = wired.get(name);
@@ -1724,12 +1724,12 @@ export async function run(
       }
     },
     // A meeting-recap copy other than the first: its own Plaud logins, from when it was added
-    // (TALENT-SEVERAL-INSTANCES-SCHEDULED, TALENT-COPY-STARTS-NOW).
+    // (SKILL-SEVERAL-INSTANCES-SCHEDULED, SKILL-COPY-STARTS-NOW).
     copyAccounts: async (name: string, copy: string) => {
       const a = wired.get(name);
       const v = voiceCreds.get(name);
       if (!a || !v) return undefined;
-      const g = (a.cfg.talents ?? []).find((t) => (t.instance ?? t.name) === copy);
+      const g = (a.cfg.skills ?? []).find((t) => (t.instance ?? t.name) === copy);
       if (!g) return [];
       const floor = copyFloor(v.floorMs, g.since, Date.now());
       const out: VoiceAccount[] = [];
@@ -1760,7 +1760,7 @@ export async function run(
       }
       const v = voiceCreds.get(name);
       const copy = j.instance ?? meetingRecap.name;
-      const grants = a?.cfg.talents ?? [];
+      const grants = a?.cfg.skills ?? [];
       const grant = grants.find((t) => (t.instance ?? t.name) === copy) ?? grants.find((t) => t.name === meetingRecap.name);
       const sharedBound = grant?.bindings?.plaud?.credentials.find((c) => c.scope !== "per_person" && c.secret_ref);
       const login = sharedBound ? sharedBound.label || sharedBound.alias : j.user ? "mine" : "";
@@ -1807,7 +1807,7 @@ export async function run(
     // the same runner that answers messages rather than a side model with its own key. No
     // systemPromptFile: the identity/persona is for conversation; a recap wants the agent's model,
     // not its voice. Dispatches on the harness the agent runs — claude-code today; a second provider
-    // (codex, an OpenAI subscription) slots in here without the Talent ever knowing.
+    // (codex, an OpenAI subscription) slots in here without the Skill ever knowing.
     // A Google calendar's events, through the registry: it refreshes the access token with the client
     // secret this worker never holds, and hands back only the short-lived access token.
     googleCalendar: async (
@@ -1841,10 +1841,10 @@ export async function run(
         console.error(`worker: ${name} auth-state report failed — ${(e as Error).message}`),
       ),
     providerLabel: (name: string): string => providerLabel(providerOf(wired.get(name)?.cfg)),
-    talentConfig: (name: string, talent: string): Record<string, unknown> => {
-      // By the instance's name first (TALENT-INSTANCE-NAMED), else the skill's first instance.
-      const all = wired.get(name)?.cfg.talents ?? [];
-      return (all.find((t) => (t.instance ?? t.name) === talent) ?? all.find((t) => t.name === talent))?.config ?? {};
+    skillConfig: (name: string, skill: string): Record<string, unknown> => {
+      // By the instance's name first (SKILL-INSTANCE-NAMED), else the skill's first instance.
+      const all = wired.get(name)?.cfg.skills ?? [];
+      return (all.find((t) => (t.instance ?? t.name) === skill) ?? all.find((t) => t.name === skill))?.config ?? {};
     },
     infer: async (name: string, p: { system: string; user: string }, owner?: string): Promise<string> => {
       const a = wired.get(name);
@@ -1871,10 +1871,10 @@ export async function run(
     // recording is not processed, so every failure here is logged and swallowed — the run proceeds,
     // the row is simply missing. Dedup does not depend on it (the git checkout still answers "already
     // published"); this makes a failing run visible, which nothing did before.
-    talentRun: {
+    skillRun: {
       open: async (
         name: string,
-        talentName: string,
+        skillName: string,
         itemKey: string,
         version: number,
         o?: { trigger?: "schedule" | "command" | "hub"; requestedBy?: string; forUser?: string; instance?: string },
@@ -1883,18 +1883,18 @@ export async function run(
         const guid = wired.get(name)?.cfg.guid;
         if (!baseUrl || !guid) return; // a file roster has no registry to record into
         try {
-          const r = await fetch(`${baseUrl}/v1/system/agents/${guid}/talent-runs`, {
+          const r = await fetch(`${baseUrl}/v1/system/agents/${guid}/skill-runs`, {
             method: "POST",
             headers: {
               authorization: `Bearer ${process.env.TONOMANCLOUD_API_TOKEN ?? ""}`,
               "content-type": "application/json",
             },
             // `trigger` and `requestedBy` are what make "why did this run, and who asked" answerable
-            // after the fact — a Talent failing on its schedule and one a person keeps re-running by
+            // after the fact — a Skill failing on its schedule and one a person keeps re-running by
             // hand are very different situations that used to leave identical rows.
             body: JSON.stringify({
-              talent: talentName,
-              ...(o?.instance && o.instance !== talentName ? { instance: o.instance } : {}),
+              skill: skillName,
+              ...(o?.instance && o.instance !== skillName ? { instance: o.instance } : {}),
               itemKey,
               version,
               trigger: o?.trigger ?? "schedule",
@@ -1904,14 +1904,14 @@ export async function run(
               ...(o?.forUser ? { forUser: o.forUser } : {}),
             }),
           });
-          if (!r.ok) console.error(`worker: ${name} talent_run open ${talentName}/${itemKey} → ${r.status}`);
+          if (!r.ok) console.error(`worker: ${name} skill_run open ${skillName}/${itemKey} → ${r.status}`);
         } catch (e) {
-          console.error(`worker: ${name} talent_run open ${talentName}/${itemKey} failed: ${String(e)}`);
+          console.error(`worker: ${name} skill_run open ${skillName}/${itemKey} failed: ${String(e)}`);
         }
       },
       close: async (
         name: string,
-        talentName: string,
+        skillName: string,
         itemKey: string,
         status: "done" | "failed",
         error?: string,
@@ -1922,7 +1922,7 @@ export async function run(
         const guid = wired.get(name)?.cfg.guid;
         if (!baseUrl || !guid) return;
         try {
-          const r = await fetch(`${baseUrl}/v1/system/agents/${guid}/talent-runs`, {
+          const r = await fetch(`${baseUrl}/v1/system/agents/${guid}/skill-runs`, {
             method: "PATCH",
             headers: {
               authorization: `Bearer ${process.env.TONOMANCLOUD_API_TOKEN ?? ""}`,
@@ -1932,8 +1932,8 @@ export async function run(
             // the activity that produced it; trimmed again here because this is the last place before
             // the wire and a field length is a contract, not a hope.
             body: JSON.stringify({
-              talent: talentName,
-              ...(instance && instance !== talentName ? { instance } : {}),
+              skill: skillName,
+              ...(instance && instance !== skillName ? { instance } : {}),
               itemKey,
               status,
               error,
@@ -1942,22 +1942,22 @@ export async function run(
                 : {}),
             }),
           });
-          if (!r.ok) console.error(`worker: ${name} talent_run close ${talentName}/${itemKey} → ${r.status}`);
+          if (!r.ok) console.error(`worker: ${name} skill_run close ${skillName}/${itemKey} → ${r.status}`);
         } catch (e) {
-          console.error(`worker: ${name} talent_run close ${talentName}/${itemKey} failed: ${String(e)}`);
+          console.error(`worker: ${name} skill_run close ${skillName}/${itemKey} failed: ${String(e)}`);
         }
       },
-      status: async (name: string, talentName: string, itemKey: string, instance?: string) => {
+      status: async (name: string, skillName: string, itemKey: string, instance?: string) => {
         const baseUrl = process.env.TONOMANCLOUD_API_URL;
         const guid = wired.get(name)?.cfg.guid;
         if (!baseUrl || !guid) return undefined; // a file roster has no registry to ask
         try {
-          const qs = `talent=${encodeURIComponent(talentName)}&itemKey=${encodeURIComponent(itemKey)}${instance && instance !== talentName ? `&instance=${encodeURIComponent(instance)}` : ""}`;
-          const r = await fetch(`${baseUrl}/v1/system/agents/${guid}/talent-runs?${qs}`, {
+          const qs = `skill=${encodeURIComponent(skillName)}&itemKey=${encodeURIComponent(itemKey)}${instance && instance !== skillName ? `&instance=${encodeURIComponent(instance)}` : ""}`;
+          const r = await fetch(`${baseUrl}/v1/system/agents/${guid}/skill-runs?${qs}`, {
             headers: { authorization: `Bearer ${process.env.TONOMANCLOUD_API_TOKEN ?? ""}` },
           });
           if (!r.ok) {
-            // 404 (no such agent/talent) and every other non-OK read FAIL OPEN: the guard's only job
+            // 404 (no such agent/skill) and every other non-OK read FAIL OPEN: the guard's only job
             // is to skip an item that is already done, so "can't tell" must mean "go ahead".
             return undefined;
           }
@@ -1968,16 +1968,16 @@ export async function run(
             ? { status: body.status as "running" | "done" | "failed", attempts: Number(body.attempts ?? 0) }
             : undefined;
         } catch (e) {
-          console.error(`worker: ${name} talent_run status ${talentName}/${itemKey} failed: ${String(e)}`);
+          console.error(`worker: ${name} skill_run status ${skillName}/${itemKey} failed: ${String(e)}`);
           return undefined;
         }
       },
     },
   };
 
-  // The capability plane — a localhost server a spawned Talent CLI calls for transcription,
+  // The capability plane — a localhost server a spawned Skill CLI calls for transcription,
   // inference and publishing. Started once, closed over `deps` (so it resolves each run's VoiceConfig
-  // live, across reloads), and attached to `deps` so the `runTalent` activity can spawn through it.
+  // live, across reloads), and attached to `deps` so the `runSkill` activity can spawn through it.
   // Best-effort: a failure here must not stop the worker from answering messages.
   // The tools a skill brings to a turn, answered here with what the worker holds: the voice flow's
   // transcription chain and brain, each person's Plaud, the calendars a copy reads (D-JOBS-ARE-PROMPTS).
@@ -2049,15 +2049,15 @@ export async function run(
       return out;
     },
     closeRun: (name, instance, id, summary) =>
-      deps.talentRun.close(name, meetingRecap.name, recordingKey(id), "done", undefined, { summary }, instance === meetingRecap.name ? undefined : instance),
+      deps.skillRun.close(name, meetingRecap.name, recordingKey(id), "done", undefined, { summary }, instance === meetingRecap.name ? undefined : instance),
   });
 
-  let talentPlane: CapabilityPlane | undefined;
+  let skillPlane: CapabilityPlane | undefined;
   try {
-    talentPlane = await startCapabilityPlane(deps as unknown as Parameters<typeof startCapabilityPlane>[0]);
-    (deps as { talentPlane?: CapabilityPlane }).talentPlane = talentPlane;
-    console.log(`worker: capability plane listening on ${talentPlane.url}`);
-    signal.addEventListener("abort", () => void talentPlane?.close());
+    skillPlane = await startCapabilityPlane(deps as unknown as Parameters<typeof startCapabilityPlane>[0]);
+    (deps as { skillPlane?: CapabilityPlane }).skillPlane = skillPlane;
+    console.log(`worker: capability plane listening on ${skillPlane.url}`);
+    signal.addEventListener("abort", () => void skillPlane?.close());
   } catch (e) {
     console.error(`worker: capability plane failed to start: ${String(e)}`);
   }
@@ -2204,30 +2204,30 @@ export async function run(
     // On-demand: start the SAME per-item workflow the poll starts, so an on-demand run and a
     // scheduled one dedup against each other (the deterministic id). AlreadyStarted is the normal
     // answer for an item in flight or already done — reported, not an error.
-    runTalent: async (name, word, item, user, force, how) => {
-      // The word is an instance's name (TALENT-INSTANCE-NAMED) or a skill's, which is its first
+    runSkill: async (name, word, item, user, force, how) => {
+      // The word is an instance's name (SKILL-INSTANCE-NAMED) or a skill's, which is its first
       // instance: `!skill acme-recap <id>` runs meeting-recap with acme-recap's settings and record.
-      const grants = wired.get(name)?.cfg.talents ?? [];
+      const grants = wired.get(name)?.cfg.skills ?? [];
       const g = grants.find((t) => (t.instance ?? t.name) === word) ?? grants.find((t) => t.name === word);
-      const talent = g?.name ?? word;
-      const instance = g?.instance && g.instance !== talent ? g.instance : undefined;
-      const tdef = getTalent(talent);
+      const skill = g?.name ?? word;
+      const instance = g?.instance && g.instance !== skill ? g.instance : undefined;
+      const tdef = getSkill(skill);
       if (!tdef) return { started: false, message: `I don't run a skill called "${word}".` };
       // Keyed on the recording's KEY, exactly as the poll keys it, so an on-demand run of an item
       // the poll knows under a renamed id is the same item — same workflow id, same run record.
       // A brief is about NOW, not an item: every ask is its own run, never deduped against the last.
-      if (talent === agendaBrief.name) item = `now-${Date.now()}`;
+      if (skill === agendaBrief.name) item = `now-${Date.now()}`;
       const key = recordingKey(item);
       const who = instance ? `${name}~${instance}` : name;
-      const wfId = user ? `talent:${who}:${user}:${key}` : `talent:${who}:${key}`;
+      const wfId = user ? `skill:${who}:${user}:${key}` : `skill:${who}:${key}`;
       try {
-        await client.workflow.start(runTalentWorkflow, {
+        await client.workflow.start(runSkillWorkflow, {
           workflowId: wfId,
           taskQueue: o.taskQueue,
           args: [
             {
               agent: name,
-              talent,
+              skill,
               ...(instance ? { instance } : {}),
               itemKey: key,
               recordingId: item,
@@ -2235,7 +2235,7 @@ export async function run(
               notify: user ?? "",
               user,
               force,
-              // `command` is the default because the two callers of this function are `!talent` and
+              // `command` is the default because the two callers of this function are `!skill` and
               // the Hub endpoint; a schedule starts the workflow directly and says so itself.
               trigger: how?.trigger ?? "command",
               requestedBy: how?.requestedBy,
@@ -2244,7 +2244,7 @@ export async function run(
         });
         // The workflow id goes back to the caller (W4): it is the one handle the Hub can use to
         // follow the run it just started, and it was being computed here and thrown away.
-        if (talent === agendaBrief.name) {
+        if (skill === agendaBrief.name) {
           return { started: true, message: "Looking at today's calendar now — the brief follows in a moment.", workflowId: wfId };
         }
         return {
@@ -3056,10 +3056,10 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
           }
           return undefined;
         },
-        // The SAME function `!talent` calls, so a run started from the Hub and one typed in Slack
-        // are one mechanism — same per-item workflow id, same dedup, same `talent_run` row.
-        runTalent: (name, talent, item, user, force, how) =>
-          commandDeps.runTalent!(name, talent, item, user, force, how),
+        // The SAME function `!skill` calls, so a run started from the Hub and one typed in Slack
+        // are one mechanism — same per-item workflow id, same dedup, same `skill_run` row.
+        runSkill: (name, skill, item, user, force, how) =>
+          commandDeps.runSkill!(name, skill, item, user, force, how),
         // Present only when reload is enabled; the wake endpoint answers 404 otherwise, so the API
         // learns "reload off" rather than silently believing a poke landed.
         reload: triggerReload,
@@ -3133,18 +3133,18 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
 
   for (const name of disabledFlows) await pauseVoiceSchedule(name, DISABLED_NOTE);
 
-  /** The note this worker writes when a Talent's schedule is switched off in the registry. OUR pause,
+  /** The note this worker writes when a Skill's schedule is switched off in the registry. OUR pause,
    *  like the two above, so switching it back on resumes it; a pause with any other note is a person's
    *  and is left alone. */
   const SCHEDULE_OFF_NOTE = "the skill's schedule is switched off";
 
-  /** Whether an agent's grant for a Talent has its schedule on. Absent means on. */
-  function scheduleOn(name: string, talent: string): boolean {
-    return wired.get(name)?.cfg.talents?.find((t) => t.name === talent)?.schedule_enabled !== false;
+  /** Whether an agent's grant for a Skill has its schedule on. Absent means on. */
+  function scheduleOn(name: string, skill: string): boolean {
+    return wired.get(name)?.cfg.skills?.find((t) => t.name === skill)?.schedule_enabled !== false;
   }
 
-  /** Make a Talent's Temporal schedule match its switch: pause it when off, resume it when on but
-   *  only from our own off-pause. On-demand runs (`!talent`) never go through the schedule, so they
+  /** Make a Skill's Temporal schedule match its switch: pause it when off, resume it when on but
+   *  only from our own off-pause. On-demand runs (`!skill`) never go through the schedule, so they
    *  keep working while it is paused. */
   async function applyScheduleSwitch(name: string, scheduleId: string, on: boolean, what: string): Promise<void> {
     const h = client.schedule.getHandle(scheduleId);
@@ -3191,7 +3191,7 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
     }
     const recipient = v?.notifyUser ?? "";
     const reach = !!v && (!!recipient || !!v.notifyChannel);
-    const grants = (a?.cfg.talents ?? []).filter((t) => t.schedule_enabled !== false);
+    const grants = (a?.cfg.skills ?? []).filter((t) => t.schedule_enabled !== false);
     const secs = v?.pollSeconds ?? 300;
     const recaps = reach && secs > 0 ? grants.filter((t) => t.name === meetingRecap.name) : [];
     const times = new Map<string, { hour: number; minute: number }>();
@@ -3241,11 +3241,11 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
   /** The drop watcher's timer (drop-watch.md): while the agent holds the grant and somebody has
    *  connected a login, it looks every few minutes — not on the minute: each look is put off by a
    *  random part of a minute (DROPS-HOW-OFTEN) — and a look that comes round while the last is still
-   *  going is skipped (TALENT-NO-OVERLAP). No grant, or nobody connected: no timer. */
+   *  going is skipped (SKILL-NO-OVERLAP). No grant, or nobody connected: no timer. */
   async function ensureDropSchedule(name: string): Promise<void> {
     const a = wired.get(name);
     const scheduleId = `drops:${a?.cfg.guid ?? name}`;
-    const grant = a?.cfg.talents?.find((t) => t.name === dropWatch.name);
+    const grant = a?.cfg.skills?.find((t) => t.name === dropWatch.name);
     const connected = a && grant ? await drops.users(name).catch(() => []) : [];
     if (!a || !grant || !connected.length) {
       try {
