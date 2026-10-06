@@ -32,6 +32,15 @@ describe("what may be opened", () => {
     expect(publicAddress("172.32.0.1")).toBe(true);
   });
 
+  it("TOOL-WEB-FETCH an IPv4 address inside IPv6 is judged as that IPv4 address, however it is written", () => {
+    // `new URL("https://[::ffff:10.0.0.1]/").hostname` is `[::ffff:a00:1]` — the form a real request takes.
+    expect(new URL("https://[::ffff:10.0.0.1]/").hostname).toBe("[::ffff:a00:1]");
+    for (const ip of ["::ffff:a00:1", "::ffff:7f00:1", "::ffff:a9fe:a9fe", "0:0:0:0:0:ffff:a00:1", "::a00:1", "64:ff9b::a00:1", "64:ff9b::808:808", "2002:a00:1::1", "2001:0:4136:e378::1", "0:0:0:0:0:0:0:1", "fe80::1%eth0"]) {
+      expect(publicAddress(ip), ip).toBe(false);
+    }
+    for (const ip of ["::ffff:808:808", "::ffff:8.8.8.8", "2606:4700:4700::1111"]) expect(publicAddress(ip), ip).toBe(true);
+  });
+
   it("TOOL-WEB-FETCH an internal address is refused before anything is sent", async () => {
     await expect(fetchPage("https://169.254.169.254/latest/meta-data/")).rejects.toThrow("is not on the public internet");
     await expect(fetchPage("https://[::1]:7233/")).rejects.toThrow("is not on the public internet");

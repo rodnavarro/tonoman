@@ -28,17 +28,45 @@ export function publicAddress(ip: string): boolean {
     return true;
   }
   if (v === 6) {
-    const s = ip.toLowerCase();
-    if (s === "::" || s === "::1") return false;
-    const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(s);
-    if (mapped) return publicAddress(mapped[1]!);
-    const first = parseInt(s.split(":")[0] || "0", 16);
+    const w = ipv6Words(ip);
+    if (!w) return false;
+    const zero = (n: number) => w.slice(0, n).every((x) => x === 0);
+    const v4 = () => `${w[6]! >> 8}.${w[6]! & 255}.${w[7]! >> 8}.${w[7]! & 255}`;
+    if (zero(8)) return false; // ::
+    if (zero(7) && w[7] === 1) return false; // ::1
+    // An IPv4 address carried inside IPv6 is only as public as that IPv4 address. Node writes
+    // `[::ffff:10.0.0.1]` in a URL as `::ffff:a00:1`, so the words are read, never the spelling.
+    if (zero(5) && w[5] === 0xffff) return publicAddress(v4()); // mapped ::ffff:0:0/96
+    if (zero(6)) return publicAddress(v4()); // compatible ::/96 (deprecated)
+    if (w[0] === 0x64 && w[1] === 0xff9b) return false; // NAT64 64:ff9b::/96 — reaches any IPv4
+    if (w[0] === 0x2002) return false; // 6to4 2002::/16 — carries an IPv4
+    if (w[0] === 0x2001 && w[1] === 0) return false; // Teredo 2001::/32 — carries an IPv4
+    const first = w[0]!;
     if ((first & 0xfe00) === 0xfc00) return false; // unique local fc00::/7
     if ((first & 0xffc0) === 0xfe80) return false; // link-local fe80::/10
     if ((first & 0xff00) === 0xff00) return false; // multicast
     return true;
   }
   return false;
+}
+
+/** The eight 16-bit words of an IPv6 address (`::` expanded, a trailing dotted IPv4 read as two
+ *  words), or null if it is not one. */
+function ipv6Words(ip: string): number[] | null {
+  let s = ip.toLowerCase().split("%")[0]!;
+  const dotted = /(\d+)\.(\d+)\.(\d+)\.(\d+)$/.exec(s);
+  if (dotted) {
+    const [a, b, c, d] = dotted.slice(1).map(Number) as [number, number, number, number];
+    s = s.slice(0, dotted.index) + `${((a << 8) | b).toString(16)}:${((c << 8) | d).toString(16)}`;
+  }
+  const halves = s.split("::");
+  if (halves.length > 2) return null;
+  const part = (h: string) => (h ? h.split(":").map((x) => parseInt(x, 16)) : []);
+  const head = part(halves[0]!), tail = halves.length === 2 ? part(halves[1]!) : [];
+  const fill = 8 - head.length - tail.length;
+  if (halves.length === 1 ? fill !== 0 : fill < 1) return null;
+  const words = [...head, ...Array(halves.length === 2 ? fill : 0).fill(0), ...tail];
+  return words.length === 8 && words.every((x) => Number.isInteger(x) && x >= 0 && x <= 0xffff) ? words : null;
 }
 
 /** A `lookup` that resolves as usual and refuses any address that is not public, so the check is on
