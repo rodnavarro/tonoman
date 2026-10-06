@@ -80,6 +80,25 @@ export interface SkillSchedule {
   summary: string;
 }
 
+/** A deterministic step around a Skill's run (SKILL-HOOKS-SHOWN in Tonoman Cloud): `before` decides
+ *  what there is to do — new recordings, new drops — and `after` checks what the run did. The agent's
+ *  part, between them, is the prompt. `does` is what it does, in a sentence a person reads; `script`
+ *  is where its code lives in the Skill's repository. */
+export interface SkillHook {
+  when: 'before' | 'after';
+  does: string;
+  script: string;
+}
+
+/** Where a Skill's code lives (SKILL-LIVES-IN-GIT): the repository and the folder in it. */
+export interface SkillSource {
+  repo: string;
+  path: string;
+}
+
+/** The open-source runtime's own repository, where the built-in Skills live. */
+export const RUNTIME_REPO = 'https://github.com/rodnavarro/tonoman';
+
 /** A Skill's manifest: its identity and its declared, deterministic requirements + config. This is
  *  what registration upserts into the Cloud `skill` registry (git = source of truth). */
 export interface SkillManifest {
@@ -89,4 +108,6 @@ export interface SkillManifest {
   requires: CredentialRequirement[];
   configSchema: ConfigField[];
   schedule?: SkillSchedule;
+  hooks?: SkillHook[];
+  source?: SkillSource;
 }

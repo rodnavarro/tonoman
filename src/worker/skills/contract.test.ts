@@ -111,3 +111,22 @@ describe("the Receipts Skill (receipt.md in Tonoman Cloud)", () => {
     expect(r.requires).toEqual([]);
   });
 });
+
+describe("how a built-in skill runs, and where it lives", () => {
+  it("SKILL-HOOKS-SHOWN meeting-recap declares what it does before and after a run, each with a script that exists", async () => {
+    const { BUILTIN_SKILLS } = await import("./registry");
+    const { existsSync } = await import("node:fs");
+    const recap = BUILTIN_SKILLS.find((s) => s.name === "meeting-recap")!;
+    expect(recap.hooks?.map((h) => h.when)).toEqual(["before", "after"]);
+    for (const s of BUILTIN_SKILLS) for (const h of s.hooks ?? []) expect(existsSync(h.script), h.script).toBe(true);
+  });
+
+  it("SKILL-LIVES-IN-GIT every built-in skill names the runtime's repository and a folder that exists in it", async () => {
+    const { BUILTIN_SKILLS } = await import("./registry");
+    const { existsSync } = await import("node:fs");
+    for (const s of BUILTIN_SKILLS) {
+      expect(s.source?.repo).toBe("https://github.com/rodnavarro/tonoman");
+      expect(existsSync(s.source!.path), s.source!.path).toBe(true);
+    }
+  });
+});

@@ -1,4 +1,5 @@
 import type { SkillManifest } from './contract';
+import { RUNTIME_REPO } from './contract';
 
 // The agenda brief, as the worker registers it in the Cloud catalogue. Kept in step with the Skill's
 // own manifest (src/skills/calendar/agenda-brief/manifest.ts): same name, version and config.
@@ -12,6 +13,14 @@ export const agendaBrief: SkillManifest = {
   requires: [{ kind: 'calendar' }],
   configSchema: [{ key: 'times', type: 'text', label: 'When to send it (HH:MM, comma-separated, local time)' }],
   schedule: { kind: 'times', summary: 'Sends a brief at the set times of day' },
+  hooks: [
+    {
+      when: 'before',
+      does: "At each set time, reads the day's calendars; one that could not be read is said, never taken for a clear day.",
+      script: 'src/worker/workflows.ts',
+    },
+  ],
+  source: { repo: RUNTIME_REPO, path: 'src/skills/calendar/agenda-brief' },
 };
 
 /** The times a brief goes out when the grant does not say. */

@@ -1,4 +1,5 @@
 import type { SkillManifest } from './contract';
+import { RUNTIME_REPO } from './contract';
 
 // The LOREALISTAR drop watcher, as the worker registers it in the Cloud catalogue. Kept in step with
 // the Skill's own manifest (src/skills/lorealistar/drop-watch/manifest.ts).
@@ -14,6 +15,14 @@ export const dropWatch: SkillManifest = {
     { key: 'brain', type: 'brain', label: 'Where each drop gets its page (the person’s own brain unless said)' },
   ],
   schedule: { kind: 'interval', summary: 'Looks every few minutes for each person who has connected' },
+  hooks: [
+    {
+      when: 'before',
+      does: "Signs in to LOREALISTAR for each connected login and lists its campaigns; only a drop that person has not been told of starts a run.",
+      script: 'src/worker/lorealistar.ts',
+    },
+  ],
+  source: { repo: RUNTIME_REPO, path: 'src/skills/lorealistar/drop-watch' },
 };
 
 /** How often it looks when the grant does not say, and the bounds a setting is held to: never so

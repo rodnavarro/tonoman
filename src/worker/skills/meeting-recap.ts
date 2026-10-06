@@ -1,4 +1,5 @@
 import type { SkillManifest } from './contract';
+import { RUNTIME_REPO } from './contract';
 
 // The Plaud Skill — the built-in REFERENCE Skill, and the first program on the framework.
 //
@@ -42,4 +43,17 @@ export const meetingRecap: SkillManifest = {
     { key: 'reply_in_thread', type: 'toggle', label: 'Answer questions in-thread in the output channel' },
   ],
   schedule: { kind: 'interval', summary: 'Checks for new recordings every couple of minutes' },
+  hooks: [
+    {
+      when: 'before',
+      does: "Finds recordings on each connected Plaud login that have not been recapped yet, from when this copy was added — one run each.",
+      script: 'src/worker/workflows.ts',
+    },
+    {
+      when: 'after',
+      does: 'Waits for the agent to file the recap, checking every 30 seconds; asks once more if it has not, then marks the run failed with the reason.',
+      script: 'src/worker/workflows.ts',
+    },
+  ],
+  source: { repo: RUNTIME_REPO, path: 'src/skills/voice/plaud-and-calendar-meetings' },
 };

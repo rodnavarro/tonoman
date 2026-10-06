@@ -1104,6 +1104,8 @@ export async function registerBuiltinSkills(): Promise<void> {
           requires: t.requires,
           configSchema: t.configSchema,
           schedule: t.schedule ?? null,
+          hooks: t.hooks ?? [],
+          source: t.source ?? null,
         }),
       });
       if (!r.ok) console.error(`worker: register Skill ${t.name}@${t.version} → ${r.status}`);
