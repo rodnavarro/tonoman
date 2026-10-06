@@ -171,6 +171,9 @@ export interface AgentConfig {
   /** The tools the registry has granted this agent (AGENT-TOOLS-GRANTED): `web-search`, `web-fetch`,
    *  `tonoman-secondbrain`. Absent on an agent with no registry, which keeps web search as before. */
   granted_tools?: string[];
+  /** Tools a Tonoman Cloud serves this agent (D-CLOUD-TOOLS): each a `tonoman` group the turn gets,
+   *  whose calls go back to the Cloud. Absent on an agent with no Cloud. */
+  cloud_tools?: { name: string; about: string; note?: string; commands: Record<string, { args: string[]; about: string; stdin?: string; file?: string }> }[];
   /** Second-brain sources this agent has been GRANTED (§8). A list, not one repo: the end state
    * binds an Azure DevOps repo over SSH alongside a GitHub one. Empty when the tool is not granted,
    * which is what makes revoking it in the console remove the checkout rather than hide a button. */

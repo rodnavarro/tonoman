@@ -492,10 +492,29 @@ async function startBrains(): Promise<{ registry: ReturnType<typeof registryClie
     const closed = await call("PATCH", { talent: r.talent, itemKey: r.itemKey, status: r.status, result: { summary: r.summary } });
     if (!closed.ok) console.error(`worker: ${r.talent} run from a conversation not closed (${closed.status})`);
   };
-  // The Website connection's secret is read by reference, for the agent it belongs to, when a
-  // `tonoman site` command runs (SITE-CONNECTED-ONCE).
-  const siteSecret = (guid: string, ref: string): Promise<string> => resolveRef(ref, guid);
-  const broker = createBroker({ store, registry, provisioner, scratch: path.join(root, "_scratch"), toolsDir: turnUsersOn() ? TOOLS_DIR : undefined, recordRun, siteSecret });
+  // A call to a tool the Cloud serves (D-CLOUD-TOOLS in Tonoman Cloud), carried there with the person
+  // speaking; the Cloud's answer is the turn's.
+  const cloudTool = async (
+    guid: string,
+    tool: string,
+    command: string,
+    call: { speaker: string; body: Record<string, unknown>; file?: { name: string; data: string } },
+  ): Promise<{ status: number; text: string }> => {
+    const base = process.env.TONOMANCLOUD_API_URL;
+    if (!base) return { status: 503, text: "This runtime has no Tonoman Cloud behind it, so it cannot do that." };
+    try {
+      const r = await fetch(`${base}/v1/system/agents/${encodeURIComponent(guid)}/tools/${encodeURIComponent(tool)}/${encodeURIComponent(command)}`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${process.env.TONOMANCLOUD_API_TOKEN ?? ""}`, "content-type": "application/json" },
+        body: JSON.stringify(call),
+      });
+      const j = (await r.json().catch(() => ({}))) as { text?: string; error?: string };
+      return { status: r.status, text: j.text ?? j.error ?? `Tonoman Cloud answered ${r.status}.` };
+    } catch (e) {
+      return { status: 502, text: `Tonoman Cloud could not be reached just now (${(e as Error).message}). Nothing was done.` };
+    }
+  };
+  const broker = createBroker({ store, registry, provisioner, scratch: path.join(root, "_scratch"), toolsDir: turnUsersOn() ? TOOLS_DIR : undefined, recordRun, cloudTool });
   await broker.start();
   // The refresh runs on the LOCAL model only (BRAIN-LOCAL-MODEL): gemma4:e4b by default, at the URL
   // given. With no URL, brains are still mapped, just not connected by topic.
@@ -1521,7 +1540,7 @@ export async function run(
     start: (agent, user, who, key, opts) => {
       const g = wired.get(agent)?.cfg.guid;
       // Each use is saved with the session the moment it happens (BRAIN-USED-DECIDES).
-      return b && g ? b.broker.startTurn({ agentGuid: g, slackUserId: user, who, receipts: opts?.receipts, site: opts?.site, webFetch: opts?.webFetch }, { onUse: (id) => remember(agent, key, [id]) }) : undefined;
+      return b && g ? b.broker.startTurn({ agentGuid: g, slackUserId: user, who, receipts: opts?.receipts, cloudTools: opts?.cloudTools, webFetch: opts?.webFetch }, { onUse: (id) => remember(agent, key, [id]) }) : undefined;
     },
     bind: (token, cwd) => b?.broker.bindFolder(token, cwd),
     attach: (token, files) => b?.broker.attach(token, files),
