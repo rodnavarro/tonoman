@@ -2512,6 +2512,18 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
     },
   };
 
+  // Who may reach an agent at all (AGENTACCOUNT-ACCESS-IS-GRANTED in Tonoman Cloud): the people the
+  // registry granted access, handed over as `principals`. Anyone else reaches nothing — no command,
+  // no login prompt, no model; being a member of the tenant or connecting an account is not access.
+  // A stranger is looked up once per person and agent in ten minutes, in case they were granted
+  // since the last reload; the notice is said once per conversation in ten minutes.
+  const unknownNotice = noticeLimiter();
+  const strangerLookup = noticeLimiter();
+  // The agent as wired NOW — a reload may have replaced the one a handler was built with.
+  const hasAccess = async (name: string, a: Wired, user: string): Promise<boolean> =>
+    knowsSpeaker((wired.get(name) ?? a).cfg.principals, user) || (strangerLookup.shouldSay(name, "", user) && (await knowSpeaker(name, user)));
+  const noticeFor = (name: string, a: Wired, user: string) => unknownSpeakerNotice(a.cfg.displayName ?? a.cfg.name ?? name, user);
+
   // Interactions are wired per connector below, at construction.
   for (const [name, a] of wired) {
     // Slash commands answer through the SAME dispatcher as `!` — the connector hands us the
@@ -2522,12 +2534,22 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
       // `/sapien-connect` arrives as `!sapien-connect`; the app's name comes off before parsing.
       const cmd = cmds.parse(cmds.unprefixSlash(text));
       if (!cmd) return null;
+      if (!(await hasAccess(name, a, user))) {
+        console.log(`worker: ${name} — ${user} has no access to this agent; slash ${cmd.name} not run`);
+        return noticeFor(name, a, user);
+      }
       return cmds.run(commandDeps, name, conversation, cmd, user).catch((e) => {
         console.error(`worker: ${name} slash ${cmd.name} failed: ${(e as Error).message}`);
         return `I couldn't run that — ${String((e as Error)?.message ?? e).slice(0, 150)}`;
       });
     });
-    (a.conn as SlackConnector).setInteractionHandler?.((it) => {
+    (a.conn as SlackConnector).setInteractionHandler?.(async (it) => {
+      // A button someone else was shown (a connect prompt in a shared channel) does nothing for a
+      // person without access.
+      if (!(await hasAccess(name, a, it.userId))) {
+        console.log(`worker: ${name} — ${it.userId} has no access to this agent; interaction ignored`);
+        return;
+      }
       // Two gates now, and each claims only what it recognises: connecting Claude and connecting
       // Plaud both end in a dialog, so the router asks the Plaud one first and falls through when
       // the interaction is not its own.
@@ -2579,19 +2601,29 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
   // reason wireOne was: reload starts a pump for a newly-added or rebuilt agent, and the ingress
   // logic must be identical whether it is boot or reload that starts it.
   const pumps: Promise<void>[] = [];
-  const unknownNotice = noticeLimiter();
-  // Asking the registry about a stranger is once per person and agent in ten minutes, like the notice.
-  const strangerLookup = noticeLimiter();
   const startPump = (name: string, a: Wired): Promise<void> => {
     const ac = new AbortController();
     signal.addEventListener("abort", () => ac.abort(), { once: true });
     a.abort = ac;
     const pump = (async () => {
       for await (const env of a.conn.receive(ac.signal)) {
+        // Someone without access to the agent reaches nothing (AGENTACCOUNT-ACCESS-IS-GRANTED): not
+        // a command, not a login prompt, not a turn. Checked first, from what the registry granted,
+        // so it costs nothing; they are told their Slack id and whom to ask.
+        if (!(await hasAccess(name, a, env.user))) {
+          if (unknownNotice.shouldSay(name, env.conversation, env.user)) {
+            const text = noticeFor(name, a, env.user);
+            const conn = a.conn as SlackConnector;
+            const privately = await conn.postEphemeral(env.conversation, env.user, text).catch(() => false);
+            if (!privately) await a.conn.reply(env.conversation).send(text).catch(() => {});
+          }
+          console.log(`worker: ${name} — ${env.user} has no access to this agent; nothing run`);
+          continue;
+        }
         // Commands are answered HERE, before the durability boundary: `!status` is a read of
         // state this process already holds, and routing it through a workflow would queue it
         // behind — or interrupt — the very turn it is asking about. They are also answered
-        // before the auth gate, so `!help` still works on an agent that cannot yet run turns.
+        // before the login gate, so `!help` still works on an agent that cannot yet run turns.
         const cmd = cmds.parse(env.text);
         if (cmd) {
           const out = await cmds.run(commandDeps, name, env.conversation, cmd, env.user).catch((e) => {
@@ -2607,22 +2639,6 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
             if (out !== "") await a.conn.reply(env.conversation).send(out).catch(() => {});
             continue;
           }
-        }
-        // Someone the agent does not know starts no turn (AGENTACCOUNT-UNKNOWN-NO-TURN): whether
-        // they are known is a registry fact, so it is checked here and costs nothing. Commands above
-        // still answer — connecting an account is how a person becomes known.
-        if (
-          !knowsSpeaker(a.cfg.principals, env.user) &&
-          !(strangerLookup.shouldSay(name, "", env.user) && (await knowSpeaker(name, env.user)))
-        ) {
-          if (unknownNotice.shouldSay(name, env.conversation, env.user)) {
-            const text = unknownSpeakerNotice(a.cfg.displayName ?? a.cfg.name ?? name, env.user);
-            const conn = a.conn as SlackConnector;
-            const privately = await conn.postEphemeral(env.conversation, env.user, text).catch(() => false);
-            if (!privately) await a.conn.reply(env.conversation).send(text).catch(() => {});
-          }
-          console.log(`worker: ${name} — ${env.user} is not known to this agent; no turn`);
-          continue;
         }
         // Whether inference is ready is a different question per mode. A SHARED agent's login is a
         // FACT the registry tracks (auth_state), so ask in the channel rather than spend a turn to
