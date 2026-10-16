@@ -171,6 +171,9 @@ export interface AgentConfig {
   /** The tools the registry has granted this agent (AGENT-TOOLS-GRANTED): `web-search`, `web-fetch`,
    *  `tonoman-secondbrain`. Absent on an agent with no registry, which keeps web search as before. */
   granted_tools?: string[];
+  /** Tools a Tonoman Cloud serves this agent (D-CLOUD-TOOLS): each a `tonoman` group the turn gets,
+   *  whose calls go back to the Cloud. Absent on an agent with no Cloud. */
+  cloud_tools?: { name: string; about: string; note?: string; commands: Record<string, { args: string[]; about: string; stdin?: string; file?: string }> }[];
   /** Second-brain sources this agent has been GRANTED (§8). A list, not one repo: the end state
    * binds an Azure DevOps repo over SSH alongside a GitHub one. Empty when the tool is not granted,
    * which is what makes revoking it in the console remove the checkout rather than hide a button. */
@@ -206,18 +209,26 @@ export interface AgentConfig {
    *  hint. The worker never assembles or extends it: the words are the tenant's knowledge
    *  (TENANT-VOCABULARY-IS-THE-TENANTS), and an empty list from the registry means none. */
   vocabulary?: string;
-  /** Talents GRANTED and enabled for this agent, from the registry — the catalogue row plus the
-   *  attachment's `config` values. A Talent is CODE behind a manifest, not interpreted steps: only
+  /** Skills GRANTED and enabled for this agent, from the registry — the catalogue row plus the
+   *  attachment's `config` values. A Skill is CODE behind a manifest, not interpreted steps: only
    *  the grant travels (`name`, its pinned `version`, this agent's `config`), and the worker resolves
-   *  name→implementation from its own built-in registry. The worker knows which built-in Talent is
+   *  name→implementation from its own built-in registry. The worker knows which built-in Skill is
    *  the voice pipeline by NAME (`meeting-recap`), not by a wire trigger. */
-  talents?: {
+  skills?: {
     name: string;
     version: number;
     config?: Record<string, unknown>;
-    /** False when the Talent's schedule is switched off for this agent: its timer is paused, and
-     *  `!talent` still runs it. Absent means on, as it was before the switch existed. */
+    /** False when the Skill's schedule is switched off for this agent: its timer is paused, and
+     *  `!skill` still runs it. Absent means on, as it was before the switch existed. */
     schedule_enabled?: boolean;
+    /** Which instance of the skill this is (SKILL-INSTANCE-NAMED in Tonoman Cloud): its name is the
+     *  word that runs it. Absent, or the skill's own name, for the first. */
+    instance?: string;
+    /** What each of its tools uses (SKILL-BINDING-PER-TOOL), resolved by the registry: the
+     *  credentials, never their values. Absent from an older registry. */
+    bindings?: Record<string, { mode: string; copy?: string; credentials: { id: string; kind: string; alias: string; label?: string; scope?: string; secret_ref?: string; status?: string; accounts?: { secret_ref?: string; status?: string }[] }[] }>;
+    /** When this copy was added: its scheduled work starts here (SKILL-COPY-STARTS-NOW). */
+    since?: string;
   }[];
   /** Outside credentials this agent may use, from the registry (§8). Identified by `(kind, alias)`:
    *  the KIND is what the platform knows how to talk to, the ALIAS is which one of them this is.

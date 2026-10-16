@@ -618,30 +618,30 @@ A2 (sandbox boundary)._
 
 ---
 
-## A15 — Talents (self-contained CLIs on the runtime)
+## A15 — Skills (self-contained CLIs on the runtime)
 
-A **Talent** is the one versioned unit an agent *runs* — distinct from a harness **skill** (A10,
-the `/<skill>` menu the model invokes mid-turn). The Plaud voice pipeline is the first Talent. A
-Talent is **code behind a manifest**, and the load-bearing decisions are:
+A **Skill** is the one versioned unit an agent *runs* — distinct from a harness **skill** (A10,
+the `/<skill>` menu the model invokes mid-turn). The Plaud voice pipeline is the first Skill. A
+Skill is **code behind a manifest**, and the load-bearing decisions are:
 
 - **A self-contained CLI the runtime *spawns*** — not a module the worker `import()`s. The process
   boundary buys self-containment, dev/prod parity, and isolation-as-a-trajectory (subprocess →
   per-conversation pod) at once. (An earlier step-interpreter model is **deleted**.)
-- **Temporal stays minimal:** one generic `runTalent` activity, forever — it spawns the CLI, streams
-  progress to the heartbeat, returns the outcome, and never knows individual Talents. Adding a Talent
+- **Temporal stays minimal:** one generic `runSkill` activity, forever — it spawns the CLI, streams
+  progress to the heartbeat, returns the outcome, and never knows individual Skills. Adding a Skill
   touches neither worker code nor Temporal registration.
-- **Report, don't speak:** the Talent returns an *outcome* + a `steer`; the runtime announces through
-  the agent (a real turn, in the agent's own words). A Talent never holds a channel.
+- **Report, don't speak:** the Skill returns an *outcome* + a `steer`; the runtime announces through
+  the agent (a real turn, in the agent's own words). A Skill never holds a channel.
 - **`infer` runs on the agent's OWN provider** (its Claude subscription, a lean captured turn), while
   `transcribe`/`publish` route through the runtime's provider chain and git-backed second brain. So a
   recap is the agent thinking on the same brain it answers with.
 
 **→ Full feature doc, with the run sequence diagram, the outcome/`steer` contract, the capability
-plane, idempotency, and the OSS/Cloud line:** [`features/tonoman-talents.md`](features/tonoman-talents.md).
-The developer guide (how to *build* one) is [`product/talent-sdk.md`](product/talent-sdk.md).
+plane, idempotency, and the OSS/Cloud line:** [`features/tonoman-skills.md`](features/tonoman-skills.md).
+The developer guide (how to *build* one) is [`product/skill-sdk.md`](product/skill-sdk.md).
 
 _Built on A2 (sandbox boundary), A3 (git-backed second brain), A11 (per-agent config); the worker's
-Temporal orchestration hosts `runTalent`. Supersedes the deleted step-interpreter model._
+Temporal orchestration hosts `runSkill`. Supersedes the deleted step-interpreter model._
 
 ---
 

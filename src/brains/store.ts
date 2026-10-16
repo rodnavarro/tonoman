@@ -46,7 +46,7 @@ export interface StoreOptions {
   log?: (s: string) => void;
   /** How long a fetch stays fresh for reads. Writes always fetch. */
   fetchEveryMs?: number;
-  /** Called after a person's or a Talent's write is pushed — never after the refresh's own
+  /** Called after a person's or a Skill's write is pushed — never after the refresh's own
    *  (BRAIN-REFRESH-NO-LOOP). The refresh queue listens here. */
   onPushed?: (b: BrainRef) => void;
 }
@@ -84,8 +84,8 @@ export interface WriteRequest {
   authorize?: () => Promise<boolean>;
 }
 
-/** Several pages written as one commit, replacing what is there — what a Talent files (a recap page
- *  and its transcript). The Talent owns those paths; a person's pages are written with `write`. */
+/** Several pages written as one commit, replacing what is there — what a Skill files (a recap page
+ *  and its transcript). The Skill owns those paths; a person's pages are written with `write`. */
 /** What a plan can see of the brain as it is on its remote. Paths are relative to the brain. */
 export interface PlanTree {
   /** Every file under a folder (links and submodules left out). */

@@ -36,7 +36,7 @@ const CHILD_MAY_KNOW = new Set([
 
 /** PURE: the environment for a program started as a turn's own user: the machine's settings from the
  *  worker, plus `extra` — what THIS run is given, by whoever starts it: where its login is, the
- *  turn's own credential, a Talent's. A credential is never taken from the worker's environment, only
+ *  turn's own credential, a Skill's. A credential is never taken from the worker's environment, only
  *  from `extra`, where it was made for this run. A Bedrock agent cannot run without AWS credentials,
  *  so those come from the worker too — only when the run itself says it is one. */
 export function childEnv(base: NodeJS.ProcessEnv, extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {

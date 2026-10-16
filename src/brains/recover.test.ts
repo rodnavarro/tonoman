@@ -90,7 +90,7 @@ describe("a restart finds an unfinished write", () => {
   });
 });
 
-describe("a restart finds an unfinished Talent filing", () => {
+describe("a restart finds an unfinished Skill filing", () => {
   it("BRAIN-WRITE-SURVIVES-RESTART it is re-checked against what the run may reach, and redone as one filing", async () => {
     const files = [{ path: "r/page.md", content: "p" }, { path: "r/Transcript.md", content: "t" }];
     const redone: unknown[] = [];

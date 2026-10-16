@@ -17,11 +17,11 @@ export function recordingKey(id: string): string {
   return id.replace(/^of_/, "");
 }
 
-/** How many times the poll will re-launch a Talent run that keeps failing, before it stops and
- *  leaves the item for a person (`!talent <name> <id> again` forces it). Each launch already carries
+/** How many times the poll will re-launch a Skill run that keeps failing, before it stops and
+ *  leaves the item for a person (`!skill <name> <id> again` forces it). Each launch already carries
  *  the activity's own retries, so three launches is a lot of trying — the day of the GPU outage it
  *  was fourteen, and every one re-announced the recording. */
-export const MAX_TALENT_LAUNCHES = 3;
+export const MAX_SKILL_LAUNCHES = 3;
 
 export interface PriorRun {
   status: "running" | "done" | "failed";
@@ -36,16 +36,16 @@ export interface PriorRun {
  *  - anything else (`running`, or `failed` with budget left): launch again, silently. `running` is
  *    not trusted as "in flight" — a run that died without closing would otherwise block its item
  *    forever; the workflow id is what actually dedups an in-flight run. */
-export function talentGate(prior: PriorRun | undefined, force = false): "skip-done" | "skip-given-up" | "first" | "again" {
+export function skillGate(prior: PriorRun | undefined, force = false): "skip-done" | "skip-given-up" | "first" | "again" {
   if (force) return prior ? "again" : "first";
   if (!prior) return "first";
   if (prior.status === "done") return "skip-done";
-  if (prior.status === "failed" && prior.attempts >= MAX_TALENT_LAUNCHES) return "skip-given-up";
+  if (prior.status === "failed" && prior.attempts >= MAX_SKILL_LAUNCHES) return "skip-given-up";
   return "again";
 }
 
 /** PURE: whether the launch that is about to open the record is the LAST one the budget allows —
  *  the one whose failure is worth telling the person about. */
 export function isFinalLaunch(prior: PriorRun | undefined): boolean {
-  return (prior?.attempts ?? 0) + 1 >= MAX_TALENT_LAUNCHES;
+  return (prior?.attempts ?? 0) + 1 >= MAX_SKILL_LAUNCHES;
 }

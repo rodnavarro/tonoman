@@ -10,7 +10,7 @@
  *  (CLI-SMALL-CONTEXT). */
 export const CLI_NOTE = [
   "You have one command-line tool, `tonoman`, and no other program. It reaches the brains this person",
-  "can read and write (and, where they are on, Receipts and the tenant's website). Run `tonoman --help` to see its groups and",
+  "can read and write (and, where they are on, Receipts and the tools your organization gives you). Run `tonoman --help` to see its groups and",
   "`tonoman <group> --help` for each command's arguments. Start with `tonoman brain list`.",
 ].join("\n");
 
@@ -59,9 +59,14 @@ process.stdin.on("end", () => { ended = true; done(); });
 export const cliSource = String.raw`"use strict";
 const URL_ = process.env.TONOMAN_BRAIN_URL, TOKEN = process.env.TONOMAN_BRAIN_TOKEN;
 const RECEIPTS = process.env.TONOMAN_RECEIPTS === "1";
-const SITE = process.env.TONOMAN_SITE === "1";
+let CLOUD_TOOLS = [];
+try { CLOUD_TOOLS = JSON.parse(process.env.TONOMAN_CLOUD_TOOLS || "[]"); } catch { CLOUD_TOOLS = []; }
 const WEB_FETCH = process.env.TONOMAN_WEB_FETCH === "1";
+// The worker's own tools a skill on this agent brings (plaud, calendar, meeting-recap): their groups
+// are here only when one is (CLI-GRANTED-GROUPS).
+const LOCAL = (process.env.TONOMAN_LOCAL_TOOLS || "").split(",").filter(Boolean);
 const MAX = 6000; // CLI-OUTPUT-BOUNDED
+let LIMIT = MAX;
 
 const GROUPS = {
   brain: {
@@ -90,25 +95,44 @@ const GROUPS = {
       fetch: { route: "web/fetch", args: ["--url", "[--from N]"], about: "Open one public https page and print its title, description and text (5000 characters at a time; --from continues). Use it for a page your web search could not open. Private and internal addresses are refused." },
     },
   },
-  site: {
-    about: "read and change the tenant's website: drafts, a preview link, publish on an owner's word (Website skill)",
-    needs: "site",
+  plaud: {
+    about: "the Plaud recordings you may read, by the login's label (plaud tool)",
+    needs: "plaud",
     commands: {
-      pages: { route: "site/pages", args: [], about: "Every page: its address in each language, its title, and whether it is published, a draft, or published with changes waiting. Run this first." },
-      read: { route: "site/read", args: ["--path", "[--lang]", "[--section N]", "[--live]"], about: "One page in one language: title, description, summary and its sections by number — its latest DRAFT when changes are waiting, and it says so and what they change. --live shows the version visitors see now. --section N prints that section in full, as the JSON you would save." },
-      sections: { route: "site/sections", args: ["[--kind]"], about: "The kinds of section this site offers and their fields (* = required). --kind <kind> says what each field of one kind is for. Read this before making a section." },
-      edit: { route: "site/edit", args: ["--path", "--lang", "--find", "--replace"], about: "Change ONE place in a page's words: --find the exact words there now (enough to be found once on that page), --replace with the new words. Saved as a draft. Use this for a word, a line, a name." },
-      save: { route: "site/save", args: ["--path", "--lang", "--json (or the JSON on stdin)", "[--section N | --insert N | --remove N]", "[--same-as <address>]"], about: "Save as a draft. With --section N: replace that section with the JSON section. --insert N: put the JSON section in at position N. --remove N: take that section out (no JSON). With none of those, the JSON is a whole page {title, summary, meta:{description}, layout:[sections]}: a new page at --path, or a rewrite of the one there. --same-as <address> makes it another language of the page at that address." },
-      upload: { route: "site/upload", args: ["--file", "[--alt]"], about: "Put a photo the person SENT in this conversation (JPEG, PNG or WebP, by its file name) into the site's own images, and print its address on the site (/media/…). --alt says what it shows. It changes no page: then put that address in a section's image field with site save." },
-      preview: { route: "site/preview", args: ["--path"], about: "The link that shows the page's latest saved version on the real site. Give it to the person with what you changed." },
-      publish: { route: "site/publish", args: ["--path"], about: "Make the page's draft live, in every language it has one. Works only when the person speaking is an owner or admin; say what it answers, never more." },
+      logins: { route: "tool/plaud/logins", args: [], about: "The Plaud logins you can use here, by label. Your own is 'mine'." },
+      list: { route: "tool/plaud/list", args: ["[--login <label>]"], about: "The newest recordings on a login: id, title, when, minutes. Without --login, your own (or the one shared login)." },
+      transcript: { route: "tool/plaud/transcript", args: ["--id", "[--login <label>]"], about: "Transcribe one recording and print the whole transcript, with its title, start and length. Kept after the first time.", max: 400000 },
+    },
+  },
+  calendar: {
+    about: "the calendars you may read, by label (calendar tool)",
+    needs: "calendar",
+    commands: {
+      list: { route: "tool/calendar/list", args: [], about: "The calendars you can read here, by label." },
+      find: { route: "tool/calendar/find", args: ["--from <ISO time>", "--to <ISO time>", "[--calendars <label,label>]"], about: "Entries around a stretch of time (padded either side): title, start, end, attendees, which calendar. Without --calendars, every one you can read." },
+      day: { route: "tool/calendar/day", args: ["[--calendars <label,label>]"], about: "Today in the tenant's time zone, worked out exactly: what is left, every overlap, back-to-back stretches and the best free block." },
+    },
+  },
+  "meeting-recap": {
+    about: "file a meeting's recap (meeting-recap skill)",
+    needs: "meeting-recap",
+    commands: {
+      file: { route: "tool/meeting-recap/file", args: ["--id", "[--login <label>]", "[--copy <keyword>]", "--recap (the recap JSON, or on stdin)"], about: "File one recording's recap in the second brain, with its transcript. The recap is JSON: summary, highlights, decisions, followups, participants, and route, meeting and alignment when asked for. It is checked before it is filed; a refusal says what to fix.", stdin: "recap" },
     },
   },
 };
 
-const out = (s) => process.stdout.write(s.length > MAX ? s.slice(0, MAX) + "\n… " + (s.length - MAX) + " more characters not shown; narrow the request (a folder, a smaller page).\n" : s.endsWith("\n") ? s : s + "\n");
+const out = (s) => process.stdout.write(s.length > LIMIT ? s.slice(0, LIMIT) + "\n… " + (s.length - LIMIT) + " more characters not shown; narrow the request (a folder, a smaller page).\n" : s.endsWith("\n") ? s : s + "\n");
 const fail = (s, code = 1) => { process.stderr.write(s + "\n"); process.exit(code); };
-const available = (g) => !GROUPS[g].needs || (GROUPS[g].needs === "receipts" && RECEIPTS) || (GROUPS[g].needs === "site" && SITE) || (GROUPS[g].needs === "web" && WEB_FETCH);
+// The tools a Tonoman Cloud serves this agent (D-CLOUD-TOOLS): each a group whose commands go to the
+// broker under /cloud/<group>/<command>, which carries them to the Cloud.
+for (const t of CLOUD_TOOLS) {
+  if (!t || typeof t.name !== "string" || GROUPS[t.name]) continue;
+  const commands = {};
+  for (const [c, x] of Object.entries(t.commands || {})) commands[c] = { route: "cloud/" + t.name + "/" + c, args: x.args || [], about: x.about || "", stdin: x.stdin };
+  GROUPS[t.name] = { about: t.about || "", cloud: true, commands };
+}
+const available = (g) => !GROUPS[g].needs || (GROUPS[g].needs === "receipts" && RECEIPTS) || (GROUPS[g].needs === "web" && WEB_FETCH) || LOCAL.includes(GROUPS[g].needs);
 
 function help(group) {
   if (!group) {
@@ -147,14 +171,17 @@ async function stdin() {
   const [group, cmd, ...rest] = process.argv.slice(2);
   if (!group || group === "--help" || group === "help") return out(help());
   if (!GROUPS[group]) fail("No command group '" + group + "'. See tonoman --help.", 2);
-  if (!available(group)) fail(group === "receipts" ? "Receipts is not on for this agent, so tonoman receipts does nothing here." : group === "site" ? "Website is not on for this agent, or its site is not connected, so tonoman site does nothing here." : group === "web" ? "Web fetch is not granted to this agent, so tonoman web does nothing here." : "Not available here.", 3);
+  if (!available(group)) fail(group === "receipts" ? "Receipts is not on for this agent, so tonoman receipts does nothing here." : group === "web" ? "Web fetch is not granted to this agent, so tonoman web does nothing here." : "Not available here.", 3);
   if (!cmd || cmd === "--help" || cmd === "help") return out(help(group));
   const spec = GROUPS[group].commands[cmd];
   if (!spec) fail("No command '" + group + " " + cmd + "'. See tonoman " + group + " --help.", 2);
   if (!URL_ || !TOKEN) fail("tonoman is not connected in this turn.", 4);
   const body = parse(rest);
+  // A command whose whole answer is the point (a transcript) says how much it may print.
+  if (spec.max) LIMIT = spec.max;
   if (group === "brain" && cmd === "write" && typeof body.content !== "string") body.content = await stdin();
-  if (group === "site" && cmd === "save" && typeof body.json !== "string" && body.remove === undefined) body.json = await stdin();
+  // A Cloud tool's command names the argument it reads from standard input when not given.
+  if (spec.stdin && typeof body[spec.stdin] !== "string" && body.remove === undefined) body[spec.stdin] = await stdin();
   let r;
   try {
     r = await fetch(URL_ + "/" + spec.route, { method: "POST", headers: { authorization: "Bearer " + TOKEN, "content-type": "application/json" }, body: JSON.stringify(body) });

@@ -1,5 +1,5 @@
 // The runtime's half of the drop watcher: it holds each person's login and what it has told them,
-// looks on their behalf, and hands the Talent only what the site said (drop-watch.md in Tonoman Cloud).
+// looks on their behalf, and hands the Skill only what the site said (drop-watch.md in Tonoman Cloud).
 // The site is faked; tests never use a real person's address (D-TEST-ACCOUNTS).
 import { describe, it, expect } from "vitest";
 import { dropWatcher, memoryDropStore, type DropRecord } from "./lorealistar";
@@ -73,7 +73,7 @@ describe("looking", () => {
     expect((await w.lookFor("mia", "USTEF")).news).toEqual([]);
   });
 
-  it("DROPS-LOGIN-SEALED what the Talent can ask for is what the site said about a drop — for that person, and nothing of their login", async () => {
+  it("DROPS-LOGIN-SEALED what the Skill can ask for is what the site said about a drop — for that person, and nothing of their login", async () => {
     const { w } = setup({ active: [drop("a", { name: "Serum" })] });
     await w.connect("mia", "USTEF", login.email, login.password);
     await w.lookFor("mia", "USTEF");

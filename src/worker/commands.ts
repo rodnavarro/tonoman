@@ -21,6 +21,7 @@
 // Slack connection, a harness, or Temporal.
 
 import { parseStatusMode, renderStatus, renderWindows, STATUS_MODES, type StatusMode, type UsageWindow } from "../statusline";
+import { slotKey } from "./tokenstore";
 import type { TurnUsage } from "../core/contracts";
 
 export interface Command {
@@ -45,7 +46,7 @@ export const KNOWN = [
   "code",
   "callback",
   "new",
-  "talent",
+  "skill",
 ] as const;
 
 /** What starts a command. One character, on purpose.
@@ -128,8 +129,10 @@ export function parse(text: string): Command | undefined {
   const m = /^!(\S+)\s*([\s\S]*)$/.exec(t);
   if (!m) return undefined;
   const name = m[1]!.toLowerCase();
-  // Talents are called skills now; `!skill` runs the same command, and `!talent` keeps working.
-  return { name: name === "skill" ? "talent" : name, arg: (m[2] ?? "").trim() };
+  // Skills are called skills now; `!skill` runs the same command, and `!skill` keeps working.
+  // Connections are called credentials now (CRED-ABSORBS-CONNECTION); `!connections` keeps working.
+  const ALIASES: Record<string, string> = { skill: "skill", credentials: "connections" };
+  return { name: ALIASES[name] ?? name, arg: (m[2] ?? "").trim() };
 }
 
 /** PURE: a slash command's line with the app's name taken off — `!sapien-dev-connect plaud` →
@@ -174,16 +177,16 @@ export interface ConnectionLine {
 export interface CommandDeps {
   /** What this agent is connected to. Absent on a deployment with no registry behind it. */
   connections?(agent: string): Promise<ConnectionLine[]>;
-  /** Run a Talent on ONE item now, out of band from its schedule — the on-demand, tool-like trigger.
+  /** Run a Skill on ONE item now, out of band from its schedule — the on-demand, tool-like trigger.
    *  Shares the poll's per-item workflow id, so an on-demand run and a scheduled one never
-   *  double-process the same item. Absent on a deployment with no Talent runtime behind it. */
-  runTalent?(
+   *  double-process the same item. Absent on a deployment with no Skill runtime behind it. */
+  runSkill?(
     agent: string,
-    talent: string,
+    skill: string,
     item: string,
     user?: string,
     force?: boolean,
-    /** WHAT started this run, and who asked. `!talent` is a `command`; the Hub's run-now button is
+    /** WHAT started this run, and who asked. `!skill` is a `command`; the Hub's run-now button is
      *  `hub` and supplies its own `requestedBy`. Recorded on the run, never interpreted here. */
     o?: { trigger?: "schedule" | "command" | "hub"; requestedBy?: string },
   ): Promise<{ started: boolean; message: string; workflowId?: string }>;
@@ -238,8 +241,12 @@ export interface CommandDeps {
   connectClaude?(agent: string, conversation: string, user?: string): Promise<string>;
   /** Offer the calendar dialog. Same contract: "" when the blocks are the message. */
   connectIcs?(agent: string, conversation: string): Promise<string>;
-  /** Offer the private dialog for a person's own LOREALISTAR login (drop-watch.md). */
-  connectLorealistar?(agent: string, conversation: string): Promise<string>;
+  /** Offer the private dialog for a person's own LOREALISTAR login (drop-watch.md) — for a copy of
+   *  the tool when `copy` names one (`lorealistar-2`, D-TOOL-COPIES in Tonoman Cloud). */
+  connectLorealistar?(agent: string, conversation: string, copy?: string): Promise<string>;
+  /** The kind a word names when it is one of this agent's copies of a tool that takes a person's
+   *  login — `plaud-2` → plaud — so `!connect plaud-2` connects that copy (D-TOOL-COPIES). */
+  toolCopyKind?(agent: string, word: string): string | undefined;
   /** Forget the SPEAKER's LOREALISTAR login, and stop watching for them. */
   disconnectLorealistar?(agent: string, user?: string): Promise<string>;
   /** Finish a connection with the callback URL the person pasted back. `user` completes the
@@ -263,7 +270,7 @@ const HELP = [
   "• `!connect lorealistar` — connect your own LOREALISTAR login, so I can watch for new drops for you",
   "• `!disconnect plaud` / `!disconnect lorealistar` — forget it again",
   "• `!disconnect claude` / `!disconnect codex` — sign out of the subscription I answer on",
-  "• `!connections` — what this agent is connected to",
+  "• `!credentials` — the logins this agent uses (`!connections` also works)",
   "• `!skill <name> <id> [again]` — run a skill on one item now, instead of waiting for its schedule (`again` re-runs an already-filed item)",
   "• `!skill agenda-brief now` — review today's calendar now: what's left, what overlaps, where the free time is",
   "• `!new` — forget this thread and start over",
@@ -402,6 +409,13 @@ export async function run(
     case "logout": {
       const { which } = splitConnector(cmd.arg);
       if (!which) return "Which one? `!disconnect plaud` or `!disconnect claude`.";
+      // A copy of a tool forgets the person's login for that copy only (D-TOOL-COPIES).
+      const copyKind = deps.toolCopyKind?.(agent, which);
+      if (copyKind && user) {
+        const key = slotKey(which, user);
+        if (copyKind === "plaud" && deps.disconnectPlaud) return deps.disconnectPlaud(agent, key);
+        if (copyKind === "lorealistar" && deps.disconnectLorealistar) return deps.disconnectLorealistar(agent, key);
+      }
       if ((INFERENCE_KINDS as readonly string[]).includes(which)) {
         if (!deps.disconnectClaude) return "I have no way to sign out of an inference provider on this deployment.";
         return deps.disconnectClaude(agent, user);
@@ -418,6 +432,22 @@ export async function run(
     case "connect": {
       const { which, rest } = splitConnector(cmd.arg);
       if (!which) return `Which one? ${CONNECT_KINDS.map((c) => `\`!connect ${c}\``).join(", ")}.`;
+      // A copy of a tool (`plaud-2`, D-TOOL-COPIES in Tonoman Cloud): the person's own login for that
+      // copy, kept apart from the one they connected for the first — the same account, or another.
+      const copyKind = deps.toolCopyKind?.(agent, which);
+      if (copyKind === "plaud" || copyKind === "lorealistar") {
+        if (!user) return "I don't know who is asking, so I can't keep a login for you.";
+        if (copyKind === "lorealistar") {
+          if (!deps.connectLorealistar) return "I can't watch LOREALISTAR on this deployment.";
+          return deps.connectLorealistar(agent, conversation, which);
+        }
+        if (!deps.connectPlaud) return "I have no way to connect an account on this deployment.";
+        const key = slotKey(which, user);
+        if (rest.toLowerCase() !== "again" && (await deps.plaudConnected?.(agent, key).catch(() => false))) {
+          return `✅ Your Plaud login for ${which} is already connected. Type \`!connect ${which} again\` to sign in with a different one.`;
+        }
+        return deps.connectPlaud(agent, conversation, key);
+      }
       if (!(CONNECT_KINDS as readonly string[]).includes(which)) return unknownConnector(which, CONNECT_KINDS);
 
       // The subscription this agent ANSWERS on, as opposed to an outside account it reads. Listed
@@ -548,11 +578,11 @@ export async function run(
       return [`*Connected* — ${list.length} thing${list.length === 1 ? "" : "s"}:`, ...lines].join("\n");
     }
 
-    // On-demand, like a tool: `!talent meeting-recap <recording-id>` runs the Talent on that one
-    // item now. The same Talent a schedule polls, invoked by hand — a Talent is triggered by
+    // On-demand, like a tool: `!skill meeting-recap <recording-id>` runs the Skill on that one
+    // item now. The same Skill a schedule polls, invoked by hand — a Skill is triggered by
     // schedule, on demand, or both.
-    case "talent": {
-      if (!deps.runTalent) return "This deployment can't run a skill on demand.";
+    case "skill": {
+      if (!deps.runSkill) return "This deployment can't run a skill on demand.";
       const parts = (cmd.arg ?? "").trim().split(/\s+/).filter(Boolean);
       // A trailing `again` (or `force`) re-runs an item already filed — bypassing the idempotency
       // guard that otherwise makes "run this again" a no-op. It is the last word, so it never
@@ -563,7 +593,7 @@ export async function run(
       const item = rest.join(" ");
       if (!name || !item)
         return "Usage: `!skill <name> <recording-id> [again]` — runs a skill on one item now; `again` re-runs an already-filed item.";
-      const r = await deps.runTalent(agent, name, item, user, force);
+      const r = await deps.runSkill(agent, name, item, user, force);
       return r.message;
     }
 

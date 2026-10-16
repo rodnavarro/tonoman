@@ -55,7 +55,7 @@ export interface SlackOptions {
   /** The set of channel ids this agent WATCHES — Wave 6's reply-in-thread mode. In a watched
    *  channel the gate admits a plain human message (no @mention needed) and every reply lands
    *  in-thread. Called PER MESSAGE, never read once at construction: the watched set is derived from
-   *  the agent's live Talent config, which a rewire changes, and a set baked in at wire time would
+   *  the agent's live Skill config, which a rewire changes, and a set baked in at wire time would
    *  answer to a channel the config had since dropped. Empty / undefined = today's behaviour exactly
    *  (mentions and DMs only), which is every agent until one turns the toggle on — and even then,
    *  the app needs `channels:history` + a `message.channels` subscription before Slack delivers a
@@ -492,7 +492,7 @@ export class SlackConnector implements Connector {
   /** Turns a Slack event into a neutral envelope, or null to ignore it.
    *
    *  We answer three things: an `app_mention` (someone said @nelly), a `message` in a DM, and — when
-   *  Wave 6's reply-in-thread mode is on — a plain `message` in a WATCHED channel (the Talent's
+   *  Wave 6's reply-in-thread mode is on — a plain `message` in a WATCHED channel (the Skill's
    *  output channel). Everything else — channel chatter we were not addressed in, edits, joins, our
    *  own posts — is dropped here rather than in the router. */
   private async normalize(e: SlackEvent, teamID: string): Promise<Envelope | null> {

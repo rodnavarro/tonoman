@@ -269,7 +269,7 @@ export class Runner implements TurnRunner {
       // belong to the tenant rather than to whoever logged in.
       ...(this.o.allowAmbientMcp ? [] : ["--strict-mcp-config"]),
     ];
-    // A LEAN turn (Talent `infer`) has NO tools: `--tools ""` offers none, whatever the CLI adds
+    // A LEAN turn (Skill `infer`) has NO tools: `--tools ""` offers none, whatever the CLI adds
     // next. It was a hand-kept denylist, and the CLI grew tools the list did not name — with a
     // one-turn cap, a single stray `ToolSearch` call spent the turn and the recap came back empty,
     // six times on one meeting. Connectors are already out (strict-mcp).

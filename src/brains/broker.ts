@@ -21,9 +21,7 @@ import { seed, seedFiles, safePagePath } from "./store";
 import { brainFailureText, isSetupFault, SETUP_FAULT_TEXT } from "./credential";
 import { cliSource, toolShimSource } from "./cli";
 import { checkReceipt, documentTrouble, planReceipt, reportOf, totals, type FiledOutcome, type Plan } from "../receipts/receipts";
-import { imageTrouble, runSite } from "../site/commands";
 import { fetchPage } from "../web/fetch";
-import { payloadSite, SiteRefused, type PayloadSite } from "../site/payload";
 
 export interface Reachable {
   id: string;
@@ -68,22 +66,36 @@ export interface TurnSpec {
   who: string;
   /** The turn's own folder: the only place a file it files may come from (CONVO-FILES-IN-THE-TURN). */
   cwd?: string;
-  /** The Receipts Talent, when it is on for the agent: the brain it files into (TALENT-BRAIN-SETTING)
+  /** The Receipts Skill, when it is on for the agent: the brain it files into (SKILL-BRAIN-SETTING)
    *  and the tenant's legal entities. Absent = `tonoman receipts` says it is off (CLI-GRANTED-GROUPS). */
   receipts?: { brainId: string; entities?: string[]; version?: number };
-  /** The Website Talent, when it is on for the agent and its site is connected (SITE-IS-A-TALENT):
-   *  where the site is, where its content API is, and the reference to the agent's key there.
-   *  Absent = `tonoman site` says it is off. */
-  site?: { url: string; api?: string; secretRef: string; version?: number };
+  /** Tools a Tonoman Cloud serves this agent (D-CLOUD-TOOLS in Tonoman Cloud): each a `tonoman`
+   *  group whose calls the broker carries to the Cloud with the person speaking. The runtime knows
+   *  nothing of what they do. Absent = none. */
+  cloudTools?: CloudTool[];
   /** `web-fetch` is granted to the agent (TOOL-WEB-FETCH): the turn has `tonoman web fetch`. */
   webFetch?: boolean;
+  /** The worker's own tools a skill on this agent brings — `plaud`, `calendar`, `meeting-recap` — each
+   *  a `tonoman` group the worker answers, as the person speaking (D-JOBS-ARE-PROMPTS). Absent = none. */
+  localTools?: string[];
 }
 
-/** A run of a Talent begun by a conversation (RUN-FROM-CONVERSATION), content-free. */
+/** A tool a Tonoman Cloud serves an agent, as its roster describes it: the `tonoman` group it adds to
+ *  a turn and a short note for the turn's context. `stdin` names the argument read from standard
+ *  input when not given; `file` the argument that names a file the person sent, which is carried
+ *  with the call. */
+export interface CloudTool {
+  name: string;
+  about: string;
+  note?: string;
+  commands: Record<string, { args: string[]; about: string; stdin?: string; file?: string }>;
+}
+
+/** A run of a Skill begun by a conversation (RUN-FROM-CONVERSATION), content-free. */
 export interface ConversationRun {
   agentGuid: string;
   slackUserId: string;
-  talent: string;
+  skill: string;
   version: number;
   itemKey: string;
   status: "done" | "failed";
@@ -135,15 +147,22 @@ export interface BrokerOptions {
   log?: (s: string) => void;
   /** The node binary that runs the shim and the CLI; the worker's own by default. */
   node?: string;
-  /** Record a Talent's run begun by a conversation (best-effort). */
+  /** Record a Skill's run begun by a conversation (best-effort). */
   recordRun?: (run: ConversationRun) => Promise<void>;
-  /** The Website connection's secret for this agent, by reference: JSON `{"apiKey","previewSecret"}`.
-   *  Read when a `tonoman site` command runs, never kept. */
-  siteSecret?: (agentGuid: string, ref: string) => Promise<string>;
-  /** For the site's content API; the platform's `fetch` unless a test gives its own. */
-  fetch?: typeof fetch;
+  /** Carry a call to a tool the Cloud serves (D-CLOUD-TOOLS): the agent, the tool and command, the
+   *  person speaking by the id the surface gave, the arguments, and a file they sent when the command
+   *  takes one. Its answer is the turn's. Absent = no Cloud behind this runtime. */
+  cloudTool?: (
+    agentGuid: string,
+    tool: string,
+    command: string,
+    call: { speaker: string; body: Record<string, unknown>; file?: { name: string; data: string } },
+  ) => Promise<{ status: number; text: string }>;
   /** How `tonoman web fetch` opens a page; the guarded fetcher unless a test gives its own. */
   fetchPage?: typeof fetchPage;
+  /** Answer a call to one of the worker's own tools (`tonoman plaud …`, `tonoman calendar …`): the
+   *  agent, the person speaking, the group and command, the arguments. Absent = none served. */
+  localTool?: (agentGuid: string, speaker: string, group: string, command: string, body: Record<string, unknown>) => Promise<{ status: number; text: string }>;
 }
 
 const INDEX_HEAD_BYTES = 4000;
@@ -200,12 +219,12 @@ export function createBroker(o: BrokerOptions) {
     ...(b.asIs ? { asIs: true } : {}),
   });
 
-  /** The Receipts Talent's brain, as this speaker reaches it — or why not. */
+  /** The Receipts Skill's brain, as this speaker reaches it — or why not. */
   function receiptsBrain(t: Turn, reach: Reach, need: "read" | "write"): { b: Reachable } | { status: number; text: string } {
     if (!t.receipts) return { status: 403, text: "Receipts is not on for this agent, so `tonoman receipts` does nothing here." };
     if (!reach.speaker.member) return { status: 403, text: "This person is not a member of the tenant, so they cannot file or read receipts." };
     const b = reach.brains.find((x) => x.id === t.receipts!.brainId);
-    // Turning the Talent on widens nobody's reach (RECEIPT-WHO-MAY-FILE).
+    // Turning the Skill on widens nobody's reach (RECEIPT-WHO-MAY-FILE).
     if (!b || (need === "write" && b.mode !== "write")) {
       return { status: 403, text: `This person cannot ${need === "write" ? "file into" : "read"} the brain Receipts files into. Nothing was ${need === "write" ? "written" : "read"}.` };
     }
@@ -243,7 +262,7 @@ export function createBroker(o: BrokerOptions) {
   }
 
   async function runOf(t: Turn, itemKey: string, ok: boolean, summary: string): Promise<void> {
-    await o.recordRun?.({ agentGuid: t.agentGuid, slackUserId: t.slackUserId, talent: "receipts", version: t.receipts?.version ?? 1, itemKey, status: ok ? "done" : "failed", summary }).catch(() => {});
+    await o.recordRun?.({ agentGuid: t.agentGuid, slackUserId: t.slackUserId, skill: "receipts", version: t.receipts?.version ?? 1, itemKey, status: ok ? "done" : "failed", summary }).catch(() => {});
   }
 
   /** Make a brain's repo on its first use (BRAIN-REPO-ON-FIRST-USE). Only the owner's own turn does. */
@@ -280,27 +299,22 @@ export function createBroker(o: BrokerOptions) {
 
   type Handler = (t: Turn, reach: Reach, body: Record<string, unknown>) => Promise<{ status: number; text: string }>;
 
-  /** This turn's site, with the agent's key — or why there is none (SITE-IS-A-TALENT, SITE-CONNECTED-ONCE). */
-  async function siteOf(t: Turn): Promise<{ site: PayloadSite } | { status: number; text: string }> {
-    if (!t.site) return { status: 403, text: "Website is not on for this agent, so `tonoman site` does nothing here." };
-    const raw = o.siteSecret ? await o.siteSecret(t.agentGuid, t.site.secretRef).catch(() => "") : "";
-    let secret: { apiKey?: unknown; previewSecret?: unknown } = {};
-    try {
-      secret = raw ? (JSON.parse(raw) as typeof secret) : {};
-    } catch {
-      secret = {};
+  /** A call to a tool the Cloud serves this turn's agent (D-CLOUD-TOOLS), carried there with the
+   *  person speaking. A file argument must name one the person sent (CONVO-FILES-IN-THE-TURN), and
+   *  goes with the call; the Cloud decides everything else. */
+  async function cloudCall(t: Turn, tool: string, command: string, body: Record<string, unknown>): Promise<{ status: number; text: string }> {
+    const spec = (t.cloudTools ?? []).find((x) => x.name === tool);
+    const cmd = spec?.commands[command];
+    if (!spec || !cmd) return { status: 403, text: `${tool} is not on for this agent, so \`tonoman ${tool}\` does nothing here.` };
+    if (!o.cloudTool) return { status: 503, text: "This runtime has no Tonoman Cloud behind it, so it cannot do that." };
+    let file: { name: string; data: string } | undefined;
+    if (cmd.file && body[cmd.file] !== undefined) {
+      const f = await turnFile(t, body[cmd.file], { verb: "sent", done: "Not done.", trouble: () => null });
+      if ("status" in f) return f;
+      file = { name: f.name, data: f.bytes.toString("base64") };
     }
-    if (typeof secret.apiKey !== "string" || !secret.apiKey || typeof secret.previewSecret !== "string" || !secret.previewSecret) {
-      return { status: 409, text: "The site is not connected yet: the agent has no key for it. Tell the person an owner must connect the site in the Hub (Website, in the agent's skills)." };
-    }
-    return { site: payloadSite({ url: t.site.url, api: t.site.api, apiKey: secret.apiKey, previewSecret: secret.previewSecret }, o.fetch) };
+    return o.cloudTool(t.agentGuid, tool, command, { speaker: t.slackUserId, body, ...(file ? { file } : {}) });
   }
-
-  const siteCommand = (command: string): Handler => async (t, reach, body) => {
-    const s = await siteOf(t);
-    if ("status" in s) return s;
-    return runSite(command, s.site, body, { member: reach.speaker.member, role: reach.speaker.role, name: reach.speaker.name });
-  };
 
   const handlers: Record<string, Handler> = {
     // One public page, opened from the worker (TOOL-WEB-FETCH). Only for an agent granted it.
@@ -317,33 +331,6 @@ export function createBroker(o: BrokerOptions) {
         return { status: 200, text: [`${p.url} (HTTP ${p.status})`, p.title ? `title: ${p.title}` : "", p.description ? `description: ${p.description}` : "", "", part + more].filter((l, i) => l || i === 3).join("\n") };
       } catch (e) {
         return { status: 422, text: `Not opened: ${(e as Error).message}.` };
-      }
-    },
-    "site.pages": siteCommand("pages"),
-    "site.read": siteCommand("read"),
-    "site.sections": siteCommand("sections"),
-    "site.edit": siteCommand("edit"),
-    "site.save": siteCommand("save"),
-    "site.preview": siteCommand("preview"),
-    "site.publish": siteCommand("publish"),
-    // A photo the person sent, into the site's own images (SITE-IMAGE-FROM-THE-CONVERSATION). It
-    // needs the turn's attachments, so it is served here rather than in runSite. No page changes.
-    async "site.upload"(t, reach, body) {
-      const s = await siteOf(t);
-      if ("status" in s) return s;
-      if (!reach.speaker.member) return { status: 403, text: "This person is not a member of the tenant, so nothing of the site can be changed for them." };
-      const file = await turnFile(t, body.file, { verb: "uploaded", done: "Not uploaded.", trouble: imageTrouble });
-      if ("status" in file) return file;
-      const alt = typeof body.alt === "string" ? body.alt.trim() : "";
-      try {
-        const img = await s.site.upload(file.name, file.bytes, alt);
-        const size = img.width && img.height ? ` (${img.width}×${img.height})` : "";
-        return {
-          status: 200,
-          text: `Uploaded to the site's images: ${img.url}${size}. No page shows it yet: put that address in a section's image field (a team member's photo, for one) with \`tonoman site save\`, which saves a draft as always.`,
-        };
-      } catch (e) {
-        return { status: e instanceof SiteRefused ? e.status : 502, text: `Not uploaded. The site said: ${(e as Error).message}.` };
       }
     },
     async list(t, reach) {
@@ -521,7 +508,7 @@ export function createBroker(o: BrokerOptions) {
     // Change a page or a file in place (BRAIN-EDIT-IN-PLACE): the words to find, and the words to put
     // there or to add after them. Worked out on the file as it is on its remote inside every push
     // attempt, so a change someone pushed meanwhile is kept; everything but the words found stays
-    // byte for byte. General on purpose (D-BRAINS-ARE-EDITABLE): no Talent has a command of its own
+    // byte for byte. General on purpose (D-BRAINS-ARE-EDITABLE): no Skill has a command of its own
     // for correcting what it filed.
     async edit(t, reach, body) {
       const b = pickBrain(reach.brains, body.brain);
@@ -639,8 +626,18 @@ export function createBroker(o: BrokerOptions) {
     const t = turns.get(auth.startsWith("Bearer ") ? auth.slice(7) : "");
     if (!t || t.expiresAt < Date.now()) return send(401, "this turn's brain access has ended");
     const url = (req.url ?? "").replace(/\?.*$/, "");
-    const name = url.startsWith("/receipts/") ? `receipts.${url.slice("/receipts/".length)}` : url.startsWith("/site/") ? `site.${url.slice("/site/".length)}` : url.startsWith("/web/") ? `web.${url.slice("/web/".length)}` : url.replace(/^\/brain\//, "");
-    const h = Object.prototype.hasOwnProperty.call(handlers, name) ? handlers[name] : undefined;
+    const name = url.startsWith("/receipts/") ? `receipts.${url.slice("/receipts/".length)}` : url.startsWith("/web/") ? `web.${url.slice("/web/".length)}` : url.replace(/^\/brain\//, "");
+    // A tool the Cloud serves: /cloud/<tool>/<command>, carried there as is.
+    const cloud = /^\/cloud\/([a-z0-9-]+)\/([a-z0-9-]+)$/.exec(url);
+    // One of the worker's own tools a skill brings: /tool/<group>/<command>, only when the turn has it.
+    const local = /^\/tool\/([a-z0-9-]+)\/([a-z0-9-]+)$/.exec(url);
+    const h: Handler | undefined = cloud
+      ? (turn, _reach, body) => cloudCall(turn, cloud[1]!, cloud[2]!, body)
+      : local
+        ? t.localTools?.includes(local[1]!) && o.localTool
+          ? (turn, _reach, body) => o.localTool!(turn.agentGuid, turn.slackUserId, local[1]!, local[2]!, body)
+          : undefined
+        : Object.prototype.hasOwnProperty.call(handlers, name) ? handlers[name] : undefined;
     if (req.method !== "POST" || !h) return send(404, "no such tool");
     const chunks: Buffer[] = [];
     req.on("data", (c) => chunks.push(c as Buffer));
@@ -697,14 +694,14 @@ export function createBroker(o: BrokerOptions) {
     get url() {
       return baseUrl;
     },
-    /** Make a brain's repo if it has none yet (a Talent's first filing into it). */
+    /** Make a brain's repo if it has none yet (a Skill's first filing into it). */
     ensureRepo: (tenant: string, b: Reachable): Promise<Reachable> => (b.state === "active" ? Promise.resolve(b) : provision(tenant, b)),
     /** Open a turn's access. Returns the MCP server (Codex) and the `tonoman` command (Claude) — both
      *  on the same token, which works only while the turn runs (CLI-DIES-WITH-TURN). */
     startTurn(spec: TurnSpec, hooks: TurnHooks = {}): { token: string; mcp: McpServerSpec; cli: TurnCli } {
       const token = randomBytes(24).toString("hex");
       turns.set(token, { ...spec, used: new Set(), fetched: new Set(), bytes: 0, expiresAt: Date.now() + 2 * 60 * 60 * 1000, onUse: hooks.onUse });
-      const env = { TONOMAN_BRAIN_URL: baseUrl, TONOMAN_BRAIN_TOKEN: token, ...(spec.receipts ? { TONOMAN_RECEIPTS: "1" } : {}), ...(spec.site ? { TONOMAN_SITE: "1" } : {}), ...(spec.webFetch ? { TONOMAN_WEB_FETCH: "1" } : {}) };
+      const env = { TONOMAN_BRAIN_URL: baseUrl, TONOMAN_BRAIN_TOKEN: token, ...(spec.receipts ? { TONOMAN_RECEIPTS: "1" } : {}), ...(spec.cloudTools?.length ? { TONOMAN_CLOUD_TOOLS: JSON.stringify(spec.cloudTools.map(({ name, about, commands }) => ({ name, about, commands }))) } : {}), ...(spec.webFetch ? { TONOMAN_WEB_FETCH: "1" } : {}), ...(spec.localTools?.length ? { TONOMAN_LOCAL_TOOLS: spec.localTools.join(",") } : {}) };
       return {
         token,
         mcp: { name: "tonoman", command: o.node ?? process.execPath, args: [shimPath], env: { ...env, TONOMAN_CLI_PATH: cliPath } },

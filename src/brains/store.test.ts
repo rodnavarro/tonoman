@@ -132,7 +132,7 @@ describe("writing", () => {
     sh(["-c", "user.name=x", "-c", "user.email=x@x", "commit", "-q", "-m", "a site, not a brain"], other);
     sh(["push", "-q", "origin", "main"], other);
     const site: BrainRef = { ...brain, id: "b-site", asIs: true };
-    const r = await storeAt("w1").write({ brain: site, path: "app/newsletter/page.tsx", content: "export default () => null;\n", note: "Add the newsletter route", who: "Rod" });
+    const r = await storeAt("w1").write({ brain: site, path: "app/newsletter/page.tsx", content: "export default () => null;\n", note: "Add the newsletter route", who: "Priya" });
     expect(r).toMatchObject({ ok: true, path: "app/newsletter/page.tsx" });
     expect(remoteFile("app/newsletter/page.tsx")).toBe("export default () => null;\n");
     expect(remoteFile("log.md")).toBeNull();

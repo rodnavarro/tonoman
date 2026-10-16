@@ -1,3 +1,4 @@
+import type { CloudTool } from "../brains/broker";
 // The turn, as a Temporal activity.
 //
 // It reuses the runtime that already exists rather than reimplementing it: the harness Runner
@@ -18,7 +19,7 @@ import type { Connector, Reply, TurnEvent, TurnUsage } from "../core/contracts";
 import type { AgentConfig } from "../config";
 import * as recap from "./recap";
 import * as inference from "./inference";
-import { meetingRecap } from "./talents/meeting-recap";
+import { meetingRecap } from "./skills/meeting-recap";
 import * as calendar from "./calendar";
 import * as worklog from "./worklog";
 import { decideRoute, FINANCE_REASON, privateReason, THREAD_NOTE, THREAD_NOTE_FAILED, type Audience } from "../brains/delivery";
@@ -33,18 +34,30 @@ import { authFailureState, notLoggedInNotice, isNotLoggedInError } from "../turn
 
 /** How the worker finds an agent's connector and runner. Injected at worker construction so this
  *  module holds no globals and can be unit-tested without Temporal. */
+/** One login's look at LOREALISTAR: the key it is kept under, the person it is theirs, and — for a copy
+ *  of the drop watch — which copy and where it announces (D-TOOL-COPIES in Tonoman Cloud). */
+export interface DropLook {
+  user: string;
+  person?: string;
+  instance?: string;
+  channel?: string;
+  news: { id: string; name: string }[];
+  notice?: string;
+  alive?: string;
+}
+
 export interface TurnDeps {
   agent(name: string): { cfg: AgentConfig; conn: Connector; context?: string; run: (req: TurnRunReq, signal?: AbortSignal) => AsyncIterable<TurnEvent> } | undefined;
   /** What this agent needs to run the voice flow, or undefined if it is not configured for one. */
   voice?(name: string): VoiceConfig | undefined;
-  /** The capability plane, started at worker boot. `runTalent` spawns a Talent CLI through it; the
-   *  plane provides the Talent transcription/inference/publish over localhost. Undefined in tests and
+  /** The capability plane, started at worker boot. `runSkill` spawns a Skill CLI through it; the
+   *  plane provides the Skill transcription/inference/publish over localhost. Undefined in tests and
    *  on a file roster with no plane. */
-  talentPlane?: CapabilityPlane;
+  skillPlane?: CapabilityPlane;
   /** Run an inference on the AGENT'S OWN inference provider — the Claude Code harness (its
    *  subscription), not a side model — and return the reply text. A headless turn: the prompt runs
    *  through the agent's runner and the `done` text is captured, never posted. This is what the
-   *  Talent `infer` capability routes to, so a recap is the agent thinking, on its own brain. The
+   *  Skill `infer` capability routes to, so a recap is the agent thinking, on its own brain. The
    *  provider is the agent's harness today (claude-code); codex / an OpenAI subscription plug in at
    *  this one dispatch point later.
    *
@@ -54,8 +67,9 @@ export interface TurnDeps {
   infer?(agent: string, p: { system: string; user: string }, owner?: string): Promise<string>;
   /** Read one connected Google calendar for a window, through the registry's token refresh. */
   googleCalendar?(agent: string, feed: calendar.CalendarFeed, from: number, to: number): Promise<calendar.CalEvent[]>;
-  /** A granted Talent's saved config for this agent (`agent_talent.config`), or `{}`. */
-  talentConfig?(agent: string, talent: string): Record<string, unknown>;
+  /** A granted Skill's saved config for this agent (`agent_skill.config`), or `{}`. */
+  /** The settings of one instance of a skill on an agent: by the instance's name, else the skill's. */
+  skillConfig?(agent: string, skill: string): Record<string, unknown>;
   /** Say something verbatim to a person, opening a DM if needed. */
   say?(agent: string, user: string, text: string): Promise<void>;
   /** Say something verbatim IN A CHANNEL, given as its id or its name (DROPS-IN-A-CHANNEL). False when
@@ -75,27 +89,28 @@ export interface TurnDeps {
   /** How this agent's provider is named to a person ("Claude" / "Codex"), for a notice that has to
    *  tell somebody which login to start. */
   providerLabel?(agent: string): string;
-  /** The durable record of one item of one Talent run: opened before the run, closed either way.
+  /** The durable record of one item of one Skill run: opened before the run, closed either way.
    *
    *  Behind a hook rather than a direct database call for the same reason everything else here is:
    *  the worker holds no connection string. It asks the registry, over the same system-token API it
    *  already uses for the roster. */
-  talentRun?: {
+  skillRun?: {
     open(
       agent: string,
-      talent: string,
+      skill: string,
       itemKey: string,
       version: number,
-      o?: { trigger?: "schedule" | "command" | "hub"; requestedBy?: string; forUser?: string },
+      o?: { trigger?: "schedule" | "command" | "hub"; requestedBy?: string; forUser?: string; instance?: string },
     ): Promise<void>;
     close(
       agent: string,
-      talent: string,
+      skill: string,
       itemKey: string,
       status: "done" | "failed",
       error?: string,
       /** What the run produced: the announcement text, and where the output can be read. */
       result?: { summary: string; links?: { label: string; url: string }[] },
+      instance?: string,
     ): Promise<void>;
     /** The durable status of one item, for the recording-level idempotency guard: a prior `done`
      *  lets a re-run skip the transcription + inference it would otherwise re-pay. Best-effort like
@@ -103,12 +118,22 @@ export interface TurnDeps {
      *  proceeds), never blocking a genuinely-new recording because the registry blinked. */
     status?(
       agent: string,
-      talent: string,
+      skill: string,
       itemKey: string,
+      instance?: string,
     ): Promise<{ status: "running" | "done" | "failed"; attempts: number } | undefined>;
   };
-  /** Run text as a turn addressed to a person. `drewOn`: brains the text draws on (a Talent's filing). */
+  /** Run text as a turn addressed to a person. `drewOn`: brains the text draws on (a Skill's filing). */
   ask?(agent: string, user: string, text: string, drewOn?: string[]): Promise<void>;
+  /** The prompt a recording's run sends the agent (D-JOBS-ARE-PROMPTS): for this copy, this recording,
+   *  on this person's behalf — or the nudge when its turn ended without filing it. */
+  /** The Plaud accounts a skill copy other than the first reads, each floored at when the copy was
+   *  added (SKILL-COPY-STARTS-NOW). Undefined = the voice flow's own, as the first copy reads. */
+  copyAccounts?(agent: string, copy: string): Promise<VoiceAccount[] | undefined>;
+  /** What the agent's one schedule should run now (D-ONE-CLOCK-PER-AGENT): every meeting-recap copy
+   *  whose schedule is on, and each agenda-brief copy whose time this is. */
+  skillsDue?(agent: string, at: number): { notify: string; recaps: string[]; agendas: string[]; agendaVersion: number };
+  recapJob?(agent: string, j: { notify?: string; instance?: string; recordingId: string; user?: string; title?: string; minutes?: number; nudge?: boolean }): Promise<string>;
   /** The display-only status footer for a finished turn: the model, the turn's tokens, context
    *  occupancy, and how much of the Claude plan's 5h/7d windows is left. Null for none. */
   footer?(agent: string, conversation: string, usage: TurnUsage | undefined, speaker?: string): Promise<string | null>;
@@ -142,7 +167,7 @@ export interface TurnDeps {
   /** Delete a turn's folder that was handed to a turn user — AS that user. Resolves false when it
    *  never was handed over, and is still the worker's own to delete (TURNUSER-ROOT-STAYS-OUT). */
   dropTurnDir?: (dir: string) => Promise<boolean>;
-  /** What the runtime knows of LOREALISTAR for one person — asked by the drop watcher's Talent, which
+  /** What the runtime knows of LOREALISTAR for one person — asked by the drop watcher's Skill, which
    *  never sees that person's login (DROPS-LOGIN-SEALED). */
   lorealistar?: {
     drop(agent: string, user: string, id: string): Promise<{ drop: object; seen: string } | undefined>;
@@ -153,6 +178,11 @@ export interface TurnDeps {
     /** These drops' announcements have been started. */
     told(agent: string, user: string, ids: string[]): Promise<void>;
   };
+  /** Metering for a transcription the platform does, for this agent's tenant (USAGE-TRANSCRIPTION-METERED). */
+  transcriptionMeter?(agent: string, user?: string): recap.TranscriptionMeter | undefined;
+  /** Which drop-watch copy a login key is for (D-TOOL-COPIES): the person, the copy, its channel; null
+   *  when no copy uses that copy of the tool. Absent: every login is the first copy's, as before. */
+  dropCopy?(agent: string, key: string): { person: string; instance?: string; channel?: string } | null;
   /** Say something to ONE person, in a DM — never in a channel, whatever channel the agent has. */
   dm?(agent: string, user: string, text: string): Promise<void>;
   /** The tenant's timezone, for what is "today". */
@@ -164,15 +194,15 @@ export interface TurnDeps {
   /** What people sent earlier in a conversation, kept so a later turn can still file it
    *  (CONVO-SENT-FILES-STAY). */
   sentFiles?: import("./sentfiles").SentFiles;
-  /** Where a Talent run files its pages (BRAIN-TALENT-TARGET). `undefined` = the agent's second brain,
+  /** Where a Skill run files its pages (BRAIN-SKILL-TARGET). `undefined` = the agent's second brain,
    *  as it always has (BRAIN-MIGRATION); an error = the run cannot file, and says which brain and why. */
-  talentBrain?: {
-    target(agent: string, user: string | undefined, talent: string): Promise<TalentBrainTarget | { error: string } | undefined>;
+  skillBrain?: {
+    target(agent: string, user: string | undefined, skill: string): Promise<SkillBrainTarget | { error: string } | undefined>;
     store: Pick<BrainStore, "read" | "writeFiles">;
   };
 }
 
-export interface TalentBrainTarget {
+export interface SkillBrainTarget {
   /** The agent the run is for — so a restart can finish the filing and tell the person. */
   agentGuid?: string;
   id: string;
@@ -309,11 +339,11 @@ export interface VoiceConfig {
   calendarRoutes?: Record<string, string>;
   /** How far either side of a recording to look. Generous by default; see calendar.ts. */
   calendarPadMinutes?: number;
-  /** The installed voice Talent — its name and version, populated from the roster the worker already
-   *  holds. Present when the agent has a plaud-poll Talent granted and enabled. The poll pins the
-   *  version onto the run so an edit to a live Talent cannot rewrite what an in-flight run is doing.
-   *  There is no runner switch any more: a Talent is code, and the poll always runs it. */
-  talent?: { name: string; version: number };
+  /** The installed voice Skill — its name and version, populated from the roster the worker already
+   *  holds. Present when the agent has a plaud-poll Skill granted and enabled. The poll pins the
+   *  version onto the run so an edit to a live Skill cannot rewrite what an in-flight run is doing.
+   *  There is no runner switch any more: a Skill is code, and the poll always runs it. */
+  skill?: { name: string; version: number };
   /** Per-member Plaud accounts, when this agent's Plaud connection is per-person. Undefined or empty
    *  is the ordinary state: the poll reads the single shared `creds` exactly as it always has. */
   accounts?: VoiceAccount[];
@@ -378,7 +408,7 @@ export interface TurnRunReq {
   user?: string;
   /** Paths to attached files on the shared mount, passed through to the harness. */
   mediaPaths?: string[];
-  /** A lean inference turn — no tools, no connectors, one turn. Set by Talent `infer`. */
+  /** A lean inference turn — no tools, no connectors, one turn. Set by Skill `infer`. */
   lean?: boolean;
   /** `tonoman` as one tool, for a harness with no shell (Codex). */
   mcpServers?: McpServerSpec[];
@@ -415,7 +445,7 @@ export interface TurnBrains {
     user: string,
     who: string,
     key: string,
-    opts?: { receipts?: { brainId: string; entities?: string[]; version?: number }; site?: { url: string; api?: string; secretRef: string; version?: number }; webFetch?: boolean },
+    opts?: { receipts?: { brainId: string; entities?: string[]; version?: number }; cloudTools?: CloudTool[]; webFetch?: boolean },
   ): { token: string; mcp: McpServerSpec; cli: { binDir: string; env: Record<string, string> } } | undefined;
   /** The turn's own folder, once it exists: the only place a file it files may come from. */
   bind?(token: string, cwd: string): void;
@@ -448,7 +478,7 @@ export interface TurnInput {
   afterInterruption?: boolean;
   /** The platform wrote this message (a recap announcement), not `user`. */
   fromSystem?: boolean;
-  /** Brains the message draws on — a Talent's filing it announces. Routed like anything read from them. */
+  /** Brains the message draws on — a Skill's filing it announces. Routed like anything read from them. */
   drewOn?: string[];
 }
 
@@ -603,27 +633,41 @@ export function makeActivities(deps: TurnDeps) {
 
     // --- the voice flow -------------------------------------------------------------------------
 
-    /** Which Talent this agent's poll runs for each recording — its name and version, for the run
+    /** Which Skill this agent's poll runs for each recording — its name and version, for the run
      *  record and the dedup id.
      *
      *  Read by the poll trigger at the start of a tick rather than baked into the schedule, so the
      *  choice comes from the worker's live view of the agent (boot-resolved from the registry,
      *  §15.20) rather than from arguments frozen when the schedule was created. Falls back to the
-     *  built-in Plaud Talent manifest when the roster carried no grant — the voice flow IS
-     *  meeting-recap. There is no runner switch any more: a Talent is code, and the poll always runs
+     *  built-in Plaud Skill manifest when the roster carried no grant — the voice flow IS
+     *  meeting-recap. There is no runner switch any more: a Skill is code, and the poll always runs
      *  it (`processRecording`, in the child workflow), for shared and per-person accounts alike. */
-    async voicePlan(input: { agent: string }): Promise<{ talent: { name: string; version: number } }> {
+    async voicePlan(input: { agent: string }): Promise<{ skill: { name: string; version: number } }> {
       const v = deps.voice?.(input.agent);
-      return { talent: v?.talent ?? { name: meetingRecap.name, version: meetingRecap.version } };
+      return { skill: v?.skill ?? { name: meetingRecap.name, version: meetingRecap.version } };
     },
 
     /** Which finished recordings have not been published yet. Cheap and safe to retry. */
-    async findNewRecordings(input: { agent: string }): Promise<
+    async findNewRecordings(input: { agent: string; copy?: string }): Promise<
       { id: string; title: string; stamp: string; minutes: number; user?: string; notify?: string }[]
     > {
       const v = deps.voice?.(input.agent);
       if (!v) return [];
       const out: { id: string; title: string; stamp: string; minutes: number; user?: string; notify?: string }[] = [];
+      // A copy other than the first reads its own logins from when it was added; what is new to it is
+      // what IT has not run (its run records), not what another copy filed — two copies on one login
+      // are two runs, as their owner set them up (SKILL-SEVERAL-INSTANCES-SCHEDULED).
+      if (input.copy) {
+        const accounts = (await deps.copyAccounts?.(input.agent, input.copy)) ?? [];
+        for (const acct of accounts) {
+          const all = await recap.listRecordings(acct.creds, 20);
+          for (const r of all) {
+            if (r.startTime < (acct.floorMs ?? v.floorMs)) continue;
+            out.push({ id: r.id, title: r.title, stamp: r.stamp, minutes: Math.max(1, Math.round(r.duration / 60000)), user: acct.user, notify: acct.notifyUser });
+          }
+        }
+        return out;
+      }
       // One account for every tenant that has not gone per-person, so this loop runs once and makes
       // the same two calls the flow always made. With per-member accounts it runs per account, and
       // each recording is tagged with the member it belongs to so the poll can attribute and route it.
@@ -702,6 +746,7 @@ export function makeActivities(deps: TurnDeps) {
               ctx.heartbeat(note);
             },
             chunkCacheDir,
+            deps.transcriptionMeter?.(input.agent, input.user),
           ),
       );
       console.log(
@@ -796,31 +841,32 @@ export function makeActivities(deps: TurnDeps) {
       );
     },
 
-    /** Run a Talent as a self-contained CLI through the capability plane — the replacement for
-     *  `processRecording` once cut over. The Talent does the work and REPORTS an outcome; this
-     *  activity announces it (a real agent turn, from the Talent's `steer`) and lets a failure
-     *  surface as a throw so Temporal retries and the `talent_run` record closes `failed`. The work
+    /** Run a Skill as a self-contained CLI through the capability plane — the replacement for
+     *  `processRecording` once cut over. The Skill does the work and REPORTS an outcome; this
+     *  activity announces it (a real agent turn, from the Skill's `steer`) and lets a failure
+     *  surface as a throw so Temporal retries and the `skill_run` record closes `failed`. The work
      *  itself is a subprocess, so its progress drives the heartbeat and a cancel kills the child. */
-    async runTalent(input: {
+    async runSkill(input: {
       agent: string;
       item: string;
       notify?: string;
       user?: string;
-      talent?: string;
+      skill?: string;
+      instance?: string;
       channel?: string;
     }): Promise<{ status: string; summary?: string; links?: { label: string; url: string }[] }> {
-      const plane = deps.talentPlane;
-      if (!plane) throw new Error("runTalent: the capability plane is not running");
+      const plane = deps.skillPlane;
+      if (!plane) throw new Error("runSkill: the capability plane is not running");
       const ctx = Context.current();
-      // Heartbeat on a TIMER, not only on the Talent's progress notes: transcribing a 112-minute
+      // Heartbeat on a TIMER, not only on the Skill's progress notes: transcribing a 112-minute
       // recording and running the inference are each a single long capability call during which the
-      // Talent emits nothing, and a heartbeat that fired only on progress would let Temporal declare
+      // Skill emits nothing, and a heartbeat that fired only on progress would let Temporal declare
       // a healthy run dead mid-transcription. The note rides the beat so the Temporal UI stays useful.
       let lastNote = "starting";
       const beat = setInterval(() => ctx.heartbeat(lastNote), 20_000);
       try {
         const outcome = await plane.spawn(
-          { agent: input.agent, item: input.item, user: input.user, talent: input.talent },
+          { agent: input.agent, item: input.item, user: input.user, skill: input.skill, instance: input.instance },
           {
             signal: ctx.cancellationSignal,
             onProgress: (note) => {
@@ -844,16 +890,16 @@ export function makeActivities(deps: TurnDeps) {
               await deps.say?.(input.agent, input.notify, text).catch(() => {});
             }
           }
-          // A throw, not a return: the workflow's catch closes talent_run `failed` and Temporal
-          // retries, exactly as a thrown processRecording did. The reason is the Talent's own.
+          // A throw, not a return: the workflow's catch closes skill_run `failed` and Temporal
+          // retries, exactly as a thrown processRecording did. The reason is the Skill's own.
           throw new Error(reason);
         }
-        // Report, don't speak: announce the Talent's steer as a real turn, so follow-ups land in the
+        // Report, don't speak: announce the Skill's steer as a real turn, so follow-ups land in the
         // same conversation. Skipped outcomes (no speech, already filed) carry no steer, say nothing.
-        // A source's own figures are posted exactly as the Talent wrote them — never handed to the agent
-        // to put in its own words, where a number can come out wrong (TALENT-FIGURES-SAID-AS-GIVEN).
+        // A source's own figures are posted exactly as the Skill wrote them — never handed to the agent
+        // to put in its own words, where a number can come out wrong (SKILL-FIGURES-SAID-AS-GIVEN).
         // In the channel the grant names, when it names one (DROPS-IN-A-CHANNEL) - otherwise to that
-        // person, privately. Only what the Talent SAYS goes to the channel: the login alert above
+        // person, privately. Only what the Skill SAYS goes to the channel: the login alert above
         // goes to `notify`, the person, and is never said there.
         if (outcome.status === "done" && outcome.say) {
           if (input.channel) {
@@ -861,7 +907,7 @@ export function makeActivities(deps: TurnDeps) {
             // A drop is gone in minutes: a channel that cannot be posted in must not cost it. The
             // person whose login found it hears it privately instead, and why — so it gets fixed.
             if (!posted) {
-              console.error(`worker: ${input.agent} ${input.talent} failed to post in ${input.channel}; telling ${input.notify ?? "nobody"} privately`);
+              console.error(`worker: ${input.agent} ${input.skill} failed to post in ${input.channel}; telling ${input.notify ?? "nobody"} privately`);
               if (input.notify) await (deps.dm ?? deps.say)?.(input.agent, input.notify, `${outcome.say}\n\n_I could not post in ${input.channel} — invite me there (\`/invite\`) and the next one goes to the channel._`);
             }
           } else if (input.notify) await (deps.dm ?? deps.say)?.(input.agent, input.notify, outcome.say);
@@ -870,7 +916,7 @@ export function makeActivities(deps: TurnDeps) {
           await deps.ask?.(input.agent, input.notify ?? "", outcome.steer, outcome.brains);
         }
         // The announcement text travels BACK OUT so the run record can hold it (W4). `steer` is what
-        // the person was actually told; `summary` is the Talent's own one-liner and the fallback.
+        // the person was actually told; `summary` is the Skill's own one-liner and the fallback.
         // Capped here rather than at the registry, because a 2000-char field is a contract and a
         // 40kB transcript arriving at it is a 413 nobody will connect to a recap.
         // Not when the run filed into a brain: the run record is read tenant-wide, and what was filed
@@ -888,72 +934,81 @@ export function makeActivities(deps: TurnDeps) {
       }
     },
 
-    /** Open — or re-open — the durable record for one item of one Talent run.
+    /** Open — or re-open — the durable record for one item of one Skill run.
      *
      *  This is the record whose absence produced 611 attempts for 4 published recaps. "Not published
      *  yet" and "failing every two minutes for ten hours" were the same state, because the only
      *  durable fact was whether a file existed in a git checkout — a check that can answer "is it
      *  done" and can never answer "is it being worked on, or failing". */
-    async openTalentRun(input: {
+    async openSkillRun(input: {
       agent: string;
-      talent: string;
+      skill: string;
+      instance?: string;
       itemKey: string;
       version: number;
       trigger?: "schedule" | "command" | "hub";
       requestedBy?: string;
       forUser?: string;
     }): Promise<void> {
-      await deps.talentRun?.open(input.agent, input.talent, input.itemKey, input.version, {
+      await deps.skillRun?.open(input.agent, input.skill, input.itemKey, input.version, {
         trigger: input.trigger,
         requestedBy: input.requestedBy,
         forUser: input.forUser,
+        instance: input.instance,
       });
     },
 
     /** Close it, either way. The FAILED case is the one that matters: it is what makes "this
      *  recording has been failing all day" something a person can see without reading a log. */
-    async closeTalentRun(input: {
+    async closeSkillRun(input: {
       agent: string;
-      talent: string;
+      skill: string;
+      instance?: string;
       itemKey: string;
       status: "done" | "failed";
       error?: string;
       result?: { summary: string; links?: { label: string; url: string }[] };
     }): Promise<void> {
-      await deps.talentRun?.close(
+      await deps.skillRun?.close(
         input.agent,
-        input.talent,
+        input.skill,
         input.itemKey,
         input.status,
         input.error,
         input.result,
+        input.instance,
       );
     },
 
     /** The recording-level idempotency guard, read before a run spends anything. Returns the durable
-     *  status of this (agent, talent, item), or `undefined` when there is no record OR the read
+     *  status of this (agent, skill, item), or `undefined` when there is no record OR the read
      *  failed — the workflow treats both the same (go ahead), so a registry blip can only ever let a
      *  done item be re-run, never block a new one. */
-    async talentRunStatus(input: {
+    async skillRunStatus(input: {
       agent: string;
-      talent: string;
+      skill: string;
+      instance?: string;
       itemKey: string;
     }): Promise<{ status: "running" | "done" | "failed"; attempts: number } | undefined> {
-      return (await deps.talentRun?.status?.(input.agent, input.talent, input.itemKey)) ?? undefined;
+      return (await deps.skillRun?.status?.(input.agent, input.skill, input.itemKey, input.instance)) ?? undefined;
     },
 
     /** One look at LOREALISTAR for everyone who has connected a login for this agent
      *  (drop-watch.md). One person's trouble never stops another's look. */
-    async dropLooks(input: { agent: string }): Promise<{ user: string; news: { id: string; name: string }[]; notice?: string; alive?: string }[]> {
+    async dropLooks(input: { agent: string }): Promise<DropLook[]> {
       const l = deps.lorealistar;
       if (!l) return [];
-      const out: { user: string; news: { id: string; name: string }[]; notice?: string; alive?: string }[] = [];
+      const out: DropLook[] = [];
       for (const user of await l.users(input.agent)) {
+        // A login for a copy of the tool (`lorealistar-2:U…`) is looked at for the drop-watch copy that
+        // uses it, and told where that copy says (D-TOOL-COPIES); one no copy uses is not looked at.
+        const where = deps.dropCopy ? deps.dropCopy(input.agent, user) : { person: user };
+        if (!where) continue;
         const r = await l.lookFor(input.agent, user, deps.timezoneOf?.(input.agent)).catch((e) => {
           console.error(`worker: ${input.agent} could not look at LOREALISTAR for ${user} — ${String((e as Error)?.message ?? e).slice(0, 160)}`);
           return undefined;
         });
-        if (r && (r.news.length || r.notice || r.alive)) out.push({ user, ...r });
+        if (r && (r.news.length || r.notice || r.alive)) out.push({ user, ...(deps.dropCopy ? { person: where.person, instance: where.instance, channel: where.channel } : {}), ...r });
       }
       return out;
     },
@@ -961,6 +1016,20 @@ export function makeActivities(deps: TurnDeps) {
     /** These drops' announcements have been started: they are not news again (DROPS-TOLD-ONCE). */
     async dropsTold(input: { agent: string; user: string; ids: string[] }): Promise<void> {
       await deps.lorealistar?.told(input.agent, input.user, input.ids);
+    },
+
+    /** Ask the agent to recap a recording, on the person's behalf, as a turn in their conversation —
+     *  the job IS a prompt (D-JOBS-ARE-PROMPTS). The agent files it with its tools; the run's post hook
+     *  reads the run record to see that it did. */
+    async recapTurn(input: { agent: string; notify: string; instance?: string; recordingId: string; user?: string; title?: string; minutes?: number; nudge?: boolean }): Promise<void> {
+      if (!deps.recapJob || !deps.ask) throw new Error("this worker cannot run a recap as a prompt");
+      const text = await deps.recapJob(input.agent, input);
+      await deps.ask(input.agent, input.notify, text);
+    },
+
+    /** What the agent's one schedule runs on this tick (D-ONE-CLOCK-PER-AGENT). */
+    async skillsDue(input: { agent: string; at: number }): Promise<{ notify: string; recaps: string[]; agendas: string[]; agendaVersion: number }> {
+      return deps.skillsDue?.(input.agent, input.at) ?? { notify: "", recaps: [], agendas: [], agendaVersion: 1 };
     },
 
     /** Say something to one person, in a DM and nowhere else. */
@@ -1017,7 +1086,7 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
     const { conn, run } = found;
 
     const reply: Reply = conn.reply(input.conversation);
-    // AN ANNOUNCEMENT OF WHAT A TALENT FILED goes only to a person who may read where it was filed
+    // AN ANNOUNCEMENT OF WHAT A SKILL FILED goes only to a person who may read where it was filed
     // (BRAIN-PRIVATE-CONFIRMATIONS). A run can file through the agent's own grant, so the person it is
     // for is checked here, before the harness runs or anything is shown. Nobody to check — no person
     // on the announcement — is not a pass: nothing is said.
@@ -1051,10 +1120,11 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
     let held = false;
     let prior: string[] = [];
     let brainTurn: { token: string; mcp: McpServerSpec; cli: { binDir: string; env: Record<string, string> } } | undefined;
-    // The Receipts Talent, when it is on for this agent with a brain set (TALENT-IN-CONVERSATION).
-    const receipts = receiptsOf(found.cfg.talents);
-    // The Website Talent, when it is on for this agent and its site is connected (SITE-IS-A-TALENT).
-    const site = siteOf(found.cfg.talents, found.cfg.credentials);
+    // The Receipts Skill, when it is on for this agent with a brain set (SKILL-IN-CONVERSATION).
+    const receipts = receiptsOf(found.cfg.skills);
+    // The tools the Cloud serves this agent (D-CLOUD-TOOLS in Tonoman Cloud) — the tenant's website
+    // among them. The runtime shows them and carries their calls; it knows nothing else of them.
+    const cloudTools = found.cfg.cloud_tools ?? [];
     // The web tools (TOOL-WEB-SEARCH, TOOL-WEB-FETCH). An agent with no registry keeps web search.
     const granted = found.cfg.granted_tools;
     const webSearch = granted === undefined || granted.includes("web-search");
@@ -1075,7 +1145,7 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
           prior = [];
         }
       }
-      // An announcement of what a Talent filed draws on the brain it filed into.
+      // An announcement of what a Skill filed draws on the brain it filed into.
       if (input.drewOn?.length) {
         await brains.remember(input.agent, key, input.drewOn).catch(() => {});
         prior = [...new Set([...prior, ...input.drewOn])];
@@ -1093,7 +1163,7 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
         }
       }
       if (receipts && prior.includes(receipts.brainId)) finance = true;
-      brainTurn = brains.start(input.agent, input.user, input.user, key, { receipts, site, webFetch });
+      brainTurn = brains.start(input.agent, input.user, input.user, key, { receipts, cloudTools, webFetch });
       // Outside the speaker's own DM, a turn that can reach brains — or remembers one — is held. An
       // announcement is held even in their DM: it is posted only after the reach is checked again.
       held = (audience.kind !== "self" && (!!brainTurn || prior.length > 0 || finance)) || !!input.drewOn?.length;
@@ -1270,11 +1340,11 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
     if (brainTurn && brains && known?.label) {
       // Re-open with the person's name for log.md; the first token is closed unused.
       brains.end(brainTurn.token);
-      brainTurn = brains.start(input.agent, input.user, known.label, key, { receipts, site, webFetch });
+      brainTurn = brains.start(input.agent, input.user, known.label, key, { receipts, cloudTools, webFetch });
     }
     const parts = [
       found.context ?? "",
-      brainTurn ? guidanceFor(provider, receipts, !!site, { search: webSearch, fetch: webFetch }) : "",
+      brainTurn ? guidanceFor(provider, receipts, cloudTools, { search: webSearch, fetch: webFetch }) : "",
       input.afterInterruption
         ? "(your previous answer was interrupted by a new message; continue from what the user now says)"
         : "",
@@ -1556,9 +1626,9 @@ export function isFinanceDocument(file: string): boolean {
   return /[.](jpe?g|png|heic|heif|pdf)$/i.test(file);
 }
 
-/** The Receipts Talent's settings for a turn, or undefined when it is off or has no brain set. */
-export function receiptsOf(talents: { name: string; version?: number; config?: Record<string, unknown> }[] | undefined): { brainId: string; entities?: string[]; version?: number } | undefined {
-  const t = (talents ?? []).find((x) => x.name === "receipts");
+/** The Receipts Skill's settings for a turn, or undefined when it is off or has no brain set. */
+export function receiptsOf(skills: { name: string; version?: number; config?: Record<string, unknown> }[] | undefined): { brainId: string; entities?: string[]; version?: number } | undefined {
+  const t = (skills ?? []).find((x) => x.name === "receipts");
   const brainId = typeof t?.config?.brain === "string" ? t.config.brain.trim() : "";
   if (!t || !brainId) return undefined;
   const raw = t.config?.entities;
@@ -1566,22 +1636,8 @@ export function receiptsOf(talents: { name: string; version?: number; config?: R
   return { brainId, ...(entities.length ? { entities } : {}), version: t.version };
 }
 
-/** PURE: the Website Talent as this agent has it — where its site is and the reference to its key —
- *  or nothing when the Talent is off, has no address, or the site is not connected. */
-export function siteOf(
-  talents: { name: string; version?: number; config?: Record<string, unknown> }[] | undefined,
-  credentials: { kind: string; secret_ref?: string }[] | undefined,
-): { url: string; api?: string; secretRef: string; version?: number } | undefined {
-  const t = (talents ?? []).find((x) => x.name === "website");
-  const url = typeof t?.config?.site === "string" ? t.config.site.trim().replace(/\/+$/, "") : "";
-  const secretRef = (credentials ?? []).find((c) => c.kind === "website" && c.secret_ref)?.secret_ref ?? "";
-  if (!t || !/^https?:\/\//.test(url) || !secretRef) return undefined;
-  const api = typeof t.config?.api === "string" ? t.config.api.trim().replace(/\/+$/, "") : "";
-  return { url, ...(api ? { api } : {}), secretRef, version: t.version };
-}
-
 /** What the turn is told about `tonoman` (CLI-SMALL-CONTEXT), and how to use brains well. */
-function guidanceFor(provider: "claude" | "codex", receipts?: { entities?: string[] }, siteOn = false, web: { search: boolean; fetch: boolean } = { search: true, fetch: false }): string {
+function guidanceFor(provider: "claude" | "codex", receipts?: { entities?: string[] }, cloudTools: CloudTool[] = [], web: { search: boolean; fetch: boolean } = { search: true, fetch: false }): string {
   const receiptsOn = !!receipts;
   const how =
     provider === "codex"
@@ -1598,7 +1654,8 @@ function guidanceFor(provider: "claude" | "codex", receipts?: { entities?: strin
     "  Prefer an existing page (read it first and pass its revision); add a new page to the index or its topic's hub. Say which brain and page, and only once the write says it is saved.",
     "- If a brain is read only, say so. If something was cut or could not be reached, say what you could not look at.",
     ...(receiptsOn ? ["", RECEIPTS_NOTE, receipts?.entities?.length ? `This tenant's legal entities, one of which every receipt names: ${receipts.entities.join(", ")}. If it is not clear which, ask — naming these.` : ""] : []),
-    ...(siteOn ? ["", SITE_NOTE] : []),
+    // Each tool the Cloud serves says, in a few lines, how to use it (D-CLOUD-TOOLS).
+    ...cloudTools.flatMap((t) => (t.note ? ["", t.note] : [])),
   ].join("\n");
 }
 
@@ -1613,20 +1670,7 @@ function webNotes(web: { search: boolean; fetch: boolean }): string[] {
   return out;
 }
 
-/** The Website Talent's short note (the details are in `tonoman site --help`). */
-const SITE_NOTE = [
-  "Website is on: you can change the tenant's website with `tonoman site`. Its pages are data — words and sections — each with a draft and a published version.",
-  "- Look first: `tonoman site pages`, then `tonoman site read` the page (a section at a time). For anything new, `tonoman site sections` says what a page can be made of.",
-  "- A page may already have changes waiting from an earlier request. `read` shows the draft and says what it changes against the live page: tell the person, and when they ask about what the site shows now, answer from `read --live`.",
-  "- A word, a line, a name: `tonoman site edit`. A section or a whole page: `tonoman site save`. Make the change in every language the page has unless told otherwise; a new page gets every language the site has (`--same-as` ties them together).",
-  "- A new page needs a title (the page's own name — the site adds its name after it), a description of about 150 characters and a summary of what the page answers, in each language, and exactly one main heading (its first section's).",
-  "- Images: a photo the person sends goes on the site with `tonoman site upload --file <its name>`; use the address it prints (/media/…) in the section's image field. Use only images the person sent or the site already has; never link an image from another website.",
-  "- Everything you save is a DRAFT. Answer with what you changed and the preview link, and say it is a draft awaiting approval. Never say it is live.",
-  "- Publish only when the person says to: `tonoman site publish`. It works only for an owner or admin; pass on exactly what it answers, and say “live” only if it said so.",
-  "- Behaviour — checkout, sign-in, a new kind of section — is the site's code, not content: say so, and offer what the sections can do instead.",
-].join("\n");
-
-/** The Receipts Talent's short note (the details are in `tonoman receipts --help`). */
+/** The Receipts Skill's short note (the details are in `tonoman receipts --help`). */
 const RECEIPTS_NOTE = [
   "Receipts is on: a receipt, invoice or statement the person sends — a photo or a PDF, even with no words — is filed with `tonoman receipts file`.",
   "Read the date, vendor, gross amount and document type from it; pick the category and the legal entity it belongs to. If any of these is unclear, ask — never guess.",

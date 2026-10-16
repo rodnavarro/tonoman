@@ -313,7 +313,7 @@ describe("SlackConnector.receive", () => {
 });
 
 describe("SlackConnector — watched channel (reply-in-thread, Wave 6)", () => {
-  /** A connector that watches one channel, exactly as `wireVoice` wires it when a Talent's
+  /** A connector that watches one channel, exactly as `wireVoice` wires it when a Skill's
    *  `reply_in_thread` config is on. `watchedChannels` is a live callback — read per message — so a
    *  test can flip what it returns and see the next message treated differently, which is the point. */
   function watching(watched: () => Set<string>): SlackConnector {

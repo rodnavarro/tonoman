@@ -1,7 +1,7 @@
 // A brain organising itself, in the background (BRAIN-BACKGROUND-REFRESH, BRAIN-CONNECTIONS,
 // BRAIN-TRAVERSAL-FILES, BRAIN-LOCAL-MODEL).
 //
-// After a person's or a Talent's push, the brain's pushed state is read in a temporary checkout and:
+// After a person's or a Skill's push, the brain's pushed state is read in a temporary checkout and:
 //   - the map is built from what the pages say: links, the folder hierarchy, pages nothing links to;
 //   - the local model tags pages it has not seen (or that changed since), and pages that share a topic
 //     are connected even when nothing links them — a "related" edge, and a hub page for the topic;
