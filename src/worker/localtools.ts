@@ -189,6 +189,56 @@ export interface RecapIn {
 
 const ALIGNMENTS = ["advances", "neutral", "detracts"];
 
+/** The labels of a recap written as plain text, and the field each fills (RECAP-AS-PLAIN-TEXT). */
+const TEXT_LABELS: Record<string, { key: keyof RecapIn; list?: true }> = {
+  summary: { key: "summary" },
+  highlights: { key: "highlights", list: true },
+  decisions: { key: "decisions", list: true },
+  "follow-ups": { key: "followups", list: true },
+  followups: { key: "followups", list: true },
+  "follow ups": { key: "followups", list: true },
+  participants: { key: "participants", list: true },
+  route: { key: "route" },
+  "route reason": { key: "routeReason" },
+  meeting: { key: "meeting" },
+  "meeting reason": { key: "meetingReason" },
+  alignment: { key: "alignment" },
+  "alignment reason": { key: "alignmentReason" },
+};
+
+/** PURE: a recap written as plain text — `Summary:`, `Highlights:` with `- ` lines, `Meeting:` … —
+ *  into the fields a JSON recap has (RECAP-AS-PLAIN-TEXT). A turn may run only `tonoman`, and Claude
+ *  Code refuses a command holding JSON ("brace with quote character"), so the recap travels as text
+ *  on standard input. An empty list is `- (none)` or nothing; text before the first label is ignored. */
+export function recapFromText(text: string): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  let cur: { key: keyof RecapIn; list?: true } | undefined;
+  for (const raw of text.replace(/\r/g, "").split("\n")) {
+    const line = raw.trim();
+    const m = /^([A-Za-z][A-Za-z -]{2,20}):\s*(.*)$/.exec(line);
+    const label = m ? TEXT_LABELS[m[1]!.trim().toLowerCase()] : undefined;
+    if (m && label) {
+      cur = label;
+      const rest = m[2]!.trim();
+      if (label.list) {
+        out[label.key] = (out[label.key] as string[] | undefined) ?? [];
+        if (rest && !/^\(?none\)?$/i.test(rest)) (out[label.key] as string[]).push(rest.replace(/^[-*•]\s+/, ""));
+      } else {
+        out[label.key] = rest.replace(/^""$/, "");
+      }
+      continue;
+    }
+    if (!cur || !line) continue;
+    if (cur.list) {
+      const item = line.replace(/^[-*•]\s+|^\d+[.)]\s+/, "").trim();
+      if (item && !/^\(?none\)?$/i.test(item)) (out[cur.key] as string[]).push(item);
+    } else {
+      out[cur.key] = `${out[cur.key] ? `${out[cur.key]} ` : ""}${line}`;
+    }
+  }
+  return out;
+}
+
 /** PURE: is this recap fit to file? Every problem in one answer, so the agent fixes them at once
  *  (RECAP-CHECKED-BEFORE-FILED). A meeting must be one the calendar showed — or "" — so a name the
  *  model made up can never rename and misfile a recording (RECAP-NEVER-INVENTS). */
@@ -202,10 +252,15 @@ export function checkRecap(
     const text = raw.trim();
     const open = text.indexOf("{");
     const close = text.lastIndexOf("}");
-    try {
-      r = JSON.parse(open >= 0 && close > open ? text.slice(open, close + 1) : text) as Record<string, unknown>;
-    } catch {
-      return { problems: ["the recap is not JSON — send one object: {\"summary\": …, \"highlights\": [...], …}"] };
+    if (/^\s*summary\s*:/im.test(text) && !(open >= 0 && /^\s*\{/.test(text))) {
+      // The recap as plain text (RECAP-AS-PLAIN-TEXT) — what a turn sends now.
+      r = recapFromText(text);
+    } else {
+      try {
+        r = JSON.parse(open >= 0 && close > open ? text.slice(open, close + 1) : text) as Record<string, unknown>;
+      } catch {
+        return { problems: ["the recap could not be read: write it as plain text, starting with a line `Summary: …`, then `Highlights:` with one `- ` line each (see the recap job's layout)"] };
+      }
     }
   } else if (raw && typeof raw === "object") {
     r = raw as Record<string, unknown>;

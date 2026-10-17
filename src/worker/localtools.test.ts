@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { calendarChoices, checkRecap, localTools, localToolsOf, pickCalendars, pickLogin, plaudLogins, skillsNote } from "./localtools";
+import { calendarChoices, checkRecap, recapFromText, localTools, localToolsOf, pickCalendars, pickLogin, plaudLogins, skillsNote } from "./localtools";
 import { recapJobPrompt, recapNudge } from "../skills/voice/plaud-and-calendar-meetings/prompt";
 import type { AgentConfig } from "../config";
 
@@ -161,14 +161,17 @@ describe("the recap job is a prompt", () => {
     expect(p).toContain('tonoman plaud transcript --id R-1 --login "Team Plaud"');
     expect(p).toContain('--calendars "Home calendar"');
     expect(p).toContain("tonoman meeting-recap file --id R-1 --login \"Team Plaud\" --copy team-recap");
-    expect(p).toContain('"clients" (a client meeting)');
+    expect(p).toContain("clients (a client meeting)");
+    // RECAP-AS-PLAIN-TEXT: never JSON in the command — the shell refuses braces with quotes.
+    expect(p).toContain("tonoman meeting-recap file --id R-1 --login \"Team Plaud\" --copy team-recap <<'RECAP'");
+    expect(p).not.toMatch(/\{"summary"/);
   });
 
   it("D-JOBS-ARE-PROMPTS the first copy on the person's own login needs no label at all", () => {
     const p = recapJobPrompt({ copy: "meeting-recap", id: "R-1", title: "x", startedAt: 0, minutes: 1, login: "mine", calendars: [] });
     expect(p).toContain("`tonoman plaud transcript --id R-1`");
     expect(p).not.toContain("--copy");
-    expect(recapNudge({ copy: "meeting-recap", id: "R-1", title: "x", login: "mine" })).toContain("tonoman meeting-recap file --id R-1 --recap-file recap.json`");
+    expect(recapNudge({ copy: "meeting-recap", id: "R-1", title: "x", login: "mine" })).toContain("tonoman meeting-recap file --id R-1 <<'RECAP'`");
   });
 });
 
@@ -206,5 +209,53 @@ describe("the agent's one schedule", () => {
     expect(copyFloor(Date.parse("2026-09-01T00:00:00Z"), "2026-10-06T07:00:00Z", 0)).toBe(Date.parse("2026-10-06T07:00:00Z"));
     expect(copyFloor(Date.parse("2026-10-07T00:00:00Z"), "2026-10-06T07:00:00Z", 0)).toBe(Date.parse("2026-10-07T00:00:00Z"));
     expect(copyFloor(0, undefined, 1234)).toBe(1234);
+  });
+});
+
+describe("RECAP-AS-PLAIN-TEXT — a recap written as labelled text files like the JSON one", () => {
+  const TEXT = [
+    "Summary: BNI one-to-one lunch with Erik Sealy at La Fiesta Mexicana.",
+    "They compared referral partners.",
+    "Highlights:",
+    "- Erik refers commercial roofing jobs",
+    "- Rod explained {Tonoman} and the \"second brain\"",
+    "Decisions:",
+    "- (none)",
+    "Follow-ups:",
+    "1. Send Erik the intro deck",
+    "Participants: Rod Navarro",
+    "- Erik Sealy",
+    "Meeting: BNI 1-2-1",
+    "Meeting reason: the calendar entry at 1 PM names Erik.",
+  ].join("\n");
+
+  it("reads every label, lists and continued lines", () => {
+    expect(recapFromText(TEXT)).toEqual({
+      summary: "BNI one-to-one lunch with Erik Sealy at La Fiesta Mexicana. They compared referral partners.",
+      highlights: ["Erik refers commercial roofing jobs", 'Rod explained {Tonoman} and the "second brain"'],
+      decisions: [],
+      followups: ["Send Erik the intro deck"],
+      participants: ["Rod Navarro", "Erik Sealy"],
+      meeting: "BNI 1-2-1",
+      meetingReason: "the calendar entry at 1 PM names Erik.",
+    });
+  });
+
+  it("checkRecap takes the text and holds it to the same rules as JSON", () => {
+    const ok = checkRecap(TEXT, { candidates: [{ summary: "BNI 1-2-1" }] });
+    expect("recap" in ok && ok.recap.meeting).toBe("BNI 1-2-1");
+    const bad = checkRecap(TEXT.replace("Meeting: BNI 1-2-1", "Meeting: A made-up meeting"), { candidates: [{ summary: "BNI 1-2-1" }] });
+    expect("problems" in bad && bad.problems.join(" ")).toContain('"meeting" must be one of the calendar entries');
+    expect("problems" in checkRecap("Highlights:\n- x", { candidates: [] })).toBe(true);
+  });
+
+  it("an empty Meeting is the honest answer, not a problem", () => {
+    const r = checkRecap("Summary: A call.\nMeeting:", { candidates: [{ summary: "Standup" }] });
+    expect("recap" in r && r.recap.meeting).toBe("");
+  });
+
+  it("JSON still works for a caller that sends it", () => {
+    const r = checkRecap('{"summary": "A call.", "highlights": []}', { candidates: [] });
+    expect("recap" in r && r.recap.summary).toBe("A call.");
   });
 });
