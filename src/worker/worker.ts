@@ -280,6 +280,15 @@ export async function registrySecret(
   }
 }
 
+/** A connection's credential (`credential_account.secret_ref`: `plaud.tokens`, `plaud.tokens:U…`),
+ *  always out of the registry. These refs are registry names whether or not they carry the
+ *  `registry:` prefix — read through `resolveRef`, `plaud.tokens` is no mount ref at all and
+ *  `plaud.tokens:U…` is one for a file no pod has, so a connected Plaud read as "not connected"
+ *  (PLAUD-BINDING-REF). */
+export function connectionSecret(ref: string | undefined, guid: string | undefined, fetchImpl?: typeof fetch): Promise<string> {
+  return registrySecret(guid, ref?.trim().replace(/^registry:/, ""), fetchImpl);
+}
+
 /** POST one inference-credential outcome to the registry (W3).
  *
  *  TWO ROUTES, because they answer two different questions. A shared agent has one login and one
@@ -1774,7 +1783,7 @@ export async function run(
       const out: VoiceAccount[] = [];
       for (const c of g.bindings?.plaud?.credentials ?? []) {
         if (c.scope === "per_person" || !c.secret_ref) continue;
-        const tokenJson = await resolveRef(c.secret_ref, a.cfg.guid);
+        const tokenJson = await connectionSecret(c.secret_ref, a.cfg.guid);
         if (tokenJson) out.push({ creds: { tokenJson }, floorMs: floor });
       }
       // A numbered copy of the tool (`plaud-2`, D-TOOL-COPIES) reads each person's login connected for
@@ -1786,7 +1795,7 @@ export async function run(
             for (const acc of c.accounts ?? []) {
               const user = tokenstore.userFromPlaudRef(acc.secret_ref?.replace(`plaud.tokens:${toolCopy}:`, "plaud.tokens:"));
               if (!user || !acc.secret_ref || acc.status === "revoked") continue;
-              const tokenJson = await resolveRef(acc.secret_ref, a.cfg.guid);
+              const tokenJson = await connectionSecret(acc.secret_ref, a.cfg.guid);
               if (tokenJson) out.push({ creds: { tokenJson }, user, floorMs: floor });
             }
           }
@@ -1824,7 +1833,7 @@ export async function run(
       let rec: recapFloor.Recording | undefined;
       try {
         const creds = sharedBound?.secret_ref
-          ? { tokenJson: await resolveRef(sharedBound.secret_ref, a?.cfg.guid) }
+          ? { tokenJson: await connectionSecret(sharedBound.secret_ref, a?.cfg.guid) }
           : j.user
             ? v?.accounts?.find((x) => x.user === j.user)?.creds
             : v?.creds;
@@ -2046,7 +2055,7 @@ export async function run(
       const v = voiceCreds.get(name);
       if (login.user) return v?.accounts?.find((x) => x.user === login.user)?.creds;
       if (login.secretRef) {
-        const tokenJson = await resolveRef(login.secretRef, wired.get(name)?.cfg.guid);
+        const tokenJson = await connectionSecret(login.secretRef, wired.get(name)?.cfg.guid);
         return tokenJson ? { tokenJson } : undefined;
       }
       return v?.creds;

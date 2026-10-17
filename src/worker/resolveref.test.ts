@@ -10,7 +10,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { promises as fs } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { registrySecret, resolveRef } from "./worker";
+import { connectionSecret, registrySecret, resolveRef } from "./worker";
 import { parseRef } from "../core/secretref";
 
 const env = { ...process.env };
@@ -142,5 +142,27 @@ describe("resolveRef — the registry scheme (W7)", () => {
     const f = recorder({ body: { value: "v" } });
     await registrySecret("g-1", "slack.bot-token", f.impl);
     expect(f.calls[0].url).toBe("https://api.test/v1/system/agents/g-1/secrets/slack.bot-token");
+  });
+});
+
+describe("connectionSecret — a connection's ref is a registry name (PLAUD-BINDING-REF)", () => {
+  it("reads the bare shared Plaud ref from the registry, not a mount", async () => {
+    const f = recorder({ body: { value: '{"authorization":"x"}' } });
+    expect(await connectionSecret("plaud.tokens", "g-1", f.impl)).toBe('{"authorization":"x"}');
+    expect(f.calls[0].url).toBe("https://api.test/v1/system/agents/g-1/secrets/plaud.tokens");
+    // The bug: the same ref through resolveRef is no mount ref, so it was "not connected".
+    expect(await resolveRef("plaud.tokens", "g-1", f.impl)).toBe("");
+  });
+
+  it("keeps a person's ref whole — its colon is part of the name, not a secret:key split", async () => {
+    const f = recorder({ body: { value: "t" } });
+    expect(await connectionSecret("plaud.tokens:U0TEST", "g-1", f.impl)).toBe("t");
+    expect(f.calls[0].url).toContain("/secrets/plaud.tokens%3AU0TEST");
+  });
+
+  it("takes a prefixed ref the same way", async () => {
+    const f = recorder({ body: { value: "t" } });
+    await connectionSecret("registry:plaud.tokens", "g-1", f.impl);
+    expect(f.calls[0].url).toBe("https://api.test/v1/system/agents/g-1/secrets/plaud.tokens");
   });
 });
