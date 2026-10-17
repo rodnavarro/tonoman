@@ -54,7 +54,7 @@ export function recapJobPrompt(j: RecapJob): string {
     "",
     `1. Read it: \`tonoman plaud transcript --id ${j.id}${login}\`. If it has no speech in it, stop there: file nothing and tell them in one line.`,
     `2. See which meeting it was: \`tonoman calendar find --from ${start} --to ${end}${cals}\`.`,
-    `3. Write the recap as JSON and file it: \`tonoman meeting-recap file --id ${j.id}${login}${copy}\` with the JSON on stdin. If it is refused, fix what it says and file it again.`,
+    `3. Write the recap as JSON to a file in your folder (recap.json) with your file-writing tool, then file it: \`tonoman meeting-recap file --id ${j.id}${login}${copy} --recap-file recap.json\`. Never put the JSON in the command itself. If it is refused, fix what it says and file it again.`,
     ...rules.map((r) => `   ${r}`),
     "4. Then write them a short message: it is ready, where it was filed, and the three most useful things from it in your own words; offer to answer questions about it.",
   ].join("\n");
@@ -64,5 +64,5 @@ export function recapJobPrompt(j: RecapJob): string {
 export function recapNudge(j: Pick<RecapJob, "copy" | "id" | "title" | "login">): string {
   const login = j.login && j.login !== "mine" ? ` --login ${q(j.login)}` : "";
   const copy = j.copy && j.copy !== "meeting-recap" ? ` --copy ${j.copy}` : "";
-  return `The recap of ${q(j.title)} is not filed yet. File it now with \`tonoman meeting-recap file --id ${j.id}${login}${copy}\` (the recap JSON on stdin), then tell them it is ready — or, if the recording has no speech, say so in one line.`;
+  return `The recap of ${q(j.title)} is not filed yet. File it now with \`tonoman meeting-recap file --id ${j.id}${login}${copy} --recap-file recap.json\` (write the recap JSON to recap.json with your file-writing tool first; never put JSON in the command), then tell them it is ready — or, if the recording has no speech, say so in one line.`;
 }

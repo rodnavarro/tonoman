@@ -83,6 +83,19 @@ describe("tools a Cloud serves", () => {
     expect(calls).toEqual([{ agent: "g1", tool: "notes", command: "add", speaker: "UANA", body: { title: "Offsite", text: "remember the offsite" } }]);
   });
 
+  it("CLI-INPUT-FROM-A-FILE what a command reads from stdin can come from a file the agent wrote (--<arg>-file), byte for byte", async () => {
+    const { cli } = broker.startTurn({ agentGuid: "g1", slackUserId: "UANA", who: "Ana", cloudTools: [NOTES] });
+    const json = '{\n  "summary": "BNI lunch",\n  "highlights": ["a \\"quoted\\" one", "{braces}"]\n}\n';
+    const file = path.join(tmp, "recap.json");
+    writeFileSync(file, json);
+    const r = await tonoman(cli.env, "ignored stdin", "notes", "add", "--title", "Lunch", "--text-file", file);
+    expect(r.code).toBe(0);
+    expect(calls).toEqual([{ agent: "g1", tool: "notes", command: "add", speaker: "UANA", body: { title: "Lunch", text: json } }]);
+    const missing = await tonoman(cli.env, undefined, "notes", "add", "--title", "x", "--text-file", path.join(tmp, "nope.json"));
+    expect(missing.code).not.toBe(0);
+    expect(missing.out).toContain("Could not read");
+  });
+
   it("CLI-CLOUD-TOOLS a tool not listed for this turn's agent is refused, and nothing reaches the Cloud", async () => {
     const { token } = broker.startTurn({ agentGuid: "g1", slackUserId: "UANA", who: "Ana" });
     expect((await post(token, "cloud/notes/add", { title: "x" })).status).toBe(403);
