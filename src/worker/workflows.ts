@@ -36,7 +36,7 @@ import type { Activities } from "./activities";
 // import. These are pure string functions, which is also what keeps the workflow deterministic.
 import { failureReason, isNotLoggedInError, notLoggedInNotice } from "../turnfailure";
 import { isFinalLaunch, recordingKey, skillGate } from "./recordingkey";
-import { WorkflowExecutionAlreadyStartedError } from "@temporalio/common";
+import { ApplicationFailure, TemporalFailure, WorkflowExecutionAlreadyStartedError } from "@temporalio/common";
 
 const { runTurn, postNotice } = proxyActivities<Activities>({
   // A turn is a person waiting on an LLM: minutes, not seconds. The heartbeat is what makes a dead
@@ -488,13 +488,16 @@ export async function runSkillWorkflow(input: RunSkillInput): Promise<void> {
       if (await filed(30)) return;
       await recapTurn({ ...job, nudge: true });
       if (await filed(20)) return;
-      throw new Error("the agent was asked twice and did not file the recap");
+      // A FAILURE, not an Error: a plain Error thrown in workflow code fails the workflow TASK, which
+      // Temporal retries forever — the run replayed to this line every few seconds for days and held
+      // its workflow id, so a re-run was refused as "already running" (RUN-FAILS-ONCE).
+      throw ApplicationFailure.nonRetryable("the agent was asked twice and did not file the recap", "RecapNotFiled");
     } catch (e) {
       await closeSkillRun({ agent: input.agent, skill: input.skill, instance: input.instance, itemKey: input.itemKey, status: "failed", error: failureReason(e).slice(0, 500) }).catch(() => {});
       if (input.force || isFinalLaunch(prior)) {
         await sayVerbatim({ agent: input.agent, user: input.notify, text: `⚠️ I couldn't finish a recording — ${failureReason(e).slice(0, 200)}` }).catch(() => {});
       }
-      throw e;
+      throw e instanceof TemporalFailure ? e : ApplicationFailure.nonRetryable(failureReason(e).slice(0, 500), "RecapFailed");
     }
   }
 

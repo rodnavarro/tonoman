@@ -117,7 +117,7 @@ const GROUPS = {
     about: "file a meeting's recap (meeting-recap skill)",
     needs: "meeting-recap",
     commands: {
-      file: { route: "tool/meeting-recap/file", args: ["--id", "[--login <label>]", "[--copy <keyword>]", "--recap (the recap JSON, or on stdin)"], about: "File one recording's recap in the second brain, with its transcript. The recap is JSON: summary, highlights, decisions, followups, participants, and route, meeting and alignment when asked for. It is checked before it is filed; a refusal says what to fix.", stdin: "recap" },
+      file: { route: "tool/meeting-recap/file", args: ["--id", "[--login <label>]", "[--copy <keyword>]", "--recap-file <path> (the recap JSON, written to a file first; or --recap, or on stdin)"], about: "File one recording's recap in the second brain, with its transcript. The recap is JSON: summary, highlights, decisions, followups, participants, and route, meeting and alignment when asked for. It is checked before it is filed; a refusal says what to fix.", stdin: "recap" },
     },
   },
 };
@@ -179,6 +179,15 @@ async function stdin() {
   const body = parse(rest);
   // A command whose whole answer is the point (a transcript) says how much it may print.
   if (spec.max) LIMIT = spec.max;
+  // CLI-INPUT-FROM-A-FILE: what a command reads from standard input may come from a file the agent
+  // wrote instead, --<arg>-file <path>: a recap or a page written to a file is passed as it is, and
+  // never as JSON inside a shell command (which a harness may refuse to run).
+  const fromKey = spec.stdin || (group === "brain" && cmd === "write" ? "content" : "");
+  if (fromKey && typeof body[fromKey + "File"] === "string") {
+    try { body[fromKey] = require("node:fs").readFileSync(body[fromKey + "File"], "utf8"); }
+    catch (e) { fail("Could not read " + body[fromKey + "File"] + ": " + e.message, 2); }
+    delete body[fromKey + "File"];
+  }
   if (group === "brain" && cmd === "write" && typeof body.content !== "string") body.content = await stdin();
   // A Cloud tool's command names the argument it reads from standard input when not given.
   if (spec.stdin && typeof body[spec.stdin] !== "string" && body.remove === undefined) body[spec.stdin] = await stdin();

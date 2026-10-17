@@ -168,7 +168,7 @@ describe("the recap job is a prompt", () => {
     const p = recapJobPrompt({ copy: "meeting-recap", id: "R-1", title: "x", startedAt: 0, minutes: 1, login: "mine", calendars: [] });
     expect(p).toContain("`tonoman plaud transcript --id R-1`");
     expect(p).not.toContain("--copy");
-    expect(recapNudge({ copy: "meeting-recap", id: "R-1", title: "x", login: "mine" })).toContain("tonoman meeting-recap file --id R-1`");
+    expect(recapNudge({ copy: "meeting-recap", id: "R-1", title: "x", login: "mine" })).toContain("tonoman meeting-recap file --id R-1 --recap-file recap.json`");
   });
 });
 
