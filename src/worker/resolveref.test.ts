@@ -10,7 +10,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { promises as fs } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { connectionSecret, registrySecret, resolveRef } from "./worker";
+import { connectionSecret, plaudCredsOf, registrySecret, resolveRef } from "./worker";
 import { parseRef } from "../core/secretref";
 
 const env = { ...process.env };
@@ -164,5 +164,26 @@ describe("connectionSecret — a connection's ref is a registry name (PLAUD-BIND
     const f = recorder({ body: { value: "t" } });
     await connectionSecret("registry:plaud.tokens", "g-1", f.impl);
     expect(f.calls[0].url).toBe("https://api.test/v1/system/agents/g-1/secrets/plaud.tokens");
+  });
+});
+
+describe("plaudCredsOf — a !connect plaud login is read through the token store, not as a bearer", () => {
+  it("the shared login is the agent's own CLI tokens", async () => {
+    const f = recorder({ body: { value: '{"access_token":"a","refresh_token":"r"}' } });
+    expect(await plaudCredsOf("plaud.tokens", "sapien", "g-1", f.impl)).toEqual({ tokenJson: "", cliAgent: "sapien" });
+  });
+
+  it("a person's slot, copy name and all, is the CLI user", async () => {
+    const f = recorder({ body: { value: "{}" } });
+    expect(await plaudCredsOf("plaud.tokens:plaud-2:U0TEST", "sapien", "g-1", f.impl)).toEqual({ tokenJson: "", cliAgent: "sapien", cliUser: "plaud-2:U0TEST" });
+  });
+
+  it("nothing stored is not connected", async () => {
+    expect(await plaudCredsOf("plaud.tokens", "sapien", "g-1", recorder({ status: 404 }).impl)).toBeUndefined();
+  });
+
+  it("any other ref is a captured bearer, passed as it is", async () => {
+    const f = recorder({ body: { value: '{"authorization":"bearer x"}' } });
+    expect(await plaudCredsOf("registry:plaud.bearer", "sapien", "g-1", f.impl)).toEqual({ tokenJson: '{"authorization":"bearer x"}' });
   });
 });

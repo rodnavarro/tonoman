@@ -289,6 +289,20 @@ export function connectionSecret(ref: string | undefined, guid: string | undefin
   return registrySecret(guid, ref?.trim().replace(/^registry:/, ""), fetchImpl);
 }
 
+/** The Plaud credentials behind a bound login's ref, or undefined when nothing is connected there.
+ *  A `plaud.tokens[:<slot>]` ref holds the OAuth tokens `!connect plaud` keeps, which the official
+ *  API reads through the token store (`cliAgent`, and `cliUser` for a person's slot) — they are not
+ *  a captured web bearer, and handing them over as `tokenJson` read as "captured token has no
+ *  authorization". Any other ref is a captured bearer, passed as it is. */
+export async function plaudCredsOf(ref: string | undefined, agent: string, guid: string | undefined, fetchImpl?: typeof fetch): Promise<recapFloor.PlaudCreds | undefined> {
+  const value = await connectionSecret(ref, guid, fetchImpl);
+  if (!value) return undefined;
+  const r = (ref ?? "").trim().replace(/^registry:/, "");
+  if (r === "plaud.tokens") return { tokenJson: "", cliAgent: agent };
+  if (r.startsWith("plaud.tokens:")) return { tokenJson: "", cliAgent: agent, cliUser: r.slice("plaud.tokens:".length) };
+  return { tokenJson: value };
+}
+
 /** POST one inference-credential outcome to the registry (W3).
  *
  *  TWO ROUTES, because they answer two different questions. A shared agent has one login and one
@@ -1783,8 +1797,8 @@ export async function run(
       const out: VoiceAccount[] = [];
       for (const c of g.bindings?.plaud?.credentials ?? []) {
         if (c.scope === "per_person" || !c.secret_ref) continue;
-        const tokenJson = await connectionSecret(c.secret_ref, a.cfg.guid);
-        if (tokenJson) out.push({ creds: { tokenJson }, floorMs: floor });
+        const creds = await plaudCredsOf(c.secret_ref, name, a.cfg.guid);
+        if (creds) out.push({ creds, floorMs: floor });
       }
       // A numbered copy of the tool (`plaud-2`, D-TOOL-COPIES) reads each person's login connected for
       // IT — `!connect plaud-2` — never the one they connected for `plaud`.
@@ -1795,8 +1809,8 @@ export async function run(
             for (const acc of c.accounts ?? []) {
               const user = tokenstore.userFromPlaudRef(acc.secret_ref?.replace(`plaud.tokens:${toolCopy}:`, "plaud.tokens:"));
               if (!user || !acc.secret_ref || acc.status === "revoked") continue;
-              const tokenJson = await connectionSecret(acc.secret_ref, a.cfg.guid);
-              if (tokenJson) out.push({ creds: { tokenJson }, user, floorMs: floor });
+              const creds = await plaudCredsOf(acc.secret_ref, name, a.cfg.guid);
+              if (creds) out.push({ creds, user, floorMs: floor });
             }
           }
         }
@@ -1833,7 +1847,7 @@ export async function run(
       let rec: recapFloor.Recording | undefined;
       try {
         const creds = sharedBound?.secret_ref
-          ? { tokenJson: await connectionSecret(sharedBound.secret_ref, a?.cfg.guid) }
+          ? await plaudCredsOf(sharedBound.secret_ref, name, a?.cfg.guid)
           : j.user
             ? v?.accounts?.find((x) => x.user === j.user)?.creds
             : v?.creds;
@@ -2054,10 +2068,7 @@ export async function run(
     plaudCreds: async (name, login) => {
       const v = voiceCreds.get(name);
       if (login.user) return v?.accounts?.find((x) => x.user === login.user)?.creds;
-      if (login.secretRef) {
-        const tokenJson = await connectionSecret(login.secretRef, wired.get(name)?.cfg.guid);
-        return tokenJson ? { tokenJson } : undefined;
-      }
+      if (login.secretRef) return plaudCredsOf(login.secretRef, name, wired.get(name)?.cfg.guid);
       return v?.creds;
     },
     listRecordings: (creds, limit) => recapFloor.listRecordings(creds, limit),
