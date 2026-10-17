@@ -155,9 +155,33 @@ const MAX_MEDIA_BYTES = 25 * 1024 * 1024;
 /** Extensions trusted from the file's name when the magic bytes are unrecognised — text and audio,
  *  which have no single signature. `claude`'s Read keys on the extension to know how to open it. */
 const TRUSTED_EXT = new Set([
-  ".txt", ".md", ".csv", ".json", ".log", ".xml", ".yaml", ".yml",
+  ".txt", ".md", ".csv", ".tsv", ".json", ".log", ".xml", ".yaml", ".yml",
+  // Text an agent reads as it is — a guide sent as one HTML file among them (CONVO-ATTACHMENT-KEEPS-ITS-TYPE).
+  ".html", ".htm", ".srt", ".vtt",
   ".m4a", ".mp3", ".wav", ".ogg", ".opus", ".aac", ".flac",
 ]);
+
+/** What a file the agent is not handed — a video, or anything over the cap — becomes instead: a small
+ *  note naming it in the conversation, which a tool takes by name and reads at its source
+ *  (CONVO-LARGE-FILE-BY-REFERENCE). The note is the worker's, never the agent's, so it can only ever
+ *  name a file the person really sent. */
+export const SLACK_FILE_REF_EXT = ".slackfile.json";
+
+/** PURE: the reference note for a file left in Slack. */
+export function slackFileRef(f: { id?: string; name?: string; mimetype?: string; size?: number }, team?: string): string {
+  return JSON.stringify({ kind: "slack-file", team: team ?? null, id: f.id ?? null, name: f.name ?? null, mimetype: f.mimetype ?? null, size: f.size ?? null }, null, 2) + "\n";
+}
+
+/** PURE: true for a file that stays in Slack and reaches the turn as a reference. */
+export function staysInSlack(f: { mimetype?: string; size?: number }): boolean {
+  return (f.mimetype ?? "").startsWith("video/") || (typeof f.size === "number" && f.size > MAX_MEDIA_BYTES);
+}
+
+/** PURE: a file's own name, kept readable and safe for a path: `guia produccion.html` → `guia-produccion`. */
+export function safeStem(name: string | undefined): string {
+  const stem = path.basename(name ?? "", path.extname(name ?? "")).normalize("NFKD").replace(/[̀-ͯ]/g, "");
+  return stem.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^[-.]+|[-.]+$/g, "").slice(0, 80) || "file";
+}
 
 /** PURE: the file's real extension from its MAGIC BYTES (authoritative), else a trusted name
  *  extension, else `.bin`. Covers the image/PDF set `claude` can read AND audio, which it cannot
@@ -174,7 +198,13 @@ export function sniffMedia(buf: Buffer, name?: string): string {
   if (ascii(0, "ID3") || (b(0) === 0xff && (b(1) & 0xe0) === 0xe0)) return ".mp3";
   if (ascii(4, "ftyp")) {
     if (ascii(8, "heic") || ascii(8, "heix") || ascii(8, "mif1") || ascii(8, "heif")) return ".heic";
-    if (ascii(8, "M4A") || ascii(8, "mp4") || ascii(8, "isom")) return ".m4a";
+    if (ascii(8, "M4A")) return ".m4a";
+    if (ascii(8, "qt  ")) return ".mov";
+    // isom / mp41 / mp42 / avc1 hold video as often as audio: the name decides, and video is the
+    // default — an MP4 video named as audio is the bug this replaced.
+    if (ascii(8, "mp4") || ascii(8, "isom") || ascii(8, "avc1") || ascii(8, "iso")) {
+      return path.extname(name || "").toLowerCase() === ".m4a" ? ".m4a" : ".mp4";
+    }
   }
   const ext = path.extname(name || "").toLowerCase();
   return TRUSTED_EXT.has(ext) ? ext : ".bin";
@@ -590,22 +620,32 @@ export class SlackConnector implements Connector {
       text: stripMention(e.text ?? ""),
       // Files attached to the message, downloaded so the turn can read them. Empty for an ordinary
       // message, which is every message today — so nothing about a text turn changes.
-      mediaPaths: await this.downloadFiles(e.files ?? []),
+      mediaPaths: await this.downloadFiles(e.files ?? [], teamID),
     };
   }
 
   /** Download the files attached to a message into `mediaDir`, returning the paths the turn will
    *  hand the model. Best-effort per file: a failed download is logged and skipped (NEVER silent —
    *  a swallowed download is the "agent says it sees nothing" bug), and the text turn still runs. */
-  private async downloadFiles(files: SlackFile[]): Promise<string[]> {
+  private async downloadFiles(files: SlackFile[], team?: string): Promise<string[]> {
     if (!files.length || !this.o.mediaDir) return [];
     await this.cleanMedia().catch(() => {});
     const out: string[] = [];
+    // Each file keeps its own name behind a short tag, so the agent (and a guide's address) can tell
+    // `guia-produccion.html` from a receipt; the tag keeps two files of one name apart.
+    const named = (ext: string, f: SlackFile) => `${randomUUID().slice(0, 8)}-${safeStem(f.name)}${ext}`;
     for (const f of files) {
       const url = f.url_private_download || f.url_private;
       if (!url) continue;
-      if (typeof f.size === "number" && f.size > MAX_MEDIA_BYTES) {
-        console.error(`slack: attachment "${f.name ?? f.id}" is ${f.size} bytes, over the ${MAX_MEDIA_BYTES} cap — skipping`);
+      if (staysInSlack(f)) {
+        // A video, or anything over the cap, is not pulled onto the volume: the turn gets a note
+        // naming it, and a tool that takes it reads it from Slack (CONVO-LARGE-FILE-BY-REFERENCE).
+        if (!f.id) continue;
+        await fs.mkdir(this.o.mediaDir, { recursive: true });
+        const file = named(SLACK_FILE_REF_EXT, f);
+        await fs.writeFile(path.join(this.o.mediaDir, file), slackFileRef(f, team));
+        console.log(`slack: attachment "${f.name ?? f.id}" (${f.mimetype ?? "?"}, ${f.size ?? "?"} bytes) left in Slack; the turn gets a reference`);
+        out.push(this.o.mediaMount ? `${this.o.mediaMount}/${file}` : path.join(this.o.mediaDir, file));
         continue;
       }
       try {
@@ -616,7 +656,7 @@ export class SlackConnector implements Connector {
         const buf = Buffer.from(await resp.arrayBuffer());
         const ext = sniffMedia(buf, f.name);
         await fs.mkdir(this.o.mediaDir, { recursive: true });
-        const file = `${randomUUID()}${ext}`;
+        const file = named(ext, f);
         await fs.writeFile(path.join(this.o.mediaDir, file), buf);
         out.push(this.o.mediaMount ? `${this.o.mediaMount}/${file}` : path.join(this.o.mediaDir, file));
       } catch (err) {

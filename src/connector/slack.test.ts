@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { promises as fsp } from "node:fs";
 import * as os from "node:os";
 import * as nodePath from "node:path";
-import { SlackConnector, stripMention, conversationKey, repliesToOwnThread, parseConversation, splitForSlack, SLACK_MSG_LIMIT, sniffMedia } from "./slack";
+import { SlackConnector, stripMention, conversationKey, repliesToOwnThread, parseConversation, splitForSlack, SLACK_MSG_LIMIT, sniffMedia, safeStem, staysInSlack, slackFileRef } from "./slack";
 
 describe("sniffMedia — name an attachment by what it IS, so claude's Read opens it right", () => {
   it("reads the magic bytes for images, pdf and audio", () => {
@@ -527,5 +527,78 @@ describe("asking Slack the way Slack answers", () => {
       }),
     });
     expect(await conn.audience("T1/G1/1.2", "UANA")).toEqual({ kind: "members", members: ["UANA", "UBEN"], name: "eng" });
+  });
+});
+
+
+describe("CONVO-ATTACHMENT-KEEPS-ITS-TYPE — a file reaches the agent as what it is", () => {
+  it("an HTML guide is .html, not .bin (Steffy's guide, 2026-10-17)", () => {
+    expect(sniffMedia(Buffer.from("<!doctype html><html>"), "guia_produccion_beauty_skincare.html")).toBe(".html");
+    expect(sniffMedia(Buffer.from("<html>"), "old.HTM")).toBe(".htm");
+  });
+
+  it("an MP4 video is .mp4, never named as audio; a QuickTime one .mov; a real M4A stays .m4a", () => {
+    const ftyp = (brand: string) => Buffer.concat([Buffer.from([0, 0, 0, 0x20]), Buffer.from(`ftyp${brand}`)]);
+    expect(sniffMedia(ftyp("isom"), "clase-1.mp4")).toBe(".mp4");
+    expect(sniffMedia(ftyp("mp42"), "clase.mp4")).toBe(".mp4");
+    expect(sniffMedia(ftyp("isom"))).toBe(".mp4");
+    expect(sniffMedia(ftyp("qt  "), "clase.mov")).toBe(".mov");
+    expect(sniffMedia(ftyp("M4A "), "memo.m4a")).toBe(".m4a");
+    expect(sniffMedia(ftyp("isom"), "memo.m4a")).toBe(".m4a");
+  });
+
+  it("keeps the file's own name, safely", () => {
+    expect(safeStem("guia_produccion_beauty_skincare.html")).toBe("guia_produccion_beauty_skincare");
+    expect(safeStem("Guía de producción (v2).html")).toBe("Guia-de-produccion-v2");
+    expect(safeStem("../../etc/passwd")).toBe("passwd");
+    expect(safeStem(undefined)).toBe("file");
+  });
+});
+
+describe("CONVO-LARGE-FILE-BY-REFERENCE — a video stays in Slack and the turn gets a reference", () => {
+  it("a video of any size, or any file over 25 MB, stays in Slack; a photo does not", () => {
+    expect(staysInSlack({ mimetype: "video/mp4", size: 3_000_000 })).toBe(true);
+    expect(staysInSlack({ mimetype: "application/zip", size: 900 * 1024 * 1024 })).toBe(true);
+    expect(staysInSlack({ mimetype: "image/jpeg", size: 2_000_000 })).toBe(false);
+    expect(staysInSlack({ mimetype: "text/html", size: 10_400_000 })).toBe(false);
+  });
+
+  it("the reference names the file in Slack and nothing else (no URL, no token)", () => {
+    const ref = JSON.parse(slackFileRef({ id: "F9", name: "clase-1.mp4", mimetype: "video/mp4", size: 900_000_000 }, "T1"));
+    expect(ref).toEqual({ kind: "slack-file", team: "T1", id: "F9", name: "clase-1.mp4", mimetype: "video/mp4", size: 900_000_000 });
+  });
+
+  it("a video attached to a message is never downloaded: the turn gets a .slackfile.json reference with its name", async () => {
+    const dir = await fsp.mkdtemp(nodePath.join(os.tmpdir(), "slack-media-"));
+    let downloads = 0;
+    const fetchImpl = (async (url: string) => {
+      if (String(url).includes("/download/")) {
+        downloads++;
+        return { ok: true, arrayBuffer: async () => Buffer.alloc(8) } as unknown as Response;
+      }
+      const method = String(url).split("/").pop()!;
+      const body = method === "apps.connections.open" ? { ok: true, url: "wss://example.invalid/link" } : method === "auth.test" ? { ok: true, user_id: "UBOT" } : { ok: true };
+      return { json: async () => body } as unknown as Response;
+    }) as unknown as typeof fetch;
+    const conn = new SlackConnector({ appToken: "xapp", botToken: "xoxb-secret", fetchImpl, socketImpl: FakeSocket as unknown as typeof WebSocket, mediaDir: dir, mediaMount: dir });
+    const { envs } = await collect(conn, 1, (s) =>
+      s.push({
+        type: "events_api",
+        envelope_id: "v",
+        payload: {
+          team_id: "T1",
+          event: {
+            type: "message", subtype: "file_share", channel_type: "im", channel: "D1", user: "U7", text: "<@UBOT> this is the class", ts: "2.1",
+            files: [{ id: "FVID", name: "Clase 1.mp4", mimetype: "video/mp4", size: 900_000_000, url_private_download: "https://files.slack.com/files-pri/T1-FVID/download/clase.mp4" }],
+          },
+        },
+      }),
+    );
+    const env = envs[0] as unknown as { mediaPaths: string[] };
+    expect(downloads).toBe(0);
+    expect(env.mediaPaths).toHaveLength(1);
+    expect(env.mediaPaths[0]).toMatch(/[0-9a-f]{8}-Clase-1\.slackfile\.json$/);
+    const ref = JSON.parse(await fsp.readFile(env.mediaPaths[0]!, "utf8"));
+    expect(ref).toMatchObject({ kind: "slack-file", team: "T1", id: "FVID", name: "Clase 1.mp4", mimetype: "video/mp4" });
   });
 });
