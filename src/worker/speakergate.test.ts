@@ -43,3 +43,10 @@ describe("who the agent answers", () => {
     expect(gate.shouldSay("atlas", "D1", "U9")).toBe(true);
   });
 });
+
+describe("on Teams (TEAMS-PERSON-IS-ACCOUNT in Tonoman Cloud)", () => {
+  it("TEAMS-PERSON-IS-ACCOUNT a person granted access is known by their Entra id on a Teams agent", () => {
+    expect(knowsSpeaker([{ kind: "teams_user", value: "aad-ben", label: "Ben" }], "aad-ben")).toBe(true);
+    expect(knowsSpeaker([{ kind: "teams_user", value: "aad-ben", label: "Ben" }], "aad-other")).toBe(false);
+  });
+});

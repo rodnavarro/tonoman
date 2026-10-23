@@ -249,6 +249,34 @@ describe("writing", () => {
     expect((await call(token, "read", { brain: "Ben's brain", path: "BRAIN.md" })).text).toContain("How this brain is organised");
   });
 
+  it("BRAIN-TENANT-HOME a brain in its tenant's own git home is made by the registry with the tenant's credential, never by this worker's provisioner", async () => {
+    await broker.close();
+    const made: string[] = [];
+    let provisioned = 0;
+    const home = { ...bensPersonal, home: true };
+    const store = createStore({ root: path.join(tmp, "clones-home"), token: async () => "", fetchEveryMs: 0, log: () => {} });
+    broker = createBroker({
+      store,
+      scratch: path.join(tmp, "scratch-home"),
+      log: () => {},
+      registry: {
+        reach: async (): Promise<Reach> => ({ tenant: "test-a", speaker: { accountId: BEN, name: "Ben", member: true }, brains: [home] }),
+        recordRepo: async () => void recorded.push({ id: "worker", url: "should not be called" }),
+        makeRepo: async (id) => (made.push(id), { repoUrl: await newRemote("brain-person-ben", false) }),
+        homeToken: async () => "",
+      },
+      provisioner: { create: async () => (provisioned++, { repoUrl: "", repoName: "" }), token: async () => "" },
+    });
+    await broker.start();
+    const { token } = broker.startTurn({ agentGuid: "echo", slackUserId: BEN, who: "Ben" });
+    const r = await call(token, "write", { brain: "Ben's brain", path: "offsite.md", content: "Offsite on the 14th.\n", note: "Offsite date" });
+    expect(r.status).toBe(200);
+    expect(made).toEqual(["b-ben"]);
+    expect(provisioned).toBe(0);
+    // The registry recorded the repo itself; the worker recorded nothing.
+    expect(recorded).toEqual([]);
+  });
+
   it("BRAIN-REPO-ON-FIRST-USE nobody but the owner can bring a brain into being", async () => {
     reachOf[ANA] = [...reachOf[ANA], { ...bensPersonal, own: false, mode: "write" }];
     const { token } = broker.startTurn({ agentGuid: "echo", slackUserId: ANA, who: "Ana" });

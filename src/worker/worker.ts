@@ -25,6 +25,7 @@ import * as path from "node:path";
 import type { Config, AgentConfig } from "../config";
 import type { Connector, TurnEvent, TurnRunner, TurnUsage } from "../core/contracts";
 import { SlackConnector } from "../connector/slack";
+import { TeamsConnector, TeamsWebhook } from "../connector/teams";
 import { threadOwners, type ThreadOwners } from "../connector/threadowners";
 import * as cmds from "./commands";
 import * as plaudcli from "./plaudcli";
@@ -38,6 +39,8 @@ import * as lorealistargate from "./lorealistargate";
 import { channelResolver } from "./channelsay";
 import { isPoolCredential, startHeartbeat } from "./heartbeat";
 import { knowsSpeaker, noticeLimiter, unknownSpeakerNotice } from "./speakergate";
+import { policyGate } from "./policygate";
+import { repoSkills } from "./reposkills";
 import { cloudDropStore, dropWatcher, memoryDropStore } from "./lorealistar";
 import { siteOver } from "../lorealistar/watch";
 import { dropWatch, dropEveryMinutes, dropChannel } from "./skills/drop-watch";
@@ -58,7 +61,7 @@ import * as secondbrain from "./secondbrain";
 import { brainCredential, makesBrains, type LegacySource } from "../brains/credential";
 import { createStore, type BrainStore, type BrainRef } from "../brains/store";
 import { recoverWrites } from "../brains/recover";
-import { refreshBrain, createRefreshQueue, type RefreshPublish } from "../brains/refresh";
+import { refreshBrain, refreshModel, createRefreshQueue, type RefreshPublish } from "../brains/refresh";
 import type { LlmProvider } from "../secondbrain/wiki-reindex/llm";
 import { createBroker, pickBrain, type Broker, type ConversationRun } from "../brains/broker";
 import { registryClient } from "../brains/registry";
@@ -477,10 +480,11 @@ let legacySources: LegacySource[] = [];
  *  the agents are wired; until then a call is told to try again (D-JOBS-ARE-PROMPTS). */
 let localToolCall: ReturnType<typeof localTools> | undefined;
 
-async function startBrains(): Promise<{ registry: ReturnType<typeof registryClient>; broker: Broker; store: BrainStore } | undefined> {
+async function startBrains(): Promise<{ registry: ReturnType<typeof registryClient>; broker: Broker; store: BrainStore; queueRefresh: (b: BrainRef) => void } | undefined> {
   const base = process.env.TONOMANCLOUD_API_URL;
   if (!base || process.env.TONOMAN_BRAINS === "off") return undefined;
   const registry = registryClient(base, process.env.TONOMANCLOUD_API_TOKEN ?? "");
+  const homeTokens = new Map<string, { token: string; until: number }>();
   const root = path.join(process.env.TONOMAN_STATE_ROOT ?? "/root/.tonoman", "brains");
   // One credential for the brains' git host, by reference (a mounted secret). Used per command.
   const gitSecret = process.env.TONOMAN_BRAIN_GIT_SECRET ?? "";
@@ -493,6 +497,15 @@ async function startBrains(): Promise<{ registry: ReturnType<typeof registryClie
     // and to nothing else, so a brain on GitHub was cloned with none and nobody could open it. A brain
     // with no credential is not tried without one: the fault is said, not discovered by a failed clone.
     token: async (b) => {
+      // A brain in its tenant's own git home is reached with the token the registry hands out for it,
+      // and with nothing of this worker's (BRAIN-TENANT-HOME). Kept until a minute before it expires.
+      if (b.home) {
+        const had = homeTokens.get(b.id);
+        if (had && had.until > Date.now()) return had.token;
+        const token = await registry.homeToken!(b.id);
+        homeTokens.set(b.id, { token, until: Date.now() + 10 * 60_000 });
+        return token;
+      }
       const c = brainCredential(
         { tenant: b.tenant, repoUrl: b.repoUrl, kind: b.kind, slug: b.slug, branch: b.branch, subpath: b.subpath },
         legacySources,
@@ -556,7 +569,9 @@ async function startBrains(): Promise<{ registry: ReturnType<typeof registryClie
     : undefined;
   const publish = (id: string, p: RefreshPublish) => registry.publishIndex(id, p as unknown as Record<string, unknown>);
   const queue = createRefreshQueue({
-    run: (b) => refreshBrain({ store, provider, publish, active: (x) => registry.brainActive(x.id) }, b, b.name ?? "Brain"),
+    // A tenant that refreshes nowhere gets its map with no model at all: not ours, not another
+    // (BRAIN-REFRESH-PER-TENANT). The links between its pages need none.
+    run: (b) => refreshBrain({ store, provider: refreshModel(b, provider), publish, active: (x) => registry.brainActive(x.id) }, b, b.name ?? "Brain"),
     stale: (b) => publish(b.id, { state: "stale", detail: "refreshing after a change" }),
     delayMs: Number(process.env.TONOMAN_BRAIN_REFRESH_DELAY_MS ?? 60_000),
     // Kept on disk, so a refresh waiting — or cut off halfway — when the worker stops runs after it starts.
@@ -566,7 +581,7 @@ async function startBrains(): Promise<{ registry: ReturnType<typeof registryClie
   void queue.resume().then((n) => n && console.log(`worker: ${n} brain refresh(es) carried over from before the restart`));
   console.log(`worker: brain refresh ${provider ? `on ${provider.model} at ${provider.url}` : "maps only — no local model set (TONOMAN_BRAIN_REFRESH_URL)"}`);
   console.log(`worker: brains on — ${provisioner ? `new brains go to Azure DevOps ${org}/${project}` : "no git host configured, so no new brains can be created"}`);
-  return { registry, broker, store };
+  return { registry, broker, store, queueRefresh: (b: BrainRef) => queue.touch(b) };
 }
 
 /** One wired agent: the roster row, its channel, its harness, and the second-brain note the turn
@@ -940,6 +955,7 @@ const sharedThreadOwners = (): ThreadOwners =>
 function wireOne(a: AgentConfig, harnesses: ReturnType<typeof defaultHarnesses>): Wired | null {
   const label = agentLabel(a);
   const channel = a.channel ?? (a.slack ? "slack" : a.teams ? "teams" : "telegram");
+  if (channel === "teams") return wireTeams(a, harnesses, label);
   if (channel !== "slack") {
     console.error(`worker: skipping ${label} — channel "${channel}" has no worker connector yet`);
     return null;
@@ -968,6 +984,29 @@ function wireOne(a: AgentConfig, harnesses: ReturnType<typeof defaultHarnesses>)
     threadOwners: sharedThreadOwners(),
   });
 
+  const runner = newRunnerFor(a, harnesses);
+  if (!runner) {
+    console.error(`worker: skipping ${label} — harness "${a.harness}" cannot run turns`);
+    return null;
+  }
+  return { cfg: a, conn, runner, run: runClosure(runner, a, usersOfThisWorker()) };
+}
+
+/** The worker's one webhook for every Teams bot it serves (TEAMS-ONE-ADDRESS-PER-POOL in Tonoman Cloud),
+ *  made when the first Teams agent is wired. Its public address is the pool's, set on each bot. */
+let teamsHook: TeamsWebhook | undefined;
+const teamsWebhook = (): TeamsWebhook => (teamsHook ??= new TeamsWebhook(Number(process.env.TONOMAN_TEAMS_PORT ?? 3979)));
+
+/** An agent in Microsoft Teams (TEAMS-WORKER-SERVES): its bot's app id, secret and the customer's
+ *  Microsoft tenant, reached through the worker's one webhook; people are known by their Entra id. */
+function wireTeams(a: AgentConfig, harnesses: ReturnType<typeof defaultHarnesses>, label: string): Wired | null {
+  const t = a.teams;
+  if (!t?.app_id || !t.app_password || !t.tenant_id) {
+    console.error(`worker: skipping ${label} — its Teams bot is missing ${!t?.app_id ? "an app id" : !t.app_password ? "a secret" : "a tenant"}`);
+    return null;
+  }
+  const mediaDir = path.join(process.env.TONOMAN_STATE_ROOT ?? "/root/.tonoman", "media", a.name);
+  const conn = new TeamsConnector({ appId: t.app_id, appPassword: t.app_password, tenantId: t.tenant_id, mediaDir, mediaMount: mediaDir, webhook: teamsWebhook(), speakerById: true });
   const runner = newRunnerFor(a, harnesses);
   if (!runner) {
     console.error(`worker: skipping ${label} — harness "${a.harness}" cannot run turns`);
@@ -1591,7 +1630,7 @@ export async function run(
       const localGroups = localToolsOf(wired.get(agent)!.cfg);
       return b && g
         ? b.broker.startTurn(
-            { agentGuid: g, slackUserId: user, who, receipts: opts?.receipts, cloudTools: opts?.cloudTools, webFetch: opts?.webFetch, localTools: localGroups },
+            { agentGuid: g, slackUserId: user, who, receipts: opts?.receipts, cloudTools: opts?.cloudTools, webFetch: opts?.webFetch, localTools: localGroups, runTools: opts?.runTools },
             { onUse: (id) => remember(agent, key, [id]) },
           )
         : undefined;
@@ -1693,6 +1732,11 @@ export async function run(
     claimSession,
     resetSession,
     brains: turnBrains(brainsSys),
+    // The tenant's own skills (SKILL-FROM-YOUR-REPO): checked out where every turn's user may read and
+    // none may change, beside `tonoman` itself.
+    repoSkills: brainsSys
+      ? repoSkills({ root: process.env.TONOMAN_SKILL_REPOS_DIR || path.join(TOOLS_DIR, "..", "skillrepos"), token: (g) => brainsSys.registry.skillRepoToken(g) })
+      : undefined,
     // A Skill's program goes out as the run's own Linux user too (TURNUSER-NOTHING-AS-ROOT).
     turnUser: usersOfThisWorker()
       ? async (agent: string, user: string | undefined) => {
@@ -2201,14 +2245,16 @@ export async function run(
   // it attaches the Slack id to the account with that email and answers whether this agent knows
   // that account (AGENTACCOUNT-MEMBERS-ARE-KNOWN in Tonoman Cloud). Known: added to the agent's
   // people in memory, so the next message needs no call. Not known, or no registry: false.
-  const knowSpeaker = async (name: string, user: string): Promise<boolean> => {
+  const knowSpeaker = async (name: string, user: string, said?: { email?: string; name?: string }): Promise<boolean> => {
     const a = wired.get(name);
     const guid = a?.cfg.guid;
     const baseUrl = process.env.TONOMANCLOUD_API_URL;
     if (!a || !guid || !baseUrl) return false;
-    let profileName: string | undefined;
-    let email: string | undefined;
-    try {
+    // Teams says who someone is with the message (TEAMS-PERSON-IS-ACCOUNT): their Entra id and email.
+    const teams = (a.cfg.channel ?? (a.cfg.teams ? "teams" : "slack")) === "teams";
+    let profileName: string | undefined = said?.name;
+    let email: string | undefined = said?.email;
+    if (!teams) try {
       const info = await (a.conn as SlackConnector).call<{
         user?: { real_name?: string; is_bot?: boolean; profile?: { real_name?: string; display_name?: string; email?: string } };
       }>(`users.info?user=${encodeURIComponent(user)}`);
@@ -2222,11 +2268,11 @@ export async function run(
       const r = await fetch(`${baseUrl}/v1/system/agents/${guid}/know-speaker`, {
         method: "POST",
         headers: { authorization: `Bearer ${process.env.TONOMANCLOUD_API_TOKEN ?? ""}`, "content-type": "application/json" },
-        body: JSON.stringify({ slackUserId: user, name: profileName, email }),
+        body: JSON.stringify({ ...(teams ? { teamsUserId: user } : { slackUserId: user }), name: profileName, email }),
       });
       const j = (await r.json()) as { known?: boolean; label?: string; accountId?: string };
       if (!r.ok || !j.known || !j.label) return false;
-      a.cfg.principals = [...(a.cfg.principals ?? []), { kind: "slack_user_id", value: user, label: j.label }];
+      a.cfg.principals = [...(a.cfg.principals ?? []), { kind: teams ? "teams_user" : "slack_user_id", value: user, label: j.label }];
       return true;
     } catch (e) {
       console.error(`worker: ${name} know-speaker failed for ${user}: ${(e as Error).message}`);
@@ -2607,7 +2653,17 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
   // the sidecar sharing this pod's credential volume, so the code goes from a Slack modal to the
   // process that owns the credential and nowhere else — it never transits the control plane.
   const authBase = process.env.AGENT_RUNTIME_URL ?? "http://127.0.0.1:8080";
+  // Logins offered in a private conversation where the code is pasted back (TEAMS-PRIVATE-LOGIN): by
+  // agent and conversation, whose login it is, and for fifteen minutes.
+  const pastedLogins = new Map<string, { owner: string | undefined; until: number }>();
   const authDeps: gate.AuthGateDeps = {
+    isPrivate: async (name, conversation, user) => {
+      const conn = wired.get(name)?.conn as { audience?: (c: string, u: string) => Promise<{ kind: string }> } | undefined;
+      return (await conn?.audience?.(conversation, user).catch(() => null))?.kind === "self";
+    },
+    expectCode: (name, conversation, owner) => {
+      pastedLogins.set(`${name}\u0000${conversation}`, { owner, until: Date.now() + 15 * 60_000 });
+    },
     // Named, so the login lands in THIS agent's credential directory. Without the name every
     // agent in the pool shares one Claude subscription and the last person to sign in owns them.
     // `user`, when the caller passes it (a per-person agent), lands the login in the speaker's own
@@ -2771,9 +2827,15 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
   const unknownNotice = noticeLimiter();
   const strangerLookup = noticeLimiter();
   // The agent as wired NOW — a reload may have replaced the one a handler was built with.
-  const hasAccess = async (name: string, a: Wired, user: string): Promise<boolean> =>
-    knowsSpeaker((wired.get(name) ?? a).cfg.principals, user) || (strangerLookup.shouldSay(name, "", user) && (await knowSpeaker(name, user)));
+  const hasAccess = async (name: string, a: Wired, user: string, said?: { email?: string; name?: string }): Promise<boolean> =>
+    knowsSpeaker((wired.get(name) ?? a).cfg.principals, user) || (strangerLookup.shouldSay(name, "", user) && (await knowSpeaker(name, user, said)));
   const noticeFor = (name: string, a: Wired, user: string) => unknownSpeakerNotice(a.cfg.displayName ?? a.cfg.name ?? name, user);
+  // The tenant's policies before its agents (POLICY-AGENT-GATE in Tonoman Cloud): only where there is a
+  // registry to ask; the open-source runtime on its own roster has no policies.
+  const policies = process.env.TONOMANCLOUD_API_URL
+    ? policyGate({ baseUrl: process.env.TONOMANCLOUD_API_URL, token: process.env.TONOMANCLOUD_API_TOKEN ?? "" })
+    : undefined;
+  const policyNotice = noticeLimiter();
 
   // Interactions are wired per connector below, at construction.
   for (const [name, a] of wired) {
@@ -2861,14 +2923,37 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
         // Someone without access to the agent reaches nothing (AGENTACCOUNT-ACCESS-IS-GRANTED): not
         // a command, not a login prompt, not a turn. Checked first, from what the registry granted,
         // so it costs nothing; they are told their Slack id and whom to ask.
-        if (!(await hasAccess(name, a, env.user))) {
+        if (!(await hasAccess(name, a, env.user, env.identity))) {
           if (unknownNotice.shouldSay(name, env.conversation, env.user)) {
             const text = noticeFor(name, a, env.user);
             const conn = a.conn as SlackConnector;
-            const privately = await conn.postEphemeral(env.conversation, env.user, text).catch(() => false);
+            const privately = await conn.postEphemeral?.(env.conversation, env.user, text).catch(() => false);
             if (!privately) await a.conn.reply(env.conversation).send(text).catch(() => {});
           }
           console.log(`worker: ${name} — ${env.user} has no access to this agent; nothing run`);
+          continue;
+        }
+        // Someone who has not acknowledged the tenant's policies reaches nothing either: one fixed
+        // notice with the link to the Hub, said privately where the channel allows, and no command,
+        // no login prompt, no turn (POLICY-AGENT-GATE).
+        if (policies) {
+          const verdict = await policies.check(name, { slackUserId: env.user });
+          if (!verdict.ok) {
+            if (policyNotice.shouldSay(name, env.conversation, env.user)) {
+              const conn = a.conn as SlackConnector;
+              const privately = await conn.postEphemeral?.(env.conversation, env.user, verdict.notice).catch(() => false);
+              if (!privately) await a.conn.reply(env.conversation).send(verdict.notice).catch(() => {});
+            }
+            console.log(`worker: ${name} — ${env.user} has not acknowledged the tenant's policies; nothing run`);
+            continue;
+          }
+        }
+        // A code pasted into the private conversation a login was offered in completes it, and is
+        // never a turn (TEAMS-PRIVATE-LOGIN).
+        const waiting = pastedLogins.get(`${name}\u0000${env.conversation}`);
+        if (waiting && waiting.until > Date.now() && gate.looksLikeCode(env.text)) {
+          pastedLogins.delete(`${name}\u0000${env.conversation}`);
+          await gate.submitPastedCode(authDeps, name, env.conversation, waiting.owner, env.user, env.text).catch(() => false);
           continue;
         }
         // Commands are answered HERE, before the durability boundary: `!status` is a read of
@@ -3123,6 +3208,8 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
       token: wakeToken,
       deps: {
         has: (name) => wired.has(name),
+        // A brain saved in the Hub: refreshed like after a push of ours (BRAIN-BACKGROUND-REFRESH).
+        ...(brainsSys ? { brainPushed: (b) => brainsSys.queueRefresh(b) } : {}),
         // The Hub names an agent by its registry GUID. On a registry roster that IS the worker's own
         // key (`cfg.name` is the guid), so the common case is a straight hit — but a file roster has
         // no guid at all, and a person reading a log will type the tenant-prefixed display name. All

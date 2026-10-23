@@ -66,6 +66,57 @@ export interface ConnectorOptions {
   // Injectable inbound-token validator (teams-inbound-auth). Defaults to a real
   // Bot Framework JWKS/RS256 validator; tests pass a fake.
   validateToken?: (authHeader: string | undefined) => Promise<boolean>;
+  // One webhook for every bot of a worker pool (TEAMS-ONE-ADDRESS-PER-POOL in Tonoman Cloud): given,
+  // this connector is reached through it instead of listening on a port of its own.
+  webhook?: TeamsWebhook;
+  // The speaker is who they are, not what they are called: their Entra object id (TEAMS-PERSON-IS-ACCOUNT),
+  // with the email Teams gives for them, so the worker can know them as an account.
+  speakerById?: boolean;
+}
+
+/** One HTTP listener for every Teams bot a worker serves: a message is handed to the bot it was sent
+ *  to (its `recipient.id`, `28:<app id>`), which checks it came from Microsoft for that bot before
+ *  anything happens. A message for a bot this worker does not serve is refused. */
+export class TeamsWebhook {
+  private readonly bots = new Map<string, (body: string, auth: string | undefined) => Promise<number>>();
+  private server?: http.Server;
+  constructor(private readonly port: number) {}
+  register(appId: string, accept: (body: string, auth: string | undefined) => Promise<number>): () => void {
+    this.bots.set(appId.toLowerCase(), accept);
+    if (!this.server) {
+      this.server = http.createServer((req, res) => {
+        if (req.method !== "POST" || !(req.url ?? "").startsWith("/api/messages")) {
+          res.writeHead(req.method === "GET" ? 405 : 404).end();
+          return;
+        }
+        let body = "";
+        req.on("data", (c) => {
+          body += c;
+          if (body.length > 4 * 1024 * 1024) req.destroy();
+        });
+        req.on("end", async () => {
+          let to = "";
+          try {
+            to = String(JSON.parse(body || "{}")?.recipient?.id ?? "").replace(/^28:/, "").toLowerCase();
+          } catch {
+            /* not JSON: refused below */
+          }
+          const accept = this.bots.get(to);
+          if (!accept) {
+            res.writeHead(404).end();
+            return;
+          }
+          const code = await accept(body, req.headers["authorization"] as string | undefined).catch(() => 500);
+          if (!res.headersSent) res.writeHead(code).end();
+        });
+      });
+      this.server.on("error", (e) => console.error(`teams: webhook server: ${(e as Error).message}`));
+      this.server.listen(this.port, () => console.log(`teams: webhook listening on :${this.port}/api/messages for every bot of this worker`));
+    }
+    return () => {
+      this.bots.delete(appId.toLowerCase());
+    };
+  }
 }
 
 /** What we capture from an inbound activity to address a reply later
@@ -121,11 +172,15 @@ export class TeamsConnector implements Connector {
       wake?.();
     };
 
-    const server = http.createServer((req, res) => {
-      void this.onRequest(req, res, push);
-    });
-    server.on("error", (e) => console.error(`teams: webhook server: ${(e as Error).message}`));
-    server.listen(port, () => console.log(`teams: webhook listening on :${port}/api/messages`));
+    // Through the worker's one webhook, or a listener of this connector's own.
+    const unregister = this.o.webhook?.register(this.o.appId, (body, auth) => this.accept(body, auth, push));
+    const server = this.o.webhook
+      ? undefined
+      : http.createServer((req, res) => {
+          void this.onRequest(req, res, push);
+        });
+    server?.on("error", (e) => console.error(`teams: webhook server: ${(e as Error).message}`));
+    server?.listen(port, () => console.log(`teams: webhook listening on :${port}/api/messages`));
 
     // Fail-loud config check: mint a bot token at boot so an outbound-auth misconfig (bad
     // secret, missing service principal → AADSTS7000229) surfaces in the log at `tonoman up`
@@ -136,7 +191,10 @@ export class TeamsConnector implements Connector {
         /* botToken already logged the actionable cause */
       });
 
-    const close = () => server.close();
+    const close = () => {
+      server?.close();
+      unregister?.();
+    };
     signal.addEventListener("abort", close, { once: true });
     try {
       while (!signal.aborted) {
@@ -149,8 +207,25 @@ export class TeamsConnector implements Connector {
       }
     } finally {
       signal.removeEventListener("abort", close);
-      server.close();
+      close();
     }
+  }
+
+  /** One message, as the worker's shared webhook hands it over: checked as from Microsoft for THIS bot,
+   *  acknowledged, then turned into an envelope. Answers the HTTP status to send. */
+  async accept(body: string, auth: string | undefined, push: (e: Envelope) => void): Promise<number> {
+    if (!(await this.validate(auth))) return 401;
+    let activity: TeamsActivity;
+    try {
+      activity = JSON.parse(body || "{}");
+    } catch {
+      return 400;
+    }
+    // Acknowledged at once; the reply goes to the serviceUrl later.
+    void this.normalize(activity)
+      .then((env) => env && push(env))
+      .catch((e) => console.error(`teams: inbound: ${(e as Error).message}`));
+    return 200;
   }
 
   /** Handles one webhook request: read JSON, validate the BF token, normalize, ACK. The
@@ -207,7 +282,8 @@ export class TeamsConnector implements Connector {
     const env: Envelope = {
       channel: this.name(),
       conversation: ref.conversationId,
-      user: displayName,
+      // By id where the worker knows people as accounts (TEAMS-PERSON-IS-ACCOUNT); by name elsewhere.
+      user: this.o.speakerById ? ref.fromAad || ref.fromId : displayName,
       identity,
       text: stripMentions(activity.text || ""),
       mediaPaths: [],
@@ -253,6 +329,14 @@ export class TeamsConnector implements Connector {
       now: () => this.now(),
       pickVerb: this.o.pickVerb,
     });
+  }
+
+  /** Who will see an answer here (TEAMS-AUDIENCE in Tonoman Cloud): a one-to-one chat is the speaker.
+   *  A group chat or a channel is not counted yet, so it reads as unknown, and the worker treats an
+   *  audience it cannot count as unable to read any brain. */
+  async audience(conversation: string, _user: string): Promise<{ kind: "self" } | { kind: "unknown"; why: string }> {
+    const ref = this.refs.get(conversation);
+    return ref?.conversationType === "personal" ? { kind: "self" } : { kind: "unknown", why: "who is in a Teams group or channel is not counted yet" };
   }
 
   registerCommands(): Promise<void> {
@@ -370,7 +454,7 @@ export class TeamsConnector implements Connector {
    * returns undefined so the turn still runs (identity-email-nonfatal). Skipped entirely when no
    * roster is configured (nothing to match against). */
   private async resolveEmail(ref: ConvRef): Promise<string | undefined> {
-    if (!this.o.roster) return undefined;
+    if (!this.o.roster && !this.o.speakerById) return undefined;
     if (!ref.fromId) return undefined;
     const cached = this.emailCache.get(ref.fromId);
     if (cached && cached.exp > this.now()) return cached.value || undefined;

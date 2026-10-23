@@ -65,6 +65,10 @@ const WEB_FETCH = process.env.TONOMAN_WEB_FETCH === "1";
 // The worker's own tools a skill on this agent brings (plaud, calendar, meeting-recap): their groups
 // are here only when one is (CLI-GRANTED-GROUPS).
 const LOCAL = (process.env.TONOMAN_LOCAL_TOOLS || "").split(",").filter(Boolean);
+// The tools of the organization's own skills (SKILL-REPO-TOOLS-IN-TURN): run here, by this turn's own
+// user, with this turn's own environment — so a model call a tool makes is on this turn's login.
+let RUN = [];
+try { RUN = JSON.parse(process.env.TONOMAN_RUN_TOOLS || "[]"); } catch { RUN = []; }
 const MAX = 6000; // CLI-OUTPUT-BOUNDED
 let LIMIT = MAX;
 
@@ -138,6 +142,7 @@ function help(group) {
   if (!group) {
     const lines = ["tonoman <group> <command> [--arg value …]", ""];
     for (const [g, d] of Object.entries(GROUPS)) if (available(g)) lines.push("  " + g.padEnd(10) + d.about);
+    if (RUN.length) lines.push("  " + "run".padEnd(10) + "your organization's own tools: " + RUN.map((t) => t.name).join(", "));
     lines.push("", "tonoman <group> --help   the group's commands and their arguments");
     return lines.join("\n");
   }
@@ -170,6 +175,17 @@ async function stdin() {
 (async () => {
   const [group, cmd, ...rest] = process.argv.slice(2);
   if (!group || group === "--help" || group === "help") return out(help());
+  if (group === "run") {
+    if (!RUN.length) fail("None of your organization's own tools are on for this agent.", 3);
+    if (!cmd || cmd === "--help" || cmd === "help") return out(["tonoman run <tool> [its own arguments]", "", ...RUN.map((t) => "  " + t.name.padEnd(12) + (t.about || "")), "", "tonoman run <tool> --help   the tool's own help"].join("\n"));
+    const tool = RUN.find((t) => t.name === cmd);
+    if (!tool) fail("No tool '" + cmd + "' here. See tonoman run --help.", 2);
+    LIMIT = 20000;
+    return require("node:child_process").execFile(process.execPath, [tool.script, ...rest], { env: process.env, maxBuffer: 1 << 26 }, (err, so, se) => {
+      out(String(so) + (se ? String(se) : ""));
+      process.exit(err ? (typeof err.code === "number" ? err.code : 1) : 0);
+    });
+  }
   if (!GROUPS[group]) fail("No command group '" + group + "'. See tonoman --help.", 2);
   if (!available(group)) fail(group === "receipts" ? "Receipts is not on for this agent, so tonoman receipts does nothing here." : group === "web" ? "Web fetch is not granted to this agent, so tonoman web does nothing here." : "Not available here.", 3);
   if (!cmd || cmd === "--help" || cmd === "help") return out(help(group));

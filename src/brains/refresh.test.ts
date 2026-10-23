@@ -10,7 +10,7 @@ import { mkdtempSync, rmSync, readFileSync, existsSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { createStore, seed, type BrainRef } from "./store";
-import { refreshBrain, createRefreshQueue, relatedEdges, rootedLinks, type RefreshPublish } from "./refresh";
+import { refreshBrain, refreshModel, createRefreshQueue, relatedEdges, rootedLinks, type RefreshPublish } from "./refresh";
 
 let tmp: string;
 let remote: string;
@@ -115,6 +115,26 @@ describe("the files an agent follows", () => {
     expect(await store.write({ brain, path: ".tonoman/index.md", content: "forged", note: "x", who: "Ana" })).toMatchObject({ ok: false, reason: "bad-path" });
     expect(await store.writeFiles({ brain, files: [{ path: ".tonoman/x.md", content: "x" }], note: "x", who: "Ana" })).toMatchObject({ ok: false, reason: "bad-path" });
   });
+});
+
+describe("where a tenant's brains are refreshed", () => {
+  it("BRAIN-REFRESH-PER-TENANT a tenant set to refresh nowhere gets no model, not the local one; the others keep theirs", () => {
+    const local = { name: "brain-refresh", url: "http://ollama:11434/v1", model: "gemma" };
+    expect(refreshModel({ refresh: "off" }, local)).toBeUndefined();
+    expect(refreshModel({}, local)).toBe(local);
+    expect(refreshModel({ refresh: "local" }, local)).toBe(local);
+  });
+
+  it("BRAIN-REFRESH-PER-TENANT with no model, the brain is still mapped and no page is read by any model", async () => {
+    const calls: string[] = [];
+    const off = { ...brain, refresh: "off" as const };
+    const published: RefreshPublish[] = [];
+    // No provider and no infer: the deps a tenant set to "off" is refreshed with.
+    await refreshBrain({ store, publish: async (_id, p) => void published.push(p) }, off, "Ana's brain");
+    expect(calls).toEqual([]);
+    expect(published.at(-1)?.state).toBe("fresh");
+    expect((published.at(-1)?.graph as { nodes: unknown[] } | undefined)?.nodes.length).toBeGreaterThan(0);
+  }, 60_000);
 });
 
 describe("the local model", () => {

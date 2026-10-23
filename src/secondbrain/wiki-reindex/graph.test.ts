@@ -32,7 +32,10 @@ describe('link classification', () => {
     expect(isContentLink('/.attachments/image-abc.png')).toBe(false);
     expect(isContentLink('https://example.com')).toBe(false);
     expect(isContentLink('#heading')).toBe(false);
-    expect(isContentLink('relative/page')).toBe(false);
+    // A link relative to the page is a page edge since BRAIN-GRAPH-LINKS (Tonoman Cloud, Oct 22).
+    expect(isContentLink('relative/page')).toBe(true);
+    expect(isContentLink('mailto:ana@example.com')).toBe(false);
+    expect(isContentLink('//cdn.example.com/x')).toBe(false);
   });
   it('extracts every markdown link target', () => {
     const md = 'see [A](/Folder/A) and ![img](/.attachments/x.png) and [ext](https://y.z)';
@@ -109,5 +112,22 @@ describe('buildGraph', () => {
   it('never makes an edge to a page that does not exist', () => {
     const g = buildGraph(pages, orders, content);
     expect(g.edges.some((e) => e.target === 'Nope' || e.source === 'Nope')).toBe(false);
+  });
+});
+
+describe('the links written in the pages are the edges (BRAIN-GRAPH-LINKS in Tonoman Cloud)', () => {
+  const pages = ['sops/onboarding.md', 'sops/checklist.md', 'policies/wisp.md', 'Client Intake.md', 'alone.md'].map((path) => ({ path, size: 10 }));
+
+  it('BRAIN-GRAPH-LINKS a link relative to the page, or up a folder, joins the two pages', () => {
+    const g = buildGraph(pages, [], new Map([['sops/onboarding', 'See the [checklist](checklist.md) and the [WISP](../policies/wisp.md).']]));
+    const links = g.edges.filter((e) => e.kind === 'link').map((e) => `${e.source} -> ${e.target}`);
+    expect(links).toEqual(['sops/onboarding -> sops/checklist', 'sops/onboarding -> policies/wisp']);
+  });
+
+  it('BRAIN-GRAPH-LINKS a wiki link joins the page it names, by name or file name; the table of contents is not a link', () => {
+    const g = buildGraph(pages, [], new Map([['sops/checklist', '[[_TOC_]]\n\nStart with [[Client Intake]], then [[onboarding|the onboarding SOP]].']]));
+    const links = g.edges.filter((e) => e.kind === 'link').map((e) => `${e.source} -> ${e.target}`);
+    expect(links).toEqual(['sops/checklist -> Client Intake', 'sops/checklist -> sops/onboarding']);
+    expect(g.nodes.find((n) => n.id === 'alone')!.degree).toBe(0);
   });
 });

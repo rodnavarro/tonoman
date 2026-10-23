@@ -9,7 +9,8 @@
  *  config — the open-source runtime on its own roster) knows everyone, as before. */
 export function knowsSpeaker(principals: { kind: string; value: string }[] | undefined, user: string): boolean {
   if (principals === undefined) return true;
-  return principals.some((p) => p.kind === "slack_user_id" && p.value === user);
+  // A Slack id, or on Teams the person's Entra id (TEAMS-PERSON-IS-ACCOUNT in Tonoman Cloud).
+  return principals.some((p) => (p.kind === "slack_user_id" || p.kind === "teams_user") && p.value === user);
 }
 
 /** PURE: the platform's words to someone the agent does not know. Fixed; no model. With their Slack

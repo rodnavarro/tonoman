@@ -38,6 +38,12 @@ export interface Reachable {
   branch?: string | null;
   /** Kept exactly as it is (BRAIN-AS-IS): a records repo like finances. */
   asIs?: boolean;
+  /** It lives in its tenant's own git home (BRAIN-TENANT-HOME in Tonoman Cloud): the registry makes its
+   *  repo and hands out its token; this worker's own git credential never reaches it. */
+  home?: boolean;
+  /** Where its tenant's brains are refreshed (BRAIN-REFRESH-PER-TENANT in Tonoman Cloud): "off", no
+   *  model reads it. */
+  refresh?: "local" | "off";
 }
 
 export interface Reach {
@@ -50,6 +56,10 @@ export interface Reach {
 export interface BrainsRegistry {
   reach(agentGuid: string, slackUserId: string): Promise<Reach>;
   recordRepo(brainId: string, repoUrl: string, repoName: string): Promise<void>;
+  /** Make a brain's repo in its tenant's own git home; the registry records it (BRAIN-TENANT-HOME). */
+  makeRepo?(brainId: string): Promise<{ repoUrl: string }>;
+  /** A token for one brain in its tenant's own git home. */
+  homeToken?(brainId: string): Promise<string>;
 }
 
 export interface Provisioner {
@@ -73,6 +83,8 @@ export interface TurnSpec {
    *  group whose calls the broker carries to the Cloud with the person speaking. The runtime knows
    *  nothing of what they do. Absent = none. */
   cloudTools?: CloudTool[];
+  /** The tools of the tenant's own skills this agent has (SKILL-REPO-TOOLS-IN-TURN): `tonoman run <name>`. */
+  runTools?: { name: string; script: string; about: string }[];
   /** `web-fetch` is granted to the agent (TOOL-WEB-FETCH): the turn has `tonoman web fetch`. */
   webFetch?: boolean;
   /** The worker's own tools a skill on this agent brings — `plaud`, `calendar`, `meeting-recap` — each
@@ -217,6 +229,8 @@ export function createBroker(o: BrokerOptions) {
     subpath: b.subpath ?? undefined,
     branch: b.branch ?? undefined,
     ...(b.asIs ? { asIs: true } : {}),
+    ...(b.home ? { home: true } : {}),
+    ...(b.refresh === "off" ? { refresh: "off" as const } : {}),
   });
 
   /** The Receipts Skill's brain, as this speaker reaches it — or why not. */
@@ -267,6 +281,16 @@ export function createBroker(o: BrokerOptions) {
 
   /** Make a brain's repo on its first use (BRAIN-REPO-ON-FIRST-USE). Only the owner's own turn does. */
   async function provision(tenant: string, b: Reachable): Promise<Reachable> {
+    // In the tenant's own git home the registry makes and records the repo, with the tenant's own
+    // credential (BRAIN-TENANT-HOME); this worker's provisioner is never used for it.
+    if (b.home) {
+      if (!o.registry.makeRepo || !o.registry.homeToken) throw new Error("this worker cannot make brains in a tenant's own git home");
+      const { repoUrl } = await o.registry.makeRepo(b.id);
+      await seed(repoUrl, await o.registry.homeToken(b.id), seedFiles(b.name), o.scratch);
+      const repoName = repoUrl.replace(/\.git$/, "").split("/").pop() ?? b.id;
+      log(`brains: created ${repoName} in its tenant's home for ${b.id}`);
+      return { ...b, state: "active", repoUrl, repoName };
+    }
     if (!o.provisioner) throw new Error("brains cannot be created on this worker (no git host configured)");
     const made = await o.provisioner.create(tenant, b);
     await seed(made.repoUrl, await o.provisioner.token(), seedFiles(b.name), o.scratch);
@@ -701,7 +725,7 @@ export function createBroker(o: BrokerOptions) {
     startTurn(spec: TurnSpec, hooks: TurnHooks = {}): { token: string; mcp: McpServerSpec; cli: TurnCli } {
       const token = randomBytes(24).toString("hex");
       turns.set(token, { ...spec, used: new Set(), fetched: new Set(), bytes: 0, expiresAt: Date.now() + 2 * 60 * 60 * 1000, onUse: hooks.onUse });
-      const env = { TONOMAN_BRAIN_URL: baseUrl, TONOMAN_BRAIN_TOKEN: token, ...(spec.receipts ? { TONOMAN_RECEIPTS: "1" } : {}), ...(spec.cloudTools?.length ? { TONOMAN_CLOUD_TOOLS: JSON.stringify(spec.cloudTools.map(({ name, about, commands }) => ({ name, about, commands }))) } : {}), ...(spec.webFetch ? { TONOMAN_WEB_FETCH: "1" } : {}), ...(spec.localTools?.length ? { TONOMAN_LOCAL_TOOLS: spec.localTools.join(",") } : {}) };
+      const env = { TONOMAN_BRAIN_URL: baseUrl, TONOMAN_BRAIN_TOKEN: token, ...(spec.receipts ? { TONOMAN_RECEIPTS: "1" } : {}), ...(spec.cloudTools?.length ? { TONOMAN_CLOUD_TOOLS: JSON.stringify(spec.cloudTools.map(({ name, about, commands }) => ({ name, about, commands }))) } : {}), ...(spec.webFetch ? { TONOMAN_WEB_FETCH: "1" } : {}), ...(spec.localTools?.length ? { TONOMAN_LOCAL_TOOLS: spec.localTools.join(",") } : {}), ...(spec.runTools?.length ? { TONOMAN_RUN_TOOLS: JSON.stringify(spec.runTools) } : {}) };
       return {
         token,
         mcp: { name: "tonoman", command: o.node ?? process.execPath, args: [shimPath], env: { ...env, TONOMAN_CLI_PATH: cliPath } },

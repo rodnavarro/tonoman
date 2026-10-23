@@ -105,8 +105,17 @@ describe("RegistryControlPlane", () => {
   });
 
   it("skips a channel it has no connector for, and keeps serving the rest", async () => {
-    const cfg = await plane([{ ...base, channel: "teams" }]).roster();
-    expect(cfg.agents).toHaveLength(0);
+    await putSecret("acme-slack", "SLACK_BOT_TOKEN", "b");
+    await putSecret("acme-slack", "SLACK_APP_TOKEN", "a");
+    const cfg = await plane([{ ...base, guid: "g0", channel: "discord" }, base]).roster();
+    expect(cfg.agents.map((a) => a.name)).toEqual(["g1"]);
+  });
+
+  it("TEAMS-WORKER-SERVES maps a Teams entry to its bot: the app id, the secret by reference and the Microsoft tenant", async () => {
+    await putSecret("acme-teams", "BOT", "s3cret");
+    const cfg = await plane([{ ...base, channel: "teams", teamId: "ms-tenant", botTokenRef: "acme-teams:BOT", appTokenRef: undefined, externalAppId: "app-1" }]).roster();
+    expect(cfg.agents).toHaveLength(1);
+    expect(cfg.agents[0]).toMatchObject({ channel: "teams", teams: { app_id: "app-1", app_password: "s3cret", tenant_id: "ms-tenant" } });
   });
 
   it("raises on a roster the API refuses — a gateway with no agents must not look healthy", async () => {

@@ -275,3 +275,27 @@ describe("serveWake — POST /api/skill-run (W4)", () => {
     }
   });
 });
+
+describe("serveWake — POST /api/brain-pushed (BRAIN-BACKGROUND-REFRESH in Tonoman Cloud)", () => {
+  const PORT = 39857;
+  const TOKEN = "t0k";
+
+  it("BRAIN-BACKGROUND-REFRESH a brain saved in the Hub is queued for its refresh, as the registry describes it", async () => {
+    const ac = new AbortController();
+    const got: unknown[] = [];
+    serveWake({ port: PORT, token: TOKEN, deps: stubDeps({ brainPushed: (b) => void got.push(b) }) }, ac.signal);
+    await new Promise((r) => setTimeout(r, 50));
+    try {
+      const body = { brain: { id: "b1", tenant: "test-a", repoUrl: "http://git:3000/test-a/brain-policies.git", kind: "shared", home: true, refresh: "off", junk: 1 } };
+      const un = await fetch(`http://127.0.0.1:${PORT}/api/brain-pushed`, { method: "POST", body: JSON.stringify(body) });
+      expect(un.status).toBe(401);
+      const ok = await fetch(`http://127.0.0.1:${PORT}/api/brain-pushed`, { method: "POST", headers: { authorization: `Bearer ${TOKEN}` }, body: JSON.stringify(body) });
+      expect(ok.status).toBe(202);
+      expect(got).toEqual([{ id: "b1", tenant: "test-a", repoUrl: "http://git:3000/test-a/brain-policies.git", kind: "shared", home: true, refresh: "off" }]);
+      const bad = await fetch(`http://127.0.0.1:${PORT}/api/brain-pushed`, { method: "POST", headers: { authorization: `Bearer ${TOKEN}` }, body: JSON.stringify({ brain: { id: "b1" } }) });
+      expect(bad.status).toBe(400);
+    } finally {
+      ac.abort();
+    }
+  });
+});
