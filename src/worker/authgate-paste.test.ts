@@ -50,6 +50,22 @@ describe("signing in on a channel with no dialogs", () => {
     expect(bad.said.at(-1)!.text).toMatch(/didn't complete the login/);
   });
 
+  it("TEAMS-PRIVATE-LOGIN a channel with dialogs (Slack) keeps its button and modal: no link in the text, no code waited for", async () => {
+    const f = fakes({ private: true });
+    const blocks: { conversation: string; text: string }[] = [];
+    let askedPrivate = false;
+    const conn = {
+      reply: (conversation: string) => ({ send: async (text: string) => void f.said.push({ conversation, text }) }),
+      postBlocks: async (conversation: string, text: string) => void blocks.push({ conversation, text }),
+    };
+    const deps = { ...f.deps, conn: () => conn, isPrivate: async () => ((askedPrivate = true), true) } as unknown as AuthGateDeps;
+    expect(await ask(deps, "sapien", "Sapien", "D0SLACKDM", undefined, "U0ANA")).toBe(true);
+    expect(blocks).toHaveLength(1);
+    expect(f.said).toEqual([]);
+    expect(f.expected).toEqual([]);
+    expect(askedPrivate).toBe(false);
+  });
+
   it("TEAMS-PRIVATE-LOGIN only a message shaped like a code is taken as one; a question is not", () => {
     expect(looksLikeCode("abcDEF123456789-_xyz#STATE123")).toBe(true);
     expect(looksLikeCode("what is our refund policy?")).toBe(false);
