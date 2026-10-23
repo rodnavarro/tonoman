@@ -38,6 +38,7 @@ import * as lorealistargate from "./lorealistargate";
 import { channelResolver } from "./channelsay";
 import { isPoolCredential, startHeartbeat } from "./heartbeat";
 import { knowsSpeaker, noticeLimiter, unknownSpeakerNotice } from "./speakergate";
+import { policyGate } from "./policygate";
 import { cloudDropStore, dropWatcher, memoryDropStore } from "./lorealistar";
 import { siteOver } from "../lorealistar/watch";
 import { dropWatch, dropEveryMinutes, dropChannel } from "./skills/drop-watch";
@@ -2774,6 +2775,12 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
   const hasAccess = async (name: string, a: Wired, user: string): Promise<boolean> =>
     knowsSpeaker((wired.get(name) ?? a).cfg.principals, user) || (strangerLookup.shouldSay(name, "", user) && (await knowSpeaker(name, user)));
   const noticeFor = (name: string, a: Wired, user: string) => unknownSpeakerNotice(a.cfg.displayName ?? a.cfg.name ?? name, user);
+  // The tenant's policies before its agents (POLICY-AGENT-GATE in Tonoman Cloud): only where there is a
+  // registry to ask; the open-source runtime on its own roster has no policies.
+  const policies = process.env.TONOMANCLOUD_API_URL
+    ? policyGate({ baseUrl: process.env.TONOMANCLOUD_API_URL, token: process.env.TONOMANCLOUD_API_TOKEN ?? "" })
+    : undefined;
+  const policyNotice = noticeLimiter();
 
   // Interactions are wired per connector below, at construction.
   for (const [name, a] of wired) {
@@ -2870,6 +2877,21 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
           }
           console.log(`worker: ${name} — ${env.user} has no access to this agent; nothing run`);
           continue;
+        }
+        // Someone who has not acknowledged the tenant's policies reaches nothing either: one fixed
+        // notice with the link to the Hub, said privately where the channel allows, and no command,
+        // no login prompt, no turn (POLICY-AGENT-GATE).
+        if (policies) {
+          const verdict = await policies.check(name, { slackUserId: env.user });
+          if (!verdict.ok) {
+            if (policyNotice.shouldSay(name, env.conversation, env.user)) {
+              const conn = a.conn as SlackConnector;
+              const privately = await conn.postEphemeral?.(env.conversation, env.user, verdict.notice).catch(() => false);
+              if (!privately) await a.conn.reply(env.conversation).send(verdict.notice).catch(() => {});
+            }
+            console.log(`worker: ${name} — ${env.user} has not acknowledged the tenant's policies; nothing run`);
+            continue;
+          }
         }
         // Commands are answered HERE, before the durability boundary: `!status` is a read of
         // state this process already holds, and routing it through a workflow would queue it
