@@ -482,6 +482,7 @@ async function startBrains(): Promise<{ registry: ReturnType<typeof registryClie
   const base = process.env.TONOMANCLOUD_API_URL;
   if (!base || process.env.TONOMAN_BRAINS === "off") return undefined;
   const registry = registryClient(base, process.env.TONOMANCLOUD_API_TOKEN ?? "");
+  const homeTokens = new Map<string, { token: string; until: number }>();
   const root = path.join(process.env.TONOMAN_STATE_ROOT ?? "/root/.tonoman", "brains");
   // One credential for the brains' git host, by reference (a mounted secret). Used per command.
   const gitSecret = process.env.TONOMAN_BRAIN_GIT_SECRET ?? "";
@@ -494,6 +495,15 @@ async function startBrains(): Promise<{ registry: ReturnType<typeof registryClie
     // and to nothing else, so a brain on GitHub was cloned with none and nobody could open it. A brain
     // with no credential is not tried without one: the fault is said, not discovered by a failed clone.
     token: async (b) => {
+      // A brain in its tenant's own git home is reached with the token the registry hands out for it,
+      // and with nothing of this worker's (BRAIN-TENANT-HOME). Kept until a minute before it expires.
+      if (b.home) {
+        const had = homeTokens.get(b.id);
+        if (had && had.until > Date.now()) return had.token;
+        const token = await registry.homeToken!(b.id);
+        homeTokens.set(b.id, { token, until: Date.now() + 10 * 60_000 });
+        return token;
+      }
       const c = brainCredential(
         { tenant: b.tenant, repoUrl: b.repoUrl, kind: b.kind, slug: b.slug, branch: b.branch, subpath: b.subpath },
         legacySources,

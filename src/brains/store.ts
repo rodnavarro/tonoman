@@ -36,6 +36,8 @@ export interface BrainRef {
   kind?: "personal" | "shared";
   /** Kept exactly as it is (BRAIN-AS-IS): no log.md line, no seed, no map, never refreshed. */
   asIs?: boolean;
+  /** In its tenant's own git home: reached with a token the registry hands out (BRAIN-TENANT-HOME). */
+  home?: boolean;
 }
 
 export interface StoreOptions {
@@ -139,7 +141,9 @@ function git(args: string[], cwd?: string, input?: string, token?: string): Prom
     ? {
         GIT_CONFIG_COUNT: "1",
         GIT_CONFIG_KEY_0: "http.extraHeader",
-        GIT_CONFIG_VALUE_0: `Authorization: Basic ${Buffer.from(`tonoman:${token}`).toString("base64")}`,
+        // `x-access-token`: the name GitHub expects with a GitHub App's installation token. Azure DevOps
+        // and a personal token ignore the name, so one name serves every host (BRAIN-TENANT-HOME).
+        GIT_CONFIG_VALUE_0: `Authorization: Basic ${Buffer.from(`x-access-token:${token}`).toString("base64")}`,
       }
     : {};
   return new Promise((resolve) => {

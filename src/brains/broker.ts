@@ -38,6 +38,9 @@ export interface Reachable {
   branch?: string | null;
   /** Kept exactly as it is (BRAIN-AS-IS): a records repo like finances. */
   asIs?: boolean;
+  /** It lives in its tenant's own git home (BRAIN-TENANT-HOME in Tonoman Cloud): the registry makes its
+   *  repo and hands out its token; this worker's own git credential never reaches it. */
+  home?: boolean;
 }
 
 export interface Reach {
@@ -50,6 +53,10 @@ export interface Reach {
 export interface BrainsRegistry {
   reach(agentGuid: string, slackUserId: string): Promise<Reach>;
   recordRepo(brainId: string, repoUrl: string, repoName: string): Promise<void>;
+  /** Make a brain's repo in its tenant's own git home; the registry records it (BRAIN-TENANT-HOME). */
+  makeRepo?(brainId: string): Promise<{ repoUrl: string }>;
+  /** A token for one brain in its tenant's own git home. */
+  homeToken?(brainId: string): Promise<string>;
 }
 
 export interface Provisioner {
@@ -217,6 +224,7 @@ export function createBroker(o: BrokerOptions) {
     subpath: b.subpath ?? undefined,
     branch: b.branch ?? undefined,
     ...(b.asIs ? { asIs: true } : {}),
+    ...(b.home ? { home: true } : {}),
   });
 
   /** The Receipts Skill's brain, as this speaker reaches it — or why not. */
@@ -267,6 +275,16 @@ export function createBroker(o: BrokerOptions) {
 
   /** Make a brain's repo on its first use (BRAIN-REPO-ON-FIRST-USE). Only the owner's own turn does. */
   async function provision(tenant: string, b: Reachable): Promise<Reachable> {
+    // In the tenant's own git home the registry makes and records the repo, with the tenant's own
+    // credential (BRAIN-TENANT-HOME); this worker's provisioner is never used for it.
+    if (b.home) {
+      if (!o.registry.makeRepo || !o.registry.homeToken) throw new Error("this worker cannot make brains in a tenant's own git home");
+      const { repoUrl } = await o.registry.makeRepo(b.id);
+      await seed(repoUrl, await o.registry.homeToken(b.id), seedFiles(b.name), o.scratch);
+      const repoName = repoUrl.replace(/\.git$/, "").split("/").pop() ?? b.id;
+      log(`brains: created ${repoName} in its tenant's home for ${b.id}`);
+      return { ...b, state: "active", repoUrl, repoName };
+    }
     if (!o.provisioner) throw new Error("brains cannot be created on this worker (no git host configured)");
     const made = await o.provisioner.create(tenant, b);
     await seed(made.repoUrl, await o.provisioner.token(), seedFiles(b.name), o.scratch);

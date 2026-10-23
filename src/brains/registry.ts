@@ -24,6 +24,8 @@ export function registryClient(baseUrl: string, token: string, fetchImpl: typeof
   };
   return {
     reach: (agentGuid, slackUserId) => call<Reach>("POST", `/v1/system/agents/${encodeURIComponent(agentGuid)}/brain-reach`, { slackUserId }),
+    makeRepo: (brainId) => call<{ repoUrl: string }>("POST", `/v1/system/brains/${encodeURIComponent(brainId)}/make`, {}),
+    homeToken: async (brainId) => (await call<{ token: string }>("POST", `/v1/system/brains/${encodeURIComponent(brainId)}/token`, {})).token,
     recordRepo: async (brainId, repoUrl, repoName) => {
       await call("PUT", `/v1/system/brains/${encodeURIComponent(brainId)}/repo`, { repoUrl, repoName });
     },
