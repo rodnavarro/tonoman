@@ -2653,7 +2653,17 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
   // the sidecar sharing this pod's credential volume, so the code goes from a Slack modal to the
   // process that owns the credential and nowhere else — it never transits the control plane.
   const authBase = process.env.AGENT_RUNTIME_URL ?? "http://127.0.0.1:8080";
+  // Logins offered in a private conversation where the code is pasted back (TEAMS-PRIVATE-LOGIN): by
+  // agent and conversation, whose login it is, and for fifteen minutes.
+  const pastedLogins = new Map<string, { owner: string | undefined; until: number }>();
   const authDeps: gate.AuthGateDeps = {
+    isPrivate: async (name, conversation, user) => {
+      const conn = wired.get(name)?.conn as { audience?: (c: string, u: string) => Promise<{ kind: string }> } | undefined;
+      return (await conn?.audience?.(conversation, user).catch(() => null))?.kind === "self";
+    },
+    expectCode: (name, conversation, owner) => {
+      pastedLogins.set(`${name}\u0000${conversation}`, { owner, until: Date.now() + 15 * 60_000 });
+    },
     // Named, so the login lands in THIS agent's credential directory. Without the name every
     // agent in the pool shares one Claude subscription and the last person to sign in owns them.
     // `user`, when the caller passes it (a per-person agent), lands the login in the speaker's own
@@ -2937,6 +2947,14 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
             console.log(`worker: ${name} — ${env.user} has not acknowledged the tenant's policies; nothing run`);
             continue;
           }
+        }
+        // A code pasted into the private conversation a login was offered in completes it, and is
+        // never a turn (TEAMS-PRIVATE-LOGIN).
+        const waiting = pastedLogins.get(`${name}\u0000${env.conversation}`);
+        if (waiting && waiting.until > Date.now() && gate.looksLikeCode(env.text)) {
+          pastedLogins.delete(`${name}\u0000${env.conversation}`);
+          await gate.submitPastedCode(authDeps, name, env.conversation, waiting.owner, env.user, env.text).catch(() => false);
+          continue;
         }
         // Commands are answered HERE, before the durability boundary: `!status` is a read of
         // state this process already holds, and routing it through a workflow would queue it
