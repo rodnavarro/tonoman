@@ -65,8 +65,10 @@ export function decodeLabel(id: string): string {
  *  `/.attachments/`. */
 export function isContentLink(href: string): boolean {
   const h = href.trim();
-  if (!h.startsWith('/')) return false; // external (http…), anchors (#…), relative — not a page edge
-  if (/^\/\.attachments\//i.test(h)) return false; // an embedded image or file, not a page
+  // External (http…, mailto:…), protocol-relative and anchors (#…) are not page edges. A link relative
+  // to the page is (BRAIN-GRAPH-LINKS in Tonoman Cloud): `resolveFrom` reads it from the page's folder.
+  if (!h || h.startsWith('#') || h.startsWith('//') || /^[a-z][a-z0-9+.-]*:/i.test(h)) return false;
+  if (/(^|\/)\.attachments\//i.test(h)) return false; // an embedded image or file, not a page
   return true;
 }
 
@@ -114,6 +116,30 @@ export function extractLinks(md: string): string[] {
   let m: RegExpExecArray | null;
   while ((m = re.exec(md))) out.push(m[1]!);
   return out;
+}
+
+/** Every `[[wiki link]]` in a page, by what it names (`[[Name]]`, `[[Name|shown as]]`, `[[Name#part]]`).
+ *  `[[_TOC_]]` is an Azure DevOps wiki's table of contents, not a link. */
+export function extractWikiLinks(md: string): string[] {
+  const out: string[] = [];
+  const re = /\[\[([^\]|#]+)(?:#[^\]|]*)?(?:\|[^\]]*)?\]\]/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(md))) if (m[1]!.trim() !== '_TOC_') out.push(m[1]!.trim());
+  return out;
+}
+
+/** A link written in page `from`, resolved: from the brain's root as an Azure DevOps wiki writes it
+ *  (`/Folder/Page`), or relative to the page's own folder (`checklist.md`, `../policies/wisp.md`). */
+export function resolveFrom(from: string, href: string, knownIds: Set<string>): string | undefined {
+  const rooted = resolveLink(href, knownIds);
+  if (rooted || href.startsWith('/')) return rooted;
+  const parts: string[] = [];
+  for (const seg of `${parentOf(from)}/${href.split('#')[0]!.split('?')[0]!}`.split('/')) {
+    if (!seg || seg === '.') continue;
+    if (seg === '..') parts.pop();
+    else parts.push(seg);
+  }
+  return parts.length ? resolveLink(`/${parts.join('/')}`, knownIds) : undefined;
 }
 
 /** The child names a `.order` file lists (one per line, blank lines ignored). These are page/folder
@@ -174,12 +200,22 @@ export function buildGraph(
     const parent = parentOf(id);
     if (parent && nodes.has(parent)) addEdge(parent, id, 'hierarchy');
   }
-  // Content edges from internal links.
+  // Content edges from the links written in the pages (BRAIN-GRAPH-LINKS): markdown links, from the
+  // root or relative to the page, and wiki links by a page's name.
+  const byName = new Map<string, string>();
+  for (const n of nodes.values()) {
+    byName.set(n.label.toLowerCase(), n.id);
+    byName.set(decodeLabel(n.id).toLowerCase().replace(/\s+/g, '-'), n.id);
+  }
   for (const [id, md] of contentOf) {
     if (!nodes.has(id)) continue;
     for (const href of extractLinks(md)) {
       if (!isContentLink(href)) continue;
-      const target = resolveLink(href, ids);
+      const target = resolveFrom(id, href, ids);
+      if (target) addEdge(id, target, 'link');
+    }
+    for (const name of extractWikiLinks(md)) {
+      const target = byName.get(name.toLowerCase()) ?? byName.get(name.toLowerCase().replace(/\s+/g, '-')) ?? resolveFrom(id, name, ids);
       if (target) addEdge(id, target, 'link');
     }
   }

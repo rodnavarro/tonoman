@@ -59,7 +59,7 @@ import * as secondbrain from "./secondbrain";
 import { brainCredential, makesBrains, type LegacySource } from "../brains/credential";
 import { createStore, type BrainStore, type BrainRef } from "../brains/store";
 import { recoverWrites } from "../brains/recover";
-import { refreshBrain, createRefreshQueue, type RefreshPublish } from "../brains/refresh";
+import { refreshBrain, refreshModel, createRefreshQueue, type RefreshPublish } from "../brains/refresh";
 import type { LlmProvider } from "../secondbrain/wiki-reindex/llm";
 import { createBroker, pickBrain, type Broker, type ConversationRun } from "../brains/broker";
 import { registryClient } from "../brains/registry";
@@ -567,7 +567,9 @@ async function startBrains(): Promise<{ registry: ReturnType<typeof registryClie
     : undefined;
   const publish = (id: string, p: RefreshPublish) => registry.publishIndex(id, p as unknown as Record<string, unknown>);
   const queue = createRefreshQueue({
-    run: (b) => refreshBrain({ store, provider, publish, active: (x) => registry.brainActive(x.id) }, b, b.name ?? "Brain"),
+    // A tenant that refreshes nowhere gets its map with no model at all: not ours, not another
+    // (BRAIN-REFRESH-PER-TENANT). The links between its pages need none.
+    run: (b) => refreshBrain({ store, provider: refreshModel(b, provider), publish, active: (x) => registry.brainActive(x.id) }, b, b.name ?? "Brain"),
     stale: (b) => publish(b.id, { state: "stale", detail: "refreshing after a change" }),
     delayMs: Number(process.env.TONOMAN_BRAIN_REFRESH_DELAY_MS ?? 60_000),
     // Kept on disk, so a refresh waiting — or cut off halfway — when the worker stops runs after it starts.

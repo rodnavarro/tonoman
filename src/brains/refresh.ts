@@ -163,6 +163,12 @@ export type RefreshOutcome = RefreshPublish & { again?: "soon" | "later" | "neve
 const NOT_A_FILE = new Set(["120000", "160000"]);
 
 /** Refresh one brain. Returns what it published. */
+/** PURE: the model a brain's refresh may use (BRAIN-REFRESH-PER-TENANT, BRAIN-LOCAL-MODEL): this
+ *  deployment's local model, unless its tenant refreshes nowhere — then none at all. */
+export function refreshModel(brain: Pick<BrainRef, "refresh">, local: LlmProvider | undefined): LlmProvider | undefined {
+  return brain.refresh === "off" ? undefined : local;
+}
+
 export async function refreshBrain(d: RefreshDeps, brain: BrainRef, name: string): Promise<RefreshOutcome> {
   const now = d.now ?? (() => new Date());
   const log = d.log ?? ((s: string) => console.log(s));

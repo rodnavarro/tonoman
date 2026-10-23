@@ -38,6 +38,8 @@ export interface BrainRef {
   asIs?: boolean;
   /** In its tenant's own git home: reached with a token the registry hands out (BRAIN-TENANT-HOME). */
   home?: boolean;
+  /** Its tenant refreshes nowhere (BRAIN-REFRESH-PER-TENANT): no model reads it; the map is still made. */
+  refresh?: "local" | "off";
 }
 
 export interface StoreOptions {

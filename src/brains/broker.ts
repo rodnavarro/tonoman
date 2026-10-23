@@ -41,6 +41,9 @@ export interface Reachable {
   /** It lives in its tenant's own git home (BRAIN-TENANT-HOME in Tonoman Cloud): the registry makes its
    *  repo and hands out its token; this worker's own git credential never reaches it. */
   home?: boolean;
+  /** Where its tenant's brains are refreshed (BRAIN-REFRESH-PER-TENANT in Tonoman Cloud): "off", no
+   *  model reads it. */
+  refresh?: "local" | "off";
 }
 
 export interface Reach {
@@ -225,6 +228,7 @@ export function createBroker(o: BrokerOptions) {
     branch: b.branch ?? undefined,
     ...(b.asIs ? { asIs: true } : {}),
     ...(b.home ? { home: true } : {}),
+    ...(b.refresh === "off" ? { refresh: "off" as const } : {}),
   });
 
   /** The Receipts Skill's brain, as this speaker reaches it — or why not. */
