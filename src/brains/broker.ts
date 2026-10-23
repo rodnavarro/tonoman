@@ -83,6 +83,8 @@ export interface TurnSpec {
    *  group whose calls the broker carries to the Cloud with the person speaking. The runtime knows
    *  nothing of what they do. Absent = none. */
   cloudTools?: CloudTool[];
+  /** The tools of the tenant's own skills this agent has (SKILL-REPO-TOOLS-IN-TURN): `tonoman run <name>`. */
+  runTools?: { name: string; script: string; about: string }[];
   /** `web-fetch` is granted to the agent (TOOL-WEB-FETCH): the turn has `tonoman web fetch`. */
   webFetch?: boolean;
   /** The worker's own tools a skill on this agent brings — `plaud`, `calendar`, `meeting-recap` — each
@@ -723,7 +725,7 @@ export function createBroker(o: BrokerOptions) {
     startTurn(spec: TurnSpec, hooks: TurnHooks = {}): { token: string; mcp: McpServerSpec; cli: TurnCli } {
       const token = randomBytes(24).toString("hex");
       turns.set(token, { ...spec, used: new Set(), fetched: new Set(), bytes: 0, expiresAt: Date.now() + 2 * 60 * 60 * 1000, onUse: hooks.onUse });
-      const env = { TONOMAN_BRAIN_URL: baseUrl, TONOMAN_BRAIN_TOKEN: token, ...(spec.receipts ? { TONOMAN_RECEIPTS: "1" } : {}), ...(spec.cloudTools?.length ? { TONOMAN_CLOUD_TOOLS: JSON.stringify(spec.cloudTools.map(({ name, about, commands }) => ({ name, about, commands }))) } : {}), ...(spec.webFetch ? { TONOMAN_WEB_FETCH: "1" } : {}), ...(spec.localTools?.length ? { TONOMAN_LOCAL_TOOLS: spec.localTools.join(",") } : {}) };
+      const env = { TONOMAN_BRAIN_URL: baseUrl, TONOMAN_BRAIN_TOKEN: token, ...(spec.receipts ? { TONOMAN_RECEIPTS: "1" } : {}), ...(spec.cloudTools?.length ? { TONOMAN_CLOUD_TOOLS: JSON.stringify(spec.cloudTools.map(({ name, about, commands }) => ({ name, about, commands }))) } : {}), ...(spec.webFetch ? { TONOMAN_WEB_FETCH: "1" } : {}), ...(spec.localTools?.length ? { TONOMAN_LOCAL_TOOLS: spec.localTools.join(",") } : {}), ...(spec.runTools?.length ? { TONOMAN_RUN_TOOLS: JSON.stringify(spec.runTools) } : {}) };
       return {
         token,
         mcp: { name: "tonoman", command: o.node ?? process.execPath, args: [shimPath], env: { ...env, TONOMAN_CLI_PATH: cliPath } },

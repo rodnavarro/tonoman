@@ -39,6 +39,7 @@ import { channelResolver } from "./channelsay";
 import { isPoolCredential, startHeartbeat } from "./heartbeat";
 import { knowsSpeaker, noticeLimiter, unknownSpeakerNotice } from "./speakergate";
 import { policyGate } from "./policygate";
+import { repoSkills } from "./reposkills";
 import { cloudDropStore, dropWatcher, memoryDropStore } from "./lorealistar";
 import { siteOver } from "../lorealistar/watch";
 import { dropWatch, dropEveryMinutes, dropChannel } from "./skills/drop-watch";
@@ -1604,7 +1605,7 @@ export async function run(
       const localGroups = localToolsOf(wired.get(agent)!.cfg);
       return b && g
         ? b.broker.startTurn(
-            { agentGuid: g, slackUserId: user, who, receipts: opts?.receipts, cloudTools: opts?.cloudTools, webFetch: opts?.webFetch, localTools: localGroups },
+            { agentGuid: g, slackUserId: user, who, receipts: opts?.receipts, cloudTools: opts?.cloudTools, webFetch: opts?.webFetch, localTools: localGroups, runTools: opts?.runTools },
             { onUse: (id) => remember(agent, key, [id]) },
           )
         : undefined;
@@ -1706,6 +1707,11 @@ export async function run(
     claimSession,
     resetSession,
     brains: turnBrains(brainsSys),
+    // The tenant's own skills (SKILL-FROM-YOUR-REPO): checked out where every turn's user may read and
+    // none may change, beside `tonoman` itself.
+    repoSkills: brainsSys
+      ? repoSkills({ root: process.env.TONOMAN_SKILL_REPOS_DIR || path.join(TOOLS_DIR, "..", "skillrepos"), token: (g) => brainsSys.registry.skillRepoToken(g) })
+      : undefined,
     // A Skill's program goes out as the run's own Linux user too (TURNUSER-NOTHING-AS-ROOT).
     turnUser: usersOfThisWorker()
       ? async (agent: string, user: string | undefined) => {

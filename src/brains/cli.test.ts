@@ -160,3 +160,20 @@ describe("tonoman as Codex's one tool", () => {
     expect(called.content[0]!.text).toContain("Ana's brain");
   });
 });
+
+describe("the organization's own tools (SKILL-REPO-TOOLS-IN-TURN in Tonoman Cloud)", () => {
+  it("SKILL-REPO-TOOLS-IN-TURN `tonoman run <tool>` runs the tool with the turn's own environment and its arguments; nothing else runs", async () => {
+    const script = path.join(tmp, "reader.js");
+    writeFileSync(script, "console.log(JSON.stringify({ args: process.argv.slice(2), login: process.env.CLAUDE_CONFIG_DIR || null }));\n");
+    const off = broker.startTurn({ agentGuid: "echo", slackUserId: "UANA", who: "Ana" });
+    expect((await tonoman(off.cli.env, "--help")).out).not.toMatch(/\brun\b/);
+    expect((await tonoman(off.cli.env, "run", "reader")).code).toBe(3);
+    const on = broker.startTurn({ agentGuid: "echo", slackUserId: "UANA", who: "Ana", runTools: [{ name: "reader", script, about: "The firm's tools" }] });
+    expect((await tonoman(on.cli.env, "--help")).out).toMatch(/run\s+your organization's own tools: reader/);
+    // SKILL-REPO-TOOL-INFERENCE: whatever login the turn runs on is the one the tool's model calls see.
+    const r = await tonoman({ ...on.cli.env, CLAUDE_CONFIG_DIR: "/home/turn-ana/.claude" }, "run", "reader", "tax", "read", "g.pdf", "--full");
+    expect(r.code).toBe(0);
+    expect(JSON.parse(r.out)).toEqual({ args: ["tax", "read", "g.pdf", "--full"], login: "/home/turn-ana/.claude" });
+    expect((await tonoman(on.cli.env, "run", "sh", "-c", "id")).code).toBe(2);
+  });
+});

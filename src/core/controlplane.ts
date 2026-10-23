@@ -69,6 +69,7 @@ export interface RegistryAgent {
   principals?: { kind: string; value: string; label: string }[];
   /** Tools this Cloud serves the agent (D-CLOUD-TOOLS). */
   cloudTools?: { name: string; about: string; note?: string; commands: Record<string, { args: string[]; about: string; stdin?: string; file?: string }> }[];
+  repoSkills?: { name: string; repoUrl: string; commit: string; path: string }[];
   /** flow → key → value, straight from `flow_property`. Opaque to the registry by design. */
   flows?: Record<string, Record<string, string>>;
   /** What the TENANT is trying to do. One sentence, shared by every agent the tenant has. */
@@ -291,6 +292,8 @@ export class RegistryControlPlane implements ControlPlane {
         granted_tools: a.tools ?? [],
         // The tools the Cloud serves it (D-CLOUD-TOOLS), the tenant's website among them.
         cloud_tools: a.cloudTools ?? [],
+        // The tenant's own skills, from its repository (SKILL-FROM-YOUR-REPO).
+        repo_skills: a.repoSkills ?? [],
         flows: a.flows ?? {},
         // Mapped EXPLICITLY, like everything else here. This mapping is a whitelist by design — the
         // runtime takes only what it understands — and the cost of that is real: a field added to
