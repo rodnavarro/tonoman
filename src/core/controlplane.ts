@@ -63,6 +63,8 @@ export interface RegistryAgent {
   credentialSecretRef?: string | null;
   channel: string;
   teamId: string;
+  /** The channel's app: a Slack app id, or a Teams bot's Entra app id. */
+  externalAppId?: string | null;
   botTokenRef?: string | null;
   appTokenRef?: string | null;
   allowedUsers?: string[] | null;
@@ -240,13 +242,16 @@ export class RegistryControlPlane implements ControlPlane {
       const label = `${a.tenant}-${a.name}`;
       const localName = a.guid || label;
 
-      if (a.channel !== "slack") {
+      if (a.channel !== "slack" && a.channel !== "teams") {
         console.error(`registry: skipping ${label} — channel "${a.channel}" is not wired here yet`);
         continue;
       }
+      // Teams (TEAMS-WORKER-SERVES): the bot's Entra app id, its secret by reference, and the customer's
+      // Microsoft tenant (`teamId`). Slack: its two tokens.
+      const teams = a.channel === "teams";
       const [botToken, appToken] = await Promise.all([
         this.resolveRef(a.botTokenRef, a.guid),
-        this.resolveRef(a.appTokenRef, a.guid),
+        teams ? Promise.resolve(a.externalAppId ?? "") : this.resolveRef(a.appTokenRef, a.guid),
       ]);
       if (!botToken || !appToken) {
         // One agent's missing credential must not take the whole gateway down with it.
@@ -381,13 +386,17 @@ export class RegistryControlPlane implements ControlPlane {
             })),
           };
         }),
-        channel: "slack",
-        slack: {
-          team_id: a.teamId,
-          app_token: appToken,
-          bot_token: botToken,
-          allowed_users: a.allowedUsers ?? [],
-        },
+        ...(teams
+          ? { channel: "teams", teams: { app_id: appToken, app_password: botToken, tenant_id: a.teamId } }
+          : {
+              channel: "slack",
+              slack: {
+                team_id: a.teamId,
+                app_token: appToken,
+                bot_token: botToken,
+                allowed_users: a.allowedUsers ?? [],
+              },
+            }),
       } as AgentConfig);
     }
 

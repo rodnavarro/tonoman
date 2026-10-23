@@ -25,6 +25,7 @@ import * as path from "node:path";
 import type { Config, AgentConfig } from "../config";
 import type { Connector, TurnEvent, TurnRunner, TurnUsage } from "../core/contracts";
 import { SlackConnector } from "../connector/slack";
+import { TeamsConnector, TeamsWebhook } from "../connector/teams";
 import { threadOwners, type ThreadOwners } from "../connector/threadowners";
 import * as cmds from "./commands";
 import * as plaudcli from "./plaudcli";
@@ -954,6 +955,7 @@ const sharedThreadOwners = (): ThreadOwners =>
 function wireOne(a: AgentConfig, harnesses: ReturnType<typeof defaultHarnesses>): Wired | null {
   const label = agentLabel(a);
   const channel = a.channel ?? (a.slack ? "slack" : a.teams ? "teams" : "telegram");
+  if (channel === "teams") return wireTeams(a, harnesses, label);
   if (channel !== "slack") {
     console.error(`worker: skipping ${label} — channel "${channel}" has no worker connector yet`);
     return null;
@@ -982,6 +984,29 @@ function wireOne(a: AgentConfig, harnesses: ReturnType<typeof defaultHarnesses>)
     threadOwners: sharedThreadOwners(),
   });
 
+  const runner = newRunnerFor(a, harnesses);
+  if (!runner) {
+    console.error(`worker: skipping ${label} — harness "${a.harness}" cannot run turns`);
+    return null;
+  }
+  return { cfg: a, conn, runner, run: runClosure(runner, a, usersOfThisWorker()) };
+}
+
+/** The worker's one webhook for every Teams bot it serves (TEAMS-ONE-ADDRESS-PER-POOL in Tonoman Cloud),
+ *  made when the first Teams agent is wired. Its public address is the pool's, set on each bot. */
+let teamsHook: TeamsWebhook | undefined;
+const teamsWebhook = (): TeamsWebhook => (teamsHook ??= new TeamsWebhook(Number(process.env.TONOMAN_TEAMS_PORT ?? 3979)));
+
+/** An agent in Microsoft Teams (TEAMS-WORKER-SERVES): its bot's app id, secret and the customer's
+ *  Microsoft tenant, reached through the worker's one webhook; people are known by their Entra id. */
+function wireTeams(a: AgentConfig, harnesses: ReturnType<typeof defaultHarnesses>, label: string): Wired | null {
+  const t = a.teams;
+  if (!t?.app_id || !t.app_password || !t.tenant_id) {
+    console.error(`worker: skipping ${label} — its Teams bot is missing ${!t?.app_id ? "an app id" : !t.app_password ? "a secret" : "a tenant"}`);
+    return null;
+  }
+  const mediaDir = path.join(process.env.TONOMAN_STATE_ROOT ?? "/root/.tonoman", "media", a.name);
+  const conn = new TeamsConnector({ appId: t.app_id, appPassword: t.app_password, tenantId: t.tenant_id, mediaDir, mediaMount: mediaDir, webhook: teamsWebhook(), speakerById: true });
   const runner = newRunnerFor(a, harnesses);
   if (!runner) {
     console.error(`worker: skipping ${label} — harness "${a.harness}" cannot run turns`);
@@ -2220,14 +2245,16 @@ export async function run(
   // it attaches the Slack id to the account with that email and answers whether this agent knows
   // that account (AGENTACCOUNT-MEMBERS-ARE-KNOWN in Tonoman Cloud). Known: added to the agent's
   // people in memory, so the next message needs no call. Not known, or no registry: false.
-  const knowSpeaker = async (name: string, user: string): Promise<boolean> => {
+  const knowSpeaker = async (name: string, user: string, said?: { email?: string; name?: string }): Promise<boolean> => {
     const a = wired.get(name);
     const guid = a?.cfg.guid;
     const baseUrl = process.env.TONOMANCLOUD_API_URL;
     if (!a || !guid || !baseUrl) return false;
-    let profileName: string | undefined;
-    let email: string | undefined;
-    try {
+    // Teams says who someone is with the message (TEAMS-PERSON-IS-ACCOUNT): their Entra id and email.
+    const teams = (a.cfg.channel ?? (a.cfg.teams ? "teams" : "slack")) === "teams";
+    let profileName: string | undefined = said?.name;
+    let email: string | undefined = said?.email;
+    if (!teams) try {
       const info = await (a.conn as SlackConnector).call<{
         user?: { real_name?: string; is_bot?: boolean; profile?: { real_name?: string; display_name?: string; email?: string } };
       }>(`users.info?user=${encodeURIComponent(user)}`);
@@ -2241,11 +2268,11 @@ export async function run(
       const r = await fetch(`${baseUrl}/v1/system/agents/${guid}/know-speaker`, {
         method: "POST",
         headers: { authorization: `Bearer ${process.env.TONOMANCLOUD_API_TOKEN ?? ""}`, "content-type": "application/json" },
-        body: JSON.stringify({ slackUserId: user, name: profileName, email }),
+        body: JSON.stringify({ ...(teams ? { teamsUserId: user } : { slackUserId: user }), name: profileName, email }),
       });
       const j = (await r.json()) as { known?: boolean; label?: string; accountId?: string };
       if (!r.ok || !j.known || !j.label) return false;
-      a.cfg.principals = [...(a.cfg.principals ?? []), { kind: "slack_user_id", value: user, label: j.label }];
+      a.cfg.principals = [...(a.cfg.principals ?? []), { kind: teams ? "teams_user" : "slack_user_id", value: user, label: j.label }];
       return true;
     } catch (e) {
       console.error(`worker: ${name} know-speaker failed for ${user}: ${(e as Error).message}`);
@@ -2790,8 +2817,8 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
   const unknownNotice = noticeLimiter();
   const strangerLookup = noticeLimiter();
   // The agent as wired NOW — a reload may have replaced the one a handler was built with.
-  const hasAccess = async (name: string, a: Wired, user: string): Promise<boolean> =>
-    knowsSpeaker((wired.get(name) ?? a).cfg.principals, user) || (strangerLookup.shouldSay(name, "", user) && (await knowSpeaker(name, user)));
+  const hasAccess = async (name: string, a: Wired, user: string, said?: { email?: string; name?: string }): Promise<boolean> =>
+    knowsSpeaker((wired.get(name) ?? a).cfg.principals, user) || (strangerLookup.shouldSay(name, "", user) && (await knowSpeaker(name, user, said)));
   const noticeFor = (name: string, a: Wired, user: string) => unknownSpeakerNotice(a.cfg.displayName ?? a.cfg.name ?? name, user);
   // The tenant's policies before its agents (POLICY-AGENT-GATE in Tonoman Cloud): only where there is a
   // registry to ask; the open-source runtime on its own roster has no policies.
@@ -2886,11 +2913,11 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
         // Someone without access to the agent reaches nothing (AGENTACCOUNT-ACCESS-IS-GRANTED): not
         // a command, not a login prompt, not a turn. Checked first, from what the registry granted,
         // so it costs nothing; they are told their Slack id and whom to ask.
-        if (!(await hasAccess(name, a, env.user))) {
+        if (!(await hasAccess(name, a, env.user, env.identity))) {
           if (unknownNotice.shouldSay(name, env.conversation, env.user)) {
             const text = noticeFor(name, a, env.user);
             const conn = a.conn as SlackConnector;
-            const privately = await conn.postEphemeral(env.conversation, env.user, text).catch(() => false);
+            const privately = await conn.postEphemeral?.(env.conversation, env.user, text).catch(() => false);
             if (!privately) await a.conn.reply(env.conversation).send(text).catch(() => {});
           }
           console.log(`worker: ${name} — ${env.user} has no access to this agent; nothing run`);
