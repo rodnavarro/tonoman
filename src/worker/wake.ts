@@ -92,6 +92,47 @@ export interface WakeDeps {
    *  offer it, and `POST /api/reload` answers 404 there. The Hub's API pokes this after a write so an
    *  edit reaches the running agent in about a second rather than up to a poll interval later. */
   reload?(): void;
+  /** A brain was changed somewhere else — saved in the Hub — and its map should catch up, as after a
+   *  push of this worker's own (BRAIN-BACKGROUND-REFRESH). Optional: a worker without brains has none. */
+  brainPushed?(brain: PushedBrain): void;
+}
+
+/** A brain changed outside this worker, as the registry describes it. */
+export interface PushedBrain {
+  id: string;
+  tenant: string;
+  repoUrl: string;
+  branch?: string;
+  subpath?: string;
+  name?: string;
+  slug?: string;
+  kind?: "personal" | "shared";
+  asIs?: boolean;
+  home?: boolean;
+  refresh?: "local" | "off";
+}
+
+/** PURE: validate a brain-pushed body. */
+export function parseBrainPushed(body: unknown): { ok: true; brain: PushedBrain } | { ok: false; error: string } {
+  const b = ((body ?? {}) as { brain?: Record<string, unknown> }).brain ?? {};
+  const str = (k: string) => (typeof b[k] === "string" && (b[k] as string).trim() ? (b[k] as string).trim() : undefined);
+  for (const k of ["id", "tenant", "repoUrl"]) if (!str(k)) return { ok: false, error: `brain.${k} is required` };
+  return {
+    ok: true,
+    brain: {
+      id: str("id")!,
+      tenant: str("tenant")!,
+      repoUrl: str("repoUrl")!,
+      ...(str("branch") ? { branch: str("branch") } : {}),
+      ...(str("subpath") ? { subpath: str("subpath") } : {}),
+      ...(str("name") ? { name: str("name") } : {}),
+      ...(str("slug") ? { slug: str("slug") } : {}),
+      ...(b.kind === "personal" || b.kind === "shared" ? { kind: b.kind } : {}),
+      ...(b.asIs === true ? { asIs: true } : {}),
+      ...(b.home === true ? { home: true } : {}),
+      ...(b.refresh === "off" ? { refresh: "off" as const } : {}),
+    },
+  };
 }
 
 /** PURE: validate a wake body, returning the request or the reason it is not one. Unit-tested —
@@ -163,7 +204,7 @@ export function serveWake(o: WakeServerOptions, signal: AbortSignal): boolean {
 
     // `/api/talent-run` is the old name of `/api/skill-run`, kept for one release (D-TALENT-IS-SKILL).
     const route = (req.url ?? "").split("?")[0] === "/api/talent-run" ? "/api/skill-run" : (req.url ?? "").split("?")[0];
-    const ROUTES = ["/api/wake", "/api/reload", "/api/skill-run"];
+    const ROUTES = ["/api/wake", "/api/reload", "/api/skill-run", "/api/brain-pushed"];
     if (req.method !== "POST" || !ROUTES.includes(route)) {
       return send(404, { error: "not found" });
     }
@@ -193,6 +234,15 @@ export function serveWake(o: WakeServerOptions, signal: AbortSignal): boolean {
         parsed = JSON.parse(raw || "{}");
       } catch {
         return send(400, { error: "invalid json" });
+      }
+
+      // A brain saved in the Hub: its map catches up like after a push of ours (BRAIN-BACKGROUND-REFRESH).
+      if (route === "/api/brain-pushed") {
+        if (!o.deps.brainPushed) return send(404, { error: "this worker has no brains" });
+        const p = parseBrainPushed(parsed);
+        if (!p.ok) return send(400, { error: p.error });
+        o.deps.brainPushed(p.brain);
+        return send(202, { accepted: true });
       }
 
       // Run a Skill on one item, asked for from the Hub (W4). UNLIKE /api/wake this answers with

@@ -478,7 +478,7 @@ let legacySources: LegacySource[] = [];
  *  the agents are wired; until then a call is told to try again (D-JOBS-ARE-PROMPTS). */
 let localToolCall: ReturnType<typeof localTools> | undefined;
 
-async function startBrains(): Promise<{ registry: ReturnType<typeof registryClient>; broker: Broker; store: BrainStore } | undefined> {
+async function startBrains(): Promise<{ registry: ReturnType<typeof registryClient>; broker: Broker; store: BrainStore; queueRefresh: (b: BrainRef) => void } | undefined> {
   const base = process.env.TONOMANCLOUD_API_URL;
   if (!base || process.env.TONOMAN_BRAINS === "off") return undefined;
   const registry = registryClient(base, process.env.TONOMANCLOUD_API_TOKEN ?? "");
@@ -579,7 +579,7 @@ async function startBrains(): Promise<{ registry: ReturnType<typeof registryClie
   void queue.resume().then((n) => n && console.log(`worker: ${n} brain refresh(es) carried over from before the restart`));
   console.log(`worker: brain refresh ${provider ? `on ${provider.model} at ${provider.url}` : "maps only — no local model set (TONOMAN_BRAIN_REFRESH_URL)"}`);
   console.log(`worker: brains on — ${provisioner ? `new brains go to Azure DevOps ${org}/${project}` : "no git host configured, so no new brains can be created"}`);
-  return { registry, broker, store };
+  return { registry, broker, store, queueRefresh: (b: BrainRef) => queue.touch(b) };
 }
 
 /** One wired agent: the roster row, its channel, its harness, and the second-brain note the turn
@@ -3157,6 +3157,8 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
       token: wakeToken,
       deps: {
         has: (name) => wired.has(name),
+        // A brain saved in the Hub: refreshed like after a push of ours (BRAIN-BACKGROUND-REFRESH).
+        ...(brainsSys ? { brainPushed: (b) => brainsSys.queueRefresh(b) } : {}),
         // The Hub names an agent by its registry GUID. On a registry roster that IS the worker's own
         // key (`cfg.name` is the guid), so the common case is a straight hit — but a file roster has
         // no guid at all, and a person reading a log will type the tenant-prefixed display name. All
