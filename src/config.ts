@@ -174,6 +174,9 @@ export interface AgentConfig {
   /** Tools a Tonoman Cloud serves this agent (D-CLOUD-TOOLS): each a `tonoman` group the turn gets,
    *  whose calls go back to the Cloud. Absent on an agent with no Cloud. */
   cloud_tools?: { name: string; about: string; note?: string; commands: Record<string, { args: string[]; about: string; stdin?: string; file?: string }> }[];
+  /** The tenant's own skills this agent has, at the commit of its repository the registry read
+   *  (SKILL-FROM-YOUR-REPO in Tonoman Cloud). */
+  repo_skills?: { name: string; repoUrl: string; commit: string; path: string }[];
   /** Second-brain sources this agent has been GRANTED (§8). A list, not one repo: the end state
    * binds an Azure DevOps repo over SSH alongside a GitHub one. Empty when the tool is not granted,
    * which is what makes revoking it in the console remove the checkout rather than hide a button. */

@@ -63,12 +63,15 @@ export interface RegistryAgent {
   credentialSecretRef?: string | null;
   channel: string;
   teamId: string;
+  /** The channel's app: a Slack app id, or a Teams bot's Entra app id. */
+  externalAppId?: string | null;
   botTokenRef?: string | null;
   appTokenRef?: string | null;
   allowedUsers?: string[] | null;
   principals?: { kind: string; value: string; label: string }[];
   /** Tools this Cloud serves the agent (D-CLOUD-TOOLS). */
   cloudTools?: { name: string; about: string; note?: string; commands: Record<string, { args: string[]; about: string; stdin?: string; file?: string }> }[];
+  repoSkills?: { name: string; repoUrl: string; commit: string; path: string }[];
   /** flow → key → value, straight from `flow_property`. Opaque to the registry by design. */
   flows?: Record<string, Record<string, string>>;
   /** What the TENANT is trying to do. One sentence, shared by every agent the tenant has. */
@@ -239,13 +242,16 @@ export class RegistryControlPlane implements ControlPlane {
       const label = `${a.tenant}-${a.name}`;
       const localName = a.guid || label;
 
-      if (a.channel !== "slack") {
+      if (a.channel !== "slack" && a.channel !== "teams") {
         console.error(`registry: skipping ${label} — channel "${a.channel}" is not wired here yet`);
         continue;
       }
+      // Teams (TEAMS-WORKER-SERVES): the bot's Entra app id, its secret by reference, and the customer's
+      // Microsoft tenant (`teamId`). Slack: its two tokens.
+      const teams = a.channel === "teams";
       const [botToken, appToken] = await Promise.all([
         this.resolveRef(a.botTokenRef, a.guid),
-        this.resolveRef(a.appTokenRef, a.guid),
+        teams ? Promise.resolve(a.externalAppId ?? "") : this.resolveRef(a.appTokenRef, a.guid),
       ]);
       if (!botToken || !appToken) {
         // One agent's missing credential must not take the whole gateway down with it.
@@ -291,6 +297,8 @@ export class RegistryControlPlane implements ControlPlane {
         granted_tools: a.tools ?? [],
         // The tools the Cloud serves it (D-CLOUD-TOOLS), the tenant's website among them.
         cloud_tools: a.cloudTools ?? [],
+        // The tenant's own skills, from its repository (SKILL-FROM-YOUR-REPO).
+        repo_skills: a.repoSkills ?? [],
         flows: a.flows ?? {},
         // Mapped EXPLICITLY, like everything else here. This mapping is a whitelist by design — the
         // runtime takes only what it understands — and the cost of that is real: a field added to
@@ -378,13 +386,17 @@ export class RegistryControlPlane implements ControlPlane {
             })),
           };
         }),
-        channel: "slack",
-        slack: {
-          team_id: a.teamId,
-          app_token: appToken,
-          bot_token: botToken,
-          allowed_users: a.allowedUsers ?? [],
-        },
+        ...(teams
+          ? { channel: "teams", teams: { app_id: appToken, app_password: botToken, tenant_id: a.teamId } }
+          : {
+              channel: "slack",
+              slack: {
+                team_id: a.teamId,
+                app_token: appToken,
+                bot_token: botToken,
+                allowed_users: a.allowedUsers ?? [],
+              },
+            }),
       } as AgentConfig);
     }
 

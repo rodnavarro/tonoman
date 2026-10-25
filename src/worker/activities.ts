@@ -47,6 +47,8 @@ export interface DropLook {
 }
 
 export interface TurnDeps {
+  /** The tenant's own skills, prepared for a turn (SKILL-REPO-TOOLS-IN-TURN). Absent: none. */
+  repoSkills?: { prepare(agentGuid: string, specs: { name: string; repoUrl: string; commit: string; path: string }[] | undefined): Promise<{ tools: { name: string; script: string; about: string }[]; notes: { name: string; body: string }[] }> };
   agent(name: string): { cfg: AgentConfig; conn: Connector; context?: string; run: (req: TurnRunReq, signal?: AbortSignal) => AsyncIterable<TurnEvent> } | undefined;
   /** What this agent needs to run the voice flow, or undefined if it is not configured for one. */
   voice?(name: string): VoiceConfig | undefined;
@@ -445,7 +447,7 @@ export interface TurnBrains {
     user: string,
     who: string,
     key: string,
-    opts?: { receipts?: { brainId: string; entities?: string[]; version?: number }; cloudTools?: CloudTool[]; webFetch?: boolean },
+    opts?: { receipts?: { brainId: string; entities?: string[]; version?: number }; cloudTools?: CloudTool[]; webFetch?: boolean; runTools?: { name: string; script: string; about: string }[] },
   ): { token: string; mcp: McpServerSpec; cli: { binDir: string; env: Record<string, string> } } | undefined;
   /** The turn's own folder, once it exists: the only place a file it files may come from. */
   bind?(token: string, cwd: string): void;
@@ -1129,6 +1131,11 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
     const granted = found.cfg.granted_tools;
     const webSearch = granted === undefined || granted.includes("web-search");
     const webFetch = !!granted?.includes("web-fetch");
+    // The tenant's own skills this agent has (SKILL-REPO-TOOLS-IN-TURN): their instructions in the
+    // guidance, their tools as `tonoman run`. Ready before the turn, so a skill just added works now.
+    const repo = deps.repoSkills
+      ? await deps.repoSkills.prepare(found.cfg.guid ?? input.agent, found.cfg.repo_skills).catch(() => ({ tools: [], notes: [] }))
+      : { tools: [], notes: [] };
     let staleHistory = false;
     // This turn is about a finance document: whatever it says goes to the sender privately.
     let finance = false;
@@ -1163,7 +1170,7 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
         }
       }
       if (receipts && prior.includes(receipts.brainId)) finance = true;
-      brainTurn = brains.start(input.agent, input.user, input.user, key, { receipts, cloudTools, webFetch });
+      brainTurn = brains.start(input.agent, input.user, input.user, key, { receipts, cloudTools, webFetch, runTools: repo.tools });
       // Outside the speaker's own DM, a turn that can reach brains — or remembers one — is held. An
       // announcement is held even in their DM: it is posted only after the reach is checked again.
       held = (audience.kind !== "self" && (!!brainTurn || prior.length > 0 || finance)) || !!input.drewOn?.length;
@@ -1340,11 +1347,11 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
     if (brainTurn && brains && known?.label) {
       // Re-open with the person's name for log.md; the first token is closed unused.
       brains.end(brainTurn.token);
-      brainTurn = brains.start(input.agent, input.user, known.label, key, { receipts, cloudTools, webFetch });
+      brainTurn = brains.start(input.agent, input.user, known.label, key, { receipts, cloudTools, webFetch, runTools: repo.tools });
     }
     const parts = [
       found.context ?? "",
-      brainTurn ? guidanceFor(provider, receipts, cloudTools, { search: webSearch, fetch: webFetch }) : "",
+      brainTurn ? guidanceFor(provider, receipts, cloudTools, { search: webSearch, fetch: webFetch }, repo.notes) : "",
       input.afterInterruption
         ? "(your previous answer was interrupted by a new message; continue from what the user now says)"
         : "",
@@ -1637,7 +1644,13 @@ export function receiptsOf(skills: { name: string; version?: number; config?: Re
 }
 
 /** What the turn is told about `tonoman` (CLI-SMALL-CONTEXT), and how to use brains well. */
-function guidanceFor(provider: "claude" | "codex", receipts?: { entities?: string[] }, cloudTools: CloudTool[] = [], web: { search: boolean; fetch: boolean } = { search: true, fetch: false }): string {
+function guidanceFor(
+  provider: "claude" | "codex",
+  receipts?: { entities?: string[] },
+  cloudTools: CloudTool[] = [],
+  web: { search: boolean; fetch: boolean } = { search: true, fetch: false },
+  skillNotes: { name: string; body: string }[] = [],
+): string {
   const receiptsOn = !!receipts;
   const how =
     provider === "codex"
@@ -1656,6 +1669,9 @@ function guidanceFor(provider: "claude" | "codex", receipts?: { entities?: strin
     ...(receiptsOn ? ["", RECEIPTS_NOTE, receipts?.entities?.length ? `This tenant's legal entities, one of which every receipt names: ${receipts.entities.join(", ")}. If it is not clear which, ask — naming these.` : ""] : []),
     // Each tool the Cloud serves says, in a few lines, how to use it (D-CLOUD-TOOLS).
     ...cloudTools.flatMap((t) => (t.note ? ["", t.note] : [])),
+    // The organization's own skills (SKILL-REPO-TOOLS-IN-TURN), as their authors wrote them. Their tools
+    // run through `tonoman run <tool>`.
+    ...skillNotes.flatMap((n) => ["", `# Skill: ${n.name}`, "(Your organization's own skill. Run its tools with `tonoman run <tool> …`.)", n.body]),
   ].join("\n");
 }
 

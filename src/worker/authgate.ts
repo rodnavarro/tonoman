@@ -44,6 +44,46 @@ export interface AuthGateDeps {
    *  the worker uses it to register the person into the tenant, so their very first chat already
    *  knows their name (rather than only learning it when they connect Plaud later). */
   onLogin?(agent: string, user: string, provider: InferenceProvider): Promise<void>;
+  /** For a channel with no buttons or dialogs (Teams): is this conversation the person's own one-to-one
+   *  chat, where a pasted code is seen by nobody else (TEAMS-PRIVATE-LOGIN in Tonoman Cloud)? */
+  isPrivate?(agent: string, conversation: string, user: string): Promise<boolean>;
+  /** A login was offered in this conversation; the person's next code there completes it. */
+  expectCode?(agent: string, conversation: string, owner: string | undefined): void;
+}
+
+/** PURE: does a message look like the code a sign-in page shows (one long token, no spaces)? */
+export function looksLikeCode(text: string): boolean {
+  const t = text.trim();
+  return t.length >= 20 && t.length <= 2000 && !/\s/.test(t);
+}
+
+/** A code pasted into a private conversation completes the login waiting there (TEAMS-PRIVATE-LOGIN in
+ *  Tonoman Cloud): submitted, recorded and answered exactly as the Slack dialog does. */
+export async function submitPastedCode(
+  deps: AuthGateDeps,
+  agent: string,
+  conversation: string,
+  owner: string | undefined,
+  speaker: string,
+  code: string,
+): Promise<boolean> {
+  const conn = deps.conn(agent);
+  const ops = deps.ops(agent, owner);
+  if (!conn || !ops) return false;
+  const provider = deps.provider?.(agent) ?? "claude";
+  try {
+    const r = await ops.submitCode(code.trim());
+    if (r.ok) await deps.onLogin?.(agent, speaker, provider).catch(() => {});
+    await deps.setAuthState(agent, r.ok ? "ok" : "error", owner, provider).catch(() => {});
+    await conn
+      .reply(conversation)
+      .send(r.ok ? "✅ Connected. Ask me again and I'll answer." : `⚠️ That code didn't complete the login. ${String(r.status || r.loginTail).replace(/\s+/g, " ").slice(0, 200)}`)
+      .catch(() => {});
+    return r.ok;
+  } catch (e) {
+    await conn.reply(conversation).send(`⚠️ I couldn't submit that code — ${String((e as Error)?.message ?? e).slice(0, 150)}`).catch(() => {});
+    return false;
+  }
 }
 
 /** PURE: what registering a person after a login may say about their sign-in. A login on the
@@ -240,7 +280,7 @@ export async function ask(
     // PRIVATELY: a one-time code is theirs and nobody else's, and a channel keeps it in history and
     // in the workspace export. `postEphemeral` needs a person to address, and Slack refuses it in
     // some conversations — so an ordinary post is the fallback rather than silence.
-    const sentPrivately = audience ? await conn.postEphemeral(conversation, audience, text) : false;
+    const sentPrivately = audience ? ((await conn.postEphemeral?.(conversation, audience, text)) ?? false) : false;
     if (!sentPrivately) await conn.reply(conversation).send(text).catch(() => {});
     // The wait runs on its own: `ask` is called from the ingress loop, which must not block for ten
     // minutes on one person's sign-in.
@@ -248,6 +288,22 @@ export async function ask(
     return true;
   }
 
+  // A channel with no buttons or dialogs (Teams): the link in the person's own chat, and the code
+  // pasted back there — never in a group, where everyone would see it (TEAMS-PRIVATE-LOGIN).
+  if (typeof (conn as { postBlocks?: unknown }).postBlocks !== "function") {
+    const mine = audience && deps.isPrivate ? await deps.isPrivate(agent, conversation, audience).catch(() => false) : false;
+    const account = providerAccountLabel(provider);
+    await conn
+      .reply(conversation)
+      .send(
+        mine
+          ? `${agentLabel} needs to be signed in to ${account} before it can answer. Open this link, sign in, and send me the code it shows you, here:\n${started.url}`
+          : `${agentLabel} needs to be signed in to ${account} before it can answer. Send me a direct message and I'll walk you through it there.`,
+      )
+      .catch(() => {});
+    if (mine) deps.expectCode?.(agent, conversation, user);
+    return true;
+  }
   const { text, blocks } = connectBlocks(agentLabel, started.url, conversation, provider);
   await conn.postBlocks(conversation, text, blocks);
   return true;

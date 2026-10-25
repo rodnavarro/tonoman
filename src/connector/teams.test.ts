@@ -8,7 +8,7 @@ import { promises as fs } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as crypto from "node:crypto";
-import { TeamsConnector, createBotFrameworkJwtValidator, stripMentions, resolveAttachment, sniffExtension, type TeamsActivity } from "./teams";
+import { TeamsConnector, createBotFrameworkJwtValidator, stripMentions, resolveAttachment, sniffExtension, TeamsWebhook, type TeamsActivity } from "./teams";
 import { parseRoster } from "../identity";
 
 /** A recording fake fetch driven by a route table (matched by URL substring). */
@@ -833,5 +833,55 @@ describe("TeamsConnector — email-verified identity (identity-roster)", () => {
     const env = await conn({}, f).normalize(personalActivity());
     expect(calls.some((c) => c.url.includes("/members/"))).toBe(false);
     expect(env?.identity?.verified).toBe(false);
+  });
+});
+
+describe("one webhook for every bot of a worker (TEAMS-ONE-ADDRESS-PER-POOL in Tonoman Cloud)", () => {
+  it("TEAMS-ONE-ADDRESS-PER-POOL a message goes to the bot it was sent to, checked as that bot's; one for a bot not served here is refused", async () => {
+    const port = 39981;
+    const hook = new TeamsWebhook(port);
+    const got: string[] = [];
+    const ac = new AbortController();
+    const fetchOk = (async () => new Response(JSON.stringify({ access_token: "t", expires_in: 3600 }), { status: 200 })) as unknown as typeof fetch;
+    const one = conn({ appId: "bot-one", webhook: hook, fetchImpl: fetchOk });
+    const two = conn({ appId: "bot-two", webhook: hook, fetchImpl: fetchOk, validateToken: async () => false });
+    const drain = async (c: TeamsConnector, tag: string) => {
+      for await (const e of c.receive(ac.signal)) got.push(`${tag}:${e.text}`);
+    };
+    void drain(one, "one");
+    void drain(two, "two");
+    await new Promise((r) => setTimeout(r, 100));
+    const post = (to: string) =>
+      fetch(`http://127.0.0.1:${port}/api/messages`, { method: "POST", headers: { authorization: "Bearer x" }, body: JSON.stringify(personalActivity({ recipient: { id: `28:${to}` }, text: `hi ${to}` })) });
+    try {
+      expect((await post("bot-one")).status).toBe(200);
+      // bot-two's check refuses: nothing reaches it.
+      expect((await post("bot-two")).status).toBe(401);
+      expect((await post("bot-nobody")).status).toBe(404);
+      await new Promise((r) => setTimeout(r, 100));
+      expect(got).toEqual(["one:hi bot-one"]);
+    } finally {
+      ac.abort();
+    }
+  });
+});
+
+describe("people as accounts (TEAMS-PERSON-IS-ACCOUNT, TEAMS-AUDIENCE in Tonoman Cloud)", () => {
+  it("TEAMS-PERSON-IS-ACCOUNT the speaker is their Entra id, with the email Teams gives for them", async () => {
+    const fetchImpl = (async (url: string) =>
+      String(url).includes("/members/")
+        ? new Response(JSON.stringify({ email: "ben@example.com" }), { status: 200 })
+        : new Response(JSON.stringify({ access_token: "t", expires_in: 3600 }), { status: 200 })) as unknown as typeof fetch;
+    const env = await conn({ speakerById: true }, fetchImpl).normalize(personalActivity());
+    expect(env?.user).toBe("aad-rod");
+    expect(env?.identity?.email).toBe("ben@example.com");
+  });
+
+  it("TEAMS-AUDIENCE a one-to-one chat is the speaker; a group chat or a channel is not counted yet, so it reads as unknown", async () => {
+    const c = conn();
+    await c.normalize(personalActivity());
+    await c.normalize(personalActivity({ conversation: { id: "19:group", conversationType: "groupChat", tenantId: "tenant-1" } }));
+    expect(await c.audience("a:1conv", "aad-rod")).toEqual({ kind: "self" });
+    expect((await c.audience("19:group", "aad-rod")).kind).toBe("unknown");
   });
 });

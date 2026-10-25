@@ -12,6 +12,8 @@ export function registryClient(baseUrl: string, token: string, fetchImpl: typeof
    *  that cannot say — unreachable, or older than this route — does not stop a refresh: the refresh
    *  writes only into that brain's own repo and publishes only to people who reach it. */
   brainActive(brainId: string): Promise<boolean>;
+  /** A token for the tenant's own skills repository (SKILL-FROM-YOUR-REPO), for the agent's tenant. */
+  skillRepoToken(agentGuid: string): Promise<string>;
 } {
   const call = async <T>(method: string, pathname: string, body: unknown): Promise<T> => {
     const r = await fetchImpl(`${baseUrl}${pathname}`, {
@@ -24,6 +26,10 @@ export function registryClient(baseUrl: string, token: string, fetchImpl: typeof
   };
   return {
     reach: (agentGuid, slackUserId) => call<Reach>("POST", `/v1/system/agents/${encodeURIComponent(agentGuid)}/brain-reach`, { slackUserId }),
+    skillRepoToken: async (agentGuid: string) =>
+      (await call<{ token: string }>("POST", `/v1/system/agents/${encodeURIComponent(agentGuid)}/skill-repo-token`, {})).token,
+    makeRepo: (brainId) => call<{ repoUrl: string }>("POST", `/v1/system/brains/${encodeURIComponent(brainId)}/make`, {}),
+    homeToken: async (brainId) => (await call<{ token: string }>("POST", `/v1/system/brains/${encodeURIComponent(brainId)}/token`, {})).token,
     recordRepo: async (brainId, repoUrl, repoName) => {
       await call("PUT", `/v1/system/brains/${encodeURIComponent(brainId)}/repo`, { repoUrl, repoName });
     },
