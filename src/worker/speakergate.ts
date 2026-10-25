@@ -9,8 +9,14 @@
  *  config — the open-source runtime on its own roster) knows everyone, as before. */
 export function knowsSpeaker(principals: { kind: string; value: string }[] | undefined, user: string): boolean {
   if (principals === undefined) return true;
-  // A Slack id, or on Teams the person's Entra id (TEAMS-PERSON-IS-ACCOUNT in Tonoman Cloud).
-  return principals.some((p) => (p.kind === "slack_user_id" || p.kind === "teams_user") && p.value === user);
+  return principalOf(principals, user) !== undefined;
+}
+
+/** PURE: the registry's entry for the speaker, if it has one: by their Slack id, or on Teams their
+ *  Entra id (TEAMS-PERSON-IS-ACCOUNT in Tonoman Cloud). The access check and the turn's "who is
+ *  speaking" both read it, so the two cannot disagree about who someone is. */
+export function principalOf<P extends { kind: string; value: string }>(principals: P[] | undefined, user: string): P | undefined {
+  return (principals ?? []).find((p) => (p.kind === "slack_user_id" || p.kind === "teams_user") && p.value === user);
 }
 
 /** PURE: the platform's words to someone the agent does not know. Fixed; no model. With their Slack

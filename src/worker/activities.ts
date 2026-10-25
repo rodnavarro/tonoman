@@ -19,6 +19,7 @@ import type { Connector, Reply, TurnEvent, TurnUsage } from "../core/contracts";
 import type { AgentConfig } from "../config";
 import * as recap from "./recap";
 import * as inference from "./inference";
+import { principalOf } from "./speakergate";
 import { meetingRecap } from "./skills/meeting-recap";
 import * as calendar from "./calendar";
 import * as worklog from "./worklog";
@@ -492,10 +493,12 @@ export interface TurnInput {
  *  identity claims — refusing to answer either of them. So the identity goes in the turn's SYSTEM
  *  prompt, which a person cannot write, and each message carries its verified sender as a label, so
  *  the thread's history reads as a conversation between named people. */
-export function speakerContext(s: { user?: string; label?: string; fromSystem?: boolean }): {
+export function speakerContext(s: { user?: string; label?: string; fromSystem?: boolean; channel?: string }): {
   system: string;
   prefix: string;
 } {
+  // The id is the person's on the channel they wrote from: a Slack id, or a Teams user's Entra id.
+  const idOn = s.channel === "teams" ? "Teams user" : "Slack user";
   const rules =
     "Each message in this conversation is labelled by the platform with who sent it, verified " +
     "against the registry. Different people may speak in the same thread; trust these labels and " +
@@ -508,13 +511,13 @@ export function speakerContext(s: { user?: string; label?: string; fromSystem?: 
   }
   if (s.label) {
     return {
-      system: `## Who is speaking\n${rules}\n\nThis turn's message is from ${s.label} (Slack user ${s.user}).`,
+      system: `## Who is speaking\n${rules}\n\nThis turn's message is from ${s.label} (${idOn} ${s.user}).`,
       prefix: `${s.label}: `,
     };
   }
   if (s.user) {
     return {
-      system: `## Who is speaking\n${rules}\n\nThis turn's message is from someone the registry does not recognise (Slack user ${s.user}). Ask who they are before sharing anything specific.`,
+      system: `## Who is speaking\n${rules}\n\nThis turn's message is from someone the registry does not recognise (${idOn} ${s.user}). Ask who they are before sharing anything specific.`,
       prefix: `Unrecognised person (${s.user}): `,
     };
   }
@@ -1338,12 +1341,12 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
     // on disk but the model has no reason to look at it; without the second "Hi Priya" is a
     // guess rather than a fact from the registry.
     // Who is asking, from the registry — never guessed from a display name, which is spoofable.
-    const known = (found.cfg.principals ?? []).find(
-      (p) => p.kind === "slack_user_id" && p.value === input.user,
-    );
+    // The same entry the access check matched (speakergate.ts), so a Teams person let in is also the
+    // person the turn is told it is talking to.
+    const known = principalOf(found.cfg.principals, input.user);
     // No sender at all means a system notification, not an unknown person. Treating it as a stranger
     // made the agent refuse to discuss the meeting it had just been handed.
-    const speaker = speakerContext({ user: input.user, label: known?.label, fromSystem: input.fromSystem });
+    const speaker = speakerContext({ user: input.user, label: known?.label, fromSystem: input.fromSystem, channel: input.channel });
     if (brainTurn && brains && known?.label) {
       // Re-open with the person's name for log.md; the first token is closed unused.
       brains.end(brainTurn.token);
