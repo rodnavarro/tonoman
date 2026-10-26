@@ -79,6 +79,10 @@ export interface ConnectorOptions {
   // The speaker is who they are, not what they are called: their Entra object id (TEAMS-PERSON-IS-ACCOUNT),
   // with the email Teams gives for them, so the worker can know them as an account.
   speakerById?: boolean;
+  // The agent's commands. Teams has no slash namespace of its own for a bot, so `/new` arrives as
+  // text; one of these is handed on as `!new`, the one internal form, as Slack's connector does
+  // with a registered slash command. Anything else starting with `/` is left as typed.
+  commands?: readonly string[];
 }
 
 /** One HTTP listener for every Teams bot a worker serves: a message is handed to the bot it was sent
@@ -292,7 +296,7 @@ export class TeamsConnector implements Connector {
       // By id where the worker knows people as accounts (TEAMS-PERSON-IS-ACCOUNT); by name elsewhere.
       user: this.o.speakerById ? ref.fromAad || ref.fromId : displayName,
       identity,
-      text: stripMentions(activity.text || ""),
+      text: slashToBang(stripMentions(activity.text || ""), this.o.commands),
       mediaPaths: [],
     };
     for (const att of activity.attachments ?? []) {
@@ -990,6 +994,14 @@ export function stripMentions(s: string): string {
     .replace(/[ \t]+/g, " ")
     .replace(/ *\n */g, "\n")
     .trim();
+}
+
+/** PURE: `/new rest` → `!new rest` when `new` is one of the agent's commands; anything else as is,
+ *  so a message that merely starts with a path (`/etc/hosts is wrong`) still reaches the model. */
+export function slashToBang(text: string, commands: readonly string[] | undefined): string {
+  const m = /^\/([a-z][\w-]*)(\s[\s\S]*)?$/i.exec(text);
+  if (!m || !commands?.includes(m[1].toLowerCase())) return text;
+  return `!${m[1]}${m[2] ?? ""}`;
 }
 
 // --- Bot Framework activity shapes (only the fields we route on) -------------

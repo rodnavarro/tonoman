@@ -8,7 +8,7 @@ import { promises as fs } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as crypto from "node:crypto";
-import { TeamsConnector, createBotFrameworkJwtValidator, stripMentions, resolveAttachment, sniffExtension, TeamsWebhook, type TeamsActivity } from "./teams";
+import { TeamsConnector, createBotFrameworkJwtValidator, stripMentions, slashToBang, resolveAttachment, sniffExtension, TeamsWebhook, type TeamsActivity } from "./teams";
 import { parseRoster } from "../identity";
 
 /** A recording fake fetch driven by a route table (matched by URL substring). */
@@ -963,5 +963,19 @@ describe("stripMentions keeps a multi-line question's lines (as Marshall found)"
   it("drops the mention, collapses spaces, keeps line breaks", () => {
     expect(stripMentions("<at>Teams Test</at> two things:\n1. the invoices\n2.  the  recap")).toBe("two things:\n1. the invoices\n2. the recap");
     expect(stripMentions('<at id="0">Teams Test</at>  hi')).toBe("hi");
+  });
+});
+
+describe("slashToBang", () => {
+  const known = ["new", "status", "help"];
+  it("hands a known /command on as the !command the worker parses, with its argument", () => {
+    expect(slashToBang("/new", known)).toBe("!new");
+    expect(slashToBang("/status full", known)).toBe("!status full");
+  });
+  it("leaves anything else as typed: an unknown word, a path, a plain message, no command list", () => {
+    expect(slashToBang("/shrug", known)).toBe("/shrug");
+    expect(slashToBang("/etc/hosts is wrong", known)).toBe("/etc/hosts is wrong");
+    expect(slashToBang("new chat please", known)).toBe("new chat please");
+    expect(slashToBang("/new", undefined)).toBe("/new");
   });
 });
