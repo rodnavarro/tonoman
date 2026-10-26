@@ -2831,7 +2831,7 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
   // The agent as wired NOW — a reload may have replaced the one a handler was built with.
   const hasAccess = async (name: string, a: Wired, user: string, said?: { email?: string; name?: string }): Promise<boolean> =>
     knowsSpeaker((wired.get(name) ?? a).cfg.principals, user) || (strangerLookup.shouldSay(name, "", user) && (await knowSpeaker(name, user, said)));
-  const noticeFor = (name: string, a: Wired, user: string) => unknownSpeakerNotice(a.cfg.displayName ?? a.cfg.name ?? name, user);
+  const noticeFor = (name: string, a: Wired, user: string) => unknownSpeakerNotice(a.cfg.displayName ?? a.cfg.name ?? name, user, a.cfg.channel ?? (a.cfg.teams ? "teams" : "slack"));
   // The tenant's policies before its agents (POLICY-AGENT-GATE in Tonoman Cloud): only where there is a
   // registry to ask; the open-source runtime on its own roster has no policies.
   const policies = process.env.TONOMANCLOUD_API_URL

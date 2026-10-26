@@ -22,9 +22,11 @@ export function principalOf<P extends { kind: string; value: string }>(principal
 /** PURE: the platform's words to someone the agent does not know. Fixed; no model. With their Slack
  *  id, so the person can hand it to whoever allows them — the id is what an admin needs when Slack
  *  gave no email to know them by (ACCOUNT-NO-EMAIL-NO-GUESS in Tonoman Cloud). */
-export function unknownSpeakerNotice(agentName: string, userId?: string): string {
+export function unknownSpeakerNotice(agentName: string, userId?: string, channel?: string): string {
   const base = `I don't know who you are yet, so I can't help here. Ask an owner or admin of your team to give you access to ${agentName} in Tonoman Cloud`;
-  return userId ? `${base} — your Slack id is ${userId}.` : `${base}.`;
+  // On Teams the id is the person's Microsoft (Entra) id, which is what the admin looks them up by.
+  const idName = channel === "teams" ? "Microsoft id" : "Slack id";
+  return userId ? `${base} — your ${idName} is ${userId}.` : `${base}.`;
 }
 
 /** Says the notice at most once per person and conversation in `windowMs`, so three messages in a
