@@ -28,7 +28,7 @@ import type { McpServerSpec } from "../brains/broker";
 import { CLI_NOTE } from "../brains/cli";
 import { ownName } from "./sentfiles";
 import type { BrainRef, BrainStore } from "../brains/store";
-import { randomMysticVerb } from "../core/mystic";
+import { randomMysticVerb, settledLine } from "../core/mystic";
 import type { CapabilityPlane } from "./capability-plane";
 import { isAuthError } from "../authflow";
 import { authFailureState, notLoggedInNotice, isNotLoggedInError } from "../turnfailure";
@@ -1090,7 +1090,8 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
     if (!found) throw new Error(`worker: no agent "${input.agent}" in the roster`);
     const { conn, run } = found;
 
-    const reply: Reply = conn.reply(input.conversation);
+    // The turn's own answer: the one reply a channel like Teams streams (contracts.ts Connector.reply).
+    const reply: Reply = conn.reply(input.conversation, { stream: true });
     // AN ANNOUNCEMENT OF WHAT A SKILL FILED goes only to a person who may read where it was filed
     // (BRAIN-PRIVATE-CONFIRMATIONS). A run can file through the agent's own grant, so the person it is
     // for is checked here, before the harness runs or anything is shown. Nobody to check — no person
@@ -1309,7 +1310,11 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
      *  of, so a trace of it left on screen is only confusing. */
     const dropLog = (): void => {
       clearInterval(ticker);
-      if (noteId) void reply.note?.(noteId, null).catch(() => {});
+      if (!noteId) return;
+      // Where removing leaves a "message deleted" stub (Teams), the log settles to one past-tense
+      // line instead: quieter than a stub, and nothing about queues for a person to decode.
+      if (reply.keepsNotes) void reply.note?.(noteId, settledLine(verb, Date.now() - started)).catch(() => {});
+      else void reply.note?.(noteId, null).catch(() => {});
     };
 
     // Temporal cancels the scope when a new message arrives. Leave the partial visible and say
@@ -1590,7 +1595,9 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
     // Settle the work log into one line of what the turn actually did, or take it down when
     // there is nothing worth keeping above the answer.
     if (noteId) {
-      const settled = worklog.settledNote(held ? [] : calls, Date.now() - started, verb);
+      // Null means "take it down" (a quick answer from the model alone); where that leaves a stub,
+      // it settles to the bare past-tense line instead.
+      const settled = worklog.settledNote(held ? [] : calls, Date.now() - started, verb) ?? (reply.keepsNotes ? settledLine(verb, Date.now() - started) : null);
       await reply.note?.(noteId, settled).catch(() => {});
     }
 
@@ -1600,7 +1607,8 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
     // is metadata rather than the last paragraph of the answer, and so wanted visible separation.
     // In Slack it reads as detached instead: a stray line floating below the message, far enough
     // away that it stops looking related to it. One blank line is the separation that was wanted.
-    let final = footer ? `${body}\n\n${footer}` : body;
+    // A channel with its own way (Teams: a rule and italics) says so through reply.footer.
+    let final = footer ? (reply.footer ? reply.footer(body, footer) : `${body}\n\n${footer}`) : body;
 
     // WHERE IT GOES, decided now — not at the start: people join channels and lose access mid-turn.
     if (brains && input.user && drawnOn.length) {

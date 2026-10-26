@@ -885,3 +885,83 @@ describe("people as accounts (TEAMS-PERSON-IS-ACCOUNT, TEAMS-AUDIENCE in Tonoman
     expect((await c.audience("19:group", "aad-rod")).kind).toBe("unknown");
   });
 });
+
+describe("TeamsConnector, as the Tonoman Cloud worker drives it (TEAMS-WORKER-SERVES in Tonoman Cloud)", () => {
+  const worker = { streamOnlyWhenAsked: true, notesAsTrace: true, workingCue: "none" as const };
+  const posts = (calls: { url: string; init?: RequestInit }[]) =>
+    calls.filter((x) => x.url.includes("/activities")).map((x) => JSON.parse(x.init!.body as string));
+
+  it("a notice in a 1:1 (a sign-in link, 'Connected') is a plain message: no stream, so no Stop control left behind", async () => {
+    const { f, calls } = makeFetch([TOKEN, ACTIVITIES]);
+    const c = conn(worker, f);
+    await c.normalize(personalActivity());
+    const reply = c.reply("a:1conv");
+    expect(reply.canEdit()).toBe(false);
+    await reply.send("Open this link, sign in, and send me the code it shows you");
+    expect(posts(calls)).toEqual([expect.objectContaining({ type: "message", textFormat: "markdown" })]);
+    expect(JSON.stringify(posts(calls))).not.toContain("streaminfo");
+  });
+
+  it("a turn's own answer still streams in a 1:1, and is closed with its final", async () => {
+    const { f, calls } = makeFetch([TOKEN, ACTIVITIES]);
+    const c = conn(worker, f);
+    await c.normalize(personalActivity());
+    const reply = c.reply("a:1conv", { stream: true });
+    expect(reply.canEdit()).toBe(true);
+    const id = await reply.send("3 drafts");
+    await reply.finalize(id, "3 drafts ready");
+    const p = posts(calls);
+    expect(p[0]).toMatchObject({ type: "typing", entities: [{ streamType: "streaming" }] });
+    expect(p.at(-1)).toMatchObject({ type: "message", entities: [{ streamType: "final" }] });
+  });
+
+  it("the gateway, which never asks, streams as it always has", async () => {
+    const { f } = makeFetch([TOKEN, ACTIVITIES]);
+    const c = conn({}, f);
+    await c.normalize(personalActivity());
+    expect(c.reply("a:1conv").canEdit()).toBe(true);
+  });
+
+  it("the work log is one subtle gray card, a line per step, with the markdown marks taken off", async () => {
+    const { f, calls } = makeFetch([TOKEN, ACTIVITIES]);
+    const c = conn(worker, f);
+    await c.normalize(personalActivity());
+    const reply = c.reply("a:1conv", { stream: true });
+    const id = await reply.note!(undefined, "_…2 earlier steps_\n🔧 Grep `invoices`\n🤖 Cogitating… 12s");
+    await reply.note!(id, "Cogitated for 14 seconds · Grep ×3");
+    const [first, settled] = calls.filter((x) => x.url.includes("/activities")).map((x) => JSON.parse(x.init!.body as string));
+    const lines = (a: { attachments: { content: { body: { inlines: { text: string; isSubtle: boolean }[] }[] } }[] }) =>
+      a.attachments[0]!.content.body.map((b) => b.inlines[0]!.text);
+    expect(lines(first)).toEqual(["…2 earlier steps", "🔧 Grep invoices", "🤖 Cogitating… 12s"]);
+    expect(first.attachments[0].content.body[0].inlines[0].isSubtle).toBe(true);
+    expect(lines(settled)).toEqual(["Cogitated for 14 seconds · Grep ×3"]);
+  });
+
+  it("a note is never removed (that leaves 'This message was deleted'): the reply says so", () => {
+    expect(conn(worker).reply("a:1conv").keepsNotes).toBe(true);
+  });
+
+  it("the usage footer sits under a rule and in italics, apart from the answer", () => {
+    const footer = conn(worker).reply("a:1conv").footer!("Here are the drafts.", "sonnet-5-5 · 17.6k tok · ctx 2%");
+    expect(footer).toBe("Here are the drafts.\n\n---\n\n_sonnet-5-5 · 17.6k tok · ctx 2%_");
+  });
+
+  it("no working card of its own: the bubble only, since the worker's note is the card", async () => {
+    const { f, calls } = makeFetch([TOKEN, ACTIVITIES]);
+    let t = 0;
+    const c = conn({ ...worker, now: () => t }, f);
+    await c.normalize(personalActivity());
+    const reply = c.reply("a:1conv", { stream: true });
+    await reply.working("is running grep");
+    t = 30_000;
+    await reply.working("is running grep");
+    expect(posts(calls).every((a) => a.type === "typing" && !a.attachments)).toBe(true);
+  });
+});
+
+describe("stripMentions keeps a multi-line question's lines (as Marshall found)", () => {
+  it("drops the mention, collapses spaces, keeps line breaks", () => {
+    expect(stripMentions("<at>Teams Test</at> two things:\n1. the invoices\n2.  the  recap")).toBe("two things:\n1. the invoices\n2. the recap");
+    expect(stripMentions('<at id="0">Teams Test</at>  hi')).toBe("hi");
+  });
+});

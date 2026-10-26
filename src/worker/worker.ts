@@ -1006,7 +1006,9 @@ function wireTeams(a: AgentConfig, harnesses: ReturnType<typeof defaultHarnesses
     return null;
   }
   const mediaDir = path.join(process.env.TONOMAN_STATE_ROOT ?? "/root/.tonoman", "media", a.name);
-  const conn = new TeamsConnector({ appId: t.app_id, appPassword: t.app_password, tenantId: t.tenant_id, mediaDir, mediaMount: mediaDir, webhook: teamsWebhook(), speakerById: true });
+  // The turn draws its own work log through note() (the subtle gray card), so the connector draws
+  // none of its own; only a turn's answer streams, so a notice never leaves a Stop control behind.
+  const conn = new TeamsConnector({ appId: t.app_id, appPassword: t.app_password, tenantId: t.tenant_id, mediaDir, mediaMount: mediaDir, webhook: teamsWebhook(), speakerById: true, workingCue: "none", streamOnlyWhenAsked: true, notesAsTrace: true });
   const runner = newRunnerFor(a, harnesses);
   if (!runner) {
     console.error(`worker: skipping ${label} — harness "${a.harness}" cannot run turns`);

@@ -59,7 +59,14 @@ export interface ConnectorOptions {
   serviceHosts?: string[]; // serviceUrl host allow-list; default DEFAULT_SERVICE_HOSTS
   loginBase?: string; // token authority; default https://login.microsoftonline.com
   maxStreamAgeMs?: number; // stop re-emitting streaming updates past this age (stay under Teams' ~2min limit); default 90s
-  workingCue?: "message" | "card"; // liveness-cue style (teams-working-informative); default "message"
+  workingCue?: "message" | "card" | "none"; // liveness-cue style (teams-working-informative); default "message". "none": the typing bubble only, for a caller that draws its own work log through note()
+  // Stream only a reply opened with { stream: true } (a turn's own answer). Anything else is a plain
+  // message, so a notice or a sign-in link never opens a stream nobody closes — Teams shows a Stop
+  // control under an open stream for good. Off by default, so the gateway streams as it always has.
+  streamOnlyWhenAsked?: boolean;
+  // Notes (note()) drawn as the subtle gray status card rather than as plain messages: for a caller
+  // whose work log is its note (the Tonoman Cloud worker).
+  notesAsTrace?: boolean;
   fetchImpl?: typeof fetch; // injectable for tests
   now?: () => number; // injectable clock (ms)
   pickVerb?: () => MysticVerb; // injectable mystic-verb picker (tests); default random
@@ -321,13 +328,15 @@ export class TeamsConnector implements Connector {
     return ref;
   }
 
-  reply(conversation: string): Reply {
+  reply(conversation: string, opts?: { stream?: boolean }): Reply {
     const ref = this.refs.get(conversation);
     return new TeamsReply(this, ref, {
       maxStreamAgeMs: this.o.maxStreamAgeMs ?? DEFAULT_MAX_STREAM_AGE_MS,
       cue: this.o.workingCue ?? "message",
       now: () => this.now(),
       pickVerb: this.o.pickVerb,
+      stream: !this.o.streamOnlyWhenAsked || !!opts?.stream,
+      notesAsTrace: !!this.o.notesAsTrace,
     });
   }
 
@@ -534,13 +543,30 @@ class TeamsReply implements Reply {
   constructor(
     private readonly c: TeamsConnector,
     private readonly ref: ConvRef | undefined,
-    private readonly opts: { maxStreamAgeMs: number; cue: "message" | "card"; now: () => number; pickVerb?: () => MysticVerb },
+    private readonly opts: {
+      maxStreamAgeMs: number;
+      cue: "message" | "card" | "none";
+      now: () => number;
+      pickVerb?: () => MysticVerb;
+      stream?: boolean;
+      notesAsTrace?: boolean;
+    },
   ) {}
 
-  /** Progressive streaming only for personal (1:1) chats (teams-stream-progressive);
-   * a group/channel block-sends (teams-stream-fallback). */
+  /** A note deleted in Teams leaves "This message was deleted" behind (teams-no-delete-tombstone). */
+  readonly keepsNotes = true;
+
+  /** Progressive streaming only for personal (1:1) chats (teams-stream-progressive), and only for a
+   * reply that is a turn's answer (`stream`); a group/channel, or a notice, block-sends
+   * (teams-stream-fallback). */
   canEdit(): boolean {
-    return this.ref?.conversationType === "personal";
+    return this.ref?.conversationType === "personal" && this.opts.stream !== false;
+  }
+
+  /** The usage footer under a rule and in italics: a blank line alone reads as one more paragraph of
+   * the answer (as Marshall found). */
+  footer(answer: string, footer: string): string {
+    return `${answer}\n\n---\n\n_${footer.replace(/^_+|_+$/g, "")}_`;
   }
 
   /** The consumer calls send() in two roles: the FIRST streaming chunk (personal — may CONTINUE
@@ -662,8 +688,10 @@ class TeamsReply implements Reply {
         await this.c.updateActivity(this.ref, id, { type: "message", text: "🗂 Picked up your queued message.", textFormat: "markdown" });
         return "";
       }
-      if (id) { await this.c.updateActivity(this.ref, id, { type: "message", text, textFormat: "markdown" }); return id; }
-      return (await this.c.postActivity(this.ref, { type: "message", text: text ?? "", textFormat: "markdown" })) || "";
+      // The worker's work log is its note: drawn as the subtle gray status card, like the trace.
+      const activity = this.opts.notesAsTrace ? statusActivity(text ?? "") : { type: "message", text: text ?? "", textFormat: "markdown" };
+      if (id) { await this.c.updateActivity(this.ref, id, activity); return id; }
+      return (await this.c.postActivity(this.ref, activity)) || "";
     } catch {
       return id ?? "";
     }
@@ -761,6 +789,8 @@ class TeamsReply implements Reply {
       }
       // fall through: the "message" cue also refreshes its gray status trace (verb/elapsed + last tool)
     }
+    // "none": the caller draws its own work log through note(); the bubble and the keepalive are all.
+    if (this.opts.cue === "none") return;
 
     if (this.opts.cue === "card") {
       // informative streaminfo card — pre-text only (establishes the stream).
@@ -847,13 +877,17 @@ function statusActivity(text: string): Record<string, unknown> {
           type: "AdaptiveCard",
           $schema: "http://adaptivecards.io/schemas/adaptive-card.json",
           version: "1.4",
-          body: [
-            {
+          // One subtle line per line of the trace or work log. A card does not render markdown, so the
+          // work log's own `_…_` and `code` marks are taken off rather than shown.
+          body: text
+            .split("\n")
+            .map((l) => l.replace(/`/g, "").replace(/^_(.*)_$/, "$1").trim())
+            .filter(Boolean)
+            .map((line) => ({
               type: "RichTextBlock",
               spacing: "None",
-              inlines: [{ type: "TextRun", text, italic: true, isSubtle: true, size: "Small" }],
-            },
-          ],
+              inlines: [{ type: "TextRun", text: line, italic: true, isSubtle: true, size: "Small" }],
+            })),
         },
       },
     ],
@@ -947,9 +981,15 @@ function delay(ms: number): Promise<void> {
 function b64urlToBuf(s: string): Buffer {
   return Buffer.from(s.replace(/-/g, "+").replace(/_/g, "/"), "base64");
 }
-/** Strips Teams `<at>Name</at>` mention markup so the agent sees plain text. */
+/** Strips Teams `<at>Name</at>` mention markup so the agent sees plain text. Spaces and tabs left
+ *  behind are collapsed but line breaks are kept: collapsing every whitespace flattened a
+ *  multi-line question into one line (as Marshall found). */
 export function stripMentions(s: string): string {
-  return s.replace(/<at>.*?<\/at>/g, "").replace(/\s+/g, " ").trim();
+  return s
+    .replace(/<at\b[^>]*>[\s\S]*?<\/at>/gi, " ")
+    .replace(/[ \t]+/g, " ")
+    .replace(/ *\n */g, "\n")
+    .trim();
 }
 
 // --- Bot Framework activity shapes (only the fields we route on) -------------
