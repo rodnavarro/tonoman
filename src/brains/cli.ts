@@ -122,6 +122,7 @@ const GROUPS = {
     needs: "meeting-recap",
     commands: {
       file: { route: "tool/meeting-recap/file", args: ["--id", "[--login <label>]", "[--copy <keyword>]", "--recap-file <path> (the recap JSON, written to a file first; or --recap, or on stdin)"], about: "File one recording's recap in the second brain, with its transcript. The recap is JSON: summary, highlights, decisions, followups, participants, and route, meeting and alignment when asked for. It is checked before it is filed; a refusal says what to fix.", stdin: "recap" },
+      skip: { route: "tool/meeting-recap/skip", args: ["--id", "[--login <label>]", "[--copy <keyword>]", "--reason <why it is not a meeting to file>"], about: "Close one recording as not filed, with the reason: no speech, a test press, a few words, not a meeting. Read its transcript first. It is then done and is not asked about again." },
     },
   },
 };
