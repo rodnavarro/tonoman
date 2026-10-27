@@ -22,7 +22,7 @@ import * as inference from "./inference";
 import { meetingRecap } from "./skills/meeting-recap";
 import * as calendar from "./calendar";
 import * as worklog from "./worklog";
-import { decideRoute, FINANCE_REASON, privateReason, THREAD_NOTE, THREAD_NOTE_FAILED, type Audience } from "../brains/delivery";
+import { decideRoute, FINANCE_REASON, FINANCE_THREAD_REASON, privateReason, THREAD_NOTE, THREAD_NOTE_FAILED, type Audience } from "../brains/delivery";
 import type { McpServerSpec } from "../brains/broker";
 import { CLI_NOTE } from "../brains/cli";
 import { ownName } from "./sentfiles";
@@ -1139,6 +1139,10 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
     let staleHistory = false;
     // This turn is about a finance document: whatever it says goes to the sender privately.
     let finance = false;
+    // …and whether one came with THIS message, or only earlier in the thread: both stay private, but
+    // only the first may say "this is about a finance document" (a recap answer in a thread that
+    // once held a receipt is not about one).
+    let financeHere = false;
     if (brains && input.user) {
       prior = await brains.provenance(input.agent, key).catch(() => ["unknown"]);
       audience = await brains.audience(input.agent, input.conversation, input.user).catch((e: Error) => ({ kind: "unknown", why: e.message }) as Audience);
@@ -1163,6 +1167,7 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
       // that question, sent later with no file, is private too.
       if (receipts && (input.mediaPaths ?? []).some(isFinanceDocument)) {
         finance = true;
+        financeHere = true;
         const reach = await brains.reach(input.agent, input.user).catch(() => null);
         if (reach?.has(receipts.brainId)) {
           await brains.remember(input.agent, key, [receipts.brainId]).catch(() => {});
@@ -1614,9 +1619,9 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
       // A finance document never goes to a channel, whoever there can read the finances brain.
       if (audience.kind !== "self" && (finance || decideRoute(audience, drawnOn, readable).to === "private")) {
         // Why it went private, by kind and reason only — never the answer or a brain's content.
-        console.log(`worker: ${input.agent} answer sent privately — ${finance ? "a finance document" : `audience ${audience.kind}`}${"why" in audience ? `: ${audience.why}` : ""}`);
+        console.log(`worker: ${input.agent} answer sent privately — ${finance ? (financeHere ? "a finance document" : "a finance document earlier in the thread") : `audience ${audience.kind}`}${"why" in audience ? `: ${audience.why}` : ""}`);
         const names = drawnOn.map((b) => now?.get(b)).filter((n): n is string => !!n);
-        const sent = await brains.dm(input.agent, input.user, `${finance ? FINANCE_REASON : privateReason(names, audience)}\n\n${final}`).catch(() => false);
+        const sent = await brains.dm(input.agent, input.user, `${finance ? (financeHere ? FINANCE_REASON : FINANCE_THREAD_REASON) : privateReason(names, audience)}\n\n${final}`).catch(() => false);
         const note = sent ? THREAD_NOTE : THREAD_NOTE_FAILED;
         if (!msgId) msgId = await reply.send(note);
         else await reply.finalize(msgId, note);
