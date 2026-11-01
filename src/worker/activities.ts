@@ -1654,18 +1654,18 @@ function guidanceFor(
   const receiptsOn = !!receipts;
   const how =
     provider === "codex"
-      ? (web.search ? "Besides web search, you" : "You") + " have one tool, `tonoman`: pass the command's arguments as a list, e.g. [\"brain\",\"list\"]. Start with [\"--help\"] to see its groups, and [\"brain\",\"--help\"] for a group's commands."
+      ? (web.search ? "Besides web search, you" : "You") + " have one tool, `tonoman`: pass the command's arguments as a list, e.g. [\"context\",\"list\"]. Start with [\"--help\"] to see its groups, and [\"context\",\"--help\"] for a group's commands."
       : CLI_NOTE;
   return [
     how,
     ...webNotes(web),
-    "Brains hold this person's knowledge — their own brain and any shared with them. Nothing else of theirs is on this machine.",
-    "- Start with `tonoman brain list`: each brain, its index.md, and the map Tonoman keeps (topics and their hub pages). Follow those, then search.",
-    "- For what a folder holds, or the newest pages on something, use `tonoman brain pages` with that folder — one call, never guess paths.",
-    "- Read only what the question needs. Name the brain and page each fact came from.",
+    "Context vaults hold this person's knowledge — their own vault and any shared with them. Nothing else of theirs is on this machine.",
+    "- Start with `tonoman context list`: each vault, its index.md, and the map Tonoman keeps (topics and their hub pages). Follow those, then search.",
+    "- For what a folder holds, or the newest pages on something, use `tonoman context pages` with that folder — one call, never guess paths.",
+    "- Read only what the question needs. Name the vault and page each fact came from.",
     "- To remember something: if you do not know what it is or where it belongs, ask — or research it when asked — and never file a guess.",
-    "  Prefer an existing page (read it first and pass its revision); add a new page to the index or its topic's hub. Say which brain and page, and only once the write says it is saved.",
-    "- If a brain is read only, say so. If something was cut or could not be reached, say what you could not look at.",
+    "  Prefer an existing page (read it first and pass its revision); add a new page to the index or its topic's hub. Say which vault and page, and only once the write says it is saved.",
+    "- If a vault is read only, say so. If something was cut or could not be reached, say what you could not look at.",
     ...(receiptsOn ? ["", RECEIPTS_NOTE, receipts?.entities?.length ? `This tenant's legal entities, one of which every receipt names: ${receipts.entities.join(", ")}. If it is not clear which, ask — naming these.` : ""] : []),
     // Each tool the Cloud serves says, in a few lines, how to use it (D-CLOUD-TOOLS).
     ...cloudTools.flatMap((t) => (t.note ? ["", t.note] : [])),
@@ -1679,7 +1679,7 @@ function guidanceFor(
  *  not reach the web goes on believing it unless told otherwise. */
 function webNotes(web: { search: boolean; fetch: boolean }): string[] {
   const out: string[] = [];
-  if (web.search) out.push("You can search the web and open public pages (your web search tool). Use it when asked about something that is not in the brains — a person's public profile, a company, a page someone links. Never say you cannot reach the web.");
+  if (web.search) out.push("You can search the web and open public pages (your web search tool). Use it when asked about something that is not in the vaults — a person's public profile, a company, a page someone links. Never say you cannot reach the web.");
   if (web.fetch) out.push("When your web search cannot open a page (some sites refuse it — LinkedIn among them), open it with `tonoman web fetch --url <address>`: it reads the page from here, the way a browser does. If that is refused too, say so and ask the person for what you need.");
   else if (web.search) out.push("Some sites (LinkedIn among them) refuse your web search; then say so and ask the person for what you need.");
   if (!web.search && !web.fetch) out.push("You have no web access. If asked to look something up online, say so.");
@@ -1691,7 +1691,7 @@ const RECEIPTS_NOTE = [
   "Receipts is on: a receipt, invoice or statement the person sends — a photo or a PDF, even with no words — is filed with `tonoman receipts file`.",
   "Read the date, vendor, gross amount and document type from it; pick the category and the legal entity it belongs to. If any of these is unclear, ask — never guess.",
   "One document with several payments, or a statement whose payments may already have been sent as receipts, is NOT filed until the person says which rows it stands for: ask first, so nothing is counted twice.",
-  "To add a note to a receipt ALREADY filed, or put right what it was for, edit the brain: find its row in the year's ledger with `tonoman brain search`, then `tonoman brain edit` that row — its note only, never its amount, vendor or file. Do not rewrite the ledger with `brain write`: it is too long to read whole.",
+  "To add a note to a receipt ALREADY filed, or put right what it was for, edit the vault: find its row in the year's ledger with `tonoman context search`, then `tonoman context edit` that row — its note only, never its amount, vendor or file. Do not rewrite the ledger with `context write`: it is too long to read whole.",
   "More photos of a payment already filed go with `--extra`. A refund, a zero or a foreign amount is asked about, not filed.",
   "For a business, the note says the expense is ordinary and necessary. Report only what the command returned — never an amount, a path or 'filed' of your own. `tonoman receipts --help` has the details.",
 ].join("\n");
