@@ -250,7 +250,7 @@ describe("the turn's tools and folder", () => {
     await acts.runTurn(turn("T/D1"));
     expect(requests[0].cli?.binDir).toBe("/bin-tonoman");
     expect(requests[0].cwd).toMatch(/tonoman-turn-/);
-    expect(requests[0].prompt).toMatch(/tonoman brain list/);
+    expect(requests[0].prompt).toMatch(/tonoman context list/);
   });
 
   it("BRAIN-GRANT-TIMING if the speaker lost a brain while the turn worked, nothing new from it is sent", async () => {
@@ -450,7 +450,7 @@ const speaksThenWorks = (workMs: number, final = "I'll look at last week's meeti
   async function* (): AsyncIterable<TurnEvent> {
     // Token by token, all inside one edit interval: only the first can be shown as it arrives.
     for (const t of ["I", "'ll look at", " last week's meetings."]) yield { kind: "text", text: t } as TurnEvent;
-    yield { kind: "tool", tool: "Bash", text: "tonoman brain list" } as TurnEvent;
+    yield { kind: "tool", tool: "Bash", text: "tonoman context list" } as TurnEvent;
     await new Promise((r) => setTimeout(r, workMs));
     yield { kind: "done", final } as TurnEvent;
   };
@@ -482,7 +482,7 @@ describe("an agent that says something before it goes to work (conversation.md i
     await acts.runTurn(turn("T/C1/9"));
     const notes = posted.filter((p) => p.op === "note" && p.text).map((p) => p.text!);
     expect(notes.length).toBeGreaterThan(0);
-    expect(notes.join(" ")).not.toMatch(/Bash|tonoman brain/);
+    expect(notes.join(" ")).not.toMatch(/Bash|tonoman context/);
     const first = posted.findIndex((p) => p.op === "finalize" || p.op === "send");
     expect(posted.slice(0, first).filter((p) => p.op === "update")).toEqual([]);
   }, 20_000);
@@ -551,8 +551,8 @@ describe("tonoman in the turn (cli.md in Tonoman Cloud)", () => {
   it("RECEIPT-NOTE-LATER the agent is told that a filed receipt is corrected by editing the brain — search for its row, edit its note — not by a command of Receipts' own", async () => {
     const { acts } = build({ audience: { kind: "self" }, uses: [], answer: "ok", skills: [{ name: "receipts", version: 1, config: { brain: "b-fin" } }] });
     await acts.runTurn(turn("D1"));
-    expect(requests[0]!.prompt).toMatch(/tonoman brain search/);
-    expect(requests[0]!.prompt).toMatch(/tonoman brain edit/);
+    expect(requests[0]!.prompt).toMatch(/tonoman context search/);
+    expect(requests[0]!.prompt).toMatch(/tonoman context edit/);
   });
 
   it("RECEIPT-ONE-OR-MANY the agent is told not to file a document with several payments, or a statement, until the person says which rows it stands for", async () => {

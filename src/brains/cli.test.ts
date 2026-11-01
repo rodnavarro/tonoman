@@ -52,14 +52,17 @@ const tonomanIn = (env: Record<string, string>, input: string | undefined, ...ar
   });
 
 describe("found by asking it", () => {
-  it("CLI-SMALL-CONTEXT `tonoman --help` names the groups; `tonoman brain --help` names its commands and their arguments", async () => {
+  it("CLI-SMALL-CONTEXT `tonoman --help` names the groups; `tonoman context --help` names its commands and their arguments", async () => {
     const { cli } = broker.startTurn({ agentGuid: "echo", slackUserId: "UANA", who: "Ana" });
     const top = await tonoman(cli.env, "--help");
     expect(top.code).toBe(0);
-    expect(top.out).toMatch(/brain/);
-    const brain = await tonoman(cli.env, "brain", "--help");
+    expect(top.out).toMatch(/context/);
+    expect(top.out).not.toMatch(/^\s+brain/m);
+    const brain = await tonoman(cli.env, "context", "--help");
     for (const c of ["list", "pages", "search", "read", "write"]) expect(brain.out).toContain(c);
-    expect(brain.out).toMatch(/--brain/);
+    expect(brain.out).toMatch(/--vault/);
+    // The old words still work, unlisted (D-BRAIN-IS-CONTEXT-VAULT).
+    expect((await tonoman(cli.env, "context", "--help")).out).toMatch(/--vault/);
   });
 
   it("CLI-GRANTED-GROUPS `tonoman receipts` appears only while Receipts is on for the agent", async () => {
@@ -82,32 +85,32 @@ describe("acting as the turn's person", () => {
   it("CLI-ACTS-AS-SPEAKER the same command shows each person their own brains", async () => {
     const a = broker.startTurn({ agentGuid: "echo", slackUserId: "UANA", who: "Ana" });
     const b = broker.startTurn({ agentGuid: "echo", slackUserId: "UBEN", who: "Ben" });
-    expect((await tonoman(a.cli.env, "brain", "list")).out).toContain("Ana's brain");
-    expect((await tonoman(b.cli.env, "brain", "list")).out).not.toContain("Ana's brain");
+    expect((await tonoman(a.cli.env, "context", "list")).out).toContain("Ana's brain");
+    expect((await tonoman(b.cli.env, "context", "list")).out).not.toContain("Ana's brain");
   });
 
   it("CLI-DIES-WITH-TURN after the turn ends, its command is refused", async () => {
     const { token, cli } = broker.startTurn({ agentGuid: "echo", slackUserId: "UANA", who: "Ana" });
-    expect((await tonoman(cli.env, "brain", "list")).code).toBe(0);
+    expect((await tonoman(cli.env, "context", "list")).code).toBe(0);
     broker.endTurn(token);
-    const r = await tonoman(cli.env, "brain", "list");
+    const r = await tonoman(cli.env, "context", "list");
     expect(r.code).not.toBe(0);
     expect(r.out).toMatch(/ended/);
   });
 
   it("CLI-ACTS-AS-SPEAKER writing through the command lands as the person, and reading it back works", async () => {
     const { cli } = broker.startTurn({ agentGuid: "echo", slackUserId: "UANA", who: "Ana" });
-    const w = await tonoman(cli.env, "brain", "write", "--brain", "Ana's brain", "--path", "AI/jev.md", "--note", "Jev", "--content", "# Jev\nTypeSafe's model.");
+    const w = await tonoman(cli.env, "context", "write", "--vault", "Ana's brain", "--path", "AI/jev.md", "--note", "Jev", "--content", "# Jev\nTypeSafe's model.");
     expect(w.code).toBe(0);
-    expect((await tonoman(cli.env, "brain", "read", "--brain", "Ana's brain", "--path", "AI/jev.md")).out).toContain("TypeSafe's model.");
+    expect((await tonoman(cli.env, "context", "read", "--vault", "Ana's brain", "--path", "AI/jev.md")).out).toContain("TypeSafe's model.");
   });
 });
 
 describe("answers that fit", () => {
   it("CLI-OUTPUT-BOUNDED a command answers in a few thousand characters at most and says there is more", async () => {
     const { cli } = broker.startTurn({ agentGuid: "echo", slackUserId: "UANA", who: "Ana" });
-    expect((await tonomanIn(cli.env, "x".repeat(40_000), "brain", "write", "--brain", "Ana's brain", "--path", "big.md", "--note", "big")).code).toBe(0);
-    const r = await tonoman(cli.env, "brain", "read", "--brain", "Ana's brain", "--path", "big.md");
+    expect((await tonomanIn(cli.env, "x".repeat(40_000), "context", "write", "--vault", "Ana's brain", "--path", "big.md", "--note", "big")).code).toBe(0);
+    const r = await tonoman(cli.env, "context", "read", "--vault", "Ana's brain", "--path", "big.md");
     expect(r.out.length).toBeLessThan(9_000);
     expect(r.out).toMatch(/more/i);
   });
@@ -150,7 +153,7 @@ describe("tonoman as Codex's one tool", () => {
     const { mcp: server } = broker.startTurn({ agentGuid: "echo", slackUserId: "UANA", who: "Ana" });
     const replies = await mcp(server, [
       { jsonrpc: "2.0", id: 2, method: "tools/list" },
-      { jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "tonoman", arguments: { args: ["brain", "list"] } } },
+      { jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "tonoman", arguments: { args: ["context", "list"] } } },
     ]);
     const tools = (replies.find((r) => r.id === 2)!.result as { tools: { name: string; description: string }[] }).tools;
     expect(tools.map((t) => t.name)).toEqual(["tonoman"]);
