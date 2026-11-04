@@ -1006,7 +1006,9 @@ function wireTeams(a: AgentConfig, harnesses: ReturnType<typeof defaultHarnesses
     return null;
   }
   const mediaDir = path.join(process.env.TONOMAN_STATE_ROOT ?? "/root/.tonoman", "media", a.name);
-  const conn = new TeamsConnector({ appId: t.app_id, appPassword: t.app_password, tenantId: t.tenant_id, mediaDir, mediaMount: mediaDir, webhook: teamsWebhook(), speakerById: true });
+  // The turn draws its own work log through note() (the subtle gray card), so the connector draws
+  // none of its own; only a turn's answer streams, so a notice never leaves a Stop control behind.
+  const conn = new TeamsConnector({ appId: t.app_id, appPassword: t.app_password, tenantId: t.tenant_id, mediaDir, mediaMount: mediaDir, webhook: teamsWebhook(), speakerById: true, commands: cmds.KNOWN, workingCue: "none", streamOnlyWhenAsked: true, notesAsTrace: true });
   const runner = newRunnerFor(a, harnesses);
   if (!runner) {
     console.error(`worker: skipping ${label} — harness "${a.harness}" cannot run turns`);
@@ -2829,7 +2831,7 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
   // The agent as wired NOW — a reload may have replaced the one a handler was built with.
   const hasAccess = async (name: string, a: Wired, user: string, said?: { email?: string; name?: string }): Promise<boolean> =>
     knowsSpeaker((wired.get(name) ?? a).cfg.principals, user) || (strangerLookup.shouldSay(name, "", user) && (await knowSpeaker(name, user, said)));
-  const noticeFor = (name: string, a: Wired, user: string) => unknownSpeakerNotice(a.cfg.displayName ?? a.cfg.name ?? name, user);
+  const noticeFor = (name: string, a: Wired, user: string) => unknownSpeakerNotice(a.cfg.displayName ?? a.cfg.name ?? name, user, a.cfg.channel ?? (a.cfg.teams ? "teams" : "slack"));
   // The tenant's policies before its agents (POLICY-AGENT-GATE in Tonoman Cloud): only where there is a
   // registry to ask; the open-source runtime on its own roster has no policies.
   const policies = process.env.TONOMANCLOUD_API_URL

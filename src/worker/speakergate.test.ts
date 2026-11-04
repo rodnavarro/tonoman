@@ -1,7 +1,7 @@
 // AGENTACCOUNT-UNKNOWN-NO-TURN (agent-account.md in Tonoman Cloud): the deterministic check made
 // before any inference.
 import { describe, it, expect } from "vitest";
-import { knowsSpeaker, noticeLimiter, unknownSpeakerNotice } from "./speakergate";
+import { knowsSpeaker, noticeLimiter, principalOf, unknownSpeakerNotice } from "./speakergate";
 
 const PEOPLE = [
   { kind: "slack_user_id", value: "U0AAAAAAA1", label: "Priya Raman" },
@@ -26,6 +26,7 @@ describe("who the agent answers", () => {
     expect(unknownSpeakerNotice("Atlas")).toBe("I don't know who you are yet, so I can't help here. Ask an owner or admin of your team to give you access to Atlas in Tonoman Cloud.");
     // ACCOUNT-NO-EMAIL-NO-GUESS: the person is shown their own Slack id, which is what an admin allows.
     expect(unknownSpeakerNotice("Atlas", "U0AAAAAAA9")).toBe("I don't know who you are yet, so I can't help here. Ask an owner or admin of your team to give you access to Atlas in Tonoman Cloud — your Slack id is U0AAAAAAA9.");
+    expect(unknownSpeakerNotice("Atlas", "00000000-0000-0000-0000-000000000001", "teams")).toBe("I don't know who you are yet, so I can't help here. Ask an owner or admin of your team to give you access to Atlas in Tonoman Cloud — your Microsoft id is 00000000-0000-0000-0000-000000000001.");
   });
 
   it("AGENTACCOUNT-UNKNOWN-NO-TURN three messages in a row get one notice; it is said again after ten minutes", () => {
@@ -48,5 +49,20 @@ describe("on Teams (TEAMS-PERSON-IS-ACCOUNT in Tonoman Cloud)", () => {
   it("TEAMS-PERSON-IS-ACCOUNT a person granted access is known by their Entra id on a Teams agent", () => {
     expect(knowsSpeaker([{ kind: "teams_user", value: "aad-ben", label: "Ben" }], "aad-ben")).toBe(true);
     expect(knowsSpeaker([{ kind: "teams_user", value: "aad-ben", label: "Ben" }], "aad-other")).toBe(false);
+  });
+});
+
+describe("principalOf: the one answer to who is speaking", () => {
+  const principals = [
+    { kind: "slack_user_id", value: "U0SLACK", label: "Ana" },
+    { kind: "teams_user", value: "10431e68-a7ac-46b1-8d9e-da2c23a59ea3", label: "Ben" },
+  ];
+  it("finds a Slack person by their Slack id and a Teams person by their Entra id", () => {
+    expect(principalOf(principals, "U0SLACK")?.label).toBe("Ana");
+    expect(principalOf(principals, "10431e68-a7ac-46b1-8d9e-da2c23a59ea3")?.label).toBe("Ben");
+  });
+  it("anyone the access check lets in is someone the turn can name", () => {
+    for (const p of principals) expect(knowsSpeaker(principals, p.value)).toBe(principalOf(principals, p.value) !== undefined);
+    expect(principalOf(principals, "U0NOBODY")).toBeUndefined();
   });
 });

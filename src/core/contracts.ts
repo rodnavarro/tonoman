@@ -184,8 +184,11 @@ export interface Connector {
   name(): string;
   /** start the transport and yield envelopes until `signal` aborts. */
   receive(signal: AbortSignal): AsyncIterable<Envelope>;
-  /** open an outbound handle for streaming a response into a conversation. */
-  reply(conversation: string): Reply;
+  /** open an outbound handle for streaming a response into a conversation. `stream` says this is a
+   * turn's own answer: a channel whose streaming is a special mode (Teams' streaminfo, which shows
+   * a Stop control until the stream is closed) streams only then, and sends anything else (a notice,
+   * a sign-in link) as a plain message. Channels that stream by editing a message ignore it. */
+  reply(conversation: string, opts?: { stream?: boolean }): Reply;
   /** optional: register the channel's command menu (e.g. Telegram setMyCommands) so
    * platform commands like /new are discoverable. Best-effort; channels without a
    * menu concept omit it. */
@@ -232,6 +235,12 @@ export interface Reply {
    * channel whose streaming send opens a special stream (e.g. Teams streaminfo) can keep notices
    * as plain, independently-editable messages. Channels without it: callers fall back to send(). */
   note?(id: string | undefined, text: string | null): Promise<string>;
+  /** optional: true when removing a note costs more than keeping it (Teams leaves a "This message
+   * was deleted" stub). Callers then settle a note to one past-tense line rather than remove it. */
+  keepsNotes?: boolean;
+  /** optional: how this channel sets the usage footer apart from the answer it ends (Teams: a rule
+   * and italics, since a blank line reads as one more paragraph). Default: one blank line. */
+  footer?(answer: string, footer: string): string;
 }
 
 /** Builds a display-only footer appended to the BOTTOM of the finalized reply

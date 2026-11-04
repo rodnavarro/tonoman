@@ -250,7 +250,7 @@ describe("the turn's tools and folder", () => {
     await acts.runTurn(turn("T/D1"));
     expect(requests[0].cli?.binDir).toBe("/bin-tonoman");
     expect(requests[0].cwd).toMatch(/tonoman-turn-/);
-    expect(requests[0].prompt).toMatch(/tonoman brain list/);
+    expect(requests[0].prompt).toMatch(/tonoman vault list/);
   });
 
   it("BRAIN-GRANT-TIMING if the speaker lost a brain while the turn worked, nothing new from it is sent", async () => {
@@ -272,7 +272,7 @@ describe("found in review", () => {
     const { acts } = build({ audience: { kind: "self" }, uses: [], answer: "hi", reachAtStart: { "b-ana": "Ana's brain" } }, store);
     await acts.runTurn(turn("T/D1"));
     expect(claimed).toEqual(["reset:T/D1#UANA"]);
-    expect(requests[0].prompt).toMatch(/conversation was restarted because the person's access to a brain changed/);
+    expect(requests[0].prompt).toMatch(/conversation was restarted because the person's access to a context vault changed/);
   });
 
   it("BRAIN-PRIVATE-DELIVERY a held turn that fails says nothing of what it had read", async () => {
@@ -551,8 +551,8 @@ describe("tonoman in the turn (cli.md in Tonoman Cloud)", () => {
   it("RECEIPT-NOTE-LATER the agent is told that a filed receipt is corrected by editing the brain — search for its row, edit its note — not by a command of Receipts' own", async () => {
     const { acts } = build({ audience: { kind: "self" }, uses: [], answer: "ok", skills: [{ name: "receipts", version: 1, config: { brain: "b-fin" } }] });
     await acts.runTurn(turn("D1"));
-    expect(requests[0]!.prompt).toMatch(/tonoman brain search/);
-    expect(requests[0]!.prompt).toMatch(/tonoman brain edit/);
+    expect(requests[0]!.prompt).toMatch(/tonoman vault search/);
+    expect(requests[0]!.prompt).toMatch(/tonoman vault edit/);
   });
 
   it("RECEIPT-ONE-OR-MANY the agent is told not to file a document with several payments, or a statement, until the person says which rows it stands for", async () => {
