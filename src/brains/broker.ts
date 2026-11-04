@@ -240,13 +240,13 @@ export function createBroker(o: BrokerOptions) {
     const b = reach.brains.find((x) => x.id === t.receipts!.brainId);
     // Turning the Skill on widens nobody's reach (RECEIPT-WHO-MAY-FILE).
     if (!b || (need === "write" && b.mode !== "write")) {
-      return { status: 403, text: `This person cannot ${need === "write" ? "file into" : "read"} the brain Receipts files into. Nothing was ${need === "write" ? "written" : "read"}.` };
+      return { status: 403, text: `This person cannot ${need === "write" ? "file into" : "read"} the vault Receipts files into. Nothing was ${need === "write" ? "written" : "read"}.` };
     }
     if (b.state !== "active" || !b.repoUrl) return { status: 409, text: `${b.name} has not been set up yet.` };
     // "Filed" means on `main`, with nothing else added (RECEIPT-SAME-LAYOUT, BRAIN-AS-IS): a brain on
     // another branch, or one the worker keeps a log and a map in, is not where receipts go.
     if (need === "write" && (!b.asIs || (b.branch ?? "main") !== "main")) {
-      return { status: 409, text: `Not filed. Receipts files only into a brain kept as it is, on main; ${b.name} is not set up that way. Tell the person to check the Receipts settings in the Hub.` };
+      return { status: 409, text: `Not filed. Receipts files only into a vault kept as it is, on main; ${b.name} is not set up that way. Tell the person to check the Receipts settings in the Hub.` };
     }
     return { b };
   }
@@ -358,8 +358,8 @@ export function createBroker(o: BrokerOptions) {
       }
     },
     async list(t, reach) {
-      if (!reach.speaker.member) return { status: 200, text: "This person is not a member of the tenant, so they reach no brains." };
-      if (reach.brains.length === 0) return { status: 200, text: "This person reaches no brains." };
+      if (!reach.speaker.member) return { status: 200, text: "This person is not a member of the tenant, so they reach no context vaults." };
+      if (reach.brains.length === 0) return { status: 200, text: "This person reaches no context vaults." };
       // Every brain named here counts as used, even an empty one: its name and whose it is are
       // things the audience may not be allowed to know.
       await mark(t, reach.brains.map((b) => b.id));
@@ -379,7 +379,7 @@ export function createBroker(o: BrokerOptions) {
 
     async pages(t, reach, body) {
       const b = pickBrain(reach.brains, body.brain);
-      if (!b) return { status: 404, text: `No brain called "${String(body.brain ?? "")}" is within reach.` };
+      if (!b) return { status: 404, text: `No vault called "${String(body.brain ?? "")}" is within reach.` };
       await mark(t, [b.id]);
       if (b.state !== "active" || !b.repoUrl) return { status: 404, text: `${b.name} is empty so far.` };
       await first(t, reach.tenant, b);
@@ -395,7 +395,7 @@ export function createBroker(o: BrokerOptions) {
       const q = typeof body.query === "string" ? body.query : "";
       if (!q.trim()) return { status: 400, text: "query is required" };
       const pool = body.brain ? [pickBrain(reach.brains, body.brain)].filter(Boolean) as Reachable[] : reach.brains;
-      if (body.brain && pool.length === 0) return { status: 404, text: `No brain called "${body.brain}" is within reach.` };
+      if (body.brain && pool.length === 0) return { status: 404, text: `No vault called "${body.brain}" is within reach.` };
       const out: string[] = [];
       const failed: string[] = [];
       const setupFaults: string[] = [];
@@ -435,7 +435,7 @@ export function createBroker(o: BrokerOptions) {
 
     async read(t, reach, body) {
       const b = pickBrain(reach.brains, body.brain);
-      if (!b) return { status: 404, text: `No brain called "${String(body.brain ?? "")}" is within reach.` };
+      if (!b) return { status: 404, text: `No vault called "${String(body.brain ?? "")}" is within reach.` };
       await mark(t, [b.id]);
       if (b.state !== "active" || !b.repoUrl) return { status: 404, text: `${b.name} is empty so far.` };
       await first(t, reach.tenant, b);
@@ -536,7 +536,7 @@ export function createBroker(o: BrokerOptions) {
     // for correcting what it filed.
     async edit(t, reach, body) {
       const b = pickBrain(reach.brains, body.brain);
-      if (!b) return { status: 404, text: `No brain called "${String(body.brain ?? "")}" is within reach.` };
+      if (!b) return { status: 404, text: `No vault called "${String(body.brain ?? "")}" is within reach.` };
       if (b.mode !== "write") {
         await mark(t, [b.id]);
         return { status: 403, text: `${b.name} is read only for this person. Nothing was changed.` };
@@ -594,14 +594,14 @@ export function createBroker(o: BrokerOptions) {
 
     async write(t, reach, body) {
       let b = pickBrain(reach.brains, body.brain);
-      if (!b) return { status: 404, text: `No brain called "${String(body.brain ?? "")}" is within reach.` };
+      if (!b) return { status: 404, text: `No vault called "${String(body.brain ?? "")}" is within reach.` };
       if (b.mode !== "write") {
         const writableBrains = reach.brains.filter((x) => x.mode === "write");
         await mark(t, [b.id, ...writableBrains.map((x) => x.id)]);
         const writable = writableBrains.map((x) => x.name);
         return {
           status: 403,
-          text: `${b.name} is read only for this person.${writable.length ? ` They can write to: ${writable.join(", ")}.` : " They cannot write to any brain."}`,
+          text: `${b.name} is read only for this person.${writable.length ? ` They can write to: ${writable.join(", ")}.` : " They cannot write to any vault."}`,
         };
       }
       const content = typeof body.content === "string" ? body.content : "";
@@ -648,7 +648,7 @@ export function createBroker(o: BrokerOptions) {
     };
     const auth = String(req.headers.authorization ?? "");
     const t = turns.get(auth.startsWith("Bearer ") ? auth.slice(7) : "");
-    if (!t || t.expiresAt < Date.now()) return send(401, "this turn's brain access has ended");
+    if (!t || t.expiresAt < Date.now()) return send(401, "this turn's vault access has ended");
     const url = (req.url ?? "").replace(/\?.*$/, "");
     const name = url.startsWith("/receipts/") ? `receipts.${url.slice("/receipts/".length)}` : url.startsWith("/web/") ? `web.${url.slice("/web/".length)}` : url.replace(/^\/brain\//, "");
     // A tool the Cloud serves: /cloud/<tool>/<command>, carried there as is.
@@ -679,7 +679,7 @@ export function createBroker(o: BrokerOptions) {
         const reach = await o.registry.reach(t.agentGuid, t.slackUserId);
         const r = await h(t, reach, body);
         // The turn may have ended while this call ran: nothing goes back to a finished turn.
-        if (![...turns.values()].includes(t)) return send(401, "this turn's brain access has ended");
+        if (![...turns.values()].includes(t)) return send(401, "this turn's vault access has ended");
         send(r.status, r.text);
       } catch (e) {
         const why = (e as Error).message ?? "";
@@ -769,11 +769,11 @@ export type Broker = ReturnType<typeof createBroker>;
 export const mcpShimSource = String.raw`"use strict";
 const URL_ = process.env.TONOMAN_BRAIN_URL, TOKEN = process.env.TONOMAN_BRAIN_TOKEN;
 const tools = [
-  { name: "brain_list", description: "List the brains this person can reach — whose each is, read or write — with the start of each brain's index.md. Call this first, before searching or writing.", inputSchema: { type: "object", properties: {} } },
-  { name: "brain_pages", description: "List the pages of one brain, or of one folder in it, newest change first, with the day each last changed (at most 40, and how many there are). Use it to find the newest pages on a topic, or what a folder holds, instead of guessing paths.", inputSchema: { type: "object", properties: { brain: { type: "string" }, folder: { type: "string", description: "A folder in the brain, e.g. Research/AI (optional: the whole brain)." } }, required: ["brain"] } },
-  { name: "brain_search", description: "Search the brains for lines containing all the given words (case-insensitive). Optionally limit to one brain by name.", inputSchema: { type: "object", properties: { query: { type: "string" }, brain: { type: "string", description: "A brain's name or id (optional)." } }, required: ["query"] } },
-  { name: "brain_read", description: "Read one page of a brain. Returns its revision: pass that back to brain_write when you edit the page, so someone else's change made meanwhile is merged rather than lost.", inputSchema: { type: "object", properties: { brain: { type: "string" }, path: { type: "string", description: "Relative page path, e.g. AI/typesafe-ai.md" } }, required: ["brain", "path"] } },
-  { name: "brain_write", description: "Create or replace one page of a brain the person can write to, and commit it. To edit an existing page, brain_read it first and pass its revision. Confirms only once it is saved; if it is not saved, say so. Also add the page to the brain's index.md or to the hub page for its topic.", inputSchema: { type: "object", properties: { brain: { type: "string" }, path: { type: "string" }, content: { type: "string", description: "The whole page, in Markdown." }, note: { type: "string", description: "One line for the brain's log: what this is." }, revision: { type: "string", description: "The revision brain_read returned, when editing." } }, required: ["brain", "path", "content", "note"] } },
+  { name: "brain_list", description: "List the context vaults this person can reach — whose each is, read or write — with the start of each vault's index.md. Call this first, before searching or writing.", inputSchema: { type: "object", properties: {} } },
+  { name: "brain_pages", description: "List the pages of one vault, or of one folder in it, newest change first, with the day each last changed (at most 40, and how many there are). Use it to find the newest pages on a topic, or what a folder holds, instead of guessing paths.", inputSchema: { type: "object", properties: { brain: { type: "string" }, folder: { type: "string", description: "A folder in the vault, e.g. Research/AI (optional: the whole vault)." } }, required: ["brain"] } },
+  { name: "brain_search", description: "Search the context vaults for lines containing all the given words (case-insensitive). Optionally limit to one vault by name.", inputSchema: { type: "object", properties: { query: { type: "string" }, brain: { type: "string", description: "A vault's name or id (optional)." } }, required: ["query"] } },
+  { name: "brain_read", description: "Read one page of a vault. Returns its revision: pass that back to brain_write when you edit the page, so someone else's change made meanwhile is merged rather than lost.", inputSchema: { type: "object", properties: { brain: { type: "string" }, path: { type: "string", description: "Relative page path, e.g. AI/typesafe-ai.md" } }, required: ["brain", "path"] } },
+  { name: "brain_write", description: "Create or replace one page of a vault the person can write to, and commit it. To edit an existing page, brain_read it first and pass its revision. Confirms only once it is saved; if it is not saved, say so. Also add the page to the vault's index.md or to the hub page for its topic.", inputSchema: { type: "object", properties: { brain: { type: "string" }, path: { type: "string" }, content: { type: "string", description: "The whole page, in Markdown." }, note: { type: "string", description: "One line for the vault's log: what this is." }, revision: { type: "string", description: "The revision brain_read returned, when editing." } }, required: ["brain", "path", "content", "note"] } },
 ];
 const send = (m) => process.stdout.write(JSON.stringify(m) + "\n");
 async function call(name, args) {
@@ -782,7 +782,7 @@ async function call(name, args) {
     const text = await r.text();
     return { content: [{ type: "text", text }], isError: !r.ok };
   } catch (e) {
-    return { content: [{ type: "text", text: "The brain could not be reached just now." }], isError: true };
+    return { content: [{ type: "text", text: "The vault could not be reached just now." }], isError: true };
   }
 }
 let buf = "";

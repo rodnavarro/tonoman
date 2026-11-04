@@ -9,9 +9,9 @@
 /** What the agent's context says about `tonoman`: one paragraph, however many commands there are
  *  (CLI-SMALL-CONTEXT). */
 export const CLI_NOTE = [
-  "You have one command-line tool, `tonoman`, and no other program. It reaches the brains this person",
+  "You have one command-line tool, `tonoman`, and no other program. It reaches the context vaults this person",
   "can read and write (and, where they are on, Receipts and the tools your organization gives you). Run `tonoman --help` to see its groups and",
-  "`tonoman <group> --help` for each command's arguments. Start with `tonoman brain list`.",
+  "`tonoman <group> --help` for each command's arguments. Start with `tonoman vault list`.",
 ].join("\n");
 
 /** `tonoman` as ONE MCP tool, for a harness that must not have a shell (Codex): the tool takes the
@@ -20,7 +20,7 @@ export const toolShimSource = String.raw`"use strict";
 const { execFile } = require("node:child_process");
 const tool = {
   name: "tonoman",
-  description: "Tonoman's one command. Pass its arguments as a list, e.g. [\"brain\",\"list\"]. Start with [\"--help\"]; [\"<group>\",\"--help\"] lists a group's commands and arguments.",
+  description: "Tonoman's one command. Pass its arguments as a list, e.g. [\"vault\",\"list\"]. Start with [\"--help\"]; [\"<group>\",\"--help\"] lists a group's commands and arguments.",
   inputSchema: { type: "object", properties: { args: { type: "array", items: { type: "string" } } }, required: ["args"] },
 };
 const send = (m) => process.stdout.write(JSON.stringify(m) + "\n");
@@ -73,15 +73,18 @@ const MAX = 6000; // CLI-OUTPUT-BOUNDED
 let LIMIT = MAX;
 
 const GROUPS = {
-  brain: {
-    about: "the brains this person can reach",
+  // "Context vault" is what people and the model read (D-BRAIN-IS-CONTEXT-VAULT in Tonoman Cloud);
+  // the broker's routes keep their old name, which nobody reads. "brain" stays as a hidden alias, so a
+  // turn, a skill or a person that still types it keeps working.
+  vault: {
+    about: "the context vaults this person can reach",
     commands: {
-      list: { route: "brain/list", args: [], about: "List the brains this person can reach, whose each is, read or write, and the start of each index.md. Run this first." },
-      pages: { route: "brain/pages", args: ["--brain", "[--folder]"], about: "A brain's pages, or a folder's, newest change first (at most 40)." },
-      search: { route: "brain/search", args: ["--query", "[--brain]"], about: "Lines containing all the words, across brains or in one." },
-      read: { route: "brain/read", args: ["--brain", "--path"], about: "Read one page; prints its revision, to pass back when you edit it." },
-      edit: { route: "brain/edit", args: ["--brain", "--path", "--find", "--replace | --after", "[--note]"], about: "Change ONE place in a page or any text file, in place: --find the exact words (enough of the line to be found only once), then --replace them or add --after them. Everything else in the file stays as it is. Use this, not write, to correct or add to a long file such as a ledger or a log. Find the exact text first with search or read." },
-      write: { route: "brain/write", args: ["--brain", "--path", "--note", "--content (or the page on stdin)", "[--revision]"], about: "Create or replace one page and commit it. Pass --revision when editing. Also add the page to index.md or its topic's hub." },
+      list: { route: "brain/list", args: [], about: "List the context vaults this person can reach, whose each is, read or write, and the start of each index.md. Run this first." },
+      pages: { route: "brain/pages", args: ["--vault", "[--folder]"], about: "A vault's pages, or a folder's, newest change first (at most 40)." },
+      search: { route: "brain/search", args: ["--query", "[--vault]"], about: "Lines containing all the words, across vaults or in one." },
+      read: { route: "brain/read", args: ["--vault", "--path"], about: "Read one page; prints its revision, to pass back when you edit it." },
+      edit: { route: "brain/edit", args: ["--vault", "--path", "--find", "--replace | --after", "[--note]"], about: "Change ONE place in a page or any text file, in place: --find the exact words (enough of the line to be found only once), then --replace them or add --after them. Everything else in the file stays as it is. Use this, not write, to correct or add to a long file such as a ledger or a log. Find the exact text first with search or read." },
+      write: { route: "brain/write", args: ["--vault", "--path", "--note", "--content (or the page on stdin)", "[--revision]"], about: "Create or replace one page and commit it. Pass --revision when editing. Also add the page to index.md or its topic's hub." },
     },
   },
   receipts: {
@@ -136,12 +139,13 @@ for (const t of CLOUD_TOOLS) {
   for (const [c, x] of Object.entries(t.commands || {})) commands[c] = { route: "cloud/" + t.name + "/" + c, args: x.args || [], about: x.about || "", stdin: x.stdin };
   GROUPS[t.name] = { about: t.about || "", cloud: true, commands };
 }
+GROUPS.brain = { ...GROUPS.vault, hidden: true };
 const available = (g) => !GROUPS[g].needs || (GROUPS[g].needs === "receipts" && RECEIPTS) || (GROUPS[g].needs === "web" && WEB_FETCH) || LOCAL.includes(GROUPS[g].needs);
 
 function help(group) {
   if (!group) {
     const lines = ["tonoman <group> <command> [--arg value …]", ""];
-    for (const [g, d] of Object.entries(GROUPS)) if (available(g)) lines.push("  " + g.padEnd(10) + d.about);
+    for (const [g, d] of Object.entries(GROUPS)) if (available(g) && !d.hidden) lines.push("  " + g.padEnd(10) + d.about);
     if (RUN.length) lines.push("  " + "run".padEnd(10) + "your organization's own tools: " + RUN.map((t) => t.name).join(", "));
     lines.push("", "tonoman <group> --help   the group's commands and their arguments");
     return lines.join("\n");
@@ -193,18 +197,21 @@ async function stdin() {
   if (!spec) fail("No command '" + group + " " + cmd + "'. See tonoman " + group + " --help.", 2);
   if (!URL_ || !TOKEN) fail("tonoman is not connected in this turn.", 4);
   const body = parse(rest);
+  // --vault is the name people and the model read; the broker still takes it as "brain".
+  if (body.vault !== undefined) { body.brain = body.vault; delete body.vault; }
   // A command whose whole answer is the point (a transcript) says how much it may print.
   if (spec.max) LIMIT = spec.max;
   // CLI-INPUT-FROM-A-FILE: what a command reads from standard input may come from a file the agent
   // wrote instead, --<arg>-file <path>: a recap or a page written to a file is passed as it is, and
   // never as JSON inside a shell command (which a harness may refuse to run).
-  const fromKey = spec.stdin || (group === "brain" && cmd === "write" ? "content" : "");
+  const vaultWrite = (group === "vault" || group === "brain") && cmd === "write";
+  const fromKey = spec.stdin || (vaultWrite ? "content" : "");
   if (fromKey && typeof body[fromKey + "File"] === "string") {
     try { body[fromKey] = require("node:fs").readFileSync(body[fromKey + "File"], "utf8"); }
     catch (e) { fail("Could not read " + body[fromKey + "File"] + ": " + e.message, 2); }
     delete body[fromKey + "File"];
   }
-  if (group === "brain" && cmd === "write" && typeof body.content !== "string") body.content = await stdin();
+  if (vaultWrite && typeof body.content !== "string") body.content = await stdin();
   // A Cloud tool's command names the argument it reads from standard input when not given.
   if (spec.stdin && typeof body[spec.stdin] !== "string" && body.remove === undefined) body[spec.stdin] = await stdin();
   let r;
