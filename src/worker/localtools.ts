@@ -353,7 +353,7 @@ export function localTools(deps: LocalToolDeps) {
     const { name, cfg } = agent;
     const v = deps.voice(name);
 
-    if (group === "plaud" || (group === "meeting-recap" && command === "file")) {
+    if (group === "plaud" || (group === "meeting-recap" && (command === "file" || command === "skip"))) {
       const logins = plaudLogins(cfg, v, speaker);
       if (group === "plaud" && command === "logins") {
         return { status: 200, text: logins.length ? logins.map((l) => `${l.label}${l.user || l.own ? " (your own)" : " (shared)"}`).join("\n") : "No Plaud login you may use here. Connect yours with !connect plaud in a DM." };
@@ -382,16 +382,28 @@ export function localTools(deps: LocalToolDeps) {
       }
 
       if (group === "plaud" && command === "transcript") {
-        if (!got.text.trim()) return { status: 200, text: `"${got.rec.title}" has no speech in it. Nothing to recap: do not file it.` };
+        if (!got.text.trim()) return { status: 200, text: `"${got.rec.title}" has no speech in it. Nothing to recap: do not file it; close it with tonoman meeting-recap skip --id ${id} --reason "no speech".` };
         return {
           status: 200,
           text: `Recording ${id}: "${got.rec.title}", started ${iso(got.rec.startTime)}, ${minutes(got.rec.duration)} min.\n\n${got.text}`,
         };
       }
 
-      // meeting-recap file
-      if (!got.text.trim()) return { status: 409, text: "That recording has no speech in it; it is not filed." };
       const copy = typeof body.copy === "string" && body.copy ? body.copy : "meeting-recap";
+
+      // meeting-recap skip: not every recording is a meeting. Declining one is an answer the run can
+      // see — before this, only a filing closed it, so a correct "nothing to file" was nudged and
+      // relaunched, and the person was told the same sentence over and over (RECAP-SKIP-CLOSES-RUN).
+      if (command === "skip") {
+        const reason = String(body.reason ?? "").trim();
+        if (!reason) return { status: 400, text: "Why is it not filed? --reason <why>, for example \"no speech\" or \"a test press, two words\"." };
+        const summary = `Not filed: “${got.rec.title}”, ${reason.slice(0, 300)}`;
+        await deps.closeRun(name, copy, id, summary);
+        return { status: 200, text: `${summary}. It is closed and will not be asked about again. Tell them in one line.` };
+      }
+
+      // meeting-recap file
+      if (!got.text.trim()) return { status: 409, text: "That recording has no speech in it; it is not filed. Close it with tonoman meeting-recap skip." };
       const choices = calendarChoices(cfg, (cfg.skills ?? []).some((t) => (t.instance ?? t.name) === copy) ? copy : undefined);
       const feeds = await deps.feeds(name, cfg, choices);
       const pad = (v?.calendarPadMinutes ?? 30) * 60000;

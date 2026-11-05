@@ -52,7 +52,7 @@ export function recapJobPrompt(j: RecapJob): string {
   return [
     `Run ${j.copy} on a new recording: ${q(j.title)}, ${j.minutes} minute${j.minutes === 1 ? "" : "s"}, recorded ${start}.`,
     "",
-    `1. Read it: \`tonoman plaud transcript --id ${j.id}${login}\`. If it has no speech in it, stop there: file nothing and tell them in one line.`,
+    `1. Read it: \`tonoman plaud transcript --id ${j.id}${login}\`. If it is not a meeting to file (no speech, a test press, a few stray words), stop there: close it with \`tonoman meeting-recap skip --id ${j.id}${login}${copy} --reason "<why, in a few words>"\` and tell them in one line. Without the skip it is asked about again.`,
     `2. See which meeting it was: \`tonoman calendar find --from ${start} --to ${end}${cals}\`.`,
     `3. File the recap, as plain text on standard input (never JSON — the shell refuses braces with quotes): \`tonoman meeting-recap file --id ${j.id}${login}${copy} <<'RECAP'\` then the recap's lines, then a line \`RECAP\`. If it is refused, fix what it says and file it again.`,
     ...rules.map((r) => `   ${r}`),
@@ -64,5 +64,5 @@ export function recapJobPrompt(j: RecapJob): string {
 export function recapNudge(j: Pick<RecapJob, "copy" | "id" | "title" | "login">): string {
   const login = j.login && j.login !== "mine" ? ` --login ${q(j.login)}` : "";
   const copy = j.copy && j.copy !== "meeting-recap" ? ` --copy ${j.copy}` : "";
-  return `The recap of ${q(j.title)} is not filed yet. File it now: \`tonoman meeting-recap file --id ${j.id}${login}${copy} <<'RECAP'\` with the recap as plain text (Summary:, Highlights:, Decisions:, Follow-ups:, Participants:, Meeting: …) and a closing line \`RECAP\` — never JSON — then tell them it is ready — or, if the recording has no speech, say so in one line.`;
+  return `The recap of ${q(j.title)} is not filed yet. File it now: \`tonoman meeting-recap file --id ${j.id}${login}${copy} <<'RECAP'\` with the recap as plain text (Summary:, Highlights:, Decisions:, Follow-ups:, Participants:, Meeting: …) and a closing line \`RECAP\` — never JSON — then tell them it is ready. If it is not a meeting to file (no speech, a test press, a few stray words), close it instead with \`tonoman meeting-recap skip --id ${j.id}${login}${copy} --reason "<why>"\` and say nothing more: they were already told.`;
 }
