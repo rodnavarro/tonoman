@@ -299,3 +299,80 @@ describe("serveWake — POST /api/brain-pushed (BRAIN-BACKGROUND-REFRESH in Tono
     }
   });
 });
+
+// Trying an agent directly (CONVO-TRY-* in Tonoman Cloud's conversation.md).
+import { parseTry } from "./wake";
+
+describe("parseTry", () => {
+  it("CONVO-TRY-AS-A-MEMBER needs the agent, the person speaking and what they say", () => {
+    expect(parseTry({ agent: "g-1", user: "U1", text: "hola" })).toEqual({ ok: true, req: { agent: "g-1", user: "U1", text: "hola" } });
+    expect(parseTry({ user: "U1", text: "x" })).toEqual({ ok: false, error: "agent is required" });
+    expect(parseTry({ agent: "g-1", text: "x" })).toEqual({ ok: false, error: "user is required" });
+    expect(parseTry({ agent: "g-1", user: "U1", text: " " })).toEqual({ ok: false, error: "text is required" });
+  });
+  it("CONVO-TRY-OWN-CONVERSATION continues only a try conversation, never a Slack or Teams one", () => {
+    expect(parseTry({ agent: "g-1", user: "U1", text: "x", conversation: "try/U1/mfx01abc123" })).toMatchObject({ ok: true, req: { conversation: "try/U1/mfx01abc123" } });
+    for (const c of ["T1/C2", "try/U1/../x", "a:b"]) expect(parseTry({ agent: "g-1", user: "U1", text: "x", conversation: c }).ok, c).toBe(false);
+  });
+});
+
+describe("serveWake — POST /api/try", () => {
+  const TOKEN = "t0k";
+  let port = 39880;
+  function boot(over: Partial<WakeDeps> = {}) {
+    const ac = new AbortController();
+    const calls: unknown[] = [];
+    const deps = stubDeps({
+      has: (a: string) => a === "g-1",
+      resolveAgent: (a: string) => (a === "g-1" || a === "acme-atlas" ? "g-1" : undefined),
+      tryTurn: async (...args: unknown[]) => {
+        calls.push(args);
+        return { conversation: "try/U1/abc123", transcript: { answer: "Zoom or Teams?", messages: ["Zoom or Teams?"], notes: [], calls: [{ tool: "Bash", detail: "tonoman site events" }], ms: 900 } };
+      },
+      ...over,
+    });
+    const p = port++;
+    serveWake({ port: p, token: TOKEN, deps }, ac.signal);
+    const post = (body: unknown, auth = TOKEN) =>
+      fetch(`http://127.0.0.1:${p}/api/try`, { method: "POST", headers: { authorization: `Bearer ${auth}`, "content-type": "application/json" }, body: JSON.stringify(body) });
+    return { ac, calls, post, ready: new Promise((r) => setTimeout(r, 50)) };
+  }
+
+  it("CONVO-TRY-ANSWER-COMES-BACK waits for the turn and answers with what it said and did", async () => {
+    const s = boot();
+    await s.ready;
+    try {
+      const res = await s.post({ agent: "acme-atlas", user: "U1", text: "set up the workshop" });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ agent: "g-1", conversation: "try/U1/abc123", answer: "Zoom or Teams?", messages: ["Zoom or Teams?"], notes: [], calls: [{ tool: "Bash", detail: "tonoman site events" }], ms: 900 });
+      expect(s.calls).toEqual([["g-1", "U1", "set up the workshop", undefined]]);
+    } finally {
+      s.ac.abort();
+    }
+  });
+
+  it("refuses without the token, names a bad body, 404s an agent it does not serve, and 500s a failed turn in words", async () => {
+    const s = boot({ tryTurn: async () => { throw new Error("model unavailable"); } });
+    await s.ready;
+    try {
+      expect((await s.post({ agent: "g-1", user: "U1", text: "x" }, "nope")).status).toBe(401);
+      expect(await (await s.post({ agent: "g-1", text: "x" })).json()).toEqual({ error: "user is required" });
+      expect((await s.post({ agent: "other", user: "U1", text: "x" })).status).toBe(404);
+      const failed = await s.post({ agent: "g-1", user: "U1", text: "x" });
+      expect(failed.status).toBe(500);
+      expect((await failed.json()).error).toContain("model unavailable");
+    } finally {
+      s.ac.abort();
+    }
+  });
+
+  it("is not offered by a worker that cannot run one", async () => {
+    const s = boot({ tryTurn: undefined });
+    await s.ready;
+    try {
+      expect((await s.post({ agent: "g-1", user: "U1", text: "x" })).status).toBe(404);
+    } finally {
+      s.ac.abort();
+    }
+  });
+});
