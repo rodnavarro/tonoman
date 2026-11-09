@@ -87,7 +87,7 @@ import { calendarChoices, copyFloor, dueCopies, localTools, localToolsOf, skills
 import { recapJobPrompt, recapNudge } from "../skills/voice/plaud-and-calendar-meetings/prompt";
 import { agendaFacts, describeFacts, localParts, localTimeOn } from "../skills/calendar/agenda-brief/facts";
 import { checkPhase } from "../skills/calendar/agenda-brief/run";
-import { agendaTickWorkflow, conversationWorkflow, dropsPollWorkflow, messageSignal, plaudPollWorkflow, runSkillWorkflow, skillsTickWorkflow, type AgendaTickInput, type DropsPollInput, type Inbound, type PollInput, type SkillsTickInput } from "./workflows";
+import { agendaTickWorkflow, conversationWorkflow, dropsPollWorkflow, messageSignal, plaudPollWorkflow, runSkillWorkflow, skillsTickWorkflow, tryTurnWorkflow, type AgendaTickInput, type DropsPollInput, type Inbound, type PollInput, type SkillsTickInput } from "./workflows";
 import { agendaBrief, parseAgendaTimes } from "./skills/agenda-brief";
 import { ApplicationFailure, WorkflowExecutionAlreadyStartedError } from "@temporalio/common";
 import { planReload } from "./reload";
@@ -3239,6 +3239,17 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
         // learns "reload off" rather than silently believing a poke landed.
         reload: triggerReload,
         dmFor,
+        // A tried turn (CONVO-TRY-*): its own one-shot workflow, awaited, in a try conversation of its
+        // own — a new one each time unless the caller continues one, so a try never lands in a real chat.
+        tryTurn: async (name, user, text, conversation) => {
+          const conv = conversation ?? `try/${user.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 64) || "someone"}/${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+          const transcript = await client.workflow.execute(tryTurnWorkflow, {
+            workflowId: `${name}:try:${conv}:${Date.now().toString(36)}`,
+            taskQueue: o.taskQueue,
+            args: [{ agent: name, conversation: conv, user, text }],
+          });
+          return { conversation: conv, transcript: transcript ?? {} };
+        },
         say: async (name, conversation, text) => {
           await wired.get(name)?.conn.reply(conversation).send(text);
         },

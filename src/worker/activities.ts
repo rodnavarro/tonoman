@@ -16,6 +16,7 @@ import { promises as fs } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { Connector, Reply, TurnEvent, TurnUsage } from "../core/contracts";
+import { captureTurn, type CaptureSink, type TurnTranscript } from "./capture";
 import type { AgentConfig } from "../config";
 import * as recap from "./recap";
 import * as inference from "./inference";
@@ -483,6 +484,9 @@ export interface TurnInput {
   fromSystem?: boolean;
   /** Brains the message draws on — a Skill's filing it announces. Routed like anything read from them. */
   drewOn?: string[];
+  /** A tried turn (CONVO-TRY-NOTHING-POSTED): everything it would post comes back to the caller
+   *  instead of going to a channel. The tools still act. */
+  capture?: boolean;
 }
 
 /** PURE: who is speaking in one turn, said where the model will believe it.
@@ -595,8 +599,14 @@ export function serializer(): <T>(key: string, fn: () => Promise<T>) => Promise<
 export function makeActivities(deps: TurnDeps) {
   const serialize = serializer();
   return {
-    async runTurn(input: TurnInput): Promise<void> {
-      return serialize(`${input.agent}/${input.conversation}`, () => oneTurn(deps, input));
+    /** One turn. A tried turn (`capture`) answers with what it said and did; any other answers nothing. */
+    async runTurn(input: TurnInput): Promise<TurnTranscript | undefined> {
+      return serialize(`${input.agent}/${input.conversation}`, async () => {
+        const sink = input.capture ? captureTurn() : undefined;
+        const started = Date.now();
+        await oneTurn(deps, input, sink);
+        return sink?.transcript(Date.now() - started);
+      });
     },
 
 
@@ -1084,14 +1094,15 @@ export type Activities = ReturnType<typeof makeActivities>;
 
 /** One turn, start to finish. Split out of the activity so the serializer above owns exactly
  *  one thing — when a turn may run — and this owns what a turn IS. */
-async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
+async function oneTurn(deps: TurnDeps, input: TurnInput, sink?: CaptureSink): Promise<void> {
     const ctx = Context.current();
     const found = deps.agent(input.agent);
     if (!found) throw new Error(`worker: no agent "${input.agent}" in the roster`);
     const { conn, run } = found;
 
     // The turn's own answer: the one reply a channel like Teams streams (contracts.ts Connector.reply).
-    const reply: Reply = conn.reply(input.conversation, { stream: true });
+    // A tried turn posts nowhere: its reply keeps what it is given (CONVO-TRY-NOTHING-POSTED).
+    const reply: Reply = sink?.reply ?? conn.reply(input.conversation, { stream: true });
     // AN ANNOUNCEMENT OF WHAT A SKILL FILED goes only to a person who may read where it was filed
     // (BRAIN-PRIVATE-CONFIRMATIONS). A run can file through the agent's own grant, so the person it is
     // for is checked here, before the harness runs or anything is shown. Nobody to check — no person
@@ -1145,7 +1156,11 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
     let finance = false;
     if (brains && input.user) {
       prior = await brains.provenance(input.agent, key).catch(() => ["unknown"]);
-      audience = await brains.audience(input.agent, input.conversation, input.user).catch((e: Error) => ({ kind: "unknown", why: e.message }) as Audience);
+      // A tried turn is between the agent and the person trying it: nobody else is there to hold the
+      // answer from, and nothing may be DMed (CONVO-TRY-NOTHING-POSTED).
+      audience = sink
+        ? { kind: "self" }
+        : await brains.audience(input.agent, input.conversation, input.user).catch((e: Error) => ({ kind: "unknown", why: e.message }) as Audience);
       if (audience.kind === "unknown") console.log(`worker: ${input.agent} could not count who is in ${input.conversation}: ${audience.why}`);
       // A history that drew on a brain this person no longer reaches is not continued: what it holds
       // is no longer theirs to hear (BRAIN-GRANT-TIMING). The turn starts a fresh session instead.
@@ -1222,6 +1237,7 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
     // by events — a turn that greps the second brain for ten seconds emits one event, and a line
     // that does not move is indistinguishable from being stuck.
     const calls: worklog.ToolCall[] = [];
+    if (sink) sink.calls = calls;
     let current: worklog.ToolCall | undefined;
     let noteId = "";
     let noteText = "";
@@ -1584,6 +1600,7 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
     const used = brainTurn && brains ? brains.end(brainTurn.token) : [];
     const drawnOn = [...new Set([...prior, ...used])];
     if (usage) deps.recordUsage?.(input.agent, input.conversation, usage);
+    if (sink) sink.usage = usage;
     // Slack leaves "is thinking…" on screen until it is cleared, so an answered turn that
     // forgets this looks permanently busy.
     await settleCue();

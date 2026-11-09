@@ -716,3 +716,30 @@ describe("a turn that could not sign in is not a lost memory (conversation.md in
   });
 });
 
+
+describe("a tried turn (CONVO-TRY-* in Tonoman Cloud)", () => {
+  it("CONVO-TRY-NOTHING-POSTED the answer, work log and tools come back; nothing reaches the channel or a DM", async () => {
+    // A public channel would have held this answer and DMed it: a try does neither.
+    const { acts } = build({ audience: { kind: "public", name: "general" }, uses: ["b-ana"], answer: "Jev is TypeSafe's first model." });
+    const t = await acts.runTurn({ ...turn("try/UANA/abc123"), capture: true });
+    expect(posted).toEqual([]);
+    expect(dms).toEqual([]);
+    expect(t).toBeDefined();
+    expect(t!.answer).toContain("Jev is TypeSafe's first model.");
+    expect(t!.calls).toEqual([{ tool: "mcp__brain__brain_read", detail: "Ana's brain · AI/jev.md" }]);
+    expect(t!.ms).toBeGreaterThanOrEqual(0);
+  });
+
+  it("CONVO-TRY-SAME-TURN it is the real turn: the same person's session in the try conversation, the model run once", async () => {
+    const { acts } = build({ audience: { kind: "self" }, uses: [], answer: "Hola Ana." });
+    await acts.runTurn({ ...turn("try/UANA/abc123"), capture: true });
+    expect(requests).toHaveLength(1);
+    expect(claimed).toEqual([sessionKeyOf("try/UANA/abc123", "UANA")]);
+  });
+
+  it("an ordinary turn still answers nothing back and posts to its channel", async () => {
+    const { acts } = build({ audience: { kind: "self" }, uses: [], answer: "Hola." });
+    expect(await acts.runTurn(turn("T/D1/1"))).toBeUndefined();
+    expect(inThread().join("\n")).toContain("Hola.");
+  });
+});
