@@ -80,6 +80,14 @@ describe("found by asking it", () => {
     expect((await tonoman(on.cli.env, "--help")).out).toMatch(/receipts/);
   });
 
+  it("RECAP-AS-PLAIN-TEXT `tonoman meeting-recap --help` asks for the recap as plain text, never JSON (the shell refuses braces with quotes)", async () => {
+    const { cli } = broker.startTurn({ agentGuid: "echo", slackUserId: "UANA", who: "Ana", localTools: ["meeting-recap"] });
+    const help = (await tonoman(cli.env, "meeting-recap", "--help")).out;
+    expect(help).toMatch(/plain text/);
+    expect(help).toMatch(/Summary:/);
+    expect(help).not.toMatch(/JSON/);
+  });
+
   it("CLI-ONE-COMMAND an unknown command says so and points to --help", async () => {
     const { cli } = broker.startTurn({ agentGuid: "echo", slackUserId: "UANA", who: "Ana" });
     const r = await tonoman(cli.env, "brian", "list");
