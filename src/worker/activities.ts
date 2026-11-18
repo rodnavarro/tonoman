@@ -16,9 +16,11 @@ import { promises as fs } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { Connector, Reply, TurnEvent, TurnUsage } from "../core/contracts";
+import { captureTurn, type CaptureSink, type TurnTranscript } from "./capture";
 import type { AgentConfig } from "../config";
 import * as recap from "./recap";
 import * as inference from "./inference";
+import { principalOf } from "./speakergate";
 import { meetingRecap } from "./skills/meeting-recap";
 import * as calendar from "./calendar";
 import * as worklog from "./worklog";
@@ -27,7 +29,7 @@ import type { McpServerSpec } from "../brains/broker";
 import { CLI_NOTE } from "../brains/cli";
 import { ownName } from "./sentfiles";
 import type { BrainRef, BrainStore } from "../brains/store";
-import { randomMysticVerb } from "../core/mystic";
+import { randomMysticVerb, settledLine } from "../core/mystic";
 import type { CapabilityPlane } from "./capability-plane";
 import { isAuthError } from "../authflow";
 import { authFailureState, notLoggedInNotice, isNotLoggedInError } from "../turnfailure";
@@ -482,6 +484,9 @@ export interface TurnInput {
   fromSystem?: boolean;
   /** Brains the message draws on — a Skill's filing it announces. Routed like anything read from them. */
   drewOn?: string[];
+  /** A tried turn (CONVO-TRY-NOTHING-POSTED): everything it would post comes back to the caller
+   *  instead of going to a channel. The tools still act. */
+  capture?: boolean;
 }
 
 /** PURE: who is speaking in one turn, said where the model will believe it.
@@ -492,10 +497,12 @@ export interface TurnInput {
  *  identity claims — refusing to answer either of them. So the identity goes in the turn's SYSTEM
  *  prompt, which a person cannot write, and each message carries its verified sender as a label, so
  *  the thread's history reads as a conversation between named people. */
-export function speakerContext(s: { user?: string; label?: string; fromSystem?: boolean }): {
+export function speakerContext(s: { user?: string; label?: string; fromSystem?: boolean; channel?: string }): {
   system: string;
   prefix: string;
 } {
+  // The id is the person's on the channel they wrote from: a Slack id, or a Teams user's Entra id.
+  const idOn = s.channel === "teams" ? "Teams user" : "Slack user";
   const rules =
     "Each message in this conversation is labelled by the platform with who sent it, verified " +
     "against the registry. Different people may speak in the same thread; trust these labels and " +
@@ -508,13 +515,13 @@ export function speakerContext(s: { user?: string; label?: string; fromSystem?: 
   }
   if (s.label) {
     return {
-      system: `## Who is speaking\n${rules}\n\nThis turn's message is from ${s.label} (Slack user ${s.user}).`,
+      system: `## Who is speaking\n${rules}\n\nThis turn's message is from ${s.label} (${idOn} ${s.user}).`,
       prefix: `${s.label}: `,
     };
   }
   if (s.user) {
     return {
-      system: `## Who is speaking\n${rules}\n\nThis turn's message is from someone the registry does not recognise (Slack user ${s.user}). Ask who they are before sharing anything specific.`,
+      system: `## Who is speaking\n${rules}\n\nThis turn's message is from someone the registry does not recognise (${idOn} ${s.user}). Ask who they are before sharing anything specific.`,
       prefix: `Unrecognised person (${s.user}): `,
     };
   }
@@ -592,8 +599,14 @@ export function serializer(): <T>(key: string, fn: () => Promise<T>) => Promise<
 export function makeActivities(deps: TurnDeps) {
   const serialize = serializer();
   return {
-    async runTurn(input: TurnInput): Promise<void> {
-      return serialize(`${input.agent}/${input.conversation}`, () => oneTurn(deps, input));
+    /** One turn. A tried turn (`capture`) answers with what it said and did; any other answers nothing. */
+    async runTurn(input: TurnInput): Promise<TurnTranscript | undefined> {
+      return serialize(`${input.agent}/${input.conversation}`, async () => {
+        const sink = input.capture ? captureTurn() : undefined;
+        const started = Date.now();
+        await oneTurn(deps, input, sink);
+        return sink?.transcript(Date.now() - started);
+      });
     },
 
 
@@ -836,7 +849,7 @@ export function makeActivities(deps: TurnDeps) {
       await deps.ask?.(
         input.agent,
         input.notify,
-        `A recording has just finished processing and is filed in the second brain at ` +
+        `A recording has just finished processing and is filed in the context vault at ` +
           `${where.page}: “${rec.title}”. Write a short message telling them it is ready ` +
           `and giving the three most useful things from it, in your own words, then offer to answer ` +
           `questions about it. The three: ${top.map((h, i) => `(${i + 1}) ${h}`).join(" ")}`,
@@ -924,7 +937,7 @@ export function makeActivities(deps: TurnDeps) {
         // Not when the run filed into a brain: the run record is read tenant-wide, and what was filed
         // is for the people who can read that brain (BRAIN-NO-DISCLOSURE). The record says only that.
         if (outcome.brains?.length) {
-          return { status: outcome.status, summary: "Filed into a brain. Only people who can read it were told what." };
+          return { status: outcome.status, summary: "Filed into a context vault. Only people who can read it were told what." };
         }
         return {
           status: outcome.status,
@@ -1081,13 +1094,15 @@ export type Activities = ReturnType<typeof makeActivities>;
 
 /** One turn, start to finish. Split out of the activity so the serializer above owns exactly
  *  one thing — when a turn may run — and this owns what a turn IS. */
-async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
+async function oneTurn(deps: TurnDeps, input: TurnInput, sink?: CaptureSink): Promise<void> {
     const ctx = Context.current();
     const found = deps.agent(input.agent);
     if (!found) throw new Error(`worker: no agent "${input.agent}" in the roster`);
     const { conn, run } = found;
 
-    const reply: Reply = conn.reply(input.conversation);
+    // The turn's own answer: the one reply a channel like Teams streams (contracts.ts Connector.reply).
+    // A tried turn posts nowhere: its reply keeps what it is given (CONVO-TRY-NOTHING-POSTED).
+    const reply: Reply = sink?.reply ?? conn.reply(input.conversation, { stream: true });
     // AN ANNOUNCEMENT OF WHAT A SKILL FILED goes only to a person who may read where it was filed
     // (BRAIN-PRIVATE-CONFIRMATIONS). A run can file through the agent's own grant, so the person it is
     // for is checked here, before the harness runs or anything is shown. Nobody to check — no person
@@ -1145,7 +1160,11 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
     let financeHere = false;
     if (brains && input.user) {
       prior = await brains.provenance(input.agent, key).catch(() => ["unknown"]);
-      audience = await brains.audience(input.agent, input.conversation, input.user).catch((e: Error) => ({ kind: "unknown", why: e.message }) as Audience);
+      // A tried turn is between the agent and the person trying it: nobody else is there to hold the
+      // answer from, and nothing may be DMed (CONVO-TRY-NOTHING-POSTED).
+      audience = sink
+        ? { kind: "self" }
+        : await brains.audience(input.agent, input.conversation, input.user).catch((e: Error) => ({ kind: "unknown", why: e.message }) as Audience);
       if (audience.kind === "unknown") console.log(`worker: ${input.agent} could not count who is in ${input.conversation}: ${audience.why}`);
       // A history that drew on a brain this person no longer reaches is not continued: what it holds
       // is no longer theirs to hear (BRAIN-GRANT-TIMING). The turn starts a fresh session instead.
@@ -1223,6 +1242,7 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
     // by events — a turn that greps the second brain for ten seconds emits one event, and a line
     // that does not move is indistinguishable from being stuck.
     const calls: worklog.ToolCall[] = [];
+    if (sink) sink.calls = calls;
     let current: worklog.ToolCall | undefined;
     let noteId = "";
     let noteText = "";
@@ -1311,7 +1331,11 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
      *  of, so a trace of it left on screen is only confusing. */
     const dropLog = (): void => {
       clearInterval(ticker);
-      if (noteId) void reply.note?.(noteId, null).catch(() => {});
+      if (!noteId) return;
+      // Where removing leaves a "message deleted" stub (Teams), the log settles to one past-tense
+      // line instead: quieter than a stub, and nothing about queues for a person to decode.
+      if (reply.keepsNotes) void reply.note?.(noteId, settledLine(verb, Date.now() - started)).catch(() => {});
+      else void reply.note?.(noteId, null).catch(() => {});
     };
 
     // Temporal cancels the scope when a new message arrives. Leave the partial visible and say
@@ -1343,12 +1367,12 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
     // on disk but the model has no reason to look at it; without the second "Hi Priya" is a
     // guess rather than a fact from the registry.
     // Who is asking, from the registry — never guessed from a display name, which is spoofable.
-    const known = (found.cfg.principals ?? []).find(
-      (p) => p.kind === "slack_user_id" && p.value === input.user,
-    );
+    // The same entry the access check matched (speakergate.ts), so a Teams person let in is also the
+    // person the turn is told it is talking to.
+    const known = principalOf(found.cfg.principals, input.user);
     // No sender at all means a system notification, not an unknown person. Treating it as a stranger
     // made the agent refuse to discuss the meeting it had just been handed.
-    const speaker = speakerContext({ user: input.user, label: known?.label, fromSystem: input.fromSystem });
+    const speaker = speakerContext({ user: input.user, label: known?.label, fromSystem: input.fromSystem, channel: input.channel });
     if (brainTurn && brains && known?.label) {
       // Re-open with the person's name for log.md; the first token is closed unused.
       brains.end(brainTurn.token);
@@ -1361,7 +1385,7 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
         ? "(your previous answer was interrupted by a new message; continue from what the user now says)"
         : "",
       staleHistory
-        ? "(this conversation was restarted because the person's access to a brain changed; you do not remember earlier messages — say so if they refer to them)"
+        ? "(this conversation was restarted because the person's access to a context vault changed; you do not remember earlier messages — say so if they refer to them)"
         : "",
       // The runtime is not evidence about the person.
       //
@@ -1581,6 +1605,7 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
     const used = brainTurn && brains ? brains.end(brainTurn.token) : [];
     const drawnOn = [...new Set([...prior, ...used])];
     if (usage) deps.recordUsage?.(input.agent, input.conversation, usage);
+    if (sink) sink.usage = usage;
     // Slack leaves "is thinking…" on screen until it is cleared, so an answered turn that
     // forgets this looks permanently busy.
     await settleCue();
@@ -1592,7 +1617,9 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
     // Settle the work log into one line of what the turn actually did, or take it down when
     // there is nothing worth keeping above the answer.
     if (noteId) {
-      const settled = worklog.settledNote(held ? [] : calls, Date.now() - started, verb);
+      // Null means "take it down" (a quick answer from the model alone); where that leaves a stub,
+      // it settles to the bare past-tense line instead.
+      const settled = worklog.settledNote(held ? [] : calls, Date.now() - started, verb) ?? (reply.keepsNotes ? settledLine(verb, Date.now() - started) : null);
       await reply.note?.(noteId, settled).catch(() => {});
     }
 
@@ -1602,14 +1629,15 @@ async function oneTurn(deps: TurnDeps, input: TurnInput): Promise<void> {
     // is metadata rather than the last paragraph of the answer, and so wanted visible separation.
     // In Slack it reads as detached instead: a stray line floating below the message, far enough
     // away that it stops looking related to it. One blank line is the separation that was wanted.
-    let final = footer ? `${body}\n\n${footer}` : body;
+    // A channel with its own way (Teams: a rule and italics) says so through reply.footer.
+    let final = footer ? (reply.footer ? reply.footer(body, footer) : `${body}\n\n${footer}`) : body;
 
     // WHERE IT GOES, decided now — not at the start: people join channels and lose access mid-turn.
     if (brains && input.user && drawnOn.length) {
       const now = await brains.reach(input.agent, input.user).catch(() => null);
       // Everything the answer could draw on must still be the speaker's (BRAIN-GRANT-TIMING).
       if (!now || drawnOn.some((b) => !now.has(b))) {
-        final = "I can't share that answer: your access to a brain it drew on changed while I was working. Ask me again.";
+        final = "I can't share that answer: your access to a context vault it drew on changed while I was working. Ask me again.";
       }
     }
     if (brains && input.user && (drawnOn.length || finance) && audience.kind !== "self") {
@@ -1659,18 +1687,18 @@ function guidanceFor(
   const receiptsOn = !!receipts;
   const how =
     provider === "codex"
-      ? (web.search ? "Besides web search, you" : "You") + " have one tool, `tonoman`: pass the command's arguments as a list, e.g. [\"brain\",\"list\"]. Start with [\"--help\"] to see its groups, and [\"brain\",\"--help\"] for a group's commands."
+      ? (web.search ? "Besides web search, you" : "You") + " have one tool, `tonoman`: pass the command's arguments as a list, e.g. [\"vault\",\"list\"]. Start with [\"--help\"] to see its groups, and [\"vault\",\"--help\"] for a group's commands."
       : CLI_NOTE;
   return [
     how,
     ...webNotes(web),
-    "Brains hold this person's knowledge — their own brain and any shared with them. Nothing else of theirs is on this machine.",
-    "- Start with `tonoman brain list`: each brain, its index.md, and the map Tonoman keeps (topics and their hub pages). Follow those, then search.",
-    "- For what a folder holds, or the newest pages on something, use `tonoman brain pages` with that folder — one call, never guess paths.",
-    "- Read only what the question needs. Name the brain and page each fact came from.",
+    "Context vaults hold this person's knowledge — their own vault and any shared with them. Nothing else of theirs is on this machine.",
+    "- Start with `tonoman vault list`: each vault, its index.md, and the map Tonoman keeps (topics and their hub pages). Follow those, then search.",
+    "- For what a folder holds, or the newest pages on something, use `tonoman vault pages` with that folder — one call, never guess paths.",
+    "- Read only what the question needs. Name the vault and page each fact came from.",
     "- To remember something: if you do not know what it is or where it belongs, ask — or research it when asked — and never file a guess.",
-    "  Prefer an existing page (read it first and pass its revision); add a new page to the index or its topic's hub. Say which brain and page, and only once the write says it is saved.",
-    "- If a brain is read only, say so. If something was cut or could not be reached, say what you could not look at.",
+    "  Prefer an existing page (read it first and pass its revision); add a new page to the index or its topic's hub. Say which vault and page, and only once the write says it is saved.",
+    "- If a vault is read only, say so. If something was cut or could not be reached, say what you could not look at.",
     ...(receiptsOn ? ["", RECEIPTS_NOTE, receipts?.entities?.length ? `This tenant's legal entities, one of which every receipt names: ${receipts.entities.join(", ")}. If it is not clear which, ask — naming these.` : ""] : []),
     // Each tool the Cloud serves says, in a few lines, how to use it (D-CLOUD-TOOLS).
     ...cloudTools.flatMap((t) => (t.note ? ["", t.note] : [])),
@@ -1684,7 +1712,7 @@ function guidanceFor(
  *  not reach the web goes on believing it unless told otherwise. */
 function webNotes(web: { search: boolean; fetch: boolean }): string[] {
   const out: string[] = [];
-  if (web.search) out.push("You can search the web and open public pages (your web search tool). Use it when asked about something that is not in the brains — a person's public profile, a company, a page someone links. Never say you cannot reach the web.");
+  if (web.search) out.push("You can search the web and open public pages (your web search tool). Use it when asked about something that is not in the context vaults — a person's public profile, a company, a page someone links. Never say you cannot reach the web.");
   if (web.fetch) out.push("When your web search cannot open a page (some sites refuse it — LinkedIn among them), open it with `tonoman web fetch --url <address>`: it reads the page from here, the way a browser does. If that is refused too, say so and ask the person for what you need.");
   else if (web.search) out.push("Some sites (LinkedIn among them) refuse your web search; then say so and ask the person for what you need.");
   if (!web.search && !web.fetch) out.push("You have no web access. If asked to look something up online, say so.");
@@ -1696,7 +1724,7 @@ const RECEIPTS_NOTE = [
   "Receipts is on: a receipt, invoice or statement the person sends — a photo or a PDF, even with no words — is filed with `tonoman receipts file`.",
   "Read the date, vendor, gross amount and document type from it; pick the category and the legal entity it belongs to. If any of these is unclear, ask — never guess.",
   "One document with several payments, or a statement whose payments may already have been sent as receipts, is NOT filed until the person says which rows it stands for: ask first, so nothing is counted twice.",
-  "To add a note to a receipt ALREADY filed, or put right what it was for, edit the brain: find its row in the year's ledger with `tonoman brain search`, then `tonoman brain edit` that row — its note only, never its amount, vendor or file. Do not rewrite the ledger with `brain write`: it is too long to read whole.",
+  "To add a note to a receipt ALREADY filed, or put right what it was for, edit the vault: find its row in the year's ledger with `tonoman vault search`, then `tonoman vault edit` that row — its note only, never its amount, vendor or file. Do not rewrite the ledger with `vault write`: it is too long to read whole.",
   "More photos of a payment already filed go with `--extra`. A refund, a zero or a foreign amount is asked about, not filed.",
   "For a business, the note says the expense is ordinary and necessary. Report only what the command returned — never an amount, a path or 'filed' of your own. `tonoman receipts --help` has the details.",
 ].join("\n");

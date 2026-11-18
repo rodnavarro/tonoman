@@ -250,7 +250,7 @@ describe("the turn's tools and folder", () => {
     await acts.runTurn(turn("T/D1"));
     expect(requests[0].cli?.binDir).toBe("/bin-tonoman");
     expect(requests[0].cwd).toMatch(/tonoman-turn-/);
-    expect(requests[0].prompt).toMatch(/tonoman brain list/);
+    expect(requests[0].prompt).toMatch(/tonoman vault list/);
   });
 
   it("BRAIN-GRANT-TIMING if the speaker lost a brain while the turn worked, nothing new from it is sent", async () => {
@@ -272,7 +272,7 @@ describe("found in review", () => {
     const { acts } = build({ audience: { kind: "self" }, uses: [], answer: "hi", reachAtStart: { "b-ana": "Ana's brain" } }, store);
     await acts.runTurn(turn("T/D1"));
     expect(claimed).toEqual(["reset:T/D1#UANA"]);
-    expect(requests[0].prompt).toMatch(/conversation was restarted because the person's access to a brain changed/);
+    expect(requests[0].prompt).toMatch(/conversation was restarted because the person's access to a context vault changed/);
   });
 
   it("BRAIN-PRIVATE-DELIVERY a held turn that fails says nothing of what it had read", async () => {
@@ -551,8 +551,8 @@ describe("tonoman in the turn (cli.md in Tonoman Cloud)", () => {
   it("RECEIPT-NOTE-LATER the agent is told that a filed receipt is corrected by editing the brain — search for its row, edit its note — not by a command of Receipts' own", async () => {
     const { acts } = build({ audience: { kind: "self" }, uses: [], answer: "ok", skills: [{ name: "receipts", version: 1, config: { brain: "b-fin" } }] });
     await acts.runTurn(turn("D1"));
-    expect(requests[0]!.prompt).toMatch(/tonoman brain search/);
-    expect(requests[0]!.prompt).toMatch(/tonoman brain edit/);
+    expect(requests[0]!.prompt).toMatch(/tonoman vault search/);
+    expect(requests[0]!.prompt).toMatch(/tonoman vault edit/);
   });
 
   it("RECEIPT-ONE-OR-MANY the agent is told not to file a document with several payments, or a statement, until the person says which rows it stands for", async () => {
@@ -716,3 +716,30 @@ describe("a turn that could not sign in is not a lost memory (conversation.md in
   });
 });
 
+
+describe("a tried turn (CONVO-TRY-* in Tonoman Cloud)", () => {
+  it("CONVO-TRY-NOTHING-POSTED the answer, work log and tools come back; nothing reaches the channel or a DM", async () => {
+    // A public channel would have held this answer and DMed it: a try does neither.
+    const { acts } = build({ audience: { kind: "public", name: "general" }, uses: ["b-ana"], answer: "Jev is TypeSafe's first model." });
+    const t = await acts.runTurn({ ...turn("try/UANA/abc123"), capture: true });
+    expect(posted).toEqual([]);
+    expect(dms).toEqual([]);
+    expect(t).toBeDefined();
+    expect(t!.answer).toContain("Jev is TypeSafe's first model.");
+    expect(t!.calls).toEqual([{ tool: "mcp__brain__brain_read", detail: "Ana's brain · AI/jev.md" }]);
+    expect(t!.ms).toBeGreaterThanOrEqual(0);
+  });
+
+  it("CONVO-TRY-SAME-TURN it is the real turn: the same person's session in the try conversation, the model run once", async () => {
+    const { acts } = build({ audience: { kind: "self" }, uses: [], answer: "Hola Ana." });
+    await acts.runTurn({ ...turn("try/UANA/abc123"), capture: true });
+    expect(requests).toHaveLength(1);
+    expect(claimed).toEqual([sessionKeyOf("try/UANA/abc123", "UANA")]);
+  });
+
+  it("an ordinary turn still answers nothing back and posts to its channel", async () => {
+    const { acts } = build({ audience: { kind: "self" }, uses: [], answer: "Hola." });
+    expect(await acts.runTurn(turn("T/D1/1"))).toBeUndefined();
+    expect(inThread().join("\n")).toContain("Hola.");
+  });
+});

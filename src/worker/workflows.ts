@@ -693,3 +693,19 @@ export async function agendaTickWorkflow(input: AgendaTickInput): Promise<void> 
 /** The old name of `runSkillWorkflow`: a run started before the rename (D-TALENT-IS-SKILL) resumes
  *  under the type it was started with. Drop once no such run is open. */
 export const runTalentWorkflow = runSkillWorkflow;
+
+/** What a tried turn needs (CONVO-TRY-*): one turn, run like any other, whose result is what it said
+ *  and did instead of anything posted. */
+export interface TryTurnInput {
+  agent: string;
+  conversation: string;
+  user: string;
+  text: string;
+}
+
+/** One tried turn. Not the conversation workflow: nothing here is posted, so there is no channel to
+ *  order messages in, and the caller is waiting for this one answer. The try conversation's history
+ *  still carries over, because the session is keyed by its conversation and person like any other. */
+export async function tryTurnWorkflow(input: TryTurnInput) {
+  return await runTurn({ agent: input.agent, conversation: input.conversation, channel: "try", text: input.text, user: input.user, capture: true });
+}

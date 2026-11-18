@@ -9,16 +9,24 @@
  *  config — the open-source runtime on its own roster) knows everyone, as before. */
 export function knowsSpeaker(principals: { kind: string; value: string }[] | undefined, user: string): boolean {
   if (principals === undefined) return true;
-  // A Slack id, or on Teams the person's Entra id (TEAMS-PERSON-IS-ACCOUNT in Tonoman Cloud).
-  return principals.some((p) => (p.kind === "slack_user_id" || p.kind === "teams_user") && p.value === user);
+  return principalOf(principals, user) !== undefined;
+}
+
+/** PURE: the registry's entry for the speaker, if it has one: by their Slack id, or on Teams their
+ *  Entra id (TEAMS-PERSON-IS-ACCOUNT in Tonoman Cloud). The access check and the turn's "who is
+ *  speaking" both read it, so the two cannot disagree about who someone is. */
+export function principalOf<P extends { kind: string; value: string }>(principals: P[] | undefined, user: string): P | undefined {
+  return (principals ?? []).find((p) => (p.kind === "slack_user_id" || p.kind === "teams_user") && p.value === user);
 }
 
 /** PURE: the platform's words to someone the agent does not know. Fixed; no model. With their Slack
  *  id, so the person can hand it to whoever allows them — the id is what an admin needs when Slack
  *  gave no email to know them by (ACCOUNT-NO-EMAIL-NO-GUESS in Tonoman Cloud). */
-export function unknownSpeakerNotice(agentName: string, userId?: string): string {
+export function unknownSpeakerNotice(agentName: string, userId?: string, channel?: string): string {
   const base = `I don't know who you are yet, so I can't help here. Ask an owner or admin of your team to give you access to ${agentName} in Tonoman Cloud`;
-  return userId ? `${base} — your Slack id is ${userId}.` : `${base}.`;
+  // On Teams the id is the person's Microsoft (Entra) id, which is what the admin looks them up by.
+  const idName = channel === "teams" ? "Microsoft id" : "Slack id";
+  return userId ? `${base} — your ${idName} is ${userId}.` : `${base}.`;
 }
 
 /** Says the notice at most once per person and conversation in `windowMs`, so three messages in a

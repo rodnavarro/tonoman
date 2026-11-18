@@ -87,7 +87,7 @@ import { calendarChoices, copyFloor, dueCopies, localTools, localToolsOf, skills
 import { recapJobPrompt, recapNudge } from "../skills/voice/plaud-and-calendar-meetings/prompt";
 import { agendaFacts, describeFacts, localParts, localTimeOn } from "../skills/calendar/agenda-brief/facts";
 import { checkPhase } from "../skills/calendar/agenda-brief/run";
-import { agendaTickWorkflow, conversationWorkflow, dropsPollWorkflow, messageSignal, plaudPollWorkflow, runSkillWorkflow, skillsTickWorkflow, type AgendaTickInput, type DropsPollInput, type Inbound, type PollInput, type SkillsTickInput } from "./workflows";
+import { agendaTickWorkflow, conversationWorkflow, dropsPollWorkflow, messageSignal, plaudPollWorkflow, runSkillWorkflow, skillsTickWorkflow, tryTurnWorkflow, type AgendaTickInput, type DropsPollInput, type Inbound, type PollInput, type SkillsTickInput } from "./workflows";
 import { agendaBrief, parseAgendaTimes } from "./skills/agenda-brief";
 import { ApplicationFailure, WorkflowExecutionAlreadyStartedError } from "@temporalio/common";
 import { planReload } from "./reload";
@@ -1006,7 +1006,9 @@ function wireTeams(a: AgentConfig, harnesses: ReturnType<typeof defaultHarnesses
     return null;
   }
   const mediaDir = path.join(process.env.TONOMAN_STATE_ROOT ?? "/root/.tonoman", "media", a.name);
-  const conn = new TeamsConnector({ appId: t.app_id, appPassword: t.app_password, tenantId: t.tenant_id, mediaDir, mediaMount: mediaDir, webhook: teamsWebhook(), speakerById: true });
+  // The turn draws its own work log through note() (the subtle gray card), so the connector draws
+  // none of its own; only a turn's answer streams, so a notice never leaves a Stop control behind.
+  const conn = new TeamsConnector({ appId: t.app_id, appPassword: t.app_password, tenantId: t.tenant_id, mediaDir, mediaMount: mediaDir, webhook: teamsWebhook(), speakerById: true, commands: cmds.KNOWN, workingCue: "none", streamOnlyWhenAsked: true, notesAsTrace: true });
   const runner = newRunnerFor(a, harnesses);
   if (!runner) {
     console.error(`worker: skipping ${label} — harness "${a.harness}" cannot run turns`);
@@ -2829,7 +2831,7 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
   // The agent as wired NOW — a reload may have replaced the one a handler was built with.
   const hasAccess = async (name: string, a: Wired, user: string, said?: { email?: string; name?: string }): Promise<boolean> =>
     knowsSpeaker((wired.get(name) ?? a).cfg.principals, user) || (strangerLookup.shouldSay(name, "", user) && (await knowSpeaker(name, user, said)));
-  const noticeFor = (name: string, a: Wired, user: string) => unknownSpeakerNotice(a.cfg.displayName ?? a.cfg.name ?? name, user);
+  const noticeFor = (name: string, a: Wired, user: string) => unknownSpeakerNotice(a.cfg.displayName ?? a.cfg.name ?? name, user, a.cfg.channel ?? (a.cfg.teams ? "teams" : "slack"));
   // The tenant's policies before its agents (POLICY-AGENT-GATE in Tonoman Cloud): only where there is a
   // registry to ask; the open-source runtime on its own roster has no policies.
   const policies = process.env.TONOMANCLOUD_API_URL
@@ -3237,6 +3239,17 @@ Record something and I'll pick it up within a couple of minutes - I'll post what
         // learns "reload off" rather than silently believing a poke landed.
         reload: triggerReload,
         dmFor,
+        // A tried turn (CONVO-TRY-*): its own one-shot workflow, awaited, in a try conversation of its
+        // own — a new one each time unless the caller continues one, so a try never lands in a real chat.
+        tryTurn: async (name, user, text, conversation) => {
+          const conv = conversation ?? `try/${user.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 64) || "someone"}/${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+          const transcript = await client.workflow.execute(tryTurnWorkflow, {
+            workflowId: `${name}:try:${conv}:${Date.now().toString(36)}`,
+            taskQueue: o.taskQueue,
+            args: [{ agent: name, conversation: conv, user, text }],
+          });
+          return { conversation: conv, transcript: transcript ?? {} };
+        },
         say: async (name, conversation, text) => {
           await wired.get(name)?.conn.reply(conversation).send(text);
         },

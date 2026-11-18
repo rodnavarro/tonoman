@@ -57,6 +57,28 @@ export interface SkillRunRequest {
   requestedBy?: string;
 }
 
+/** Trying an agent directly (CONVO-TRY-*): one real turn, as a person, with nothing posted. */
+export interface TryRequest {
+  /** The agent, by registry guid, label or local name. */
+  agent: string;
+  /** WHO is speaking: their id on the agent's channel (a Slack user id), as the registry knows them. */
+  user: string;
+  text: string;
+  /** A try conversation to continue (from an earlier answer); a new one when absent. */
+  conversation?: string;
+}
+
+/** PURE: validate a try body. */
+export function parseTry(body: unknown): { ok: true; req: TryRequest } | { ok: false; error: string } {
+  const b = (body ?? {}) as Record<string, unknown>;
+  const str = (k: string): string => (typeof b[k] === "string" ? (b[k] as string).trim() : "");
+  for (const k of ["agent", "user", "text"]) if (!str(k)) return { ok: false, error: `${k} is required` };
+  const conversation = str("conversation");
+  // Only a try conversation can be continued: a Slack or Teams one would mix a try into a real chat.
+  if (conversation && !/^try\/[A-Za-z0-9_-]{1,64}\/[a-z0-9]{6,32}$/.test(conversation)) return { ok: false, error: "conversation must be a try conversation from an earlier answer" };
+  return { ok: true, req: { agent: str("agent"), user: str("user"), text: str("text"), ...(conversation ? { conversation } : {}) } };
+}
+
 export interface WakeDeps {
   /** Open (or reuse) a DM with a user and return the conversation key. */
   dmFor(agent: string, userId: string): Promise<string | undefined>;
@@ -95,6 +117,8 @@ export interface WakeDeps {
   /** A brain was changed somewhere else — saved in the Hub — and its map should catch up, as after a
    *  push of this worker's own (BRAIN-BACKGROUND-REFRESH). Optional: a worker without brains has none. */
   brainPushed?(brain: PushedBrain): void;
+  /** Run one tried turn and wait for it (CONVO-TRY-*). Optional: a worker without it answers 404. */
+  tryTurn?(agent: string, user: string, text: string, conversation?: string): Promise<{ conversation: string; transcript: unknown }>;
 }
 
 /** A brain changed outside this worker, as the registry describes it. */
@@ -204,7 +228,7 @@ export function serveWake(o: WakeServerOptions, signal: AbortSignal): boolean {
 
     // `/api/talent-run` is the old name of `/api/skill-run`, kept for one release (D-TALENT-IS-SKILL).
     const route = (req.url ?? "").split("?")[0] === "/api/talent-run" ? "/api/skill-run" : (req.url ?? "").split("?")[0];
-    const ROUTES = ["/api/wake", "/api/reload", "/api/skill-run", "/api/brain-pushed"];
+    const ROUTES = ["/api/wake", "/api/reload", "/api/skill-run", "/api/brain-pushed", "/api/try"];
     if (req.method !== "POST" || !ROUTES.includes(route)) {
       return send(404, { error: "not found" });
     }
@@ -243,6 +267,28 @@ export function serveWake(o: WakeServerOptions, signal: AbortSignal): boolean {
         if (!p.ok) return send(400, { error: p.error });
         o.deps.brainPushed(p.brain);
         return send(202, { accepted: true });
+      }
+
+      // Try an agent directly (CONVO-TRY-*). Unlike /api/wake this holds the connection for the turn:
+      // the caller is waiting for exactly this answer, and the answer goes nowhere else.
+      if (route === "/api/try") {
+        if (!o.deps.tryTurn) return send(404, { error: "this worker cannot run a tried turn" });
+        const t = parseTry(parsed);
+        if (!t.ok) return send(400, { error: t.error });
+        const key = o.deps.resolveAgent?.(t.req.agent) ?? (o.deps.has(t.req.agent) ? t.req.agent : undefined);
+        if (!key) return send(404, { error: `no such agent "${t.req.agent}"` });
+        req.setTimeout(0);
+        res.setTimeout(0);
+        void (async () => {
+          try {
+            const r = await o.deps.tryTurn!(key, t.req.user, t.req.text, t.req.conversation);
+            send(200, { agent: key, conversation: r.conversation, ...(r.transcript as object) });
+          } catch (e) {
+            console.error(`try: ${key} failed: ${(e as Error).message}`);
+            send(500, { error: `the turn failed — ${(e as Error).message.slice(0, 300)}` });
+          }
+        })();
+        return;
       }
 
       // Run a Skill on one item, asked for from the Hub (W4). UNLIKE /api/wake this answers with

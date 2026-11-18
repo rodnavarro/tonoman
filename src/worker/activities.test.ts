@@ -25,6 +25,12 @@ describe("speakerContext — who is speaking, where the model believes it", () =
     expect(s.prefix).toBe("Unrecognised person (U999): ");
   });
 
+  it("names a person in Teams by their Entra id, not as a Slack user (TEAMS-PERSON-IS-ACCOUNT)", () => {
+    const s = speakerContext({ user: "10431e68-a7ac-46b1-8d9e-da2c23a59ea3", label: "Rod Navarro", channel: "teams" });
+    expect(s.system).toContain("from Rod Navarro (Teams user 10431e68-a7ac-46b1-8d9e-da2c23a59ea3)");
+    expect(s.system).not.toContain("Slack");
+  });
+
   it("marks a recap announcement as the platform's, addressed to its owner", () => {
     const s = speakerContext({ user: "U0AAAAAAA1", label: "Rod Navarro", fromSystem: true });
     expect(s.system).toContain("instruction from the platform");

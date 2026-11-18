@@ -52,14 +52,24 @@ const tonomanIn = (env: Record<string, string>, input: string | undefined, ...ar
   });
 
 describe("found by asking it", () => {
-  it("CLI-SMALL-CONTEXT `tonoman --help` names the groups; `tonoman brain --help` names its commands and their arguments", async () => {
+  it("CLI-SMALL-CONTEXT `tonoman --help` names the groups; `tonoman vault --help` names its commands and their arguments", async () => {
     const { cli } = broker.startTurn({ agentGuid: "echo", slackUserId: "UANA", who: "Ana" });
     const top = await tonoman(cli.env, "--help");
     expect(top.code).toBe(0);
-    expect(top.out).toMatch(/brain/);
-    const brain = await tonoman(cli.env, "brain", "--help");
-    for (const c of ["list", "pages", "search", "read", "write"]) expect(brain.out).toContain(c);
-    expect(brain.out).toMatch(/--brain/);
+    // Context vaults, as people and the model call them (D-BRAIN-IS-CONTEXT-VAULT): the old name is not offered.
+    expect(top.out).toMatch(/vault\s+the context vaults this person can reach/);
+    expect(top.out).not.toMatch(/brain/);
+    const vault = await tonoman(cli.env, "vault", "--help");
+    for (const c of ["list", "pages", "search", "read", "write"]) expect(vault.out).toContain(c);
+    expect(vault.out).toMatch(/--vault/);
+  });
+
+  it("D-BRAIN-IS-CONTEXT-VAULT `tonoman brain` and --brain still work, for a skill or a person that still types them", async () => {
+    const { cli } = broker.startTurn({ agentGuid: "echo", slackUserId: "UANA", who: "Ana" });
+    const old = await tonoman(cli.env, "brain", "list");
+    const now = await tonoman(cli.env, "vault", "list");
+    expect(old.code).toBe(0);
+    expect(old.out).toBe(now.out);
   });
 
   it("CLI-GRANTED-GROUPS `tonoman receipts` appears only while Receipts is on for the agent", async () => {
