@@ -27,6 +27,8 @@ export function decideRoute(audience: Audience, used: string[], readableByAll: s
 
 /** The first line of the DM when the turn was about a finance document (RECEIPT-PRIVATE-THROUGHOUT). */
 export const FINANCE_REASON = "_Answering here because this is about a finance document, and those I only discuss with the person who sent them._";
+/** …when the finance document was earlier in the thread, not in this message. */
+export const FINANCE_THREAD_REASON = "_Answering here because this conversation included a finance document, and I keep the rest of it between us._";
 
 /** PURE: the first line of the DM, saying why it arrived there. */
 export function privateReason(brainNames: string[], audience: Audience): string {

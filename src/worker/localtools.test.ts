@@ -126,6 +126,21 @@ describe("the tools, answered", () => {
     expect(calls.closed[0]).toEqual(["Rex", "meeting-recap", "R-1", expect.stringContaining("Filed")]);
   });
 
+  it("RECAP-SKIP-CLOSES-RUN a recording that is not a meeting is closed as done with its reason, and nothing is filed", async () => {
+    const { call, calls } = made();
+    const r = await call("g-1", "UANA", "meeting-recap", "skip", { id: "R-1", reason: "a test press, two words" });
+    expect(r).toMatchObject({ status: 200, text: expect.stringContaining("will not be asked about again") });
+    expect(calls.closed[0]).toEqual(["Rex", "meeting-recap", "R-1", expect.stringContaining("a test press, two words")]);
+    expect(calls.published).toHaveLength(0);
+  });
+
+  it("RECAP-SKIP-CLOSES-RUN a skip without a reason closes nothing", async () => {
+    const { call, calls } = made();
+    const r = await call("g-1", "UANA", "meeting-recap", "skip", { id: "R-1" });
+    expect(r.status).toBe(400);
+    expect(calls.closed).toHaveLength(0);
+  });
+
   it("RECAP-CHECKED-BEFORE-FILED a refused recap files nothing and says what to fix", async () => {
     const { call, calls } = made();
     const f = await call("g-1", "UANA", "meeting-recap", "file", { id: "R-1", recap: { summary: "x", highlights: [], decisions: [], followups: [], meeting: "Invented" } });
@@ -172,6 +187,12 @@ describe("the recap job is a prompt", () => {
     expect(p).toContain("`tonoman plaud transcript --id R-1`");
     expect(p).not.toContain("--copy");
     expect(recapNudge({ copy: "meeting-recap", id: "R-1", title: "x", login: "mine" })).toContain("tonoman meeting-recap file --id R-1 <<'RECAP'`");
+  });
+
+  it("RECAP-SKIP-CLOSES-RUN the job and its nudge both say how to close a recording that is not a meeting", () => {
+    const p = recapJobPrompt({ copy: "team-recap", id: "R-1", title: "x", startedAt: 0, minutes: 1, login: "Team Plaud", calendars: [] });
+    expect(p).toContain(`tonoman meeting-recap skip --id R-1 --login "Team Plaud" --copy team-recap --reason`);
+    expect(recapNudge({ copy: "meeting-recap", id: "R-1", title: "x", login: "mine" })).toContain("tonoman meeting-recap skip --id R-1 --reason");
   });
 });
 
