@@ -1,100 +1,75 @@
 # Tonoman and the book
 
-Status: proposal for review (11/25). Branch `feat/book`.
+Status: living list, branch `feat/book` (Rod, 11/25). This branch holds what Tonoman must do so each project in
+the book can run on Tonoman.
 
 The book *Think. Steer. Amplify.* (Rod Navarro, 2026) teaches small-business owners to use AI in 30 days, with 7
-projects. Several projects need an agent that is always on and acts by itself. This doc says what the book tells
-readers to use at launch, and the smallest Tonoman release that makes those projects work.
+projects. **The first edition uses routes that work today** (Claude, ChatGPT, Zapier, Make, n8n, and the owner's
+own always-on computer). Tonoman appears as an option for running agents on your own computer. When a gap below is
+closed, a later edition can move that project to Tonoman, or add a chapter on how to use Tonoman.
 
 ## Principles
 
 1. **The agent acts under rules, not under approval.** The owner writes the rules once (prices as ranges, service
    area, voice, what never to promise, when to call the owner). The agent tests against them, then acts. The owner
-   sees only the exceptions. A book that says "reply in 5 minutes" and then "approve every reply" misleads the reader.
-2. **AI earns its place in conversations.** An instant first email is an autoresponder; that is old. The value is
-   the back-and-forth at chat speed (text, Messenger, DMs) until a call or visit is booked.
-3. **Local first.** The simplest home for an always-on agent is a computer that stays on at the reader's home or
-   shop (an old laptop or a Mac mini). It has a home internet connection, it is the owner's own machine and
-   accounts, and it costs nothing extra. Tonoman is open source, so a local install has no usage limits.
-4. **Build locally, move to the cloud later.** The reader drives Claude Code or Codex to build the skills and
-   scripts on their own computer. Later, one command moves the same agent to Tonoman Cloud, with its secrets. That
-   move is v1.1, not launch.
-5. **Glue in the cloud, browsers at home.** Tonoman Cloud is good at glue: the second brain, git, Google Drive,
-   Slack. Browsing the web as the owner (Facebook, LinkedIn) at scale from a data center is not something we offer.
-6. **Small scope.** Ship what the book's flows need. Name the alternatives (Zapier, Make, n8n) so the book is not
-   a pitch.
+   sees only the exceptions.
+2. **AI earns its place in conversations.** An instant first email is an autoresponder. The value is the
+   back-and-forth at chat speed (text, Messenger, DMs) until a call or visit is booked.
+3. **Local first.** The simplest home for an always-on agent is a computer that stays on at the owner's home or
+   shop. It uses the owner's own internet and accounts and costs nothing extra. Tonoman is free to run there, with
+   no usage limits.
+4. **Build locally, move to the cloud later.** The owner drives Claude Code or Codex to build the skills on their
+   own computer. Later, one command moves the same agent to Tonoman Cloud with its secrets.
+5. **Glue in the cloud, browsers at home.** Tonoman Cloud is for glue: the second brain, git, Google Drive, Slack.
+   We do not offer browsers in data centers that act as the owner on Facebook or LinkedIn, and we do not help get
+   past a site's bot checks.
+6. **Small scope.** Build what the book's flows need, in the order below.
 
-## What the book says at launch (book v1.0, upload 11/28)
+## Gaps, per project
 
-| Project | What runs it | Tonoman's part | Alternatives named |
-|---|---|---|---|
-| 1. Morning brief (Day 9) | Scheduled task in Claude or ChatGPT; or Tonoman on the home computer | Brief in Slack; routine replies under rules; drafts in Gmail | Zapier schedule + AI step |
-| 2. Website (Day 15) | Coding agent; publish to a free host | none | Netlify, Cloudflare Pages, Lovable |
-| 3. Google profile and reviews (Day 17) | Browser agent once; review requests under rules | Review-request skill (later) | Zapier, Make |
-| 4. Facebook leads to a sheet (Day 19) | Meta's lead integration or Zapier/Make | none | n8n |
-| 5. Receipts (Day 24) | Tonoman (built today: receipts sent as photos in Slack) | Receipts skill | QuickBooks capture, Dext |
-| 6. Every lead answered in 5 minutes (Day 28) | Tonoman on the home computer, lead-responder skill | Section below | Zapier/Make/n8n + Twilio + AI step; GoHighLevel, Podium |
-| 7. Crews and 90-day plan (Day 30) | Tonoman skills on a schedule, results in one Slack channel | Schedules | Zapier, n8n |
+| Book project | What the first edition uses | What Tonoman needs |
+|---|---|---|
+| Day 9, morning brief | Scheduled task in Claude or ChatGPT | Schedules the owner sets by chat; Gmail read and drafts in the right thread; delivery to the phone (Slack today; text or WhatsApp later); a brief that runs without the meeting-recap skill |
+| Day 15, website | Coding agent; free static host | Publish to a live address with a phone preview; a form that writes to the lead sheet |
+| Day 17, reviews | Browser agent once; review requests by an automation service | Trigger on a job marked "done" in the sheet; send a review request by text or email; reply to good reviews under rules |
+| Day 19, leads to a sheet | Meta's lead integration, Zapier or Make | Inbound webhook per agent; Sheets read and write; duplicate check |
+| Day 23, second brain | A private folder kept by Claude or ChatGPT (see the book) | Self-serve signup (start free, Google login); one-click "Add to Slack"; fill the brain from existing emails, site and reviews in one sitting |
+| Day 24, receipts | Phone photo to the AI app (see the book) | Receipts from Gmail; ledger in a Google Sheet; images in Drive; monthly match against a bank CSV; export for the accountant |
+| Day 27, inspection | The owner runs a punch list | A test runner: run the punch list against the rules after every change, post pass/fail |
+| **Day 28, every lead answered in 5 minutes** | An automation service with texting and an AI step, or a ready-made service (see the book) | **Lead responder, below** |
+| Day 29–30, crews | Scheduled tasks; results posted to one place | Schedules; posting results to one Slack channel; exceptions only |
 
-A short new section in the book, "Where your agents live", explains:
+## The lead responder (first to build)
 
-- **Your own computer, always on** (recommended). Install the agent with your coding agent. Keep the computer
-  awake and plugged in. A Mac mini or an old laptop is enough.
-- **The cloud** (coming in Tonoman Cloud v1.1): the same agent, moved with one command.
-- **Agents that browse the web from the cloud** exist, but the sites they visit often block data-center traffic,
-  and automating a personal Facebook or LinkedIn account can break those sites' terms and get the account closed.
-  Use the official tools (Meta's lead forms and inbox automations) where they exist.
+Runs on the owner's own computer first (open-source runtime), then in Tonoman Cloud.
 
-## Tonoman v1.0.1: the minimum for the book
+- Checks the lead sheet every 60 seconds (a skill with `poll_seconds: 60`; no inbound webhook needed at home).
+- First text within a minute: the lead's name, an answer, a price range from the rules page, one question, two
+  free calendar slots.
+- Keeps the conversation going: replies come back to the business number; the state of each lead is kept in the
+  sheet (new, engaged, qualified, booked, lost, handed off).
+- Follows up if the lead goes quiet, then stops.
+- Guardrails in code, not in the prompt: texting hours, a cap on messages per lead, STOP list, SMS consent column
+  required, service-area check.
+- Asks the owner in Slack only for exceptions: emergency words, anger or "talk to a person", price push past the
+  range, a job over the owner's limit, a question the rules do not cover.
+- Watch mode for the first days: every conversation mirrored to a Slack thread with "take over".
+- `/pause leads` and `/resume leads`; one summary a day.
 
-Everything here runs on the reader's own computer with the open-source runtime. Size: S = a day, M = a few days.
+Needs: Twilio (two-way texting, with US A2P 10DLC registration), Google Sheets and Calendar (free/busy, create
+event), conversations with people who are not members of the tenant, delayed sends.
 
-1. **Install with your coding agent (M).** One page, `docs/install-with-your-agent.md`, written for Claude Code and
-   Codex to follow on Windows and macOS: Node, podman, the agent image, Slack app, login, start on boot, keep awake.
-   The reader's prompt in the book is one line: "Install Tonoman from github.com/rodnavarro/tonoman and connect it
-   to my Slack."
-2. **Lead-responder skill (M).** `examples/skills/lead-responder/`:
-   - Polls the lead sheet every 60 seconds (`poll_seconds: 60`; no inbound webhook needed at home).
-   - First text within a minute: name, answer, a price range from the rules page, one question, two free calendar
-     slots.
-   - Keeps the conversation going: replies come back by the Twilio number; state per lead in the sheet
-     (new, engaged, qualified, booked, lost, handed off).
-   - Follow-ups at +1 hour, next morning, day 3, day 7, then stop.
-   - Guardrails in code, not in the prompt: quiet hours (8 a.m. to 8 p.m., lead's time zone), at most 6 messages per
-     lead, STOP list, SMS consent column required, service-area check.
-   - Escalates to the owner's Slack only for: emergency words, anger or "talk to a person", price push past the
-     range, a job over the owner's limit, a question the rules do not cover.
-   - Watch mode for the first days: every conversation mirrored to a Slack thread with "take over".
-3. **Lead rules page template (S).** A page in the second brain: prices as ranges, service area, hours, voice,
-   never-promise list, escalation list. The skill reads it on every turn; the owner edits it by chat ("raise water
-   heaters to $1,800").
-4. **Inspection before go-live (S).** `!skill lead-responder test` runs 10 sample leads against the rules page and
-   posts pass/fail to Slack. It runs again after every rules change.
-5. **Pause switch (S).** `/pause leads` and `/resume leads` in Slack stop and start the skill at once.
-6. **Daily digest (S).** One Slack message at 6 p.m.: leads in, replied in under 5 minutes, booked, handed off.
-7. **Morning-brief and review-request skills (M, after 6).** Same pattern: schedule, rules page, act, report
-   exceptions.
+## Also needed
 
-Not in v1.0.1: inbound webhooks, Messenger or Instagram connectors, Gmail send, a desktop app, anything in the cloud.
-
-## Tonoman Cloud v1.1: from your computer to the cloud
-
-- `tonoman push <agent>`: moves an agent built locally (skills, rules page, schedule) to the reader's Tonoman
-  Cloud tenant, and asks for each secret (Twilio, Google) once.
-- Self-serve signup (start free, Google login), one-click "Add to Slack".
-- Inbound webhooks per agent, so a form or Zapier can post a lead without polling.
-- The book's second edition points the projects at this.
-
-## Not doing
-
-- Browsers in data centers that act as the owner on Facebook or LinkedIn, mobile-IP proxies, or anything meant to
-  get past a site's bot checks.
-- A Tonoman desktop app, for now. The install page plus a coding agent does the same job.
+- **Install with your coding agent.** One page, `docs/install-with-your-agent.md`, for Claude Code and Codex to
+  follow on Windows and macOS: Node, podman, the agent image, Slack, login, start on boot, keep awake. Test it on a
+  clean computer before the book points to it.
+- **`tonoman push <agent>`**: move an agent built locally (skills, rules page, schedule) to Tonoman Cloud and ask
+  for each secret once.
 
 ## Open questions
 
 1. Licence: the runtime is Apache-2.0 on `main`; a branch moves it to the Sustainable Use License. The book can say
-   "open source" only while it is Apache-2.0; under the new licence say "free to run on your own computer".
-2. Twilio needs A2P 10DLC registration for US business texting (days to weeks). The book must tell readers to start
-   it on Day 19, not Day 28.
-3. Florida (the first readers) limits texting hours and counts; check the current rules before print.
+   "open source" only while it is Apache-2.0; otherwise "free to run on your own computer".
+2. The public README describes Telegram and Teams. The book names Slack only. Add Slack to the README's getting
+   started before the book points to it.
