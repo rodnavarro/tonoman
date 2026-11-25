@@ -5,7 +5,7 @@ the book can run on Tonoman.
 
 The book *Think. Steer. Amplify.* (Rod Navarro, 2026) teaches small-business owners to use AI in 30 days, with 7
 projects. **The first edition uses routes that work today** (Claude, ChatGPT, Zapier, Make, n8n, and the owner's
-own always-on computer). Tonoman appears as an option for running agents on your own computer. When a gap below is
+own always-on computer). Days 23 and 24 use Tonoman Cloud (second brain, receipts); elsewhere Tonoman appears as an option for running agents on your own computer. When a gap below is
 closed, a later edition can move that project to Tonoman, or add a chapter on how to use Tonoman.
 
 ## Principles
@@ -33,8 +33,8 @@ closed, a later edition can move that project to Tonoman, or add a chapter on ho
 | Day 15, website | Coding agent; free static host | Publish to a live address with a phone preview; a form that writes to the lead sheet |
 | Day 17, reviews | Browser agent once; review requests by an automation service | Trigger on a job marked "done" in the sheet; send a review request by text or email; reply to good reviews under rules |
 | Day 19, leads to a sheet | Meta's lead integration, Zapier or Make | Inbound webhook per agent; Sheets read and write; duplicate check |
-| Day 23, second brain | A private folder kept by Claude or ChatGPT (see the book) | Self-serve signup (start free, Google login); one-click "Add to Slack"; fill the brain from existing emails, site and reviews in one sitting |
-| Day 24, receipts | Phone photo to the AI app (see the book) | Receipts from Gmail; ledger in a Google Sheet; images in Drive; monthly match against a bank CSV; export for the accountant |
+| Day 23, second brain | **Tonoman Cloud**: Start free, Slack, and the Claude connector; a Drive folder for ChatGPT users | **Must be live before upload (11/28):** self-serve signup (start free, Google login) and the Claude connector at its public address. Then: one-click "Add to Slack"; fill the brain from existing emails, site and reviews in one sitting |
+| Day 24, receipts | **Tonoman Cloud**: receipt photos in Slack (built); emailed receipts through Claude with the connector | Receipts from Gmail; ledger in a Google Sheet; images in Drive; monthly match against a bank CSV; export for the accountant |
 | Day 27, inspection | The owner runs a punch list | A test runner: run the punch list against the rules after every change, post pass/fail |
 | **Day 28, every lead answered in 5 minutes** | An automation service with texting and an AI step, or a ready-made service (see the book) | **Lead responder, below** |
 | Day 29–30, crews | Scheduled tasks; results posted to one place | Schedules; posting results to one Slack channel; exceptions only |
